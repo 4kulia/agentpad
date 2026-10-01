@@ -1,0 +1,191 @@
+import AppKit
+import SwiftUI
+
+/// What you can do about a session running in another terminal: jump to its
+/// tab, or move the conversation into a tab here.
+@MainActor
+enum ExternalSessionActions {
+    static func focus(_ session: ExternalAgentSession) {
+        Task { @MainActor in
+            if await TerminalFocuser.focus(session) == .noTerminalFound {
+                showAlert(
+                    title: "Couldn't find this session's window",
+                    message: "It isn't running in a terminal app this Mac can bring forward (for example, it runs inside tmux or over SSH)."
+                )
+            }
+        }
+    }
+
+    static func takeOver(_ session: ExternalAgentSession, into store: WorkspaceStore) {
+        let alert = NSAlert()
+        alert.messageText = "Move “\(session.displayTitle)” here?"
+        alert.informativeText = """
+        The session will be closed in its terminal and the same conversation resumed in a new tab here. \
+        The conversation is kept; anything else running in that terminal tab is not.
+        """
+        alert.addButton(withTitle: "Move Here")
+        alert.addButton(withTitle: "Cancel")
+        present(alert) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            performTakeOver(session, into: store)
+        }
+    }
+
+    private static func performTakeOver(_ session: ExternalAgentSession, into store: WorkspaceStore) {
+        Task { @MainActor in
+            switch await ExternalSessionMonitor.shared.takeOver(session, into: store) {
+            case .success:
+                break
+            case .failure(.notIdle):
+                showAlert(title: "Session is busy", message: "Only an idle session can be moved. Try again when it's done.")
+            case .failure(.stillRunning):
+                showAlert(title: "Session didn't close", message: "It is still running in its terminal. Nothing was changed here.")
+            case .failure(.changed):
+                showAlert(title: "Session changed", message: "That session ended or restarted since the list was shown. Nothing was changed.")
+            case .failure(.noTranscript):
+                showAlert(title: "Conversation not saved", message: "Claude Code hasn't saved this conversation to disk, so it couldn't be resumed here. The session was left running.")
+            case .failure(.resumeRefused(let reason)):
+                showAlert(title: "Couldn't resume the conversation", message: reason)
+            }
+        }
+    }
+
+    static func showAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        present(alert) { _ in }
+    }
+
+    /// As a sheet on our window, with the app active first. A free-floating
+    /// `runModal()` shown while another app is frontmost renders the default
+    /// button inactive — blank on macOS 26 — so the dialog looked like it had
+    /// only "Cancel".
+    static func present(_ alert: NSAlert, completion: @escaping (NSApplication.ModalResponse) -> Void) {
+        NSApp.activate()
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: \.isVisible) {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+}
+
+struct SessionSectionLabel: View {
+    let title: String
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(title.uppercased())
+                .font(Theme.display(10, weight: .semibold))
+                .foregroundStyle(Theme.chromeMuted)
+            Text("\(count)")
+                .font(Theme.mono(10, weight: .medium))
+                .foregroundStyle(Theme.chromeMuted.opacity(0.75))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+        .padding(.bottom, 4)
+    }
+}
+
+struct ExternalSessionRow: View {
+    let session: ExternalAgentSession
+    let isTakingOver: Bool
+    let onFocus: () -> Void
+    let onTakeOver: () -> Void
+    var onShowFiles: (() -> Void)? = nil
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            AgentIconView(
+                asset: AgentTemplate.claudeCode.iconAsset,
+                fallbackSymbol: AgentTemplate.claudeCode.symbol,
+                size: 16
+            )
+            VStack(alignment: .leading, spacing: 1) {
+                Text(session.displayTitle)
+                    .font(Theme.display(12.5, weight: .medium))
+                    .foregroundStyle(Theme.chromeForeground)
+                    .lineLimit(1)
+                Text(locationLine)
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.75))
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            Spacer(minLength: 6)
+            if isTakingOver {
+                ProgressView().controlSize(.small)
+            } else if isHovered {
+                actionButtons
+            } else {
+                stateLabel
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, Theme.sidebarRowVerticalPadding)
+        .background(isHovered ? Theme.chromeHover : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chromeSelectionCornerRadius, style: .continuous))
+        .padding(.horizontal, Theme.space2)
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
+        .onTapGesture(perform: onFocus)
+        .contextMenu {
+            Button("Go to Terminal Window", action: onFocus)
+            if let onShowFiles { Button("Show Files", action: onShowFiles) }
+            Button("Move Here", action: onTakeOver).disabled(!session.canTakeOver)
+        }
+        .help(helpText)
+    }
+
+    private var stateLabel: some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            Text(stateWord)
+                .font(Theme.display(10, weight: .medium))
+                .foregroundStyle(agentStateWordColor(session.monitorState))
+            if let since = session.statusSince {
+                // Re-render once a minute so the age doesn't freeze.
+                TimelineView(.periodic(from: .now, by: 60)) { context in
+                    Text(relativeAgeTier(context.date.timeIntervalSince(since)))
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.chromeMuted.opacity(0.75))
+                }
+            }
+        }
+    }
+
+    private var actionButtons: some View {
+        HStack(spacing: 2) {
+            if let onShowFiles {
+                HoverableIconButton(systemName: "folder", fontSize: 11, size: 22, help: "Show this session's files", action: onShowFiles)
+            }
+            HoverableIconButton(systemName: "macwindow", fontSize: 11, size: 22, help: "Go to terminal window", action: onFocus)
+            if session.canTakeOver {
+                HoverableIconButton(systemName: "arrow.down.to.line", fontSize: 11, size: 22, help: "Move here", action: onTakeOver)
+            }
+        }
+    }
+
+    private var stateWord: String {
+        if case .other(let raw) = session.status { return raw }
+        return session.monitorState.label
+    }
+
+    private var locationLine: String {
+        let path = (session.cwd.path as NSString).abbreviatingWithTildeInPath
+        guard let tty = session.tty else { return path }
+        return "\(path) · \(tty)"
+    }
+
+    private var helpText: String {
+        var lines = [singleLine(session.displayTitle)]
+        if case .waiting(let reason?) = session.status { lines.append("Waiting: \(reason)") }
+        lines.append(locationLine)
+        lines.append("Click to go to its terminal window")
+        return lines.joined(separator: "\n")
+    }
+}

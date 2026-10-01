@@ -56,7 +56,7 @@ public enum KookyCLIProtocol {
     /// keeps a deliberate second gate for direct callers, and sharing the
     /// message keeps the two from drifting.
     public static func tooNewRequestMessage(requested: Int) -> String {
-        "this kooky speaks CLI protocol \(version) but the request is protocol \(requested) — update kooky"
+        "this \(AppIdentity.appName) speaks CLI protocol \(version) but the request is protocol \(requested) — update \(AppIdentity.appName)"
     }
 }
 

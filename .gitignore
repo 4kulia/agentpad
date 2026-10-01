@@ -71,3 +71,9 @@ IDEAS.md
 # Antigravity CLI runtime state (project-scoped symlinks into ~/.gemini)
 .antigravitycli/
 bench-history.jsonl
+
+# AgentPad: private planning notes (requirements, roadmap) — kept locally only
+docs/agentpad/
+# AgentPad: local scratch and review output
+*.local.md
+.scratch/

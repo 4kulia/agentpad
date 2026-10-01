@@ -88,6 +88,9 @@ final class AgentMonitor {
         /// project's colour. That's what turns the stripe into project grouping
         /// for a list whose order is purely by state.
         let tag: WorkspaceTag?
+        /// AgentPad: the agent's conversation id, so the unified list can keep
+        /// a live session from also appearing under "recent".
+        var conversationId: String? = nil
 
         /// Stable location text used when a compact surface needs the actual
         /// project path. Remote sessions name the host because their local
@@ -136,9 +139,14 @@ final class AgentMonitor {
                 agent: agent,
                 state: Self.state(of: item.session),
                 tabTitle: item.session.title,
-                directory: item.workspace.diskPath,
+                // AgentPad: the tab's own folder. Several agents can share one
+                // workspace, and the workspace's path follows whichever tab is
+                // active — so with it, every row's folder changed on each tab
+                // switch. An agent doesn't `cd`, so this stays its launch folder.
+                directory: item.session.currentDirectory,
                 remoteHost: item.session.effectiveRemoteHost,
-                tag: item.workspace.tag
+                tag: item.workspace.tag,
+                conversationId: item.session.conversationId
             )
         }
         .sorted { $0.state < $1.state }
@@ -395,25 +403,10 @@ struct AgentOverviewSidebar: View {
         .frame(width: store.rightSidebarWidth)
     }
 
+    // AgentPad: the agents page is one list of our tabs, sessions in other
+    // terminals, and recent conversations.
     private var agentsBody: some View {
-        let entries = monitor.entries   // aggregate once per render, not per read
-        return VStack(spacing: 0) {
-            RightPanelHeader(title: "agents", count: entries.count)
-            if entries.isEmpty {
-                PanelEmptyState(symbol: "sparkles", message: "no agents running")
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(entries) { entry in
-                            AgentOverviewRow(entry: entry, showTags: showTags)
-                                .onTapGesture { monitor.onActivate(entry.id) }
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-            }
-            Spacer(minLength: 0)
-        }
+        UnifiedSessionsView(store: store, showTags: showTags)
     }
 
     @ViewBuilder
@@ -456,7 +449,7 @@ struct AgentOverviewSidebar: View {
     }
 }
 
-private struct AgentOverviewRow: View {
+struct AgentOverviewRow: View {
     let entry: AgentMonitor.Entry
     let showTags: Bool
     @State private var isHovered = false

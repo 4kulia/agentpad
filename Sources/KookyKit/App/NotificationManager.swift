@@ -26,6 +26,8 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     /// delivered notification. `AppDelegate` wires this to its reveal-tab
     /// routing (deminiaturize → key → activate workspace + tab).
     var onActivate: ((UUID) -> Void)?
+    /// AgentPad: clicked a banner about a session in another terminal.
+    var onActivateExternal: ((String) -> Void)?
 
     /// `UNUserNotificationCenter` needs an app bundle: a bare `swift run`
     /// binary (the dev build) has no bundle id and `current()` traps. Gate
@@ -62,6 +64,19 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         ))
     }
 
+    /// AgentPad: a banner about a Claude Code session in another terminal.
+    /// Carries the Claude session id instead of one of our tab ids.
+    func postExternal(title: String, body: String, externalSessionId: String) {
+        guard isAvailable else { return }
+        requestAuthorizationIfNeeded()
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.userInfo = ["externalSessionId": externalSessionId]
+        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+
     /// Requests banner/sound permission once, on the first notification kooky
     /// actually wants to deliver — so the OS prompt only ever appears for a
     /// user who has notifications enabled and just hit a notifiable event.
@@ -87,8 +102,14 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let raw = response.notification.request.content.userInfo["sessionId"] as? String
+        let userInfo = response.notification.request.content.userInfo
+        let raw = userInfo["sessionId"] as? String
+        let external = userInfo["externalSessionId"] as? String
         completionHandler()
+        if let external {
+            Task { @MainActor [weak self] in self?.onActivateExternal?(external) }
+            return
+        }
         guard let raw, let id = UUID(uuidString: raw) else { return }
         Task { @MainActor [weak self] in self?.onActivate?(id) }
     }

@@ -1,4 +1,5 @@
 import AppKit
+import KookyHookKit
 import SwiftUI
 
 /// Namespace for the View menu's Tab/Workspace switch items. Tags share a
@@ -158,7 +159,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // (the second persistence flush would write the phantom tab).
         hookServer.onCLIRequest = { [weak self] request, isCallerWaiting, completion in
             guard let self, !self.isTerminating else {
-                completion(.failure("kooky is shutting down"))
+                completion(.failure("\(AppIdentity.appName) is shutting down"))
                 return
             }
             self.cliController.handle(
@@ -194,6 +195,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         AgentMonitor.shared.onActivate = { [weak self] sessionId in
             self?.activateFromNotification(sessionId)
         }
+        // AgentPad: Claude Code sessions running in other terminals, plus the
+        // Dock badge / banners / ⌘⇧U that cover them and our own tabs.
+        AttentionCoordinator.shared.notificationManager = notificationManager
+        AttentionCoordinator.shared.activateOwn = { [weak self] sessionId in
+            self?.activateFromNotification(sessionId)
+        }
+        notificationManager.onActivateExternal = { id in
+            AttentionCoordinator.shared.activate(.external(id))
+        }
+        AttentionCoordinator.shared.start()
+        ExternalSessionMonitor.shared.start()
         let agentMenuBarController = AgentMenuBarController(
             monitor: .shared,
             settings: settings,
@@ -625,7 +637,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 spawnCwd = ((await callerProbe.value) ?? nil) ?? record?.cwd
             }
             guard let self, !self.isTerminating else {
-                completion(.dropped("kooky is shutting down"))
+                completion(.dropped("\(AppIdentity.appName) is shutting down"))
                 return
             }
             // Before ANY side effect below — the reveal fronts a window, and
@@ -651,7 +663,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 if let cwd {
                     completion(.failed("directory does not exist: \(cwd)"))
                 } else {
-                    completion(.failed("conversation '\(conversationId)' is not among the newest sessions kooky scans for \(agentId) — pass a cwd (&cwd= / --cwd) to resume an older one"))
+                    completion(.failed("conversation '\(conversationId)' is not among the newest sessions \(AppIdentity.appName) scans for \(agentId) — pass a cwd (&cwd= / --cwd) to resume an older one"))
                 }
                 return
             }
@@ -667,7 +679,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 return
             }
             guard let landing = self.deepLinkController() else {
-                completion(.dropped("kooky is shutting down"))
+                completion(.dropped("\(AppIdentity.appName) is shutting down"))
                 return
             }
             let controller = landing.controller
@@ -797,7 +809,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             // the same synchronous tick, and resumeSession re-checks after
             // its async hop (the load-bearing one).
             guard let self else {
-                completion(.dropped("kooky is shutting down"))
+                completion(.dropped("\(AppIdentity.appName) is shutting down"))
                 return
             }
             self.resumeSession(
@@ -1238,6 +1250,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             responderRow("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"),
             responderRow("Zoom", #selector(NSWindow.performZoom(_:))),
             selfRow("Center", #selector(handleCenterWindow)),
+            .separator,
+            selfRow("Next Session Needing You", #selector(handleNextWaitingSession), "u", modifiers: [.command, .shift]),
         ])
         mainMenu.addItem(submenu(windowMenu))
 
@@ -1554,6 +1568,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     @objc private func handleReopenClosedTab() {
         activeStore?.reopenLastClosedTab()
+    }
+
+    @objc private func handleNextWaitingSession() {
+        AttentionCoordinator.shared.jumpToNextWaiting()
     }
 
     @objc private func handleNextTab() {

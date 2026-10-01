@@ -1,7 +1,7 @@
 import XCTest
 @testable import KookyKit
 
-/// `kooky://` deep-link grammar + the already-open-conversation lookup and
+/// `agentpad://` deep-link grammar + the already-open-conversation lookup and
 /// store lookup the handler consults before spawning a duplicate resume. The
 /// AppKit half (`application(_:open:)`, window fronting, the failure sheet)
 /// stays manual — these pin the pure decisions underneath it.
@@ -24,28 +24,28 @@ final class DeepLinkTests: XCTestCase {
 
     func testParsesResumeLink() {
         XCTAssertEqual(
-            KookyDeepLink.parse(URL(string: "kooky://resume?agent=claude-code&id=1234-abcd")!),
+            KookyDeepLink.parse(URL(string: "agentpad://resume?agent=claude-code&id=1234-abcd")!),
             .resumeSession(agentId: "claude-code", conversationId: "1234-abcd", cwd: nil)
         )
         XCTAssertEqual(
-            KookyDeepLink.parse(URL(string: "kooky://resume?agent=codex&id=abc&cwd=/Users/x/proj%20dir")!),
+            KookyDeepLink.parse(URL(string: "agentpad://resume?agent=codex&id=abc&cwd=/Users/x/proj%20dir")!),
             .resumeSession(agentId: "codex", conversationId: "abc", cwd: "/Users/x/proj dir")
         )
     }
 
     func testSchemeHostAndAgentAreCaseNormalized() {
         XCTAssertEqual(
-            KookyDeepLink.parse(URL(string: "KOOKY://Resume?agent=Codex&id=aBc")!),
+            KookyDeepLink.parse(URL(string: "AGENTPAD://Resume?agent=Codex&id=aBc")!),
             .resumeSession(agentId: "codex", conversationId: "aBc", cwd: nil)
         )
     }
 
-    /// `kooky:///resume` — the natural file:///-habit typo — parses with an
+    /// `agentpad:///resume` — the natural file:///-habit typo — parses with an
     /// empty host and the action in the path; it must be accepted, not
     /// silently dropped.
     func testTripleSlashSpellingIsAccepted() {
         XCTAssertEqual(
-            KookyDeepLink.parse(URL(string: "kooky:///resume?agent=codex&id=abc")!),
+            KookyDeepLink.parse(URL(string: "agentpad:///resume?agent=codex&id=abc")!),
             .resumeSession(agentId: "codex", conversationId: "abc", cwd: nil)
         )
     }
@@ -72,7 +72,7 @@ final class DeepLinkTests: XCTestCase {
     /// Not ours at all → nil, dropped silently (public surface must not pop
     /// UI for arbitrary URLs).
     func testForeignLinksParseToNil() {
-        for raw in ["https://resume?agent=claude-code&id=x", "kooky://open?agent=claude-code&id=x"] {
+        for raw in ["https://resume?agent=claude-code&id=x", "agentpad://open?agent=claude-code&id=x"] {
             XCTAssertNil(KookyDeepLink.parse(URL(string: raw)!), "should silently drop \(raw)")
         }
     }
@@ -82,15 +82,15 @@ final class DeepLinkTests: XCTestCase {
     /// clause), never a silent nil.
     func testBadParametersParseToInvalid() {
         let bad = [
-            "kooky://resume",                          // no query at all
-            "kooky://resume?agent=claude-code",        // missing id
-            "kooky://resume?id=x",                     // missing agent
-            "kooky://resume?agent=&id=x",              // empty agent
-            "kooky://resume?agent=%20&id=x",           // whitespace-only agent
-            "kooky://resume?agent=codex&id=x&cwd=rel/path",   // non-absolute cwd
-            "kooky://resume?agent=codex&id=a%3Brm%20-rf%20~", // `a;rm -rf ~` id
-            "kooky://resume?agent=\(String(repeating: "a", count: 65))&id=x",       // agent over cap
-            "kooky://resume?agent=codex&id=x&cwd=/\(String(repeating: "p", count: 1024))", // cwd over cap
+            "agentpad://resume",                          // no query at all
+            "agentpad://resume?agent=claude-code",        // missing id
+            "agentpad://resume?id=x",                     // missing agent
+            "agentpad://resume?agent=&id=x",              // empty agent
+            "agentpad://resume?agent=%20&id=x",           // whitespace-only agent
+            "agentpad://resume?agent=codex&id=x&cwd=rel/path",   // non-absolute cwd
+            "agentpad://resume?agent=codex&id=a%3Brm%20-rf%20~", // `a;rm -rf ~` id
+            "agentpad://resume?agent=\(String(repeating: "a", count: 65))&id=x",       // agent over cap
+            "agentpad://resume?agent=codex&id=x&cwd=/\(String(repeating: "p", count: 1024))", // cwd over cap
         ]
         for raw in bad {
             if case .invalid = KookyDeepLink.parse(URL(string: raw)!) {
@@ -119,7 +119,7 @@ final class DeepLinkTests: XCTestCase {
         ]
         for query in queries {
             var components = URLComponents()
-            components.scheme = "kooky"
+            components.scheme = KookyDeepLink.scheme
             components.host = "resume"
             var items: [URLQueryItem] = []
             if let agent = query.agent { items.append(URLQueryItem(name: "agent", value: agent)) }

@@ -58,6 +58,8 @@ enum FileTreeLister {
         return urls.compactMap { url -> FileNode? in
             let name = url.lastPathComponent
             guard !hiddenNames.contains(name) else { return nil }
+            // AgentPad: optional hiding of all dotfiles.
+            if name.hasPrefix("."), !FileTreePreferences.showHidden { return nil }
             let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             let isSymlink = values?.isSymbolicLink == true
             return FileNode(

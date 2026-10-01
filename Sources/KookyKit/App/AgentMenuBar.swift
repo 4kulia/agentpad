@@ -1,4 +1,5 @@
 import AppKit
+import KookyHookKit
 import Observation
 
 /// App-level menu-bar view of `AgentMonitor` — the same cross-window agent
@@ -136,7 +137,7 @@ final class AgentMenuBarController: NSObject, NSMenuDelegate {
         }
         menu.addItem(.separator())
         menu.addItem(actionItem(
-            title: String(localized: "Open Kooky", bundle: .kookyResources),
+            title: "Open \(AppIdentity.appName)",
             action: #selector(openKooky)
         ))
         menu.addItem(actionItem(
@@ -154,7 +155,7 @@ final class AgentMenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(keepAwake)
 
         menu.addItem(actionItem(
-            title: String(localized: "Quit Kooky", bundle: .kookyResources),
+            title: "Quit \(AppIdentity.appName)",
             action: #selector(quitKooky)
         ))
 

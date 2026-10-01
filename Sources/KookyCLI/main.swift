@@ -44,7 +44,7 @@ func launchKooky(background: Bool) -> Bool {
         .deletingLastPathComponent()  // Kooky.app
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    var arguments = bundle.pathExtension == "app" ? [bundle.path] : ["-a", "Kooky"]
+    var arguments = bundle.pathExtension == "app" ? [bundle.path] : ["-a", AppIdentity.appName]
     if background { arguments.insert("-g", at: 0) }
     process.arguments = arguments
     // `open` writes its own diagnostics (app missing, LaunchServices errors)
@@ -77,7 +77,7 @@ func printSuccess(_ response: KookyCLIResponse, for command: KookyCLICommand) {
         } else {
             let version = response.appVersion ?? "unknown version"
             let proto = response.protocolVersion.map(String.init) ?? "?"
-            print("kooky \(KookyHookKit.plain(version)) is running (protocol \(proto))")
+            print("\(AppIdentity.appName) \(KookyHookKit.plain(version)) is running (protocol \(proto))")
         }
     case .open:
         // One line either way; the id stays the third word for scripts.
@@ -157,7 +157,7 @@ if case .failure(.connectFailed) = result {
         if json {
             print(KookyHookKit.renderCLIStatusJSON(running: false, appVersion: nil, serverProtocol: nil))
         } else {
-            print("kooky is not running")
+            print("\(AppIdentity.appName) is not running")
         }
         exit(1)
     }
@@ -166,7 +166,7 @@ if case .failure(.connectFailed) = result {
         return false
     }()
     guard launchKooky(background: backgroundLaunch) else {
-        fail("kooky is not running and couldn't be launched")
+        fail("\(AppIdentity.appName) is not running and couldn't be launched")
     }
     let deadline = DispatchTime.now() + launchTimeout
     while true {
@@ -181,16 +181,16 @@ if case .failure(.connectFailed) = result {
 
 switch result {
 case .failure(.connectFailed):
-    fail("kooky did not start listening within \(Int(launchTimeout))s")
+    fail("\(AppIdentity.appName) did not start listening within \(Int(launchTimeout))s")
 case .failure(.timedOut), .failure(.closedWithoutReply):
-    fail("kooky is running but didn't answer — it may be older than this kooky-cli (no CLI support). Update kooky, or use the kooky-cli bundled with the running version.")
+    fail("\(AppIdentity.appName) is running but didn't answer — it may be older than this kooky-cli (no CLI support). Update \(AppIdentity.appName), or use the kooky-cli bundled with the running version.")
 case .failure(.writeFailed):
-    fail("couldn't send the request to kooky")
+    fail("couldn't send the request to \(AppIdentity.appName)")
 case .failure(.replyTooLarge):
-    fail("kooky sent an oversized reply")
+    fail("\(AppIdentity.appName) sent an oversized reply")
 case .success(let data):
     guard let response = KookyCLIResponse.decode(from: data) else {
-        fail("couldn't decode kooky's reply")
+        fail("couldn't decode \(AppIdentity.appName)'s reply")
     }
     // Failures print exactly ONE line (the CLI's stated contract), so the
     // mismatch note waits until we know this is a success. A refusal caused
@@ -199,7 +199,7 @@ case .success(let data):
         fail(response.error ?? "request refused")
     }
     if let serverProtocol = response.protocolVersion, serverProtocol != KookyCLIProtocol.version {
-        warn("protocol mismatch (cli \(KookyCLIProtocol.version), app \(serverProtocol)) — update kooky or use its bundled kooky-cli")
+        warn("protocol mismatch (cli \(KookyCLIProtocol.version), app \(serverProtocol)) — update \(AppIdentity.appName) or use its bundled kooky-cli")
     }
     printSuccess(response, for: command)
     exit(0)

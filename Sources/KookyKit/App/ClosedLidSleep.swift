@@ -1,4 +1,5 @@
 import AppKit
+import KookyHookKit
 
 /// Privileged plumbing for closed-lid mode. A closed lid *forces* sleep and
 /// no user-space assertion can stop it — the only public lever is
@@ -89,7 +90,7 @@ enum ClosedLidSleep {
             // osascript shows the native admin prompt; the quoted-form path +
             // validated username are the only interpolations.
             let apple = """
-            do shell script "/bin/sh '\(scriptURL.path)' '\(user)'" with administrator privileges with prompt "kooky needs a one-time authorization to keep working with the lid closed."
+            do shell script "/bin/sh '\(scriptURL.path)' '\(user)'" with administrator privileges with prompt "\(AppIdentity.appName) needs a one-time authorization to keep working with the lid closed."
             """
             let ok = runProcess("/usr/bin/osascript", ["-e", apple], timeout: 180)
             Task { @MainActor in completion(ok && isInstalled) }

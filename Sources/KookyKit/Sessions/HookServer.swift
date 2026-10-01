@@ -310,7 +310,7 @@ final class HookServer {
             return
         }
         guard let onCLIRequest else {
-            Self.writeCLIResponseAndClose(.failure("kooky's CLI handler is not ready"), fd: fd)
+            Self.writeCLIResponseAndClose(.failure("\(AppIdentity.appName)'s CLI handler is not ready"), fd: fd)
             return
         }
         // A CLI request is a REQUEST, not a fire-and-forget event: if the

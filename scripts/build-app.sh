@@ -29,8 +29,8 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
-BUNDLE_ID="com.iamcorey.kooky"
-APP_NAME="Kooky"
+BUNDLE_ID="com.4kulia.agentpad"
+APP_NAME="AgentPad"
 APP="dist/${APP_NAME}.app"
 
 echo "==> Building release config"
@@ -165,7 +165,7 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key>
     <string>${APP_NAME}</string>
     <key>CFBundleDisplayName</key>
-    <string>kooky</string>
+    <string>${APP_NAME}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -185,7 +185,7 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
             <string>${BUNDLE_ID}</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>kooky</string>
+                <string>agentpad</string>
             </array>
         </dict>
     </array>
@@ -214,55 +214,55 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
          off/on (or tccutil reset) to re-grant. Durable fix is Developer ID
          signing (same deferral as notarization). -->
     <key>NSAppleEventsUsageDescription</key>
-    <string>A program running in kooky wants to control another application.</string>
+    <string>AgentPad brings the Terminal or iTerm2 tab of a Claude Code session to the front, and programs running in AgentPad may control other applications.</string>
     <key>NSCalendarsUsageDescription</key>
-    <string>A program running in kooky wants to access your calendar.</string>
+    <string>A program running in AgentPad wants to access your calendar.</string>
     <key>NSCalendarsFullAccessUsageDescription</key>
-    <string>A program running in kooky wants to access your calendar.</string>
+    <string>A program running in AgentPad wants to access your calendar.</string>
     <key>NSCalendarsWriteOnlyAccessUsageDescription</key>
-    <string>A program running in kooky wants to add events to your calendar.</string>
+    <string>A program running in AgentPad wants to add events to your calendar.</string>
     <key>NSRemindersUsageDescription</key>
-    <string>A program running in kooky wants to access your reminders.</string>
+    <string>A program running in AgentPad wants to access your reminders.</string>
     <key>NSRemindersFullAccessUsageDescription</key>
-    <string>A program running in kooky wants to access your reminders.</string>
+    <string>A program running in AgentPad wants to access your reminders.</string>
     <key>NSContactsUsageDescription</key>
-    <string>A program running in kooky wants to access your contacts.</string>
+    <string>A program running in AgentPad wants to access your contacts.</string>
     <key>NSPhotoLibraryUsageDescription</key>
-    <string>A program running in kooky wants to access your photo library.</string>
+    <string>A program running in AgentPad wants to access your photo library.</string>
     <key>NSPhotoLibraryAddUsageDescription</key>
-    <string>A program running in kooky wants to add photos to your photo library.</string>
+    <string>A program running in AgentPad wants to add photos to your photo library.</string>
     <key>NSAppleMusicUsageDescription</key>
-    <string>A program running in kooky wants to access your music library.</string>
+    <string>A program running in AgentPad wants to access your music library.</string>
     <key>NSCameraUsageDescription</key>
-    <string>A program running in kooky wants to use the camera.</string>
+    <string>A program running in AgentPad wants to use the camera.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>A program running in kooky wants to use the microphone.</string>
+    <string>A program running in AgentPad wants to use the microphone.</string>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>A program running in kooky wants to capture system audio.</string>
+    <string>A program running in AgentPad wants to capture system audio.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>A program running in kooky wants to use speech recognition.</string>
+    <string>A program running in AgentPad wants to use speech recognition.</string>
     <key>NSLocationUsageDescription</key>
-    <string>A program running in kooky wants to access your location.</string>
+    <string>A program running in AgentPad wants to access your location.</string>
     <key>NSLocationWhenInUseUsageDescription</key>
-    <string>A program running in kooky wants to access your location.</string>
+    <string>A program running in AgentPad wants to access your location.</string>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>A program running in kooky wants to find and connect to devices on your local network.</string>
+    <string>A program running in AgentPad wants to find and connect to devices on your local network.</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>A program running in kooky wants to use Bluetooth.</string>
+    <string>A program running in AgentPad wants to use Bluetooth.</string>
     <key>NSMotionUsageDescription</key>
-    <string>A program running in kooky wants to access motion data.</string>
+    <string>A program running in AgentPad wants to access motion data.</string>
     <key>NSDesktopFolderUsageDescription</key>
-    <string>A program running in kooky wants to access files in your Desktop folder.</string>
+    <string>A program running in AgentPad wants to access files in your Desktop folder.</string>
     <key>NSDocumentsFolderUsageDescription</key>
-    <string>A program running in kooky wants to access files in your Documents folder.</string>
+    <string>A program running in AgentPad wants to access files in your Documents folder.</string>
     <key>NSDownloadsFolderUsageDescription</key>
-    <string>A program running in kooky wants to access files in your Downloads folder.</string>
+    <string>A program running in AgentPad wants to access files in your Downloads folder.</string>
     <key>NSRemovableVolumesUsageDescription</key>
-    <string>A program running in kooky wants to access files on a removable volume.</string>
+    <string>A program running in AgentPad wants to access files on a removable volume.</string>
     <key>NSNetworkVolumesUsageDescription</key>
-    <string>A program running in kooky wants to access files on a network volume.</string>
+    <string>A program running in AgentPad wants to access files on a network volume.</string>
     <key>NSSystemAdministrationUsageDescription</key>
-    <string>A program running in kooky wants to administer this computer.</string>
+    <string>A program running in AgentPad wants to administer this computer.</string>
 ${APPLE_ICON_PLIST_KEYS}
 </dict>
 </plist>

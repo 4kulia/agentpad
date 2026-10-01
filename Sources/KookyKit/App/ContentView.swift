@@ -135,7 +135,10 @@ struct ContentView: View {
         // per switch was the root of the mount-churn bug class (issues #8,
         // #24, workspace-switch flicker) — the AppKit host switches by
         // visibility instead.
-        PaneTreeHostRepresentable(host: paneHost)
+        // AgentPad: file preview docked under the terminal.
+        MainAreaWithPreview(store: store) {
+            PaneTreeHostRepresentable(host: paneHost)
+        }
     }
 
     private var chromeBackground: Color {

@@ -10,7 +10,7 @@ import Foundation
 public enum KookyHookKit {
     public static var socketPath: String {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return support.appendingPathComponent("kooky/socket").path
+        return support.appendingPathComponent("\(AppIdentity.supportDirectoryName)/socket").path
     }
 
     /// One-shot socket write. Returns true on success. `HookServer` accepts

@@ -9,6 +9,11 @@ struct FileTreeView: View {
     let model: FileTreeModel
 
     @State private var activationToken = 0
+    /// AgentPad: the dotfile setting is shared by every window; each tree
+    /// re-lists itself when it flips, not just the one whose button was hit.
+    @AppStorage(FileTreePreferences.showHiddenKey) private var showHiddenFiles = true
+    /// AgentPad: find-a-file query; non-empty swaps the tree for results.
+    @State private var fileQuery = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -17,9 +22,12 @@ struct FileTreeView: View {
                 Rectangle().fill(Theme.chromeHairline).frame(height: 1)
             }
             content
+                // AgentPad: empty space anywhere in the tree — including an
+                // empty or still-loading root — takes drops into the root.
+                .fileTreeDropTarget(directory: model.rootURL, root: model.rootURL)
         }
         .onAppear {
-            activationToken = model.activate(root: store.fileTreeRoot)
+            activationToken = model.activate(root: effectiveRoot)
             store.refreshFileTreeGitDiff()
         }
         // Tokened: an animated unmount's late onDisappear must not deactivate
@@ -29,9 +37,22 @@ struct FileTreeView: View {
         // `diskPath == workingDirectory` — OSC 7 cwd drift; worktrees stay
         // pinned via `worktreePath`.
         .onChange(of: store.fileTreeRoot?.path) { _, newPath in
+            // AgentPad: switching tabs/workspaces leaves an external session's folder.
+            ExternalTreeRoot.for(store).clear()
             model.setRoot(newPath.map { URL(fileURLWithPath: $0) })
             store.refreshFileTreeGitDiff()
         }
+        .onChange(of: showHiddenFiles) { _, _ in
+            if let root = model.rootURL { model.refresh(dirPath: root.path) }
+        }
+        .onChange(of: ExternalTreeRoot.for(store).url) { _, _ in
+            model.setRoot(effectiveRoot)
+        }
+    }
+
+    /// AgentPad: an external session's folder when one is shown, else kooky's own root.
+    private var effectiveRoot: URL? {
+        ExternalTreeRoot.for(store).url ?? store.fileTreeRoot
     }
 
     private func header(root: URL) -> some View {
@@ -52,6 +73,22 @@ struct FileTreeView: View {
                 .foregroundStyle(Theme.chromeFaint)
                 .lineLimit(1)
                 .truncationMode(.head)
+            // AgentPad: which external session this is, actions on the root
+            // folder itself, and file search.
+            if let label = ExternalTreeRoot.for(store).label {
+                HStack(spacing: 4) {
+                    Text("Session in another terminal: \(label)")
+                        .font(Theme.display(10.5))
+                        .foregroundStyle(Theme.chromeMuted)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    HoverableIconButton(systemName: "xmark", fontSize: 9, size: 18, help: "Back to the active tab's folder") {
+                        ExternalTreeRoot.for(store).clear()
+                    }
+                }
+            }
+            FileTreeRootActions(root: root)
+            FileSearchField(query: $fileQuery)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.leading, Theme.sidebarContentLeadingX)
@@ -63,7 +100,15 @@ struct FileTreeView: View {
 
     @ViewBuilder
     private var content: some View {
-        if store.active == nil {
+        if let root = model.rootURL, !fileQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+            FileSearchResults(root: root, query: fileQuery) { url in
+                model.selectedId = url.standardizedFileURL.path
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue {
+                    FilePreviewModel.for(store).open(url)
+                }
+            }
+        } else if store.active == nil {
             emptyState("square.dashed", "No active workspace")
         } else if model.isLoading {
             loadingState
@@ -225,6 +270,9 @@ private struct FileTreeRowView: View {
         } preview: {
             dragPreview(node)
         }
+        // AgentPad: drop files onto a folder row (file rows aren't targets, so
+        // the highlight never points somewhere the files won't go).
+        .fileTreeDropTarget(directory: node.isDirectory ? node.url : nil, root: model.rootURL)
         // count:2 must attach before count:1 or the double never recognizes.
         // A double-click on a file also fires the single handler on its
         // first click — select-then-open, same as Finder.
@@ -233,6 +281,8 @@ private struct FileTreeRowView: View {
         }
         .onTapGesture {
             model.selectedId = row.id
+            // AgentPad: a file click previews it under the terminal.
+            if !node.isDirectory { FilePreviewModel.for(store).open(node.url) }
             guard node.isDirectory else { return }
             // Whether the single-tap fires once or twice for a double-click
             // varies across macOS releases; swallow a second toggle inside
@@ -311,6 +361,8 @@ private struct FileTreeRowView: View {
                 store.active?.activeSession?.engine
                     .paste(KookyShellIntegration.backslashEscape(node.url.path))
             }
+            // AgentPad: file operations.
+            FileTreeOperationRows(node: node, close: { isContextMenuOpen = false })
         }
         .padding(Theme.space1)
         .frame(minWidth: 220)

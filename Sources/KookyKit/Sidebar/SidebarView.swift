@@ -1,4 +1,5 @@
 import SwiftUI
+import KookyHookKit
 
 /// Bundles every modal sheet the sidebar can show so they share one
 /// `.sheet(item:)` modifier. `.sheet(isPresented:)` per state would race
@@ -431,10 +432,10 @@ struct SidebarView: View {
             } else {
                 HStack(spacing: 0) {
                     FirstGlyphCenteredLayout(axisX: Theme.sidebarLeadingIconCenterX) {
-                        Text("Kooky")
+                        Text(AppIdentity.appName)
                             .font(Theme.display(15.5, weight: .semibold))
                             .foregroundStyle(Theme.chromeForeground)
-                        Text("K")
+                        Text("A")
                             .font(Theme.display(15.5, weight: .semibold))
                             .hidden()
                             .accessibilityHidden(true)

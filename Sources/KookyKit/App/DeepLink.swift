@@ -1,4 +1,5 @@
 import AppKit
+import KookyHookKit
 import SwiftUI
 
 /// A parsed `kooky://` deep link. Parsing is structure + character-set
@@ -29,7 +30,7 @@ enum KookyDeepLink: Equatable {
     case resumeSession(agentId: String, conversationId: String, cwd: String?)
     case invalid(reason: String)
 
-    static let scheme = "kooky"
+    static let scheme = AppIdentity.urlScheme
 
     /// Conversation ids may reach a shell command line (`claude --resume
     /// <id>` via the KOOKY_AGENT eval), so an id from an UNTRUSTED URL must
@@ -87,7 +88,7 @@ enum KookyDeepLink: Equatable {
         guard agent.count <= 64 else { return .invalid(reason: "agent id is too long") }
         guard let id = rawId.flatMap(normalizedTitle) else { return .invalid(reason: "missing 'id' parameter") }
         guard isValidConversationId(id) else {
-            return .invalid(reason: "conversation id contains characters kooky refuses")
+            return .invalid(reason: "conversation id contains characters \(AppIdentity.appName) refuses")
         }
         let cwd = rawCwd.flatMap(normalizedTitle)
         if let cwd {

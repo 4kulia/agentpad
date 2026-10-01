@@ -141,7 +141,7 @@ final class HookServerCLITests: XCTestCase {
         let line = Data("{\"kind\":\"cli\",\"protocolVersion\":99,\"verb\":42}\n".utf8)
         let response = try decodeReply(roundTrip(line))
         XCTAssertFalse(response.ok)
-        XCTAssertTrue(response.error?.contains("update kooky") == true)
+        XCTAssertTrue(response.error?.contains("update AgentPad") == true)
         XCTAssertTrue(response.error?.contains("99") == true)
     }
 

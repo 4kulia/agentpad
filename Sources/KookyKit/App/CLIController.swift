@@ -251,7 +251,7 @@ final class KookyCLIController {
         case .closed:
             return ok(note: "closed")
         case .confirming:
-            return ok(note: "confirmation shown in kooky")
+            return ok(note: "confirmation shown in \(AppIdentity.appName)")
         case .windowBusy:
             // The sheet already on that window belongs to another tab and
             // will never decide this one — reporting "confirmation shown"
@@ -391,7 +391,7 @@ final class KookyCLIController {
             // the controller is an AppDelegate property that outlives the
             // ⌘Q drain.
             guard let self, !self.isShuttingDown() else {
-                completion(.failure("kooky is shutting down"))
+                completion(.failure("\(AppIdentity.appName) is shutting down"))
                 return
             }
             guard let (exists, canonical) = resolution else {
@@ -403,7 +403,7 @@ final class KookyCLIController {
             // gave up. Opening a tab now would run `-e` for someone who was
             // already told the request failed.
             guard !deadline.hasExpired else {
-                completion(.failure("kooky took too long to answer; nothing was opened"))
+                completion(.failure("\(AppIdentity.appName) took too long to answer; nothing was opened"))
                 return
             }
             // The scan above can outlast the caller — a ^C or its own
@@ -498,12 +498,12 @@ final class KookyCLIController {
                 // presenting a "background" tab in a brand-new key window
                 // (the close verb's windowBusy precedent: refuse loudly
                 // over silently doing something else).
-                return refuse("no terminal window to land a background tab in — drop --no-focus or open a kooky window first")
+                return refuse("no terminal window to land a background tab in — drop --no-focus or open a \(AppIdentity.appName) window first")
             } else if let fallback = fallbackWindow() {
                 host = fallback.context
                 builtWindow = fallback.builtWindow
             } else {
-                return refuse("kooky is shutting down")
+                return refuse("\(AppIdentity.appName) is shutting down")
             }
             // One call, one tab: when this has to create the WORKSPACE,
             // `localSpawn` makes its seed tab the launch instead of leaving
@@ -586,7 +586,7 @@ final class KookyCLIController {
             }
             resume(agentId, conversationId, cwd, isCallerWaiting) { [weak self] outcome in
                 guard let self else {
-                    completion(.failure("kooky is shutting down"))
+                    completion(.failure("\(AppIdentity.appName) is shutting down"))
                     return
                 }
                 switch outcome {

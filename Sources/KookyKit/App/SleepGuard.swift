@@ -1,4 +1,5 @@
 import AppKit
+import KookyHookKit
 import IOKit.pwr_mgt
 import QuartzCore
 import SwiftUI
@@ -93,7 +94,7 @@ final class SleepGuard {
         let status = IOPMAssertionCreateWithName(
             kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
             IOPMAssertionLevel(kIOPMAssertionLevelOn),
-            "kooky: agent or SSH session active" as CFString,
+            "\(AppIdentity.appName): agent or SSH session active" as CFString,
             &id
         )
         return status == kIOReturnSuccess ? id : nil

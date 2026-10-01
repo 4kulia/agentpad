@@ -127,10 +127,10 @@ final class WorkspaceStore {
     /// the left sidebar's three modes (full / compact / hidden). The content is
     /// the global `AgentMonitor`; each window toggles its own panel. Defaults
     /// to hidden since it's opt-in.
-    var rightSidebarMode: SidebarMode = .hidden
+    var rightSidebarMode: SidebarMode = .full
     /// Left sidebar's middle content — workspace list or file tree. Persisted
     /// like `sidebarMode`; the footer toggle in `SidebarView` flips it.
-    var sidebarContent: SidebarContent = .workspaces
+    var sidebarContent: SidebarContent = .files
     /// Right sidebar's full-mode content — live agents, history, or active
     /// session information.
     /// Persisted like `sidebarContent`; the panel's own footer toggle flips it.
@@ -1998,8 +1998,8 @@ final class WorkspaceStore {
             ? state.activeWorkspaceId
             : workspaces.first?.id
         sidebarMode = state.sidebarMode ?? .full
-        rightSidebarMode = state.rightSidebarMode ?? .hidden
-        sidebarContent = state.sidebarContent ?? .workspaces
+        rightSidebarMode = state.rightSidebarMode ?? .full
+        sidebarContent = state.sidebarContent ?? .files
         rightSidebarContent = state.rightSidebarContent ?? .agents
         sidebarWidth = state.sidebarWidth
             .map { SidebarView.clampWidth(CGFloat($0)) }

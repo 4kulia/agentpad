@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import KookyHookKit
 
 /// We don't bundle ghostty's shell-integration assets, so we ship a small zsh
 /// wrapper that:
@@ -513,7 +514,7 @@ enum KookyShellIntegration {
     /// don't grow their own spelling of the root.
     static func kookyAppSupport(_ subpath: String, isDirectory: Bool) -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("kooky/\(subpath)", isDirectory: isDirectory)
+            .appendingPathComponent("\(AppIdentity.supportDirectoryName)/\(subpath)", isDirectory: isDirectory)
     }
 
     /// Directory we prepend to spawned-shell `PATH` so wrapper scripts (e.g.

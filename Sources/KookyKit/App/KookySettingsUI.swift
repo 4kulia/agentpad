@@ -1,4 +1,5 @@
 import AppKit
+import KookyHookKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -1342,11 +1343,11 @@ struct KookySettingsView: View {
     private var generalDetail: some View {
         let previewBundle = model.appLanguage.previewBundle
         let restartCaption = String(
-            localized: "Changes take effect after restarting Kooky.",
+            localized: "Changes take effect after restarting \(AppIdentity.appName).",
             bundle: previewBundle
         )
         let restartTitle = String(
-            localized: "Restart Kooky",
+            localized: "Restart \(AppIdentity.appName)",
             bundle: previewBundle
         )
         let systemDefaultTitle = String(
@@ -1509,7 +1510,7 @@ struct KookySettingsView: View {
 
     private var advancedDetail: some View {
         VStack(alignment: .leading, spacing: 0) {
-            SettingsRow(label: "~/.kooky/settings.json") {
+            SettingsRow(label: "~/\(AppIdentity.configDirectoryName)/settings.json") {
                 BracketButton("open in new tab", action: onOpenInTab)
             }
             Text(String(localized: "Edit the raw JSON for any key not exposed above. Comments (`//`, `/* */`) are accepted.", bundle: .kookyResources))
@@ -1526,7 +1527,7 @@ struct KookySettingsView: View {
                 .font(Theme.mono(11.5))
                 .foregroundStyle(Theme.chromeMuted)
             Spacer()
-            BracketButton("restart kooky", action: restartApp)
+            BracketButton("restart \(AppIdentity.appName.lowercased())", action: restartApp)
         }
         .padding(.horizontal, 28)
         .padding(.top, 22)

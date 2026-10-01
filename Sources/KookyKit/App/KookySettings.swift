@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import KookyHookKit
 import GhosttyKit
 
 /// Reads `~/.kooky/settings.json` and forwards its `terminal.*` section to
@@ -15,7 +16,7 @@ enum KookySettings {
     static let pairedThemeSchemaVersion = 2
 
     static let directory: URL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".kooky", isDirectory: true)
+        .appendingPathComponent(AppIdentity.configDirectoryName, isDirectory: true)
 
     static let url: URL = directory.appendingPathComponent("settings.json")
 
@@ -383,8 +384,8 @@ enum KookyOnboarding {
 
     private static func promptGhosttyImport(from path: URL) {
         let alert = NSAlert()
-        alert.messageText = String(localized: "Welcome to kooky", bundle: .kookyResources)
-        alert.informativeText = String(localized: "We found your existing ghostty configuration. Would you like to import it into kooky?\n\nYou can change settings any time via Help → Open Settings.", bundle: .kookyResources)
+        alert.messageText = "Welcome to \(AppIdentity.appName)"
+        alert.informativeText = "We found your existing ghostty configuration. Would you like to import it into \(AppIdentity.appName)?\n\nYou can change settings any time via Help → Open Settings."
         alert.addButton(withTitle: String(localized: "Use ghostty settings", bundle: .kookyResources))
         alert.addButton(withTitle: String(localized: "Start fresh", bundle: .kookyResources))
 
