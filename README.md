@@ -74,6 +74,19 @@ Click a file to preview it under the terminal. Drag the divider to resize the pr
 - **Live reload:** the preview follows the file as the agent rewrites it.
 - **Large files:** text files over 5 MB show their first 5 MB.
 
+## Team work
+
+*In progress: pairing and presence work today; calling a colleague's agents comes next.*
+
+Pair AgentPad with a colleague's, and see when they are online:
+
+1. **Team → Turn Team Work On or Off…** and choose the name colleagues will see.
+2. **Team → Invite Colleague…** creates a link that works once, for 24 hours. Send it in a private message.
+3. Your colleague opens the link. Both of you see the same six-digit code; you allow the request if the codes match.
+4. **Team → Colleagues…** shows who is online.
+
+The two Macs connect directly over QUIC, end-to-end encrypted, and find each other by public key; when a direct path is impossible, traffic goes through the public relays of [iroh](https://www.iroh.computer). The invitation carries no IP addresses. Turning team work off closes all connections. Everything team work stores lives in `~/Library/Application Support/agentpad/team/`; deleting that folder resets it.
+
 ## Where the data comes from
 
 AgentPad reads what the agents already write; it doesn't install hooks into your configuration.
@@ -88,11 +101,14 @@ Claude Code's session files are an internal format. AgentPad treats them defensi
 
 ## Privacy
 
-There are no accounts, no telemetry and no sync. Conversations and files stay on your Mac. AgentPad makes no network requests on its own; the only one is **Check for Updates…**, which asks GitHub for the latest release of this repository when you choose it.
+There are no accounts, no telemetry and no sync. Conversations and files stay on your Mac. AgentPad makes no network requests on its own, with two exceptions you start yourself:
+
+- **Check for Updates…** asks GitHub for the latest release of this repository.
+- **Team work**, while turned on, connects to the colleagues you paired with (see below).
 
 ## Install
 
-Download the latest `AgentPad-v….dmg` from [Releases](https://github.com/4kulia/agentpad/releases), open it and drag AgentPad to Applications. It needs macOS 14 or later on Apple Silicon.
+Download the latest `AgentPad-v….dmg` from [Releases](https://github.com/4kulia/agentpad/releases), open it and drag AgentPad to Applications. It needs macOS 14.5 or later on Apple Silicon.
 
 The build is not signed with an Apple Developer ID, so macOS blocks the first launch of every version you download. Allow it once, either in System Settings → Privacy & Security → **Open Anyway**, or from a terminal:
 
@@ -108,7 +124,7 @@ For the same reason macOS asks for AgentPad's permissions again after each updat
 
 Requirements:
 
-- macOS 14 or later on Apple Silicon;
+- macOS 14.5 or later on Apple Silicon;
 - Xcode 26 or later (Swift 6.2).
 
 ```sh

@@ -22,6 +22,8 @@ public enum AgentPadCLICommand: Equatable, Sendable {
     case close(tab: String)
     case rename(tab: String, title: String)
     case status(json: Bool)
+    /// AgentPad: `team <action>` (TeamCLI.swift).
+    case team(action: String, name: String?, link: String?, peer: String?, json: Bool)
     case help
 }
 
@@ -80,7 +82,7 @@ extension AgentPadHookKit {
 
     private static func unknownVerbFailure(_ verb: String) -> AgentPadCLIParseFailure {
         AgentPadCLIParseFailure(
-            "unknown command '\(verb)' — one of: open, resume, list, focus, close, rename, status. Run `agentpad-cli --help`."
+            "unknown command '\(verb)' — one of: open, resume, list, focus, close, rename, status, team. Run `agentpad-cli --help`."
         )
     }
 
@@ -92,6 +94,8 @@ extension AgentPadHookKit {
         // next token verbatim).
         guard let verb = args.first else { return .success(.help) }
         if verb == "help" || verb == "--help" || verb == "-h" { return .success(.help) }
+        // AgentPad: `team` takes a positional subcommand.
+        if verb == "team" { return parseTeamCommand(Array(args.dropFirst())) }
         guard let spec = verbSpecs[verb] else {
             return .failure(unknownVerbFailure(verb))
         }
@@ -228,6 +232,13 @@ extension AgentPadHookKit {
             return AgentPadCLIRequest(verb: .rename, tab: tab, title: title)
         case .status:
             return AgentPadCLIRequest(verb: .status)
+        case .team(let action, let name, let link, let peer, _):
+            var request = AgentPadCLIRequest(verb: .team)
+            request.teamAction = action
+            request.teamName = name
+            request.teamLink = link
+            request.teamPeer = peer
+            return request
         case .help:
             return nil
         }
@@ -275,6 +286,10 @@ extension AgentPadHookKit {
                                   set a tab's title (clear it in-app)
           status [--json]         app version + protocol; exits 1 when
                                   AgentPad isn't running
+          team status|on|off|invite|join|approve|deny|remove
+                                  team work: colleagues, invitations and
+                                  join requests (`agentpad-cli team` for
+                                  the options)
 
         Exit code 0 means the request was accepted; anything else prints one
         reason line on stderr. Every command except `status` launches AgentPad

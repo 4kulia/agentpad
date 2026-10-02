@@ -131,8 +131,12 @@ final class AttentionCoordinator {
         seenWaitingEpisodes = keys
     }
 
+    /// AgentPad: recount now, e.g. when a team join request arrives.
+    func refreshBadge() { updateBadge(external: ExternalSessionMonitor.shared.sessions) }
+
     private func updateBadge(external: [ExternalAgentSession]) {
         let count = Self.waitingTargets(own: AgentMonitor.shared.entries, external: external).count
+            + TeamService.shared.pendingPairings.count
         let label = count > 0 ? "\(count)" : nil
         if NSApp.dockTile.badgeLabel != label { NSApp.dockTile.badgeLabel = label }
     }

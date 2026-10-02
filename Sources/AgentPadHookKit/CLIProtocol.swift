@@ -71,6 +71,8 @@ public enum AgentPadCLIVerb: String, Sendable {
     case close
     case status
     case rename
+    /// AgentPad: team work (TeamCLI.swift).
+    case team
 }
 
 public struct AgentPadCLIRequest: Codable, Equatable, Sendable {
@@ -99,6 +101,12 @@ public struct AgentPadCLIRequest: Codable, Equatable, Sendable {
     /// activation, no window fronting, and the tab is not made its pane's
     /// active tab.
     public var noFocus: Bool?
+    /// AgentPad, `team`: the subcommand and its values. Optional on the wire,
+    /// like every field added after v1.
+    public var teamAction: String?
+    public var teamName: String?
+    public var teamLink: String?
+    public var teamPeer: String?
 
     public init(
         verb: AgentPadCLIVerb,
@@ -139,6 +147,8 @@ public struct AgentPadCLIResponse: Codable, Equatable, Sendable {
     public var note: String?
     /// `list` payload.
     public var windows: [AgentPadCLIWindowInfo]?
+    /// AgentPad: `team` payload.
+    public var team: AgentPadCLITeamInfo?
 
     public init(
         ok: Bool,

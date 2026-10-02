@@ -41,6 +41,8 @@ struct UnifiedSessionsView: View {
                 ) { groupByProject.toggle() }
             }
             searchField
+            // AgentPad: team requests waiting for a decision, above everything.
+            TeamPanelSection()
             if sections.isEmpty {
                 PanelEmptyState(
                     symbol: query.isEmpty ? "sparkles" : "magnifyingglass",

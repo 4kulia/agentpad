@@ -410,3 +410,29 @@ final class CLICommandTests: XCTestCase {
         XCTAssertEqual(statusJSON["cliProtocolVersion"] as? Int, AgentPadCLIProtocol.version)
     }
 }
+
+/// AgentPad: `agentpad-cli team …`.
+final class TeamCLICommandTests: XCTestCase {
+    func testParsesTeamSubcommands() {
+        XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", "status", "--json"]).get(),
+                       .team(action: "status", name: nil, link: nil, peer: nil, json: true))
+        XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", "join", "--link", "agentpad://team/join?t=a"]).get(),
+                       .team(action: "join", name: nil, link: "agentpad://team/join?t=a", peer: nil, json: false))
+        XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", "approve", "--peer", "abc"]).get(),
+                       .team(action: "approve", name: nil, link: nil, peer: "abc", json: false))
+    }
+
+    func testRejectsIncompleteTeamCommands() {
+        for args in [["team"], ["team", "fly"], ["team", "join"], ["team", "remove"], ["team", "status", "--bogus"]] {
+            if case .success = AgentPadHookKit.parseCLICommand(args) { XCTFail("\(args) must fail") }
+        }
+    }
+
+    func testTeamRequestCarriesTheSubcommand() throws {
+        let request = try XCTUnwrap(AgentPadHookKit.cliRequest(for: .team(action: "invite", name: nil, link: nil, peer: nil, json: false)))
+        XCTAssertEqual(request.verb, "team")
+        XCTAssertEqual(request.teamAction, "invite")
+        let line = try XCTUnwrap(request.encodedLine())
+        XCTAssertEqual(AgentPadCLIRequest.decode(from: line.dropLast())?.teamAction, "invite")
+    }
+}

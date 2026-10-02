@@ -85,6 +85,9 @@ func printSuccess(_ response: AgentPadCLIResponse, for command: AgentPadCLIComma
         print(response.note.map { "\(head) — \(AgentPadHookKit.plain($0))" } ?? head)
     case .resume, .focus, .close, .rename:
         print(AgentPadHookKit.plain(response.note ?? "ok"))
+    case .team(let action, _, _, _, let json):
+        guard let team = response.team else { print(AgentPadHookKit.plain(response.note ?? "ok")); break }
+        print(json ? AgentPadHookKit.renderCLITeamJSON(team) : AgentPadHookKit.renderCLITeam(team, action: action))
     case .help:
         break
     }
@@ -142,7 +145,11 @@ guard line.count <= AgentPadCLIProtocol.maxRequestLineBytes else {
 let socketPath = AgentPadHookKit.socketPath
 // Reply deadline exceeds the app's own 10s resume-resolution deadline so a
 // slow-but-answered resume never reads as a dead server.
-let replyTimeout: TimeInterval = 15
+// AgentPad: joining a team waits for the colleague's approval (up to 120 s).
+let replyTimeout: TimeInterval = {
+    if case .team(let action, _, _, _, _) = command, action == "join" { return 170 }
+    return 15
+}()
 let launchTimeout: TimeInterval = 10
 
 func attempt() -> Result<Data, AgentPadCLITransport.Failure> {

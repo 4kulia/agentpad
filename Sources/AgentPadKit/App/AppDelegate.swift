@@ -208,6 +208,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             AttentionCoordinator.shared.activate(.external(id))
         }
         AttentionCoordinator.shared.start()
+        // AgentPad: team work — off unless the user turned it on.
+        TeamUI.install()
         // AgentPad: correct own Claude tabs whose hooks left a stale state.
         ExternalSessionMonitor.shared.onOwnSessions = { [weak self] own in
             for controller in self?.windowControllers ?? [] {
@@ -509,7 +511,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // terminated, so acting would spawn into a dying app (and the second
         // persistence flush would write the phantom tab to state.json).
         guard !isTerminating else { return }
-        let links = urls.compactMap(AgentPadDeepLink.parse)
+        // AgentPad: team invitation links (Team/TeamUI.swift); everything
+        // else goes through the usual deep link parser.
+        let links = urls.filter { !TeamUI.handleLink($0) }.compactMap(AgentPadDeepLink.parse)
         guard deepLinksReady else {
             pendingDeepLinks.append(contentsOf: links)
             return
@@ -1264,7 +1268,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         ])
         mainMenu.addItem(submenu(windowMenu))
 
+        // AgentPad: team work (Team/TeamUI.swift).
+        mainMenu.addItem(submenu(buildMenu(title: "Team", entries: [
+            selfRow("Colleagues…", #selector(handleTeamColleagues)),
+            .separator,
+            selfRow("Invite Colleague…", #selector(handleTeamInvite)),
+            selfRow("Join with Link…", #selector(handleTeamJoin)),
+            .separator,
+            selfRow("Turn Team Work On or Off…", #selector(handleTeamToggle)),
+        ])))
+
         #if DEBUG
+
         mainMenu.addItem(submenu(buildMenu(title: "Debug", entries: [
             selfRow("Cycle Activity", #selector(handleCycleActivity), "a", modifiers: [.command, .shift]),
         ])))
@@ -1854,6 +1869,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             UpdatePromptWindowController.present(outcome: outcome, currentVersion: currentVersion)
         }
     }
+
+    // AgentPad: Team menu.
+    @objc private func handleTeamColleagues() { TeamUI.showColleagues() }
+    @objc private func handleTeamInvite() { TeamUI.invite() }
+    @objc private func handleTeamJoin() { TeamUI.joinFromPrompt() }
+    @objc private func handleTeamToggle() { TeamUI.toggleTeamWork() }
 
     @objc private func handleOpenSettings() {
         // Pass a live resolver, not a snapshot — the Settings window is a

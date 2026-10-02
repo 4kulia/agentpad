@@ -7,9 +7,15 @@ let package = Package(
     platforms: [
         // .v14 floor — `@Observable` macro requires Sonoma+. Dropping further
         // would mean reverting all session models to ObservableObject + @Published.
-        .macOS(.v14)
+        // AgentPad: 14.5 — IrohLib (team work transport) requires it.
+        .macOS("14.5")
     ],
-    dependencies: [],
+    dependencies: [
+        // AgentPad: peer-to-peer QUIC between colleagues' Macs, dialed by
+        // public key (docs/agentpad/TEAM.md, 7.1). Pinned: n0's public relays
+        // support only the latest stable iroh, so updates are deliberate.
+        .package(url: "https://github.com/n0-computer/iroh-ffi", exact: "1.1.0"),
+    ],
     targets: [
         // Thin executable: main.swift only. Everything else lives in AgentPadKit so
         // tests can `@testable import` it (SPM doesn't allow importing executables).
@@ -57,6 +63,8 @@ let package = Package(
                 // both ends so the protocol can't drift. One-way dependency;
                 // AgentPadHookKit stays Foundation/Darwin-only.
                 "AgentPadHookKit",
+                // AgentPad: team work transport (Sources/AgentPadKit/AgentPad/Team).
+                .product(name: "IrohLib", package: "iroh-ffi"),
             ],
             path: "Sources/AgentPadKit",
             resources: [
