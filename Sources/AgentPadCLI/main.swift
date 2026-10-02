@@ -85,9 +85,9 @@ func printSuccess(_ response: AgentPadCLIResponse, for command: AgentPadCLIComma
         print(response.note.map { "\(head) — \(AgentPadHookKit.plain($0))" } ?? head)
     case .resume, .focus, .close, .rename:
         print(AgentPadHookKit.plain(response.note ?? "ok"))
-    case .team(let action, _, _, _, let json):
+    case .team(let command):
         guard let team = response.team else { print(AgentPadHookKit.plain(response.note ?? "ok")); break }
-        print(json ? AgentPadHookKit.renderCLITeamJSON(team) : AgentPadHookKit.renderCLITeam(team, action: action))
+        print(command.json ? AgentPadHookKit.renderCLITeamJSON(team) : AgentPadHookKit.renderCLITeam(team, action: command.action.rawValue))
     case .help:
         break
     }
@@ -127,19 +127,29 @@ case .resume(let agent, let id, let cwd):
         id: id,
         cwd: cwd.map { AgentPadHookKit.normalizeCLIPath($0, relativeTo: processCwd) }
     )
+case .team(var team):
+    // AgentPad: a request read from stdin, a folder relative to here.
+    if team.prompt == "-" {
+        team.prompt = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
+    }
+    team.folder = team.folder.map { AgentPadHookKit.normalizeCLIPath($0, relativeTo: processCwd) }
+    command = .team(team)
 default:
     command = parsed
 }
 
-guard let request = AgentPadHookKit.cliRequest(for: command),
-      let line = request.encodedLine()
-else {
+guard var request = AgentPadHookKit.cliRequest(for: command) else {
+    fail("internal error: request encoding failed")
+}
+// AgentPad: team calls name the project the caller works in.
+if case .team = command { request.teamCwd = processCwd }
+guard let line = request.encodedLine() else {
     fail("internal error: request encoding failed")
 }
 // Same limit the server's read loop enforces — fail here with the real
 // reason instead of a server-side truncation.
 guard line.count <= AgentPadCLIProtocol.maxRequestLineBytes else {
-    fail("request is too large (over \(AgentPadCLIProtocol.maxRequestLineBytes) bytes) — shorten the -e command")
+    fail("request is too large (over \(AgentPadCLIProtocol.maxRequestLineBytes) bytes) — shorten the -e command or the team request")
 }
 
 let socketPath = AgentPadHookKit.socketPath
@@ -147,7 +157,7 @@ let socketPath = AgentPadHookKit.socketPath
 // slow-but-answered resume never reads as a dead server.
 // AgentPad: joining a team waits for the colleague's approval (up to 120 s).
 let replyTimeout: TimeInterval = {
-    if case .team(let action, _, _, _, _) = command, action == "join" { return 170 }
+    if case .team(let team) = command { return team.replyTimeout }
     return 15
 }()
 let launchTimeout: TimeInterval = 10
@@ -208,6 +218,53 @@ case .success(let data):
     if let serverProtocol = response.protocolVersion, serverProtocol != AgentPadCLIProtocol.version {
         warn("protocol mismatch (cli \(AgentPadCLIProtocol.version), app \(serverProtocol)) — update \(AppIdentity.appName) or use its bundled agentpad-cli")
     }
+    if case .team(let team) = command, team.action == .ask || team.action == .check, let call = response.team?.call {
+        followTeamCall(call, team: team, first: response)
+    }
     printSuccess(response, for: command)
     exit(0)
+}
+
+/// AgentPad: `team ask` / `team check` wait for the answer as a series of
+/// short requests, so the socket keeps its one-request-one-reply rule (7.5).
+/// Exit 0 with the answer, 1 when the call ended without one, 2 when it is
+/// still in progress after the wait.
+func followTeamCall(_ first: AgentPadCLITeamInfo.Call, team: AgentPadCLITeamCommand, first response: AgentPadCLIResponse) -> Never {
+    var call = first
+    var info = response.team!
+    let defaultWait = team.action == .ask ? AgentPadHookKit.teamDefaultWaitMinutes : 0
+    let deadline = Date().addingTimeInterval(TimeInterval((team.waitMinutes ?? defaultWait) * 60))
+    var lastProgress = ""
+    while !call.final {
+        let progress = AgentPadHookKit.renderCLITeamProgress(call)
+        if progress != lastProgress, !team.json {
+            FileHandle.standardError.write(Data("\(progress)\n".utf8))
+            lastProgress = progress
+        }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 1 else { break }
+        var check = AgentPadCLIRequest(verb: .team)
+        check.teamAction = AgentPadCLITeamAction.check.rawValue
+        check.teamCall = call.id
+        check.teamWaitSeconds = min(AgentPadHookKit.teamCheckRoundSeconds, Int(remaining))
+        guard let line = check.encodedLine() else { fail("internal error: request encoding failed") }
+        let timeout = TimeInterval(AgentPadHookKit.teamCheckRoundSeconds + 20)
+        switch AgentPadCLITransport.roundTrip(line: line, socketPath: socketPath, timeout: timeout) {
+        case .success(let data):
+            guard let next = AgentPadCLIResponse.decode(from: data) else { fail("couldn't decode \(AppIdentity.appName)'s reply") }
+            guard next.ok, let nextInfo = next.team, let nextCall = nextInfo.call else { fail(next.error ?? "request refused") }
+            info = nextInfo
+            call = nextCall
+        case .failure:
+            fail("lost \(AppIdentity.appName) while waiting; the call goes on — check it with: agentpad-cli team check \(call.id)")
+        }
+    }
+    if team.json {
+        print(AgentPadHookKit.renderCLITeamJSON(info))
+    } else if call.final && call.state != "done" {
+        fail(AgentPadHookKit.renderCLITeamCall(call))
+    } else {
+        print(AgentPadHookKit.renderCLITeamCall(call))
+    }
+    exit(call.state == "done" ? 0 : call.final ? 1 : 2)
 }

@@ -107,6 +107,18 @@ public struct AgentPadCLIRequest: Codable, Equatable, Sendable {
     public var teamName: String?
     public var teamLink: String?
     public var teamPeer: String?
+    public var teamAgent: String?
+    public var teamPrompt: String?
+    public var teamThread: String?
+    public var teamCall: String?
+    /// check: seconds the app may hold the request waiting for news.
+    public var teamWaitSeconds: Int?
+    public var teamFolder: String?
+    public var teamDescription: String?
+    public var teamAccess: String?
+    public var teamMine: Bool?
+    /// The caller's working directory, for the project it is in.
+    public var teamCwd: String?
 
     public init(
         verb: AgentPadCLIVerb,

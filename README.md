@@ -76,7 +76,7 @@ Click a file to preview it under the terminal. Drag the divider to resize the pr
 
 ## Team work
 
-*In progress: pairing and presence work today; calling a colleague's agents comes next.*
+*In progress: pairing, presence and calling a colleague's agents from the command line work today; tools for agents inside Claude Code sessions come next.*
 
 Pair AgentPad with a colleague's, and see when they are online:
 
@@ -84,6 +84,12 @@ Pair AgentPad with a colleague's, and see when they are online:
 2. **Team → Invite Colleague…** creates a link that works once, for 24 hours. Send it in a private message.
 3. Your colleague opens the link. Both of you see the same six-digit code; you allow the request if the codes match.
 4. **Team → Colleagues…** shows who is online.
+
+Let your colleague's agents ask yours:
+
+1. **Team → Published Agents… → Publish Agent…**: a name, what to ask it about, a project folder, and its rights — *Read*, *Read and git*, or *Edit*. Files with secrets (`.env`, keys) are excluded from reading by default.
+2. A colleague's agent calls it: `agentpad-cli team agents` lists what you may call, `agentpad-cli team ask backend@masha "How does auth work in your branch?"` waits for the answer.
+3. Each call shows up at the top of the right panel with its full text. Nothing runs until the owner clicks **Allow**; then Claude Code runs in the agent's folder with those rights, as a separate `claude -p`, and the answer goes back. `--thread <id>` continues the conversation.
 
 The two Macs connect directly over QUIC, end-to-end encrypted, and find each other by public key; when a direct path is impossible, traffic goes through the public relays of [iroh](https://www.iroh.computer). The invitation carries no IP addresses. Turning team work off closes all connections. Everything team work stores lives in `~/Library/Application Support/agentpad/team/`; deleting that folder resets it.
 

@@ -71,6 +71,8 @@ final class TeamService {
     /// Fires when `pendingPairings` changes, for the Dock badge.
     var onPendingChange: @MainActor () -> Void = {}
 
+    /// Published agents and calls (stage 2).
+    let calls: TeamCalls
     private let storage: TeamStorage
     private let makeTransport: @Sendable (Data) async throws -> TeamTransport
     private var transport: TeamTransport?
@@ -92,10 +94,13 @@ final class TeamService {
 
     init(
         storage: TeamStorage,
+        runner: TeamAgentRunner = ClaudeCodeRunner(),
         makeTransport: @escaping @Sendable (Data) async throws -> TeamTransport = { try await IrohTeamTransport.bind(secretKey: $0) }
     ) {
         self.storage = storage
         self.makeTransport = makeTransport
+        self.calls = TeamCalls(storage: storage, runner: runner)
+        calls.service = self
     }
 
     // MARK: Lifecycle
@@ -106,6 +111,7 @@ final class TeamService {
             config = try storage.load(TeamConfig.self, from: storage.configURL, default: TeamConfig())
             contacts = try storage.load([TeamContact].self, from: storage.contactsURL, default: [])
             invites = try storage.load([TeamInviteRecord].self, from: storage.invitesURL, default: [])
+            try calls.load()
         } catch {
             status = .failed(error.localizedDescription)
             return
@@ -191,6 +197,7 @@ final class TeamService {
         for (_, decision) in decisions { decision.resume(returning: false) }
         decisions = [:]
         commitments = [:]
+        calls.stopAll()
         if !pendingPairings.isEmpty {
             pendingPairings = []
             onPendingChange()
@@ -288,6 +295,7 @@ final class TeamService {
     /// saved, since they would be accepted again after a restart.
     func remove(_ contactId: String) throws {
         contacts.removeAll { $0.id == contactId }
+        calls.peerRemoved(contactId)
         try storage.save(contacts, to: storage.contactsURL)
     }
 
@@ -322,6 +330,17 @@ final class TeamService {
         }
         try storage.save(contacts, to: storage.contactsURL)
         return contact
+    }
+
+    /// One request to a paired colleague; the answer must come from their key.
+    func send(_ message: TeamMessage, to contactId: String, timeout: Duration) async throws -> TeamMessage {
+        guard let transport else { throw TeamError.notEnabled }
+        guard let contact = contacts.first(where: { $0.id == contactId }) else { throw TeamError.refused("not_paired") }
+        let address = TeamPeerAddress.endpoint(id: contact.id, relayURL: contact.relayURL)
+        let (peer, reply) = try await transport.request(message, to: address, timeout: timeout)
+        guard peer == contact.id else { throw TeamError.protocolViolation("answered by another key") }
+        markSeen(peer, name: nil)
+        return reply
     }
 
     // MARK: Presence
@@ -379,6 +398,14 @@ final class TeamService {
             return handlePairCommit(message, from: peer)
         case .pairRequest:
             return await handlePairRequest(message, from: peer)
+        case .catalogGet, .callStart, .callAttach, .callCancel:
+            // A request accepted just before team work was turned off is
+            // answered, not queued.
+            guard isOn, config.enabled else { return .error("shutting_down") }
+            // Only colleagues see the catalog or call agents (P-5).
+            guard let contact = contacts.first(where: { $0.id == peer }) else { return .error("not_paired") }
+            markSeen(peer, name: nil)
+            return await calls.handle(message, from: contact)
         default:
             return .error("unexpected")
         }

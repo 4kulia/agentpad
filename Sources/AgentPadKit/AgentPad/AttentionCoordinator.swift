@@ -137,6 +137,7 @@ final class AttentionCoordinator {
     private func updateBadge(external: [ExternalAgentSession]) {
         let count = Self.waitingTargets(own: AgentMonitor.shared.entries, external: external).count
             + TeamService.shared.pendingPairings.count
+            + TeamService.shared.calls.awaitingDecision.count
         let label = count > 0 ? "\(count)" : nil
         if NSApp.dockTile.badgeLabel != label { NSApp.dockTile.badgeLabel = label }
     }

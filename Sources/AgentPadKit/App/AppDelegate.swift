@@ -1108,6 +1108,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
+        // AgentPad: a colleague's call running here must not outlive the app
+        // that enforces its time limit and Stop button.
+        TeamProcesses.shared.killAll()
         terminationFallback?.cancel()
         terminationFallback = nil
         systemAppearanceObservation = nil
@@ -1271,6 +1274,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // AgentPad: team work (Team/TeamUI.swift).
         mainMenu.addItem(submenu(buildMenu(title: "Team", entries: [
             selfRow("Colleagues…", #selector(handleTeamColleagues)),
+            selfRow("Published Agents…", #selector(handleTeamAgents)),
             .separator,
             selfRow("Invite Colleague…", #selector(handleTeamInvite)),
             selfRow("Join with Link…", #selector(handleTeamJoin)),
@@ -1872,6 +1876,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     // AgentPad: Team menu.
     @objc private func handleTeamColleagues() { TeamUI.showColleagues() }
+    @objc private func handleTeamAgents() { TeamUI.showAgents() }
     @objc private func handleTeamInvite() { TeamUI.invite() }
     @objc private func handleTeamJoin() { TeamUI.joinFromPrompt() }
     @objc private func handleTeamToggle() { TeamUI.toggleTeamWork() }

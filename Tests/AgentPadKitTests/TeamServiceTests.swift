@@ -490,4 +490,43 @@ final class TeamLiveIrohTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(a.contacts.first).isOnline())
         try try await a.disable(); try await b.disable()
     }
+
+    /// A call over real iroh: the long wait of `call.attach` and an answer
+    /// far larger than one stream buffer.
+    @MainActor
+    func testCallOverIroh() async throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["AGENTPAD_LIVE_IROH"] == "1", "set AGENTPAD_LIVE_IROH=1")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("team-live-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let runner = FakeTeamRunner()
+        let owner = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("a")), runner: runner)
+        let caller = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("b")))
+        await owner.enable(displayName: "Live A"); await caller.enable(displayName: "Live B")
+        guard owner.isOn, caller.isOn else { return XCTFail("start failed: \(owner.status) / \(caller.status)") }
+        owner.approvePairing = { _ in true }
+        let url = try await owner.createInvite()
+        try await caller.join(try caller.prepareJoin(try XCTUnwrap(try TeamInviteLink.parse(url))))
+        try await owner.calls.save(TeamPublishedAgent(name: "backend", description: "Live", folder: folder.path))
+
+        let catalog = await caller.calls.catalog()
+        XCTAssertEqual(catalog.map(\.address), ["backend@live-a"])
+        let sent = try caller.calls.ask("backend@live-a", prompt: "hello", threadId: nil, origin: nil)
+        let deadline = ContinuousClock.now + .seconds(30)
+        while owner.calls.awaitingDecision.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(50)) }
+        // Undecided for longer than one attach round: the caller keeps waiting.
+        try await Task.sleep(for: .seconds(TeamCalls.maxWaitSeconds + 3))
+        XCTAssertEqual(caller.calls.outgoing.first?.report.state, .awaitingApproval)
+        owner.calls.decide(sent.id, allow: true)
+        while runner.waiting == 0, ContinuousClock.now < deadline + .seconds(30) { try await Task.sleep(for: .milliseconds(50)) }
+        let big = String(repeating: "ответ ", count: 20_000)
+        runner.release(big)
+        while caller.calls.outgoing.first?.report.state.isFinal != true, ContinuousClock.now < deadline + .seconds(60) {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertEqual(caller.calls.outgoing.first?.report.state, .done)
+        XCTAssertEqual(caller.calls.outgoing.first?.report.text, big)
+        try await owner.disable(); try await caller.disable()
+    }
 }

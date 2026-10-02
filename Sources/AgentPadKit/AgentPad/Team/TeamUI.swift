@@ -21,6 +21,18 @@ enum TeamUI {
             return nil
         }
         service.onPendingChange = { AttentionCoordinator.shared.refreshBadge() }
+        // Colleagues' calls wait there too; when AgentPad is in the
+        // background a notification says who calls which agent (R-1).
+        service.calls.onPendingChange = { AttentionCoordinator.shared.refreshBadge() }
+        service.calls.onIncomingCall = { call in
+            NSApp.requestUserAttention(.criticalRequest)
+            guard !NSApp.isActive, AgentPadSettingsModel.shared.notificationsEnabled else { return }
+            let preview = call.prompt.replacingOccurrences(of: "\n", with: " ")
+            AttentionCoordinator.shared.notificationManager?.postTeam(
+                title: "\(call.peerName) calls \(call.agentName)",
+                body: String(preview.prefix(160)) + (preview.count > 160 ? "…" : "")
+            )
+        }
         loading = Task { await service.load() }
     }
 
@@ -79,6 +91,13 @@ enum TeamUI {
 
     static func showColleagues() {
         TeamWindows.showColleagues()
+    }
+
+    static func showAgents() {
+        Task {
+            await loading?.value
+            TeamWindows.showAgents()
+        }
     }
 
     // MARK: Links
@@ -211,6 +230,14 @@ enum TeamWindows {
     static var colleaguesWindow: NSWindow? { colleagues }
     private static var invite: NSWindow?
     private static var waiting: NSWindow?
+    private static var agents: NSWindow?
+
+    static func showAgents() {
+        if agents == nil {
+            agents = window(title: "Published Agents", content: TeamAgentsView(service: .shared))
+        }
+        present(agents)
+    }
 
     static func showColleagues() {
         if colleagues == nil {

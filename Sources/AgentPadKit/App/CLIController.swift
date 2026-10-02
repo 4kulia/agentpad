@@ -196,7 +196,7 @@ final class AgentPadCLIController {
             handleResume(request, isCallerWaiting: isCallerWaiting, completion: completion)
         case .team:
             // AgentPad: team work (Team/TeamCLIHandler.swift).
-            Task { @MainActor in completion(await TeamCLIHandler.handle(request)) }
+            Task { @MainActor in completion(await TeamCLIHandler.handle(request, isCallerWaiting: isCallerWaiting)) }
         }
     }
 

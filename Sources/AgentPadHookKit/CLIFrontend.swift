@@ -23,7 +23,7 @@ public enum AgentPadCLICommand: Equatable, Sendable {
     case rename(tab: String, title: String)
     case status(json: Bool)
     /// AgentPad: `team <action>` (TeamCLI.swift).
-    case team(action: String, name: String?, link: String?, peer: String?, json: Bool)
+    case team(AgentPadCLITeamCommand)
     case help
 }
 
@@ -232,12 +232,20 @@ extension AgentPadHookKit {
             return AgentPadCLIRequest(verb: .rename, tab: tab, title: title)
         case .status:
             return AgentPadCLIRequest(verb: .status)
-        case .team(let action, let name, let link, let peer, _):
+        case .team(let team):
             var request = AgentPadCLIRequest(verb: .team)
-            request.teamAction = action
-            request.teamName = name
-            request.teamLink = link
-            request.teamPeer = peer
+            request.teamAction = team.action.rawValue
+            request.teamName = team.name
+            request.teamLink = team.link
+            request.teamPeer = team.peer
+            request.teamAgent = team.agent
+            request.teamPrompt = team.prompt
+            request.teamThread = team.thread
+            request.teamCall = team.call
+            request.teamFolder = team.folder
+            request.teamDescription = team.description
+            request.teamAccess = team.access
+            request.teamMine = team.mine ? true : nil
             return request
         case .help:
             return nil
@@ -286,10 +294,11 @@ extension AgentPadHookKit {
                                   set a tab's title (clear it in-app)
           status [--json]         app version + protocol; exits 1 when
                                   AgentPad isn't running
-          team status|on|off|invite|join|approve|deny|remove
-                                  team work: colleagues, invitations and
-                                  join requests (`agentpad-cli team` for
-                                  the options)
+          team status|on|off|invite|join|approve|deny|remove|
+               agents|ask|check|cancel|publish|unpublish
+                                  team work: colleagues, invitations,
+                                  publishing agents and calling colleagues'
+                                  agents (`agentpad-cli team` for the options)
 
         Exit code 0 means the request was accepted; anything else prints one
         reason line on stderr. Every command except `status` launches AgentPad

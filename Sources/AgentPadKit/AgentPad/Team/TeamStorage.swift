@@ -15,6 +15,8 @@ struct TeamStorage: Sendable {
     var configURL: URL { directory.appendingPathComponent("config.json") }
     var contactsURL: URL { directory.appendingPathComponent("contacts.json") }
     var invitesURL: URL { directory.appendingPathComponent("invites.json") }
+    var agentsURL: URL { directory.appendingPathComponent("agents.json") }
+    var threadsURL: URL { directory.appendingPathComponent("threads.json") }
 
     func prepareDirectory() throws {
         do {

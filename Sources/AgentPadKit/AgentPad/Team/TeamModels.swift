@@ -61,6 +61,11 @@ struct TeamMessage: Codable, Equatable, Sendable {
         case hello, helloOK = "hello.ok"
         case pairCommit = "pair.commit", pairNonce = "pair.nonce"
         case pairRequest = "pair.request", pairOK = "pair.ok", pairDenied = "pair.denied"
+        // Stage 2: the catalog and calls (TEAM.md 7.3). Every call message is
+        // answered with `call.status`, which carries the call as it stands.
+        case catalogGet = "catalog.get", catalog
+        case callStart = "call.start", callAttach = "call.attach", callCancel = "call.cancel"
+        case callStatus = "call.status"
         case error
     }
 
@@ -77,6 +82,22 @@ struct TeamMessage: Codable, Equatable, Sendable {
     var appVersion: String?
     /// Machine-readable reason for `error` / `pair.denied`.
     var code: String?
+    /// catalog: the agents this colleague may call.
+    var agents: [TeamCatalogEntry]?
+    /// call.*: which call.
+    var callId: String?
+    /// call.start: the agent's name, the request, and the thread it continues.
+    var agent: String?
+    var prompt: String?
+    var threadId: String?
+    var from: TeamCallOrigin?
+    /// call.start: how long the caller still wants the call to wait for the owner.
+    var deliverBy: Date?
+    /// call.start, call.attach: answer when the call changes, or after this
+    /// many seconds (capped by the owner).
+    var waitSeconds: Int?
+    /// call.status: the call as the owner sees it.
+    var call: TeamCallReport?
 
     static func error(_ code: String) -> TeamMessage { TeamMessage(type: .error, code: code) }
 }
@@ -84,11 +105,14 @@ struct TeamMessage: Codable, Equatable, Sendable {
 enum TeamWire {
     static let version = 1
     static let alpn = "agentpad/team/1"
-    /// Upper bound for one message, enforced while reading.
-    static let maxMessageBytes = 64 * 1024
+    /// Upper bound for one message, enforced while reading. Holds the
+    /// largest answer (`TeamCalls.maxAnswerBytes`) with room to spare.
+    static let maxMessageBytes = 1024 * 1024
 
     static func encode(_ message: TeamMessage) throws -> Data {
-        var data = try JSONEncoder().encode(message)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var data = try encoder.encode(message)
         data.append(0x0A)
         return data
     }
@@ -100,7 +124,9 @@ enum TeamWire {
         guard let newline = data.firstIndex(of: 0x0A), newline == data.index(before: data.endIndex) else {
             throw TeamError.protocolViolation("expected one complete line")
         }
-        return try JSONDecoder().decode(TeamMessage.self, from: data[data.startIndex..<newline])
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(TeamMessage.self, from: data[data.startIndex..<newline])
     }
 }
 
@@ -142,6 +168,13 @@ enum TeamError: Error, Equatable, LocalizedError {
         case "join_in_progress": return "A join is already waiting for an answer."
         case "protocol_too_new": return "The other AgentPad is older. Ask your colleague to update."
         case "storage": return "The other Mac could not save the pairing. Try again."
+        case "unknown_agent": return "Your colleague has no agent by that name open to you."
+        case "unknown_call": return "Your colleague's Mac does not know this call (it may have restarted)."
+        case "unknown_thread": return "That thread is unknown on your colleague's Mac; start a new one."
+        case "rate_limited": return "Too many calls to this colleague in the last hour. Try later."
+        case "too_large": return "The request is too long."
+        case "expired": return "The call's delivery deadline has passed."
+        case "busy_calls": return "Your colleague already has several of your calls waiting for a decision."
         default:
             // Codes come from another machine: show only a short, plain one.
             let plain = code.prefix(32).filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") }

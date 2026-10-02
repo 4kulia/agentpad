@@ -77,6 +77,18 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
 
+    /// AgentPad: a colleague's call waiting for a decision (team work).
+    /// A click only brings AgentPad forward, where the right panel shows it.
+    func postTeam(title: String, body: String) {
+        guard isAvailable else { return }
+        requestAuthorizationIfNeeded()
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+
     /// Requests banner/sound permission once, on the first notification AgentPad
     /// actually wants to deliver — so the OS prompt only ever appears for a
     /// user who has notifications enabled and just hit a notifiable event.
