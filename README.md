@@ -92,7 +92,19 @@ There are no accounts, no telemetry and no sync. Conversations and files stay on
 
 ## Install
 
-There are no signed builds yet, so build from source.
+Download the latest `AgentPad-v….dmg` from [Releases](https://github.com/4kulia/agentpad/releases), open it and drag AgentPad to Applications. It needs macOS 14 or later on Apple Silicon.
+
+The build is not signed with an Apple Developer ID, so macOS blocks the first launch of every version you download. Allow it once, either in System Settings → Privacy & Security → **Open Anyway**, or from a terminal:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/AgentPad.app
+```
+
+For the same reason macOS asks for AgentPad's permissions again after each update.
+
+**AgentPad → Check for Updates…** tells you when a newer release is out and downloads its DMG.
+
+### Build from source
 
 Requirements:
 

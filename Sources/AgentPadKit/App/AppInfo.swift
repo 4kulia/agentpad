@@ -1,11 +1,15 @@
 import Foundation
 
 /// Single source of truth for product metadata — surfaced by the About panel,
-/// Help menu, and window title. Bump `displayVersion` on every release so the
-/// About panel matches the latest CHANGELOG `vX.Y` tag.
+/// Help menu, and window title.
+///
+/// AgentPad: `displayVersion` is AgentPad's own version, not upstream's — it
+/// must equal the tag of the GitHub release the build is published under,
+/// because Check for Updates compares the two. Upstream bumps this line on
+/// each of its releases; keep ours when merging.
 enum AgentPadApp {
     static let name = "AgentPad"
-    static let displayVersion = "0.51.11"
+    static let displayVersion = "1.0.0"
     static let tagline = "All your coding-agent sessions in one window. A fork of kooky."
     static let author = "Corey Chiu"
     static let authorURL = URL(string: "https://coreychiu.com?utm_source=kooky")!
