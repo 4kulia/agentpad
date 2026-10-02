@@ -40,6 +40,11 @@ enum UpdateChecker {
             guard let http = response as? HTTPURLResponse else {
                 return .failed("No response from GitHub.")
             }
+            // AgentPad: GitHub answers 404 for a repository with no published
+            // release. That is "nothing newer", not a failure to reach GitHub.
+            if http.statusCode == 404 {
+                return .upToDate(current: currentVersion)
+            }
             guard http.statusCode == 200 else {
                 return .failed("GitHub returned HTTP \(http.statusCode).")
             }
