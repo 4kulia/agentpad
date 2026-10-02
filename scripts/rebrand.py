@@ -25,7 +25,7 @@ import sys
 OLD = "kooky"
 
 # Files whose contents and names are never touched.
-EXCLUDED = re.compile(r"^(LICENSE|NOTICE\.md|CHANGELOG\.md|README[^/]*\.md|scripts/rebrand\.py)$")
+EXCLUDED = re.compile(r"^(LICENSE|NOTICE\.md|CHANGELOG\.md|README[^/]*\.md|scripts/rebrand\.py|Sources/AgentPadKit/AgentPad/LegacyNames\.swift)$")
 
 # Substrings kept verbatim wherever they occur.
 PROTECTED = [

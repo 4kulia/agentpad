@@ -112,8 +112,16 @@ struct AgentPadTerminalTheme: Identifiable, Hashable {
         )
     }
 
-    static func preset(for storedValue: String) -> AgentPadTerminalTheme? {
+    /// AgentPad: settings written by an earlier build name bundled themes
+    /// with the old prefix (`LegacyNames.themePrefix`); read them as current.
+    static func normalizedStoredValue(_ storedValue: String) -> String {
         let trimmed = storedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix(LegacyNames.themePrefix) else { return trimmed }
+        return bundledStoredValuePrefix + trimmed.dropFirst(LegacyNames.themePrefix.count)
+    }
+
+    static func preset(for storedValue: String) -> AgentPadTerminalTheme? {
+        let trimmed = normalizedStoredValue(storedValue)
         let isNamespaced = trimmed.hasPrefix(bundledStoredValuePrefix)
         let id = isNamespaced
             ? String(trimmed.dropFirst(bundledStoredValuePrefix.count))
@@ -128,7 +136,7 @@ struct AgentPadTerminalTheme: Identifiable, Hashable {
     }
 
     static func theme(for storedValue: String, in themes: [AgentPadTerminalTheme]) -> AgentPadTerminalTheme? {
-        let trimmed = storedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = normalizedStoredValue(storedValue)
         if trimmed.hasPrefix(bundledStoredValuePrefix) {
             return themes.first { $0.isBundled && $0.storedValue == trimmed }
         }

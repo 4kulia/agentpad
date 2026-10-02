@@ -803,6 +803,8 @@ enum AgentPadShellIntegration {
                 name: "ssh",
                 markers: ["AGENTPAD_DISABLE_SSH_AGENT_MARKERS", "agentpad-agent-markers"]
             )
+            // AgentPad: or the wrapper an earlier build wrote (`LegacyNames`).
+            removeManagedWrapper(name: "ssh", markers: LegacyNames.sshWrapperMarkers)
         }
     }
 
@@ -2464,6 +2466,11 @@ enum AgentPadShellIntegration {
         let dir = (fishVendorConfPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         writeFile(at: fishVendorConfPath, contents: fishInitScript)
+        // AgentPad: the same file under an earlier build's name would load
+        // next to this one (see `LegacyNames.fishVendorConfName`).
+        try? FileManager.default.removeItem(
+            atPath: (dir as NSString).appendingPathComponent(LegacyNames.fishVendorConfName)
+        )
     }
 
     /// Removes per-process temp files. Wired into `applicationWillTerminate`

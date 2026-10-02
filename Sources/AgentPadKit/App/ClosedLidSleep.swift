@@ -19,14 +19,30 @@ import AgentPadHookKit
 /// - Runtime calls use `sudo -n` (never prompt): if the rule is missing the
 ///   call fails fast instead of hanging.
 enum ClosedLidSleep {
-    static let helperPath = "/Library/PrivilegedHelperTools/agentpad-sleepctl"
+    /// Where `installScript` puts the helper.
+    static let installedHelperPath = "/Library/PrivilegedHelperTools/agentpad-sleepctl"
     /// No dot in the filename — sudoers.d silently ignores files containing one.
     static let sudoersPath = "/etc/sudoers.d/agentpad-sleepctl"
 
+    /// AgentPad: the helper to call — the current one, else one authorized
+    /// under the name an earlier build used (`LegacyNames`), so an upgrade
+    /// keeps a granted authorization working.
+    static var helperPath: String {
+        if pairExists(installedHelperPath, sudoersPath) { return installedHelperPath }
+        if pairExists(LegacyNames.sleepHelperPath, LegacyNames.sleepSudoersPath) {
+            return LegacyNames.sleepHelperPath
+        }
+        return installedHelperPath
+    }
+
     /// Both artifacts present = the one-time authorization already happened.
     static var isInstalled: Bool {
-        FileManager.default.fileExists(atPath: helperPath)
-            && FileManager.default.fileExists(atPath: sudoersPath)
+        pairExists(installedHelperPath, sudoersPath)
+            || pairExists(LegacyNames.sleepHelperPath, LegacyNames.sleepSudoersPath)
+    }
+
+    private static func pairExists(_ helper: String, _ sudoers: String) -> Bool {
+        FileManager.default.fileExists(atPath: helper) && FileManager.default.fileExists(atPath: sudoers)
     }
 
     /// The root helper: a fixed two-verb wrapper around pmset. `exec` so the
