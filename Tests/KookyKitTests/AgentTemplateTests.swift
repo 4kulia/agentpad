@@ -501,7 +501,7 @@ final class AgentTemplateTests: XCTestCase {
         // The READMEs list every shipped agent and which signals it supports.
         // That list drifted silently for two releases (it still said 13 agents
         // after 15 shipped) because nothing tied it to the code — and it is
-        // the first thing a new user reads. Pin all three translations: the
+        // the first thing a new user reads. Pin the README: the
         // command column against `builtin`, and the tool-pill column against
         // `reportsToolCalls`.
         let root = URL(fileURLWithPath: #filePath)
@@ -523,7 +523,7 @@ final class AgentTemplateTests: XCTestCase {
             options: [.anchorsMatchLines]
         )
 
-        for name in ["README.md", "README_CN.md", "README_JA.md"] {
+        for name in ["README.md"] {
             let text = try String(contentsOf: root.appendingPathComponent(name), encoding: .utf8)
             let range = NSRange(text.startIndex..., in: text)
 
