@@ -111,6 +111,15 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "env" {
             surface: surface,
             agent: agent
         ) else { exit(0) }
+        // AgentPad: a main-thread tool call also puts the tab back to
+        // "running" — see `runningPayloadForToolEvent`.
+        if let running = AgentPadHookKit.runningPayloadForToolEvent(
+            agent: agent,
+            stdin: stdinData,
+            surface: surface
+        ) {
+            _ = AgentPadHookKit.sendPayload(running, to: socketPath)
+        }
         payloadObject = tool
     } else {
         payloadObject = AgentPadHookKit.buildLifecyclePayload(
