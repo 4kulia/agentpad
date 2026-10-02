@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
 # Downloads and extracts a prebuilt GhosttyKit.xcframework into Vendor/.
-# The engine is kooky's patched build of the cmux ghostty fork (base SHA
-# below + scripts/kooky-libghostty-issue53.patch), hosted as a kooky
-# release asset. Idempotent — skips the download if Vendor/ already
-# matches the pinned engine id.
+# The engine is the upstream project's patched build of the cmux ghostty fork
+# (base SHA below + scripts/agentpad-libghostty-issue53.patch), hosted as a
+# release asset of the upstream repository. Idempotent — skips the download
+# if Vendor/ already matches the pinned engine id.
 
 set -euo pipefail
 
-# Engine identity: <ghostty base SHA>-<kooky patch rev>. Bump the patch
+# Engine identity: <ghostty base SHA>-<AgentPad patch rev>. Bump the patch
 # rev whenever the patched engine is rebuilt and republished.
-GHOSTTY_SHA="88c3325dc9698d887da7e07ee0f9b79c53020be2-kooky53r1"
+GHOSTTY_SHA="88c3325dc9698d887da7e07ee0f9b79c53020be2-agentpad53r1"
 EXPECTED_SHA256="fba19a549811a85323677660b35afa2e72cc81c58053669db94081e194c1e27e"
 ARCHIVE_URL="https://github.com/iAmCorey/kooky/releases/download/v0.50.5/GhosttyKit.xcframework.tar.gz"
 
@@ -25,7 +25,7 @@ if [[ -d "$FRAMEWORK_PATH" && -f "$STAMP_FILE" && "$(cat "$STAMP_FILE")" == "$GH
 fi
 
 mkdir -p "$VENDOR_DIR"
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kooky-ghosttykit.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agentpad-ghosttykit.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 ARCHIVE_PATH="$TMP_DIR/GhosttyKit.xcframework.tar.gz"
 

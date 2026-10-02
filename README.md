@@ -123,22 +123,22 @@ swift run                            # dev build
 swift test                           # 1100+ unit tests
 ```
 
-AgentPad's own code lives in `Sources/KookyKit/AgentPad/`. Changes to kooky's files are kept to small hooks marked `AgentPad:`, so upstream updates merge cleanly. The `main` branch tracks upstream kooky; development happens on `agentpad`.
+AgentPad's own code lives in `Sources/AgentPadKit/AgentPad/`. Changes to files inherited from kooky are kept to small hooks marked `AgentPad:`. The `main` branch tracks upstream kooky; development happens on `agentpad`. Upstream's name is replaced throughout by `scripts/rebrand.py`, which is re-applied to each upstream update before it is merged, so the rename itself never conflicts.
 
 ## Command line
 
-`kooky-cli` drives a running AgentPad: open tabs, run commands, resume conversations, list, focus or close tabs.
+`agentpad-cli` drives a running AgentPad: open tabs, run commands, resume conversations, list, focus or close tabs.
 
 ```sh
-kooky-cli open --cwd ~/project --agent claude-code     # new tab running an agent
-kooky-cli open --cwd ~/project -e "npm run dev"        # new tab running a command
-kooky-cli resume --agent codex --id <conversation-id>  # reopen a conversation
-kooky-cli list --json                                  # windows → workspaces → tabs, with ids
-kooky-cli focus --tab <session-uuid>
-kooky-cli status                                       # exit code 1 when AgentPad isn't running
+agentpad-cli open --cwd ~/project --agent claude-code     # new tab running an agent
+agentpad-cli open --cwd ~/project -e "npm run dev"        # new tab running a command
+agentpad-cli resume --agent codex --id <conversation-id>  # reopen a conversation
+agentpad-cli list --json                                  # windows → workspaces → tabs, with ids
+agentpad-cli focus --tab <session-uuid>
+agentpad-cli status                                       # exit code 1 when AgentPad isn't running
 ```
 
-The binary ships inside the app. AgentPad refreshes a stable copy at `~/Library/Application Support/agentpad/bin/kooky-cli` on every launch. Deep links use the `agentpad://` scheme:
+The binary ships inside the app. AgentPad refreshes a stable copy at `~/Library/Application Support/agentpad/bin/agentpad-cli` on every launch. Deep links use the `agentpad://` scheme:
 
 ```
 agentpad://resume?agent=<agent-id>&id=<conversation-id>&cwd=<abs-path>

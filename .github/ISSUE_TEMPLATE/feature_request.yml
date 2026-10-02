@@ -1,13 +1,13 @@
 name: Feature request
-description: Suggest an idea or improvement for kooky
+description: Suggest an idea or improvement for AgentPad
 labels: ["enhancement"]
 body:
   - type: textarea
     id: problem
     attributes:
       label: What's the pain?
-      description: What are you trying to do that kooky makes hard or impossible today?
-      placeholder: When I …, I have to … because kooky doesn't …
+      description: What are you trying to do that AgentPad makes hard or impossible today?
+      placeholder: When I …, I have to … because AgentPad doesn't …
     validations:
       required: true
   - type: textarea

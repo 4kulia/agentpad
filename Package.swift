@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "Kooky",
+    name: "AgentPad",
     defaultLocalization: "en",
     platforms: [
         // .v14 floor — `@Observable` macro requires Sonoma+. Dropping further
@@ -11,54 +11,54 @@ let package = Package(
     ],
     dependencies: [],
     targets: [
-        // Thin executable: main.swift only. Everything else lives in KookyKit so
+        // Thin executable: main.swift only. Everything else lives in AgentPadKit so
         // tests can `@testable import` it (SPM doesn't allow importing executables).
         .executableTarget(
-            name: "Kooky",
-            dependencies: ["KookyKit"],
-            path: "Sources/Kooky"
+            name: "AgentPad",
+            dependencies: ["AgentPadKit"],
+            path: "Sources/AgentPad"
         ),
         // Tiny stand-alone CLI invoked from Claude Code / Codex hooks. Reads
-        // $KOOKY_SURFACE_ID from env, opens the unix socket the running app
-        // owns, writes one JSON line, exits. Doesn't link KookyKit on purpose
+        // $AGENTPAD_SURFACE_ID from env, opens the unix socket the running app
+        // owns, writes one JSON line, exits. Doesn't link AgentPadKit on purpose
         // — keeps the binary fast and dependency-free.
         .executableTarget(
-            name: "KookyHook",
-            dependencies: ["KookyHookKit"],
-            path: "Sources/KookyHook"
+            name: "AgentPadHook",
+            dependencies: ["AgentPadHookKit"],
+            path: "Sources/AgentPadHook"
         ),
-        // User-facing control CLI (`kooky-cli`): open tabs / run commands /
+        // User-facing control CLI (`agentpad-cli`): open tabs / run commands /
         // resume conversations / list / focus / close / status over the same
         // unix socket, but request-response instead of fire-and-forget.
-        // Separate from KookyHook on purpose — hook argv is positional
-        // (`kooky-hook <agent> <event>`) and a custom agent id could collide
-        // with a verb. Doesn't link KookyKit for the same reason KookyHook
+        // Separate from AgentPadHook on purpose — hook argv is positional
+        // (`agentpad-hook <agent> <event>`) and a custom agent id could collide
+        // with a verb. Doesn't link AgentPadKit for the same reason AgentPadHook
         // doesn't: the binary must stay small and AppKit-free. The target
         // IS the shipped binary name so one name holds across dev builds,
         // the bundle, and the Application Support mirror (nobody imports an
         // executable, so the mangled module name never surfaces).
         .executableTarget(
-            name: "kooky-cli",
-            dependencies: ["KookyHookKit"],
-            path: "Sources/KookyCLI"
+            name: "agentpad-cli",
+            dependencies: ["AgentPadHookKit"],
+            path: "Sources/AgentPadCLI"
         ),
         // Payload builders + stdin parsing extracted out of `main.swift` so
         // they're unit-testable without spawning a subprocess. Foundation /
-        // Darwin only — must not depend on KookyKit (would bloat the CLI).
+        // Darwin only — must not depend on AgentPadKit (would bloat the CLI).
         .target(
-            name: "KookyHookKit",
-            path: "Sources/KookyHookKit"
+            name: "AgentPadHookKit",
+            path: "Sources/AgentPadHookKit"
         ),
         .target(
-            name: "KookyKit",
+            name: "AgentPadKit",
             dependencies: [
                 "GhosttyKit",
-                // CLI wire types (KookyCLIRequest/Response) — compiled into
+                // CLI wire types (AgentPadCLIRequest/Response) — compiled into
                 // both ends so the protocol can't drift. One-way dependency;
-                // KookyHookKit stays Foundation/Darwin-only.
-                "KookyHookKit",
+                // AgentPadHookKit stays Foundation/Darwin-only.
+                "AgentPadHookKit",
             ],
-            path: "Sources/KookyKit",
+            path: "Sources/AgentPadKit",
             resources: [
                 .process("Resources"),
             ],
@@ -85,16 +85,16 @@ let package = Package(
             path: "Vendor/GhosttyKit.xcframework"
         ),
         .testTarget(
-            name: "KookyKitTests",
-            // KookyHookKit is listed so socket integration tests can drive
+            name: "AgentPadKitTests",
+            // AgentPadHookKit is listed so socket integration tests can drive
             // HookServer with the real CLI transport client.
-            dependencies: ["KookyKit", "KookyHookKit"],
-            path: "Tests/KookyKitTests"
+            dependencies: ["AgentPadKit", "AgentPadHookKit"],
+            path: "Tests/AgentPadKitTests"
         ),
         .testTarget(
-            name: "KookyHookKitTests",
-            dependencies: ["KookyHookKit"],
-            path: "Tests/KookyHookKitTests"
+            name: "AgentPadHookKitTests",
+            dependencies: ["AgentPadHookKit"],
+            path: "Tests/AgentPadHookKitTests"
         ),
     ]
 )

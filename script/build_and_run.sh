@@ -2,8 +2,8 @@
 set -euo pipefail
 
 MODE="${1:-run}"
-APP_NAME="Kooky"
-BUNDLE_ID="com.iamcorey.kooky"
+APP_NAME="AgentPad"
+BUNDLE_ID="com.4kulia.agentpad"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_BUNDLE="${ROOT_DIR}/dist/${APP_NAME}.app"
@@ -20,7 +20,7 @@ stop_existing_app() {
 
 launch_app() {
     # Strip agent-session proxy vars (both cases): a Codex/Claude shell's
-    # temporary localhost proxy would otherwise be inherited by Kooky and
+    # temporary localhost proxy would otherwise be inherited by AgentPad and
     # every shell it spawns — a fake proxy pill, and dead network requests
     # once the agent session ends. Same lesson as CLAUDE.md's dev-launch note.
     env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
@@ -55,7 +55,7 @@ case "${MODE}" in
         launch_app
         ;;
     --debug|debug)
-        # Same proxy-var strip as launch_app: lldb (and the Kooky it spawns)
+        # Same proxy-var strip as launch_app: lldb (and the AgentPad it spawns)
         # must not inherit an agent session's temporary localhost proxy.
         env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
             -u http_proxy -u https_proxy -u all_proxy \
