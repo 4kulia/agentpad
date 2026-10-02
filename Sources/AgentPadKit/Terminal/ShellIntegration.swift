@@ -1276,11 +1276,11 @@ enum AgentPadShellIntegration {
     /// for 60s before flipping to `.stalled` instead of immediately showing the
     /// red failure pill.
     static func claudeHooksObject(hookCmd: String) -> [String: Any] {
-        hooksObject(
+        var object = hooksObject(
             slug: "claude",
             hookCmd: hookCmd,
             events: [
-                "SessionStart":      .running,
+                "SessionStart":      .idle,
                 "UserPromptSubmit":  .running,
                 "Stop":              .attention,
                 "Notification":      .attention,
@@ -1288,7 +1288,22 @@ enum AgentPadShellIntegration {
             ],
             passthroughEvents: ["PreToolUse", "PostToolUse", "PostToolUseFailure"]
         )
+        // AgentPad: a session that has just started, resumed, forked or been
+        // cleared sits at an empty prompt, so it reports idle — upstream
+        // reported running, which left every restored tab under "Running"
+        // until its first turn finished. Compaction is left out on purpose:
+        // it can happen mid-turn and must not change the state either way.
+        if var hooks = object["hooks"] as? [String: Any],
+           var start = (hooks["SessionStart"] as? [[String: Any]])?.first {
+            start["matcher"] = claudeSessionStartMatcher
+            hooks["SessionStart"] = [start]
+            object["hooks"] = hooks
+        }
+        return object
     }
+
+    /// The `SessionStart` sources that leave Claude waiting at the prompt.
+    static let claudeSessionStartMatcher = "startup|resume|clear|fork"
 
     /// Path to a per-custom-agent Claude settings file. Same directory as
     /// `claudeHooksPath`; named `claude-<agentId>.json` (id sanitised so a

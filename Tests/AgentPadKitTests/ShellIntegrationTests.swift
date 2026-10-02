@@ -52,6 +52,23 @@ final class ShellIntegrationTests: XCTestCase {
         }
     }
 
+    /// A started, resumed, forked or cleared session waits at the prompt: it
+    /// must report idle, and compaction (possible mid-turn) must not report.
+    func testClaudeSessionStartReportsIdleAndSkipsCompaction() throws {
+        let object = AgentPadShellIntegration.claudeHooksObject(hookCmd: Self.stubHook)
+        let hooks = try XCTUnwrap(object["hooks"] as? [String: Any])
+        let groups = try XCTUnwrap(hooks["SessionStart"] as? [[String: Any]])
+        XCTAssertEqual(groups.count, 1)
+
+        let matcher = try XCTUnwrap(groups[0]["matcher"] as? String)
+        XCTAssertEqual(Set(matcher.split(separator: "|").map(String.init)), ["startup", "resume", "clear", "fork"])
+        let inner = try XCTUnwrap((groups[0]["hooks"] as? [[String: Any]])?.first)
+        XCTAssertEqual(
+            inner["command"] as? String,
+            "AGENTPAD_MANAGED_HOOK=1 '\(Self.stubHook)' claude idle --hook-stdin"
+        )
+    }
+
     func testClaudeWrapperScopesNoSessionPersistenceToActualInvocation() {
         let script = AgentPadShellIntegration.claudeWrapperScript
         let scan = #"if [[ "$_agentpad_arg" == "--no-session-persistence" ]]; then"#
