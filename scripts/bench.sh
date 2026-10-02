@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# kooky performance benchmarks — run after any change that might affect a
+# AgentPad performance benchmarks — run after any change that might affect a
 # measured path, compare against the last lines of bench-history.jsonl.
 # Synthetic numbers are fixed-load and comparable run-over-run on one
 # machine; the "real" number is context only (it grows with real usage).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "Running benchmarks (KOOKY_BENCH=1)…"
+echo "Running benchmarks (AGENTPAD_BENCH=1)…"
 # Release build: debug (-Onone) inflates exactly the Swift-side loops the
 # scanner optimizations target, distorting before/after ratios.
 set +e
-raw=$(KOOKY_BENCH=1 swift test -c release --filter PerformanceBenchmarks 2>&1)
+raw=$(AGENTPAD_BENCH=1 swift test -c release --filter PerformanceBenchmarks 2>&1)
 status=$?
 set -e
 out=$(grep "^BENCH" <<< "$raw" || true)
@@ -23,7 +23,7 @@ if [ $status -ne 0 ]; then
 fi
 if [ -z "$out" ]; then
   echo "No BENCH output — re-run verbosely:"
-  echo "  KOOKY_BENCH=1 swift test -c release --filter PerformanceBenchmarks"
+  echo "  AGENTPAD_BENCH=1 swift test -c release --filter PerformanceBenchmarks"
   exit 1
 fi
 

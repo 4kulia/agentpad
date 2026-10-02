@@ -1,0 +1,482 @@
+import Darwin
+import Foundation
+
+// The `agentpad-cli` front half: argv parsing, output rendering, and the
+// request/response socket transport. Pure helpers in AgentPadHookKit so the
+// per-verb grammar (required flags, mutual exclusion, UUID shape) is
+// unit-testable without spawning the binary — `Sources/AgentPadCLI/main.swift`
+// stays a thin dispatcher, mirroring how AgentPadHook leans on Parser.swift.
+
+/// A parsed CLI invocation. `help` renders locally; everything else maps
+/// 1:1 onto a `AgentPadCLIRequest`.
+public enum AgentPadCLICommand: Equatable, Sendable {
+    /// `cwd` is optional ONLY because a Terminal preset carries its own
+    /// directory; every other template still needs one, which the app
+    /// enforces (it is the side that knows what a template id resolves to).
+    /// `title` seeds the tab's user override (same field tab rename writes);
+    /// `noFocus` lands the tab in the background (issue #57).
+    case open(cwd: String?, command: String?, agent: String?, title: String?, noFocus: Bool)
+    case resume(agent: String, id: String, cwd: String?)
+    case list(json: Bool)
+    case focus(tab: String)
+    case close(tab: String)
+    case rename(tab: String, title: String)
+    case status(json: Bool)
+    case help
+}
+
+public struct AgentPadCLIParseFailure: Error, Equatable, Sendable {
+    public let message: String
+    public init(_ message: String) { self.message = message }
+}
+
+extension AgentPadHookKit {
+    /// Per-verb flag grammar. Value flags take exactly the next token
+    /// verbatim (so `-e "claude -p 'hi'"` and dash-leading values survive);
+    /// bool flags stand alone.
+    private struct VerbSpec {
+        let valueFlags: Set<String>
+        let boolFlags: Set<String>
+        let usage: String
+    }
+
+    private static let verbSpecs: [String: VerbSpec] = [
+        "open": VerbSpec(
+            valueFlags: ["--cwd", "-e", "--agent", "--title"],
+            boolFlags: ["--no-focus"],
+            usage: "usage: agentpad-cli open [--cwd <dir>] [-e <command> | --agent <template-id>] [--title <title>] [--no-focus]"
+        ),
+        "resume": VerbSpec(
+            valueFlags: ["--agent", "--id", "--cwd"],
+            boolFlags: [],
+            usage: "usage: agentpad-cli resume --agent <agent-id> --id <conversation-id> [--cwd <dir>]"
+        ),
+        "list": VerbSpec(
+            valueFlags: [],
+            boolFlags: ["--json"],
+            usage: "usage: agentpad-cli list [--json]"
+        ),
+        "focus": VerbSpec(
+            valueFlags: ["--tab"],
+            boolFlags: [],
+            usage: "usage: agentpad-cli focus --tab <session-uuid>"
+        ),
+        "close": VerbSpec(
+            valueFlags: ["--tab"],
+            boolFlags: [],
+            usage: "usage: agentpad-cli close --tab <session-uuid>"
+        ),
+        "rename": VerbSpec(
+            valueFlags: ["--tab", "--title"],
+            boolFlags: [],
+            usage: "usage: agentpad-cli rename --tab <session-uuid> --title <title>"
+        ),
+        "status": VerbSpec(
+            valueFlags: [],
+            boolFlags: ["--json"],
+            usage: "usage: agentpad-cli status [--json]"
+        ),
+    ]
+
+    private static func unknownVerbFailure(_ verb: String) -> AgentPadCLIParseFailure {
+        AgentPadCLIParseFailure(
+            "unknown command '\(verb)' — one of: open, resume, list, focus, close, rename, status. Run `agentpad-cli --help`."
+        )
+    }
+
+    /// Parses `agentpad-cli` arguments (argv minus the binary name).
+    public static func parseCLICommand(_ args: [String]) -> Result<AgentPadCLICommand, AgentPadCLIParseFailure> {
+        // Help is a VERB-position word or a bare flag token — never scanned
+        // out of flag values, or `open -e "--help"` would print help instead
+        // of running the caller's command (value flags promise to take the
+        // next token verbatim).
+        guard let verb = args.first else { return .success(.help) }
+        if verb == "help" || verb == "--help" || verb == "-h" { return .success(.help) }
+        guard let spec = verbSpecs[verb] else {
+            return .failure(unknownVerbFailure(verb))
+        }
+
+        var values: [String: String] = [:]
+        var bools: Set<String> = []
+        var i = 1
+        while i < args.count {
+            let arg = args[i]
+            if spec.boolFlags.contains(arg) {
+                bools.insert(arg)
+                i += 1
+                continue
+            }
+            if spec.valueFlags.contains(arg) {
+                guard i + 1 < args.count else {
+                    return .failure(AgentPadCLIParseFailure("\(arg) expects a value. \(spec.usage)"))
+                }
+                guard values[arg] == nil else {
+                    return .failure(AgentPadCLIParseFailure("duplicate \(arg). \(spec.usage)"))
+                }
+                // A blank value counts as "flag not passed", for EVERY value
+                // flag rather than just `--cwd`. Scripts write
+                // `--cwd "$MAYBE_DIR"`, and an unset variable must not turn
+                // into "wherever the CLI happens to be running" once
+                // `normalizeCLIPath` absolutizes it against the process cwd —
+                // by then it is a perfectly valid path and every downstream
+                // "is it empty" check is already too late.
+                //
+                // The value is stored VERBATIM, never trimmed: `-e " cmd"`
+                // uses a leading space deliberately (zsh's HIST_IGNORE_SPACE
+                // keeps such a command out of history).
+                let raw = args[i + 1]
+                if !raw.trimmingCharacters(in: .whitespaces).isEmpty {
+                    values[arg] = raw
+                }
+                i += 2
+                continue
+            }
+            if arg == "--help" || arg == "-h" {
+                return .success(.help)
+            }
+            return .failure(AgentPadCLIParseFailure("unknown argument '\(arg)'. \(spec.usage)"))
+        }
+
+        func require(_ flag: String) -> Result<String, AgentPadCLIParseFailure> {
+            guard let value = values[flag], !value.isEmpty else {
+                return .failure(AgentPadCLIParseFailure("\(flag) is required. \(spec.usage)"))
+            }
+            return .success(value)
+        }
+        func requireTab() -> Result<String, AgentPadCLIParseFailure> {
+            require("--tab").flatMap { raw in
+                guard let uuid = UUID(uuidString: raw) else {
+                    return .failure(AgentPadCLIParseFailure(
+                        "--tab expects a session UUID — copy one from `agentpad-cli list`."
+                    ))
+                }
+                return .success(uuid.uuidString)
+            }
+        }
+
+        switch verb {
+        case "open":
+            let command = values["-e"]
+            let agent = values["--agent"]
+            if command != nil, agent != nil {
+                return .failure(AgentPadCLIParseFailure("-e and --agent are mutually exclusive. \(spec.usage)"))
+            }
+            // `--cwd` is optional everywhere: a Terminal preset brings its
+            // own directory, and with no directory named at all the tab
+            // opens wherever the active workspace already is. Bare
+            // `agentpad-cli open` is therefore "give me a new tab".
+            return .success(.open(
+                cwd: values["--cwd"],
+                command: command,
+                agent: agent,
+                title: values["--title"],
+                noFocus: bools.contains("--no-focus")
+            ))
+        case "resume":
+            return require("--agent").flatMap { agent in
+                require("--id").map { id in
+                    .resume(agent: agent, id: id, cwd: values["--cwd"])
+                }
+            }
+        case "list":
+            return .success(.list(json: bools.contains("--json")))
+        case "focus":
+            return requireTab().map { .focus(tab: $0) }
+        case "close":
+            return requireTab().map { .close(tab: $0) }
+        case "rename":
+            return requireTab().flatMap { tab in
+                require("--title").map { title in
+                    .rename(tab: tab, title: title)
+                }
+            }
+        case "status":
+            return .success(.status(json: bools.contains("--json")))
+        default:
+            // Unreachable while the switch covers every verbSpecs key; kept
+            // identical to the entry guard so a future verb added to the
+            // table but not here still fails with the full message.
+            return .failure(unknownVerbFailure(verb))
+        }
+    }
+
+    /// The wire request for a parsed command; nil for `help` (local-only).
+    /// Path normalization is the caller's job — this maps fields verbatim.
+    public static func cliRequest(for command: AgentPadCLICommand) -> AgentPadCLIRequest? {
+        switch command {
+        case .open(let cwd, let cmd, let agent, let title, let noFocus):
+            // `noFocus` ships only when set: an absent optional keeps the
+            // request line byte-identical to what a v0.51.0 CLI sends, so
+            // an older app's decoder never sees the field at all.
+            return AgentPadCLIRequest(
+                verb: .open,
+                cwd: cwd,
+                command: cmd,
+                agent: agent,
+                title: title,
+                noFocus: noFocus ? true : nil
+            )
+        case .resume(let agent, let id, let cwd):
+            return AgentPadCLIRequest(verb: .resume, cwd: cwd, agent: agent, conversationId: id)
+        case .list:
+            return AgentPadCLIRequest(verb: .list)
+        case .focus(let tab):
+            return AgentPadCLIRequest(verb: .focus, tab: tab)
+        case .close(let tab):
+            return AgentPadCLIRequest(verb: .close, tab: tab)
+        case .rename(let tab, let title):
+            return AgentPadCLIRequest(verb: .rename, tab: tab, title: title)
+        case .status:
+            return AgentPadCLIRequest(verb: .status)
+        case .help:
+            return nil
+        }
+    }
+
+    /// Tilde-expands, absolutizes against `base` (the CLI process cwd), and
+    /// standardizes. The server still validates existence + absoluteness —
+    /// this only saves callers from spelling out `$PWD`.
+    public static func normalizeCLIPath(_ path: String, relativeTo base: String) -> String {
+        let expanded = (path as NSString).expandingTildeInPath
+        let absolute = expanded.hasPrefix("/")
+            ? expanded
+            : (base as NSString).appendingPathComponent(expanded)
+        return (absolute as NSString).standardizingPath
+    }
+
+    // MARK: - Rendering
+
+    public static func renderCLIHelp() -> String {
+        """
+        agentpad-cli — control a running AgentPad from scripts and other apps
+
+        usage: agentpad-cli <command> [options]
+
+          open [--cwd <dir>] [-e <command> | --agent <template-id>]
+               [--title <title>] [--no-focus]
+                                  open a new tab at <dir>; -e runs a shell
+                                  command there, --agent starts an agent
+                                  (built-in, Settings → Agents custom, or a
+                                  Terminal preset). Without --cwd the tab
+                                  opens where the active workspace already
+                                  is — a Terminal preset uses its own path.
+                                  --title names the tab (outranks the
+                                  automatic title, like a manual rename);
+                                  --no-focus lands it in the background,
+                                  already running — bring it forward
+                                  later with focus
+          resume --agent <agent-id> --id <conversation-id> [--cwd <dir>]
+                                  reopen an agent conversation (same
+                                  semantics as agentpad://resume deep links)
+          list [--json]           windows → workspaces → tabs, with ids
+          focus --tab <uuid>      bring a tab to the front
+          close --tab <uuid>      close a tab (in-app confirmation rules apply)
+          rename --tab <uuid> --title <title>
+                                  set a tab's title (clear it in-app)
+          status [--json]         app version + protocol; exits 1 when
+                                  AgentPad isn't running
+
+        Exit code 0 means the request was accepted; anything else prints one
+        reason line on stderr. Every command except `status` launches AgentPad
+        first if it isn't running.
+        """
+    }
+
+    public static func renderCLIList(_ windows: [AgentPadCLIWindowInfo]) -> String {
+        guard !windows.isEmpty else { return "no windows" }
+        var lines: [String] = []
+        for window in windows {
+            lines.append("window \(window.index)\(window.isKey ? " (key)" : "")")
+            for workspace in window.workspaces {
+                let path = abbreviatePath(workspace.path)
+                lines.append("  workspace \"\(plain(workspace.title))\"\(workspace.isActive ? " (active)" : "") — \(path)")
+                for tab in workspace.tabs {
+                    let marker = tab.isActive ? "*" : " "
+                    let state = tab.agentState.map { " (\(plain($0)))" } ?? ""
+                    lines.append("  \(marker) \(tab.id)  \(plain(tab.agent))\(state)  \"\(plain(tab.title))\" — \(abbreviatePath(tab.cwd))")
+                }
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Flattens one value into something safe to print on the caller's
+    /// terminal. Tab titles come from OSC 0/2 — i.e. whatever program is
+    /// running, including one on the far side of an ssh — and a directory
+    /// name may legally contain a newline (`mkdir $'a\nb'`), so an
+    /// un-sanitized value can forge whole `list` rows (pointing a script at
+    /// the wrong tab id) or inject ANSI/OSC sequences into the terminal that
+    /// reads the output. Control characters become spaces rather than being
+    /// dropped, so a forged row still reads as one row of one entry.
+    /// `--json` needs none of this — JSONEncoder escapes them.
+    ///
+    /// This is the CLI-output twin of AgentPadKit's `singleLine(_:)` rule
+    /// (M5.aaaaa): any value interpolated into a multi-line composed string
+    /// must be flattened first. It additionally strips non-newline control
+    /// characters, which only matter when the sink is a terminal.
+    ///
+    /// EVERY dynamic value the CLI prints goes through this — list rows,
+    /// error lines, notes, the app's reported version. Not just the ones
+    /// that obviously come from a terminal title: a refusal message quotes
+    /// the caller's own `--agent` value back at them, and that string came
+    /// from whatever tool invoked agentpad-cli.
+    public static func plain(_ value: String) -> String {
+        String(String.UnicodeScalarView(value.unicodeScalars.map { scalar in
+            let isC0OrDelete = scalar.value < 0x20 || scalar.value == 0x7F
+            // C1 (0x80–0x9F) is a second escape space some terminals honor,
+            // and U+2028/2029 are Unicode's own line breaks.
+            let isC1 = (0x80...0x9F).contains(scalar.value)
+            let isUnicodeBreak = scalar.value == 0x2028 || scalar.value == 0x2029
+            return isC0OrDelete || isC1 || isUnicodeBreak ? " " : scalar
+        }))
+    }
+
+    public static func renderCLIListJSON(_ windows: [AgentPadCLIWindowInfo]) -> String {
+        struct Payload: Encodable {
+            let windows: [AgentPadCLIWindowInfo]
+        }
+        return encodeJSON(Payload(windows: windows))
+    }
+
+    public static func renderCLIStatusJSON(running: Bool, appVersion: String?, serverProtocol: Int?) -> String {
+        struct Payload: Encodable {
+            let running: Bool
+            let appVersion: String?
+            let protocolVersion: Int?
+            let cliProtocolVersion: Int
+        }
+        return encodeJSON(Payload(
+            running: running,
+            appVersion: appVersion,
+            protocolVersion: serverProtocol,
+            cliProtocolVersion: AgentPadCLIProtocol.version
+        ))
+    }
+
+    private static func encodeJSON(_ value: some Encodable) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(value) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Abbreviate first, THEN sanitize — flattening a newline inside the
+    /// path ahead of the tilde match would stop `$HOME` from matching.
+    private static func abbreviatePath(_ path: String) -> String {
+        plain((path as NSString).abbreviatingWithTildeInPath)
+    }
+}
+
+// MARK: - Transport
+
+/// One-shot request/response over the hook socket. Unlike `sendPayload`
+/// (fire-and-forget, blocking), this runs the whole exchange non-blocking
+/// under a single deadline so a stuck or older app (which never answers)
+/// surfaces as a typed failure instead of a hung CLI process.
+public enum AgentPadCLITransport {
+    public enum Failure: Error, Equatable, Sendable {
+        /// No listener on the socket path (app not running / socket gone).
+        case connectFailed
+        case writeFailed
+        /// Connected but no full reply line arrived before the deadline —
+        /// commonly a AgentPad build too old to speak the CLI protocol.
+        case timedOut
+        /// The server closed without answering — same "older app" signature.
+        case closedWithoutReply
+        case replyTooLarge
+    }
+
+    public static func roundTrip(
+        line: Data,
+        socketPath: String,
+        timeout: TimeInterval
+    ) -> Result<Data, Failure> {
+        let deadline = DispatchTime.now() + timeout
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return .failure(.connectFailed) }
+        defer { close(fd) }
+        let flags = fcntl(fd, F_GETFL)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        // A AgentPad too old to speak this protocol reads once and closes, so a
+        // request that spans several writes (a long `open -e`) can hit a
+        // gone peer mid-write. Without this that raises SIGPIPE and the CLI
+        // dies by signal — no exit code we chose, no message. With it the
+        // write returns EPIPE and the caller gets the "older AgentPad" line.
+        var noSigpipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+
+        guard let rc = AgentPadHookKit.withUnixSocketAddress(path: socketPath, { addr, len in
+            connect(fd, addr, len)
+        }) else {
+            return .failure(.connectFailed)
+        }
+        if rc != 0 {
+            guard errno == EINPROGRESS else { return .failure(.connectFailed) }
+            guard poll(fd, events: Int16(POLLOUT), deadline: deadline) else { return .failure(.connectFailed) }
+            var soError: Int32 = 0
+            var soLen = socklen_t(MemoryLayout<Int32>.size)
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &soLen)
+            guard soError == 0 else { return .failure(.connectFailed) }
+        }
+
+        var offset = 0
+        let bytes = [UInt8](line)
+        while offset < bytes.count {
+            let n = bytes.withUnsafeBufferPointer { buf in
+                write(fd, buf.baseAddress! + offset, bytes.count - offset)
+            }
+            if n > 0 {
+                offset += n
+                continue
+            }
+            if n < 0, errno == EINTR { continue }
+            if n < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                guard poll(fd, events: Int16(POLLOUT), deadline: deadline) else { return .failure(.timedOut) }
+                continue
+            }
+            // The peer hung up mid-request — same "server won't answer"
+            // situation the read loop reports, so share its message
+            // (the older-agentpad hint) instead of the generic send failure.
+            if n < 0, errno == EPIPE || errno == ECONNRESET {
+                return .failure(.closedWithoutReply)
+            }
+            return .failure(.writeFailed)
+        }
+
+        var reply = Data()
+        var sawNewline = false
+        var buffer = [UInt8](repeating: 0, count: 65536)
+        while !sawNewline {
+            guard reply.count < AgentPadCLIProtocol.maxResponseLineBytes else { return .failure(.replyTooLarge) }
+            guard poll(fd, events: Int16(POLLIN), deadline: deadline) else { return .failure(.timedOut) }
+            let n = read(fd, &buffer, buffer.count)
+            if n > 0 {
+                if buffer[0..<n].contains(0x0A) { sawNewline = true }
+                reply.append(contentsOf: buffer[0..<n])
+                continue
+            }
+            if n < 0, errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { continue }
+            // EOF (or hard error) before a full line: the server hung up
+            // without answering.
+            return .failure(.closedWithoutReply)
+        }
+        if let newline = reply.firstIndex(of: 0x0A) {
+            reply = reply.prefix(upTo: newline)
+        }
+        return .success(reply)
+    }
+
+    private static func poll(_ fd: Int32, events: Int16, deadline: DispatchTime) -> Bool {
+        while true {
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            guard deadline.uptimeNanoseconds > nowNs else { return false }
+            let remainingMs = Int32(min((deadline.uptimeNanoseconds - nowNs) / 1_000_000, 60_000))
+            var pollFd = pollfd(fd: fd, events: events, revents: 0)
+            let rc = Darwin.poll(&pollFd, 1, max(remainingMs, 1))
+            if rc > 0 { return true }
+            if rc == 0 { continue }
+            if errno == EINTR { continue }
+            return false
+        }
+    }
+}

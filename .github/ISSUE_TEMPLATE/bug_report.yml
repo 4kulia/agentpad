@@ -1,5 +1,5 @@
 name: Bug report
-description: Something in kooky is broken or behaving wrong
+description: Something in AgentPad is broken or behaving wrong
 labels: ["bug"]
 body:
   - type: markdown
@@ -11,7 +11,7 @@ body:
     attributes:
       label: What happened?
       description: What went wrong, and what did you expect instead?
-      placeholder: When I …, kooky … — I expected …
+      placeholder: When I …, AgentPad … — I expected …
     validations:
       required: true
   - type: textarea
@@ -25,10 +25,10 @@ body:
     validations:
       required: true
   - type: input
-    id: kooky-version
+    id: agentpad-version
     attributes:
-      label: kooky version
-      description: kooky menu → About kooky
+      label: AgentPad version
+      description: AgentPad menu → About AgentPad
       placeholder: "0.26.1"
     validations:
       required: true
