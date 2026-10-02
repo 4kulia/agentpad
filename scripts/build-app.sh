@@ -274,11 +274,26 @@ echo "==> Adhoc codesign (skips Gatekeeper kill on first launch)"
 # Sign inside-out: inner resource bundle first, then binaries, then the
 # .app — each layer wants its descendants already signed before signing
 # itself.
-codesign --force --sign - "${APP}/Contents/Resources/AgentPad_AgentPadKit.bundle"
-codesign --force --sign - "${APP}/Contents/MacOS/${APP_NAME}"
-codesign --force --sign - "${APP}/Contents/MacOS/AgentPadHook"
-codesign --force --sign - "${APP}/Contents/MacOS/agentpad-cli"
-codesign --force --sign - "${APP}" 2>&1 | tail -3
+#
+# AgentPad: AGENTPAD_SIGN_IDENTITY names a Developer ID certificate for a
+# distributable build (scripts/release.sh sets it). That signature carries
+# the hardened runtime and a secure timestamp, which notarization requires,
+# and the app's entitlements. AGENTPAD_HARDENED=1 applies the hardened
+# runtime to an adhoc build, to try its effect without a certificate.
+SIGN_IDENTITY="${AGENTPAD_SIGN_IDENTITY:--}"
+SIGN_FLAGS=(--force --sign "$SIGN_IDENTITY")
+APP_SIGN_FLAGS=("${SIGN_FLAGS[@]}")
+if [ "$SIGN_IDENTITY" != "-" ] || [ -n "${AGENTPAD_HARDENED:-}" ]; then
+    SIGN_FLAGS+=(--options runtime)
+    [ "$SIGN_IDENTITY" = "-" ] || SIGN_FLAGS+=(--timestamp)
+    APP_SIGN_FLAGS=("${SIGN_FLAGS[@]}" --entitlements scripts/AgentPad.entitlements)
+    echo "    identity: ${SIGN_IDENTITY} (hardened runtime)"
+fi
+codesign "${SIGN_FLAGS[@]}" "${APP}/Contents/Resources/AgentPad_AgentPadKit.bundle"
+codesign "${APP_SIGN_FLAGS[@]}" "${APP}/Contents/MacOS/${APP_NAME}"
+codesign "${SIGN_FLAGS[@]}" "${APP}/Contents/MacOS/AgentPadHook"
+codesign "${SIGN_FLAGS[@]}" "${APP}/Contents/MacOS/agentpad-cli"
+codesign "${APP_SIGN_FLAGS[@]}" "${APP}" 2>&1 | tail -3
 
 echo ""
 echo "✓ Built ${APP} (v${VERSION})"

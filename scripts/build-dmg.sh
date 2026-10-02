@@ -40,7 +40,15 @@ hdiutil create \
 
 # Adhoc-sign the DMG itself so macOS doesn't flag the *file* as unsigned
 # even before the user mounts it. Inner .app already has its own adhoc sig.
-codesign --force --sign - "$DMG"
+#
+# AgentPad: with AGENTPAD_SIGN_IDENTITY set (scripts/release.sh), the image is
+# signed with that Developer ID instead, so it can be notarized.
+SIGN_IDENTITY="${AGENTPAD_SIGN_IDENTITY:--}"
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    codesign --force --sign - "$DMG"
+else
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG"
+fi
 
 rm -rf "$STAGING"
 
