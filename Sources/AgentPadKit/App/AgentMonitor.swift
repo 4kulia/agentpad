@@ -91,6 +91,16 @@ final class AgentMonitor {
         /// AgentPad: the agent's conversation id, so the unified list can keep
         /// a live session from also appearing under "recent".
         var conversationId: String? = nil
+        /// AgentPad: work the agent left running in the background after its
+        /// turn; the row then reads "running · background".
+        var backgroundWork: Session.BackgroundWork? = nil
+
+        /// AgentPad: the state word, saying when the running is background work.
+        @MainActor
+        var stateLabel: String {
+            guard state == .running, backgroundWork != nil else { return state.label }
+            return state.label + " · " + String(localized: "background", bundle: .agentPadResources)
+        }
 
         /// Stable location text used when a compact surface needs the actual
         /// project path. Remote sessions name the host because their local
@@ -121,7 +131,14 @@ final class AgentMonitor {
         /// with it — the caller resolves that once and both follow.
         @MainActor
         func hoverText(tag: WorkspaceTag?) -> String {
-            let head = "\(singleLine(agent.title)) · \(singleLine(tabTitle)) · \(state.help)"
+            var head = "\(singleLine(agent.title)) · \(singleLine(tabTitle)) · \(state.help)"
+            // AgentPad: say what is running in the background.
+            if state == .running, let work = backgroundWork {
+                var parts: [String] = []
+                if work.subagents > 0 { parts.append(work.subagents == 1 ? "1 subagent" : "\(work.subagents) subagents") }
+                if work.shells > 0 { parts.append(work.shells == 1 ? "1 shell command" : "\(work.shells) shell commands") }
+                head += "\nIn the background: " + parts.joined(separator: ", ")
+            }
             guard let label = tag?.hashLabel else { return "\(head)\n\(locationLabel)" }
             return "\(head)\n\(label)\n\(locationLabel)"
         }
@@ -146,7 +163,8 @@ final class AgentMonitor {
                 directory: item.session.currentDirectory,
                 remoteHost: item.session.effectiveRemoteHost,
                 tag: item.workspace.tag,
-                conversationId: item.session.conversationId
+                conversationId: item.session.conversationId,
+                backgroundWork: item.session.backgroundWork
             )
         }
         .sorted { $0.state < $1.state }
@@ -474,7 +492,7 @@ struct AgentOverviewRow: View {
             }
             Spacer(minLength: 6)
             // The colored state word does the work the left accent bar used to.
-            Text(entry.state.label)
+            Text(entry.stateLabel)
                 .font(Theme.display(10, weight: .medium))
                 .foregroundStyle(agentStateWordColor(entry.state))
         }

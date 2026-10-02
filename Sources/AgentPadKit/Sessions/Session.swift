@@ -389,6 +389,28 @@ final class Session: Identifiable {
         }
     }
 
+    /// AgentPad: `tool_use_id`s of main-thread tool calls started in the
+    /// current batch and not finished yet. Kept apart from `toolCallEvents`,
+    /// whose rolling cap and stall sweep describe the activity strip, not
+    /// whether a call is still waiting. Emptied when the batch resolves and at
+    /// every turn boundary, so a call whose end is never reported (a denied
+    /// permission sends no PostToolUse) cannot keep a tab waiting.
+    var openMainThreadCalls: Set<String> = []
+
+    /// AgentPad: subagents and shell commands still running in the background
+    /// after the agent ended its turn. Non-nil only while the tab shows
+    /// "running" for that reason; the next lifecycle event replaces it.
+    var backgroundWork: BackgroundWork?
+
+    /// AgentPad: when a hook last set `activityState`. Claude Code's own
+    /// status corrects the tab only when it is newer than this.
+    var hookStateAt: Date = .distantPast
+
+    struct BackgroundWork: Equatable {
+        var subagents: Int
+        var shells: Int
+    }
+
     /// Append + enforce the 200-event rolling cap. Single source of truth
     /// for the cap policy — `recordToolCallStart` and the orphan-post
     /// branch of `recordToolCallEnd` both route through here so a future

@@ -2,29 +2,34 @@ import Foundation
 
 // AgentPad: Claude reports "attention" when it stops mid-turn to show a
 // prompt — a permission request, a question — but nothing reports the answer.
-// The next lifecycle event is the end of the turn, so a tab kept reading
-// "waiting" for as long as the agent went on working after the prompt. A tool
-// call on the main thread is the missing signal: the agent is running again.
+// Tool calls on the main thread are the signal that the agent went on; the app
+// decides from them when a waiting tab is running again
+// (`WorkspaceStore.applyToolCallEvent`).
 
 extension AgentPadHookKit {
-    /// The `running` lifecycle payload to send alongside a tool event, or nil
-    /// when the event says nothing about the tab's own state.
+    /// Payload key marking a tool event as made by the main thread.
+    public static let mainThreadKey = "main_thread"
+
+    /// `kind` of the payload saying the main thread's current batch of tool
+    /// calls has resolved (Claude's `PostToolBatch`).
+    public static let toolBatchKind = "tool_batch"
+
+    public static func buildToolBatchPayload(agent: String, surface: String) -> [String: String] {
+        ["kind": toolBatchKind, "agent": agent, "surface": surface]
+    }
+
+    /// Whether a tool event's hook stdin comes from the agent's main thread.
     ///
-    /// Tool calls made inside a subagent carry `agent_id` and are left out: a
+    /// Tool calls made inside a subagent carry `agent_id` and do not count: a
     /// background subagent keeps calling tools after the main thread has
-    /// finished its turn, and the tab must then keep saying it needs the user.
-    /// Only Claude is covered — `agent_id` is its field, and the other agents
-    /// that send tool events report their own lifecycle around each call.
-    public static func runningPayloadForToolEvent(
-        agent: String,
-        stdin data: Data,
-        surface: String
-    ) -> [String: String]? {
+    /// finished its turn, when the tab does need the user. Only Claude is
+    /// covered — `agent_id` is its field.
+    public static func isMainThreadToolEvent(agent: String, stdin data: Data) -> Bool {
         guard agent == "claude",
               !data.isEmpty,
               let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
-        if let subagent = parsed["agent_id"] as? String, !subagent.isEmpty { return nil }
-        return buildLifecyclePayload(agent: agent, event: "running", surface: surface)
+        else { return false }
+        if let subagent = parsed["agent_id"] as? String, !subagent.isEmpty { return false }
+        return true
     }
 }

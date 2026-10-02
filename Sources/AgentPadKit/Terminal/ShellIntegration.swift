@@ -1288,7 +1288,9 @@ enum AgentPadShellIntegration {
                 "Notification":      .attention,
                 "SessionEnd":        .ended,
             ],
-            passthroughEvents: ["PreToolUse", "PostToolUse", "PostToolUseFailure"]
+            // AgentPad: PostToolBatch says a batch of tool calls resolved —
+            // including one the user denied — which ends any wait inside it.
+            passthroughEvents: ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch"]
         )
         // AgentPad: a session that has just started, resumed, forked or been
         // cleared sits at an empty prompt, so it reports idle — upstream

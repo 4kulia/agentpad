@@ -103,30 +103,33 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "env" {
         )
         exit(AgentPadHookKit.sendPayload(payload, to: socketPath) ? 0 : 1)
     }
-    if event == "PreToolUse" || event == "PostToolUse" || event == "PostToolUseFailure" {
+    if event == "PostToolBatch" {
+        // AgentPad: a subagent's batch says nothing about the tab's own wait.
+        guard AgentPadHookKit.isMainThreadToolEvent(agent: agent, stdin: stdinData) else { exit(0) }
+        payloadObject = AgentPadHookKit.buildToolBatchPayload(agent: agent, surface: surface)
+    } else if event == "PreToolUse" || event == "PostToolUse" || event == "PostToolUseFailure" {
         // Tool event: stdin JSON is mandatory. Bail silently if it's
         // missing or malformed — pill UI just won't render this call.
-        guard let tool = AgentPadHookKit.parseToolEventPayload(
+        guard var tool = AgentPadHookKit.parseToolEventPayload(
             from: stdinData,
             surface: surface,
             agent: agent
         ) else { exit(0) }
-        // AgentPad: a main-thread tool call also puts the tab back to
-        // "running" — see `runningPayloadForToolEvent`.
-        if let running = AgentPadHookKit.runningPayloadForToolEvent(
-            agent: agent,
-            stdin: stdinData,
-            surface: surface
-        ) {
-            _ = AgentPadHookKit.sendPayload(running, to: socketPath)
+        // AgentPad: lets the app tell a waiting tab's own progress from a
+        // background subagent's (`isMainThreadToolEvent`).
+        if AgentPadHookKit.isMainThreadToolEvent(agent: agent, stdin: stdinData) {
+            tool[AgentPadHookKit.mainThreadKey] = "true"
         }
         payloadObject = tool
     } else {
-        payloadObject = AgentPadHookKit.buildLifecyclePayload(
+        var lifecycle = AgentPadHookKit.buildLifecyclePayload(
             agent: agent,
             event: event,
             surface: surface
         )
+        // AgentPad: background work and notification type (BackgroundWork.swift).
+        AgentPadHookKit.applyClaudeLifecycleDetails(to: &lifecycle, stdin: stdinData)
+        payloadObject = lifecycle
     }
 } else {
     exit(0)

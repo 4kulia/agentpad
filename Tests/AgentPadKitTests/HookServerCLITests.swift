@@ -176,7 +176,7 @@ final class HookServerCLITests: XCTestCase {
         // writing, which the transport reports as closedWithoutReply).
         let received = expectation(description: "hook message delivered")
         startServer(onCLIRequest: { _, _, completion in completion(AgentPadCLIResponse(ok: true)) }) { message in
-            if case .agent(let agent, let event, let sessionId) = message {
+            if case .agent(let agent, let event, let sessionId, _) = message {
                 XCTAssertEqual(agent.id, "claude-code")
                 XCTAssertEqual(event, .running)
                 XCTAssertEqual(sessionId.uuidString, "00000000-0000-0000-0000-000000000001")

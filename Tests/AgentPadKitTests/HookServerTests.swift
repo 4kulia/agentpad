@@ -18,7 +18,7 @@ final class HookServerTests: XCTestCase {
     func testParseAgentLifecyclePayload() throws {
         let json = #"{"surface":"\#(Self.surfaceUUID.uuidString)","agent":"claude","event":"running"}"#
         let message = HookServer.parseMessage(data(json))
-        guard case let .agent(agent, event, sessionId) = message else {
+        guard case let .agent(agent, event, sessionId, _) = message else {
             return XCTFail("Expected .agent, got \(String(describing: message))")
         }
         XCTAssertEqual(agent.id, AgentTemplate.claudeCodeID)
@@ -48,12 +48,50 @@ final class HookServerTests: XCTestCase {
 
     // MARK: Tool event payload — happy paths
 
+    func testParseLifecycleDetails() {
+        let json = #"""
+        {"surface":"\#(Self.surfaceUUID.uuidString)","agent":"claude","event":"running","background_subagents":"2","background_shells":"1"}
+        """#
+        guard case let .agent(_, event, _, details) = HookServer.parseMessage(data(json)) else {
+            return XCTFail("Expected .agent")
+        }
+        XCTAssertEqual(event, .running)
+        XCTAssertEqual(details, HookLifecycleDetails(backgroundSubagents: 2, backgroundShells: 1))
+    }
+
+    func testParseToolBatchResolved() {
+        let json = #"""
+        {"surface":"\#(Self.surfaceUUID.uuidString)","kind":"tool_batch","agent":"claude"}
+        """#
+        guard case let .toolBatchResolved(sessionId) = HookServer.parseMessage(data(json)) else {
+            return XCTFail("Expected .toolBatchResolved")
+        }
+        XCTAssertEqual(sessionId, Self.surfaceUUID)
+    }
+
+    func testParseToolCallMainThreadFlag() {
+        let flagged = #"""
+        {"surface":"\#(Self.surfaceUUID.uuidString)","kind":"tool","agent":"claude","tool_name":"Bash","identifier":"ls","event":"pre","main_thread":"true"}
+        """#
+        let plain = #"""
+        {"surface":"\#(Self.surfaceUUID.uuidString)","kind":"tool","agent":"claude","tool_name":"Bash","identifier":"ls","event":"pre"}
+        """#
+        guard case let .toolCall(_, _, _, _, _, _, _, mainThread) = HookServer.parseMessage(data(flagged)) else {
+            return XCTFail("Expected .toolCall")
+        }
+        XCTAssertTrue(mainThread)
+        guard case let .toolCall(_, _, _, _, _, _, _, plainFlag) = HookServer.parseMessage(data(plain)) else {
+            return XCTFail("Expected .toolCall")
+        }
+        XCTAssertFalse(plainFlag, "payloads from older hooks carry no flag")
+    }
+
     func testParseToolCallPrePayload() throws {
         let json = #"""
         {"surface":"\#(Self.surfaceUUID.uuidString)","kind":"tool","agent":"claude","tool_name":"Bash","identifier":"git status","event":"pre"}
         """#
         let message = HookServer.parseMessage(data(json))
-        guard case let .toolCall(agent, toolName, identifier, event, success, _, sessionId) = message else {
+        guard case let .toolCall(agent, toolName, identifier, event, success, _, sessionId, _) = message else {
             return XCTFail("Expected .toolCall, got \(String(describing: message))")
         }
         XCTAssertEqual(agent.id, AgentTemplate.claudeCodeID)
@@ -69,7 +107,7 @@ final class HookServerTests: XCTestCase {
         {"surface":"\#(Self.surfaceUUID.uuidString)","kind":"tool","agent":"claude","tool_name":"Edit","identifier":"/repo/x.swift","event":"post","success":"true"}
         """#
         let message = HookServer.parseMessage(data(json))
-        guard case let .toolCall(_, _, _, event, success, _, _) = message else {
+        guard case let .toolCall(_, _, _, event, success, _, _, _) = message else {
             return XCTFail("Expected .toolCall, got \(String(describing: message))")
         }
         XCTAssertEqual(event, .post)
@@ -81,7 +119,7 @@ final class HookServerTests: XCTestCase {
         {"surface":"\#(Self.surfaceUUID.uuidString)","kind":"tool","agent":"claude","tool_name":"Bash","identifier":"missing","event":"post","success":"false"}
         """#
         let message = HookServer.parseMessage(data(json))
-        guard case let .toolCall(_, _, _, _, success, _, _) = message else {
+        guard case let .toolCall(_, _, _, _, success, _, _, _) = message else {
             return XCTFail("Expected .toolCall, got \(String(describing: message))")
         }
         XCTAssertEqual(success, false)
@@ -146,7 +184,7 @@ final class HookServerTests: XCTestCase {
         {"surface":"\#(Self.surfaceUUID.uuidString)","kind":"tool","agent":"claude","tool_name":"Bash","identifier":"x","event":"post","success":"yes"}
         """#
         let message = HookServer.parseMessage(data(json))
-        guard case let .toolCall(_, _, _, _, success, _, _) = message else {
+        guard case let .toolCall(_, _, _, _, success, _, _, _) = message else {
             return XCTFail("Expected .toolCall, got \(String(describing: message))")
         }
         XCTAssertEqual(success, false)
@@ -160,7 +198,7 @@ final class HookServerTests: XCTestCase {
         {"surface":"\#(Self.surfaceUUID.uuidString)","kind":"tool","agent":"claude","tool_name":"Bash","identifier":"x","event":"post"}
         """#
         let message = HookServer.parseMessage(data(json))
-        guard case let .toolCall(_, _, _, _, success, _, _) = message else {
+        guard case let .toolCall(_, _, _, _, success, _, _, _) = message else {
             return XCTFail("Expected .toolCall, got \(String(describing: message))")
         }
         XCTAssertNil(success)

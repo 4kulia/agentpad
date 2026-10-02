@@ -95,7 +95,8 @@ final class ShellIntegrationTests: XCTestCase {
         let object = AgentPadShellIntegration.claudeHooksObject(hookCmd: Self.stubHook)
         let hooks = try XCTUnwrap(object["hooks"] as? [String: Any])
 
-        for event in ["PreToolUse", "PostToolUse"] {
+        // AgentPad: PostToolBatch ends a wait inside a resolved batch.
+        for event in ["PreToolUse", "PostToolUse", "PostToolBatch"] {
             let entries = try XCTUnwrap(hooks[event] as? [[String: Any]], "missing event \(event)")
             let inner = try XCTUnwrap((entries.first?["hooks"] as? [[String: Any]])?.first)
             XCTAssertEqual(inner["type"] as? String, "command")
@@ -780,7 +781,7 @@ final class ShellIntegrationTests: XCTestCase {
             "surface": id.uuidString,
         ])
 
-        guard case .agent(let agent, let event, let sessionId) = HookServer.parseMessage(data) else {
+        guard case .agent(let agent, let event, let sessionId, _) = HookServer.parseMessage(data) else {
             return XCTFail("expected agent hook message")
         }
         XCTAssertEqual(agent, .claudeCode)

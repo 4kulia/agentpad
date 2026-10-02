@@ -1761,8 +1761,11 @@ final class WorkspaceStore {
     /// session's current agent — otherwise a Codex run inside a Claude tab
     /// (or a delayed `ended`) would wipe the still-active icon. Dropped once
     /// `terminate()` has run (`hookSession`).
-    func applyHookEvent(agent: AgentTemplate, event: HookEvent, sessionId: UUID) {
+    func applyHookEvent(agent: AgentTemplate, event: HookEvent, sessionId: UUID, details: HookLifecycleDetails = HookLifecycleDetails()) {
         guard let session = hookSession(id: sessionId) else { return }
+        // AgentPad: Claude's "waiting for your input" reminder while its own
+        // background work runs is not a request; the work will wake it.
+        if details.notificationType == "idle_prompt", session.backgroundWork != nil { return }
         let agentBefore = session.agent.id
         if event == .ended {
             // A custom agent based on this builtin shares its binary's
@@ -1787,6 +1790,19 @@ final class WorkspaceStore {
         // SessionStart → UserPromptSubmit on Claude (and BeforeAgent on Gemini)
         // re-fires `.running` per turn; the @Observable setter notifies every
         // sidebar/tab observer even on same-value assignment, so guard.
+        // AgentPad: any lifecycle event but "attention" from the tab's own
+        // agent is a turn boundary; calls still listed as open there will
+        // report no end. Another agent run in the same tab says nothing
+        // about Claude's calls.
+        if event != .attention, session.agent.id == agent.id || session.agent.baseAgentId == agent.id || agentBefore == agent.id {
+            session.openMainThreadCalls.removeAll()
+        }
+        // AgentPad: every lifecycle event restates the background work —
+        // present only on a Stop that left some running.
+        session.backgroundWork = details.hasBackgroundWork
+            ? Session.BackgroundWork(subagents: details.backgroundSubagents, shells: details.backgroundShells)
+            : nil
+        session.hookStateAt = Date()
         if session.activityState != event.activityState {
             session.activityState = event.activityState
             if event.activityState == .attention { onSessionAlert(session.id, .attention) }
@@ -1832,7 +1848,8 @@ final class WorkspaceStore {
         event: HookToolEvent,
         success: Bool?,
         toolUseId: String?,
-        sessionId: UUID
+        sessionId: UUID,
+        mainThread: Bool = false
     ) {
         guard let session = hookSession(id: sessionId) else { return }
 
@@ -1854,6 +1871,90 @@ final class WorkspaceStore {
                 toolUseId: toolUseId
             )
         }
+        guard mainThread else { return }
+        if event == .pre {
+            // A call without an id cannot be matched to its end, so it stays
+            // open until its batch resolves.
+            let key = toolUseId.flatMap { $0.isEmpty ? nil : $0 } ?? "unmatched:\(UUID().uuidString)"
+            session.openMainThreadCalls.insert(key)
+            // The call that just started is not the one being waited on.
+            resumeIfNothingOpen(session, except: key)
+        } else {
+            if let toolUseId, !toolUseId.isEmpty { session.openMainThreadCalls.remove(toolUseId) }
+            resumeIfNothingOpen(session, except: nil)
+        }
+    }
+
+    /// AgentPad: hooks miss some transitions — a background task that ends
+    /// without waking the agent, a permission granted to a background
+    /// subagent, a prompt answered while another call still runs. Claude
+    /// Code's own session status (`~/.claude/sessions/<pid>.json`) has them,
+    /// so it corrects an own Claude tab once it is newer than the last hook
+    /// event and has held for `claudeStatusSettle`.
+    func reconcileWithClaudeStatus(_ claudeSessions: [ExternalAgentSession], now: Date = Date()) {
+        // Two processes holding one conversation cannot be told apart here;
+        // leave such a conversation to its hooks.
+        let counts = Dictionary(claudeSessions.map { ($0.sessionId, 1) }, uniquingKeysWith: +)
+        let byConversation = Dictionary(
+            claudeSessions.filter { counts[$0.sessionId] == 1 }.map { ($0.sessionId, $0) },
+            uniquingKeysWith: { a, _ in a }
+        )
+        guard !isTerminated else { return }
+        for workspace in workspaces {
+            for session in workspace.root.allPanes.flatMap(\.tabs) {
+                guard session.agent.id == AgentTemplate.claudeCodeID || session.agent.baseAgentId == AgentTemplate.claudeCodeID,
+                      let conversation = session.conversationId,
+                      let claude = byConversation[conversation],
+                      let since = claude.statusSince,
+                      now.timeIntervalSince(since) >= Self.claudeStatusSettle,
+                      // Newer than the last hook event — or contradicting it
+                      // for so long that a late hook, not Claude, is stale.
+                      since > session.hookStateAt
+                        || now.timeIntervalSince(session.hookStateAt) >= Self.claudeStatusOverride
+                else { continue }
+                switch claude.status {
+                case .idle where session.activityState == .running:
+                    // The turn is over and nothing runs in the background —
+                    // e.g. background work ended without waking the agent.
+                    session.backgroundWork = nil
+                    if session.activityState != .attention {
+                        session.activityState = .attention
+                        onSessionAlert(session.id, .attention)
+                    }
+                case .busy where session.activityState == .attention:
+                    // Working again: the prompt was answered.
+                    session.openMainThreadCalls.removeAll()
+                    session.activityState = .running
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    static let claudeStatusSettle: TimeInterval = 2
+    static let claudeStatusOverride: TimeInterval = 15
+
+    /// AgentPad: the main thread's batch resolved, so no prompt inside it is
+    /// still open — whether the user approved or denied it.
+    func applyToolBatchResolved(sessionId: UUID) {
+        guard let session = hookSession(id: sessionId) else { return }
+        session.openMainThreadCalls.removeAll()
+        resumeIfNothingOpen(session, except: nil)
+    }
+
+    /// AgentPad: Claude reports "attention" when it stops mid-turn for a
+    /// permission prompt or a question, and nothing reports the answer. A
+    /// main-thread tool event shows the agent went on — but only once no other
+    /// main-thread call of the batch is still open: with calls running in
+    /// parallel, one of them may be the one waiting, and another finishing
+    /// says nothing about it.
+    private func resumeIfNothingOpen(_ session: Session, except key: String?) {
+        guard session.activityState == .attention else { return }
+        var open = session.openMainThreadCalls
+        if let key { open.remove(key) }
+        guard open.isEmpty else { return }
+        session.activityState = .running
     }
 
     /// The workspace + pane holding the session with `id`, or nil. One DFS

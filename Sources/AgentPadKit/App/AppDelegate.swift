@@ -69,13 +69,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         for controller in self.windowControllers {
             let store = controller.store
             switch message {
-            case .agent(let agent, let event, let sessionId):
-                store.applyHookEvent(agent: agent, event: event, sessionId: sessionId)
+            case .agent(let agent, let event, let sessionId, let details):
+                store.applyHookEvent(agent: agent, event: event, sessionId: sessionId, details: details)
             case .shellEnvironment(let env, let sessionId):
                 store.applyShellEnvironment(env, sessionId: sessionId)
             case .conversationId(let conversationId, let sessionId):
                 store.applyConversationId(conversationId: conversationId, sessionId: sessionId)
-            case .toolCall(let agent, let toolName, let identifier, let event, let success, let toolUseId, let sessionId):
+            case .toolCall(let agent, let toolName, let identifier, let event, let success, let toolUseId, let sessionId, let mainThread):
                 store.applyToolCallEvent(
                     agent: agent,
                     toolName: toolName,
@@ -83,8 +83,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                     event: event,
                     success: success,
                     toolUseId: toolUseId,
-                    sessionId: sessionId
+                    sessionId: sessionId,
+                    mainThread: mainThread
                 )
+            case .toolBatchResolved(let sessionId):
+                store.applyToolBatchResolved(sessionId: sessionId)
             }
         }
     }
@@ -205,6 +208,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             AttentionCoordinator.shared.activate(.external(id))
         }
         AttentionCoordinator.shared.start()
+        // AgentPad: correct own Claude tabs whose hooks left a stale state.
+        ExternalSessionMonitor.shared.onOwnSessions = { [weak self] own in
+            for controller in self?.windowControllers ?? [] {
+                controller.store.reconcileWithClaudeStatus(own)
+            }
+        }
         ExternalSessionMonitor.shared.start()
         let agentMenuBarController = AgentMenuBarController(
             monitor: .shared,

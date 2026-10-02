@@ -18,6 +18,17 @@ import AgentPadHookKit
 /// untouched.
 /// Lifecycle signal an agent's hook fired. Wire format is the raw String
 /// case names; the enum lets `WorkspaceStore` switch exhaustively.
+/// AgentPad: what a Claude lifecycle payload says beyond its event
+/// (`AgentPadHookKit.applyClaudeLifecycleDetails`).
+struct HookLifecycleDetails: Equatable, Sendable {
+    var backgroundSubagents = 0
+    var backgroundShells = 0
+    /// Claude's `notification_type`, e.g. `permission_prompt`, `idle_prompt`.
+    var notificationType: String?
+
+    var hasBackgroundWork: Bool { backgroundSubagents + backgroundShells > 0 }
+}
+
 enum HookEvent: String {
     case running, attention, idle, ended
 
@@ -39,7 +50,7 @@ enum HookToolEvent: String {
 }
 
 enum HookMessage {
-    case agent(agent: AgentTemplate, event: HookEvent, sessionId: UUID)
+    case agent(agent: AgentTemplate, event: HookEvent, sessionId: UUID, details: HookLifecycleDetails = HookLifecycleDetails())
     case shellEnvironment(env: [String: String], sessionId: UUID)
     /// Claude's hook input JSON carries `session_id` (its conversation id).
     /// `AgentPadHook` extracts it and emits this message so AgentPad can persist
@@ -63,8 +74,13 @@ enum HookMessage {
         event: HookToolEvent,
         success: Bool?,
         toolUseId: String?,
-        sessionId: UUID
+        sessionId: UUID,
+        /// AgentPad: the call was made by the agent's main thread, not a
+        /// subagent (`AgentPadHookKit.isMainThreadToolEvent`).
+        mainThread: Bool = false
     )
+    /// AgentPad: the main thread's batch of tool calls resolved.
+    case toolBatchResolved(sessionId: UUID)
 }
 
 @MainActor
@@ -414,6 +430,10 @@ final class HookServer {
             return .conversationId(conversationId: conversationId, sessionId: id)
         }
 
+        if dict["kind"] as? String == AgentPadHookKit.toolBatchKind {
+            return .toolBatchResolved(sessionId: id)
+        }
+
         if dict["kind"] as? String == "tool" {
             guard
                 let agentSlug = dict["agent"] as? String,
@@ -448,7 +468,8 @@ final class HookServer {
                 event: event,
                 success: success,
                 toolUseId: toolUseId,
-                sessionId: id
+                sessionId: id,
+                mainThread: dict[AgentPadHookKit.mainThreadKey] as? String == "true"
             )
         }
 
@@ -458,6 +479,11 @@ final class HookServer {
             let agent = AgentTemplate.from(hookSlug: agentSlug),
             let event = HookEvent(rawValue: eventName)
         else { return nil }
-        return .agent(agent: agent, event: event, sessionId: id)
+        let details = HookLifecycleDetails(
+            backgroundSubagents: Int(dict[AgentPadHookKit.backgroundSubagentsKey] as? String ?? "") ?? 0,
+            backgroundShells: Int(dict[AgentPadHookKit.backgroundShellsKey] as? String ?? "") ?? 0,
+            notificationType: dict[AgentPadHookKit.notificationTypeKey] as? String
+        )
+        return .agent(agent: agent, event: event, sessionId: id, details: details)
     }
 }

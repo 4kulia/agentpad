@@ -27,6 +27,10 @@ final class ExternalSessionMonitor {
     var onRefresh: (([ExternalAgentSession]) -> Void)?
     /// Called when listed sessions are gone (exited, or moved here).
     var onSessionsEnded: (([ExternalAgentSession]) -> Void)?
+    /// AgentPad: Claude Code's own status for sessions running in OUR tabs,
+    /// which the list above leaves out. Lets a tab's hook-driven state be
+    /// checked against Claude's (`WorkspaceStore.reconcileWithClaudeStatus`).
+    var onOwnSessions: (([ExternalAgentSession]) -> Void)?
 
     private var pollTask: Task<Void, Never>?
     private var titleCache: [String: TitleCacheEntry] = [:]
@@ -65,6 +69,7 @@ final class ExternalSessionMonitor {
         let raw = await snapshotProvider()
         let ownPid = getpid()
         var result: [ExternalAgentSession] = []
+        var own: [ExternalAgentSession] = []
         for var session in raw {
             // Session files outlive crashed processes; only keep the ones whose
             // PID still is that session's claude.
@@ -72,7 +77,10 @@ final class ExternalSessionMonitor {
                   ProcessInfoReader.matchesClaudeSession(info, startedAt: session.startedAt)
             else { continue }
             // Sessions in our own tabs are already listed by AgentMonitor.
-            if ProcessInfoReader.ancestors(of: session.pid).contains(ownPid) { continue }
+            if ProcessInfoReader.ancestors(of: session.pid).contains(ownPid) {
+                own.append(session)
+                continue
+            }
             session.tty = info.tty
             session.processStart = info.startTime
             session.title = cachedTitle(for: session.sessionId)
@@ -94,6 +102,7 @@ final class ExternalSessionMonitor {
         if !ended.isEmpty { onSessionsEnded?(ended) }
         refreshStaleTitles(for: result)
         onRefresh?(sessions)
+        onOwnSessions?(own)
     }
 
     /// Neediest first, then the longest-waiting / most recently active.
