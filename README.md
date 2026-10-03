@@ -115,24 +115,18 @@ Claude Code's session files are an internal format. AgentPad treats them defensi
 
 ## Privacy
 
-There are no accounts, no telemetry and no sync. Conversations and files stay on your Mac. AgentPad makes no network requests on its own, with two exceptions you start yourself:
+There are no accounts, no telemetry and no sync. Conversations and files stay on your Mac. AgentPad makes no network requests on its own, with two exceptions:
 
-- **Check for Updates…** asks GitHub for the latest release of this repository.
+- **Updates.** Once a day, and when you choose **Check for Updates…**, AgentPad reads the list of releases (`appcast.xml`) from this repository's latest GitHub release. Nothing about you or your Mac is sent.
 - **Team work**, while turned on, connects to the colleagues you paired with (see below).
 
 ## Install
 
 Download the latest `AgentPad-v….dmg` from [Releases](https://github.com/4kulia/agentpad/releases), open it and drag AgentPad to Applications. It needs macOS 14.5 or later on Apple Silicon.
 
-The build is not signed with an Apple Developer ID, so macOS blocks the first launch of every version you download. Allow it once, either in System Settings → Privacy & Security → **Open Anyway**, or from a terminal:
+Releases from 1.0.5 on are signed with a Developer ID and notarized by Apple, so they open like any other app.
 
-```sh
-xattr -dr com.apple.quarantine /Applications/AgentPad.app
-```
-
-For the same reason macOS asks for AgentPad's permissions again after each update.
-
-**AgentPad → Check for Updates…** tells you when a newer release is out and downloads its DMG.
+**AgentPad → Check for Updates…** shows what is new and installs the update in place: AgentPad quits, updates itself and relaunches, keeping its macOS permissions. Versions 1.0.4 and older can only point you to the new DMG; install 1.0.5 by hand once. If one of those older, unsigned versions does not open, allow it in System Settings → Privacy & Security → **Open Anyway**.
 
 ### Build from source
 

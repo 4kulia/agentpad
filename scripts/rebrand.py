@@ -31,6 +31,7 @@ EXCLUDED = re.compile(r"^(LICENSE|NOTICE\.md|CHANGELOG\.md|README[^/]*\.md|scrip
 PROTECTED = [
     "iAmCorey/kooky",      # upstream repository: release downloads, discussions
     "utm_source=kooky",    # the upstream author's link in About
+    'upstreamName = "kooky"',  # credit in About ("Based on kooky by …")
     "fork of kooky",       # credit line
     "upstream Kooky",      # comments that mean the original app
     "upstream kooky",

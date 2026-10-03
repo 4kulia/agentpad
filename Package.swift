@@ -15,6 +15,9 @@ let package = Package(
         // public key (docs/agentpad/TEAM.md, 7.1). Pinned: n0's public relays
         // support only the latest stable iroh, so updates are deliberate.
         .package(url: "https://github.com/n0-computer/iroh-ffi", exact: "1.1.0"),
+        // AgentPad: in-app updates ("Install and Relaunch"), verified with an
+        // EdDSA key and a Developer ID signature. Pinned like iroh.
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
     ],
     targets: [
         // Thin executable: main.swift only. Everything else lives in AgentPadKit so
@@ -22,7 +25,10 @@ let package = Package(
         .executableTarget(
             name: "AgentPad",
             dependencies: ["AgentPadKit"],
-            path: "Sources/AgentPad"
+            path: "Sources/AgentPad",
+            // AgentPad: Sparkle.framework lives in Contents/Frameworks of the
+            // app bundle (scripts/build-app.sh).
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]
         ),
         // Tiny stand-alone CLI invoked from Claude Code / Codex hooks. Reads
         // $AGENTPAD_SURFACE_ID from env, opens the unix socket the running app
@@ -65,6 +71,7 @@ let package = Package(
                 "AgentPadHookKit",
                 // AgentPad: team work transport (Sources/AgentPadKit/AgentPad/Team).
                 .product(name: "IrohLib", package: "iroh-ffi"),
+                .product(name: "Sparkle", package: "Sparkle"),
             ],
             path: "Sources/AgentPadKit",
             resources: [

@@ -61,6 +61,13 @@ cp .build/release/agentpad-cli "${APP}/Contents/MacOS/agentpad-cli"
 # (= Contents/Resources/), so the resource bundle has to live there or
 # the running .app will silently fall back to .build/release/ on disk.
 cp -R .build/release/AgentPad_AgentPadKit.bundle "${APP}/Contents/Resources/"
+# AgentPad: Sparkle (in-app updates). SwiftPM leaves the binary framework next
+# to the products; the app finds it through the @executable_path/../Frameworks
+# rpath set in Package.swift.
+SPARKLE_FW="$(find .build -path '*release*' -name Sparkle.framework -type d -not -path '*/Sparkle.framework/*' | head -1)"
+[ -n "$SPARKLE_FW" ] || { echo "missing Sparkle.framework in .build" >&2; exit 1; }
+mkdir -p "${APP}/Contents/Frameworks"
+ditto "$SPARKLE_FW" "${APP}/Contents/Frameworks/Sparkle.framework"
 
 # App icon — generated from branding/AppIcon.png if present. macOS reads
 # .icns from CFBundleIconFile in Info.plist; we synthesize the multi-size
@@ -191,6 +198,16 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     </array>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.developer-tools</string>
+    <!-- AgentPad: Sparkle in-app updates. The feed is the appcast attached to
+         the latest GitHub release; the key verifies each update's EdDSA
+         signature (private half in the release maker's keychain, account
+         "agentpad"). -->
+    <key>SUFeedURL</key>
+    <string>https://github.com/4kulia/agentpad/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>GI91mksQoiDK94V9mzUTevEqkXEKJMdT0j5PCVa9HOw=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>14.5</string>
     <key>NSHighResolutionCapable</key>
@@ -290,6 +307,14 @@ if [ "$SIGN_IDENTITY" != "-" ] || [ -n "${AGENTPAD_HARDENED:-}" ]; then
     echo "    identity: ${SIGN_IDENTITY} (hardened runtime)"
 fi
 codesign "${SIGN_FLAGS[@]}" "${APP}/Contents/Resources/AgentPad_AgentPadKit.bundle"
+# AgentPad: Sparkle's nested helpers, inside out, as Sparkle documents for
+# Developer ID apps; Downloader keeps its own entitlements.
+FW="${APP}/Contents/Frameworks/Sparkle.framework"
+codesign "${SIGN_FLAGS[@]}" "${FW}/Versions/B/XPCServices/Installer.xpc"
+codesign "${SIGN_FLAGS[@]}" --preserve-metadata=entitlements "${FW}/Versions/B/XPCServices/Downloader.xpc"
+codesign "${SIGN_FLAGS[@]}" "${FW}/Versions/B/Autoupdate"
+codesign "${SIGN_FLAGS[@]}" "${FW}/Versions/B/Updater.app"
+codesign "${SIGN_FLAGS[@]}" "${FW}"
 codesign "${APP_SIGN_FLAGS[@]}" "${APP}/Contents/MacOS/${APP_NAME}"
 codesign "${SIGN_FLAGS[@]}" "${APP}/Contents/MacOS/AgentPadHook"
 codesign "${SIGN_FLAGS[@]}" "${APP}/Contents/MacOS/agentpad-cli"

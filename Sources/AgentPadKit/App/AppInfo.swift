@@ -9,10 +9,14 @@ import Foundation
 /// each of its releases; keep ours when merging.
 enum AgentPadApp {
     static let name = "AgentPad"
-    static let displayVersion = "1.0.4"
-    static let tagline = "All your coding-agent sessions in one window. A fork of kooky."
-    static let author = "Corey Chiu"
-    static let authorURL = URL(string: "https://coreychiu.com?utm_source=kooky")!
+    static let displayVersion = "1.0.5"
+    static let tagline = "All your coding-agent sessions in one window."
+    static let author = "Andrey Kulikov"
+    static let authorURL = URL(string: "https://github.com/4kulia")!
+    /// AgentPad is a fork of kooky (MIT); the About panel credits it.
+    static let upstreamName = "kooky"
+    static let upstreamAuthor = "Corey Chiu"
+    static let upstreamURL = URL(string: "https://github.com/iAmCorey/kooky")!
     static let copyrightYear = "2026"
 
     static let repositoryURL = URL(string: "https://github.com/4kulia/agentpad")!

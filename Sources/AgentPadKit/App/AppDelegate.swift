@@ -1878,6 +1878,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     @objc private func handleCheckForUpdates(_ sender: NSMenuItem) {
+        // AgentPad: the packaged app updates itself (Updater.swift).
+        if AgentPadUpdater.shared.isAvailable {
+            AgentPadUpdater.shared.checkForUpdates()
+            return
+        }
         let originalTitle = sender.title
         sender.title = String(localized: "Checking for Updates…", bundle: .agentPadResources)
         sender.isEnabled = false
