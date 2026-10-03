@@ -9,7 +9,7 @@ import Foundation
 /// each of its releases; keep ours when merging.
 enum AgentPadApp {
     static let name = "AgentPad"
-    static let displayVersion = "1.0.2"
+    static let displayVersion = "1.0.3"
     static let tagline = "All your coding-agent sessions in one window. A fork of kooky."
     static let author = "Corey Chiu"
     static let authorURL = URL(string: "https://coreychiu.com?utm_source=kooky")!
