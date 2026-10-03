@@ -52,7 +52,8 @@ enum TeamCLIHandler {
                     let agents = await service.calls.catalog(projectRemotes: remotes).map {
                         AgentPadCLITeamInfo.Agent(
                             address: $0.address, colleague: $0.colleague, description: $0.entry.description,
-                            access: $0.entry.access.rawValue, sameProject: $0.sameProject
+                            access: $0.entry.access.rawValue, sameProject: $0.sameProject,
+                            kind: $0.entry.kind, session: $0.entry.session
                         )
                     }
                     extra = { $0.agents = agents }
@@ -79,7 +80,7 @@ enum TeamCLIHandler {
                 let call = action == .check
                     ? await service.calls.check(id, wait: wait)
                     : await service.calls.cancel(id)
-                guard let call else { return .failure("no call \(id) on this Mac (calls are kept until AgentPad quits)") }
+                guard let call else { return .failure("no call \(id) on this Mac (calls are kept for 30 days)") }
                 extra = { $0.call = callInfo(call) }
             case .publish:
                 guard let name = request.teamAgent else { return .failure("publish needs a name") }

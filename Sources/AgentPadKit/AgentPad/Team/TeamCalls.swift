@@ -10,13 +10,14 @@ import Foundation
 /// Every exchange is one request and one answer: `call.start` and
 /// `call.attach` return the call as it stands, after waiting up to
 /// `maxWaitSeconds` for it to change. A caller that loses the connection
-/// simply asks again (D-6). Calls live in memory: after a restart of either
-/// Mac a call in flight is lost and reported so (queues on disk are stage 4).
+/// simply asks again (D-6). Calls are kept in `calls.json` — both the
+/// history the Team tab shows (J-1, J-2) and the queues that let a call
+/// survive a restart of either Mac (D-1).
 @MainActor
 @Observable
 final class TeamCalls {
     /// A call from a colleague to one of this Mac's agents.
-    struct Incoming: Identifiable, Equatable {
+    struct Incoming: Codable, Identifiable, Equatable {
         let id: String
         let peer: String
         var peerName: String
@@ -30,12 +31,17 @@ final class TeamCalls {
         let receivedAt: Date
         /// Undecided past this, the call expires (R-4).
         let decideBy: Date
+        /// The caller confirmed it has the outcome (D-7).
+        var acknowledged: Bool?
         var state: TeamCallState = .awaitingApproval
         var activity: String?
         var answer: TeamRunResult?
         var truncated = false
         var detail: String?
         var finishedAt: Date?
+        /// Cleared from the Team tab; still answers a caller who comes back,
+        /// and still recognizes a start delivered again (D-5).
+        var hidden: Bool?
 
         var report: TeamCallReport {
             TeamCallReport(
@@ -48,7 +54,7 @@ final class TeamCalls {
     }
 
     /// A call this Mac sent.
-    struct Outgoing: Identifiable, Equatable {
+    struct Outgoing: Codable, Identifiable, Equatable {
         let id: String
         let peer: String
         var colleague: String
@@ -60,6 +66,13 @@ final class TeamCalls {
         /// While not delivered: why, e.g. "colleague offline, retrying".
         var note: String?
         var finishedAt: Date?
+        /// Cleared from the Team tab; kept for `team check` until it ages out.
+        var hidden: Bool?
+        /// What `call.start` carries again after a restart.
+        var thread: String?
+        var origin: TeamCallOrigin?
+        /// The owner's Mac has the call; from now on it is followed with `call.attach`.
+        var delivered = false
 
         var address: String { "\(agent)@\(TeamHandle.make(colleague))" }
     }
@@ -93,7 +106,13 @@ final class TeamCalls {
     static let defaultDeliveryWindow: TimeInterval = 24 * 60 * 60
     /// Finished calls are kept as long as their caller may still come back
     /// for the answer, and to recognize a start delivered again (D-5).
-    static let keepFinished: TimeInterval = defaultDeliveryWindow + followGrace + 3600
+    /// Finished calls stay in the history this long (J-2) — longer than any
+    /// caller may come back for an answer or deliver a start again (D-5).
+    static let keepFinished: TimeInterval = 30 * 24 * 60 * 60
+    /// History beyond this many finished calls a side drops the oldest —
+    /// but never one the other Mac may still ask about (`protocolWindow`).
+    static let maxHistory = 300
+    static let protocolWindow: TimeInterval = defaultDeliveryWindow + followGrace + 3600
     static let maxEarlyCancelsPerPeer = 50
     /// How long past its delivery deadline a delivered call is still followed.
     static let followGrace: TimeInterval = 3 * 60 * 60
@@ -107,8 +126,12 @@ final class TeamCalls {
     var onIncomingCall: @MainActor (Incoming) -> Void = { _ in }
     /// Fires when the number of calls waiting for this user changes.
     var onPendingChange: @MainActor () -> Void = {}
+    /// Fires when a call this Mac sent ends: answered, declined, failed (D-4).
+    var onOutgoingFinished: @MainActor (Outgoing) -> Void = { _ in }
 
     weak var service: TeamService?
+    /// Where Claude Code keeps conversations; replaced in tests.
+    var sessionFilesRoot = TeamSessionFiles.root
     private let storage: TeamStorage
     private let runner: TeamAgentRunner
     private var threads: [Thread] = []
@@ -123,6 +146,26 @@ final class TeamCalls {
     /// Bumped on every change to a call, so waiters notice.
     private var versions: [String: Int] = [:]
     private var sweeper: Task<Void, Never>?
+    private var saving: Task<Void, Never>?
+    /// False from the start of a load until the log was read: a load that
+    /// stopped earlier (a damaged neighbouring file) must not lead to an
+    /// empty log written over a good one.
+    private var logWritable = true
+
+    /// Called first thing by `TeamService.load`.
+    func beginLoading() { logWritable = false }
+    /// The running delivery per call, so a late-ending old one cannot
+    /// unregister its successor.
+    private var deliveryTokens: [String: UUID] = [:]
+    /// Calls whose end is not yet on disk, to be told once it is.
+    private var unannounced: Set<String> = []
+    /// Bumped by `nudge`: deliveries waiting for their next retry go now.
+    private var nudges = 0
+
+    private struct Log: Codable {
+        var incoming: [Incoming]
+        var outgoing: [Outgoing]
+    }
 
     init(storage: TeamStorage, runner: TeamAgentRunner) {
         self.storage = storage
@@ -132,24 +175,122 @@ final class TeamCalls {
     var awaitingDecision: [Incoming] { incoming.filter { $0.state == .awaitingApproval } }
 
     func load() throws {
+        logWritable = false
         agents = try storage.load([TeamPublishedAgent].self, from: storage.agentsURL, default: [])
+        pruneVanishedSessions()
         threads = try storage.load([Thread].self, from: storage.threadsURL, default: [])
+        let log = try storage.load(Log.self, from: storage.callsURL, default: Log(incoming: [], outgoing: []))
+        let now = Date()
+        incoming = log.incoming.map { call in
+            var call = call
+            // Allowed but not started: allowed again, never run on an old
+            // decision — the stop or cancel since may not have been saved.
+            if call.state == .queued {
+                call.state = .awaitingApproval
+                call.detail = "AgentPad restarted before it ran; allow it again."
+            }
+            // Its process ended with the app; undecided calls wait on.
+            if call.state == .running {
+                call.state = .failed
+                call.detail = "AgentPad quit while the agent was running."
+                call.activity = nil
+                call.finishedAt = now
+            }
+            return call
+        }
+        outgoing = log.outgoing.map { call in
+            var call = call
+            if !call.report.state.isFinal { call.note = "Waiting for team work to start." }
+            return call
+        }
+        logWritable = true
+        if !incoming.isEmpty || !outgoing.isEmpty { startSweeper() }
     }
 
-    /// Team work turned off: nothing waits for decisions, nothing runs, no
-    /// call is followed any more.
+    /// Team work is on: queued calls run, and calls this Mac sent are
+    /// followed again — also those from before a restart (D-1).
+    func resume() {
+        guard let service, service.isOn else { return }
+        for call in outgoing where !call.report.state.isFinal && deliveries[call.id] == nil {
+            update(call.id) { $0.note = nil }
+            startDelivery(call)
+        }
+        pump()
+        onPendingChange()
+    }
+
+    private func startDelivery(_ call: Outgoing) {
+        let token = UUID()
+        let start = Self.startMessage(for: call)
+        deliveryTokens[call.id] = token
+        deliveries[call.id] = Task { [weak self] in
+            await self?.deliver(call.id, start: start)
+            guard let self, self.deliveryTokens[call.id] == token else { return }
+            self.deliveries[call.id] = nil
+            self.deliveryTokens[call.id] = nil
+        }
+    }
+
+    private static func startMessage(for call: Outgoing) -> TeamMessage {
+        TeamMessage(
+            type: .callStart, callId: call.id, agent: call.agent, prompt: call.prompt, threadId: call.thread,
+            from: call.origin, deliverBy: call.deliverBy, waitSeconds: 0
+        )
+    }
+
+    /// Finished calls leave the Team tab. They stay on disk, unseen, for as
+    /// long as the other Mac may still ask about them.
+    func clearHistory() {
+        for i in incoming.indices where incoming[i].state.isFinal { incoming[i].hidden = true }
+        for i in outgoing.indices where outgoing[i].report.state.isFinal { outgoing[i].hidden = true }
+        saveNow()
+    }
+
+    // MARK: Saving
+
+    /// Soon, once a burst of changes settles — and again every few
+    /// seconds while writing fails, until what is in memory is on disk.
+    private func scheduleSave(after delay: Duration = .seconds(1)) {
+        guard saving == nil else { return }
+        saving = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled else { return }
+            self.saving = nil
+            self.saveNow()
+        }
+    }
+
+    /// Now: at quit, and after explicit changes.
+    @discardableResult
+    func saveNow() -> Bool {
+        saving?.cancel()
+        saving = nil
+        guard logWritable else { return false }
+        let ok = (try? storage.save(Log(incoming: incoming, outgoing: outgoing), to: storage.callsURL)) != nil
+        // Any failed write is tried again every few seconds until one works.
+        if !ok { scheduleSave(after: .seconds(5)) }
+        if ok, !unannounced.isEmpty {
+            // Ends that could not be saved at the time are told now.
+            let ids = unannounced
+            unannounced = []
+            for call in outgoing where ids.contains(call.id) { onOutgoingFinished(call) }
+        }
+        return ok
+    }
+
+    /// Team work turned off: nothing runs and no call is followed. Running
+    /// calls stop; undecided, queued and sent ones wait for team work to
+    /// come back on (`resume`).
     func stopAll() {
         for (_, task) in deliveries { task.cancel() }
         deliveries = [:]
         for call in outgoing where !call.report.state.isFinal {
-            update(call.id) { $0.report.state = .failed; $0.report.detail = "Team work was turned off."; $0.note = nil }
+            update(call.id) { $0.note = "Team work is off; the call goes on when it is on again." }
         }
-        for i in incoming.indices where !incoming[i].state.isFinal {
+        for i in incoming.indices where incoming[i].state == .running {
             runs[incoming[i].id]?.cancel()
             finish(at: i, .cancelled, detail: "The owner turned team work off.")
         }
-        sweeper?.cancel()
-        sweeper = nil
         onPendingChange()
     }
 
@@ -174,19 +315,61 @@ final class TeamCalls {
     /// Adds or replaces an agent. Its git remotes are read now, so the
     /// catalog can say which project it belongs to.
     func save(_ agent: TeamPublishedAgent) async throws {
+        try await save([agent])
+    }
+
+    /// Adds or replaces several agents at once: every one is checked first,
+    /// then all are written together — or none is.
+    func save(_ batch: [TeamPublishedAgent]) async throws {
+        // Which agents existed is fixed before any wait: one removed while
+        // git answers must not come back.
+        let existing = Set(batch.filter { agent in agents.contains { $0.id == agent.id } }.map(\.id))
+        var prepared: [(agent: TeamPublishedAgent, existed: Bool)] = []
+        for agent in batch {
+            prepared.append((try await prepare(agent), existing.contains(agent.id)))
+        }
+        // Checked after the waits: another save or a removal may have happened.
+        let names = prepared.map(\.agent.name)
+        guard Set(names).count == names.count else { throw TeamError.storage("the two agents need different names") }
+        for (agent, existed) in prepared {
+            guard !agents.contains(where: { $0.name == agent.name && $0.id != agent.id }) else {
+                throw TeamError.storage("an agent named \(agent.name) already exists")
+            }
+            guard !existed || agents.contains(where: { $0.id == agent.id }) else {
+                throw TeamError.storage("\(agent.name) was removed meanwhile")
+            }
+        }
+        var next = agents
+        for (agent, _) in prepared {
+            if let i = next.firstIndex(where: { $0.id == agent.id }) { next[i] = agent } else { next.append(agent) }
+        }
+        try storage.save(next, to: storage.agentsURL)
+        agents = next
+    }
+
+    /// One agent checked and completed: name, rules, folder, session, git.
+    private func prepare(_ agent: TeamPublishedAgent) async throws -> TeamPublishedAgent {
         var agent = agent
         agent.name = agent.name.trimmingCharacters(in: .whitespaces).lowercased()
         guard TeamPublishedAgent.isValidName(agent.name) else {
-            throw TeamError.storage("an agent's name is lowercase letters, digits and dashes, up to 32")
+            throw TeamError.storage("“\(agent.name)”: an agent's name is lowercase letters, digits and dashes, up to 32")
         }
         for entry in agent.deniedPaths + agent.allowedCommands where !ClaudeCodeRunner.isValidRuleText(entry) {
             throw TeamError.storage("“\(entry)”: paths and commands cannot contain brackets")
+        }
+        if let session = agent.sessionId {
+            // A copy of a conversation resumes only from the folder it ran in.
+            guard TeamSessionFiles.isValidId(session), let cwd = TeamSessionFiles.workingDirectory(of: session, root: sessionFilesRoot) else {
+                throw TeamError.storage("the Claude Code conversation \(session) was not found")
+            }
+            agent.sessionId = session.lowercased()
+            agent.folder = cwd
+            agent.sessionTitle = agent.sessionTitle.map { String(TeamInviteLink.sanitizedName($0).prefix(120)) }
         }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: agent.folder, isDirectory: &isDir), isDir.boolValue else {
             throw TeamError.storage("folder \(agent.folder) does not exist")
         }
-        let existed = agents.contains { $0.id == agent.id }
         // git reads the whole repository whatever folder it starts in, so a
         // profile with git publishes the repository, not a part of it.
         if agent.access != .read, let top = try await TeamGitRemote.topLevel(of: agent.folder),
@@ -194,17 +377,22 @@ final class TeamCalls {
             throw TeamError.storage("\(agent.folder) is inside the repository \(top): with git, publish the repository's top folder, or choose the Read rights")
         }
         agent.remotes = await TeamGitRemote.remotes(of: agent.folder)
-        // Checked after the wait: another save or a removal may have happened.
-        guard !agents.contains(where: { $0.name == agent.name && $0.id != agent.id }) else {
-            throw TeamError.storage("an agent named \(agent.name) already exists")
-        }
-        guard !existed || agents.contains(where: { $0.id == agent.id }) else {
-            throw TeamError.storage("\(agent.name) was removed meanwhile")
-        }
-        var next = agents
-        if let i = next.firstIndex(where: { $0.id == agent.id }) { next[i] = agent } else { next.append(agent) }
-        try storage.save(next, to: storage.agentsURL)
+        return agent
+    }
+
+    /// Session agents whose conversation was deleted stop existing (the
+    /// owner's rule: a session agent lives as long as its session).
+    func pruneVanishedSessions() {
+        let gone = agents.filter { $0.sessionId.map { !TeamSessionFiles.exists($0, root: sessionFilesRoot) } ?? false }
+        guard !gone.isEmpty else { return }
+        let next = agents.filter { agent in !gone.contains { $0.id == agent.id } }
+        guard (try? storage.save(next, to: storage.agentsURL)) != nil else { return }
         agents = next
+    }
+
+    /// The agents published from one conversation.
+    func agents(forSession sessionId: String) -> [TeamPublishedAgent] {
+        agents.filter { $0.sessionId == sessionId.lowercased() }
     }
 
     func unpublish(_ id: UUID) throws {
@@ -219,6 +407,7 @@ final class TeamCalls {
     func handle(_ message: TeamMessage, from contact: TeamContact) async -> TeamMessage {
         switch message.type {
         case .catalogGet:
+            pruneVanishedSessions()
             return TeamMessage(type: .catalog, agents: agents.filter { $0.isOpen(to: contact.id) }.map(\.catalogEntry))
         case .callStart:
             return await start(message, from: contact)
@@ -227,6 +416,15 @@ final class TeamCalls {
                 return .error("unknown_call")
             }
             return await status(of: call.id, waiting: message.waitSeconds, known: message.call)
+        case .callAck:
+            guard let id = message.callId, let i = incoming.firstIndex(where: { $0.id == id && $0.peer == contact.id }) else {
+                return .error("unknown_call")
+            }
+            if incoming[i].state.isFinal, incoming[i].acknowledged != true {
+                incoming[i].acknowledged = true
+                scheduleSave()
+            }
+            return TeamMessage(type: .callStatus, callId: id, call: incoming[i].report)
         case .callCancel:
             guard let id = message.callId, UUID(uuidString: id) != nil else { return .error("malformed") }
             guard let i = incoming.firstIndex(where: { $0.id == id && $0.peer == contact.id }) else {
@@ -274,7 +472,9 @@ final class TeamCalls {
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               prompt.utf8.count <= Self.maxPromptBytes
         else { return .error("too_large") }
-        // An agent closed to this colleague does not exist for them.
+        // An agent closed to this colleague does not exist for them, nor
+        // does a session whose conversation is gone.
+        pruneVanishedSessions()
         guard let agent = agents.first(where: { $0.name == name && $0.isOpen(to: contact.id) }) else {
             return .error("unknown_agent")
         }
@@ -304,7 +504,11 @@ final class TeamCalls {
             decideBy: min(message.deliverBy ?? latest, latest)
         )
         incoming.append(call)
-        bump(callId)
+        // Accepted only once on disk: the caller follows it by id from now on.
+        guard bump(callId) else {
+            incoming.removeAll { $0.id == callId }
+            return .error("storage")
+        }
         startSweeper()
         onIncomingCall(call)
         onPendingChange()
@@ -377,8 +581,18 @@ final class TeamCalls {
             finish(at: i, .failed, detail: "The agent is no longer published.")
             return
         }
+        if let session = agent.sessionId, !call.resume, !TeamSessionFiles.exists(session, root: sessionFilesRoot) {
+            pruneVanishedSessions()
+            finish(at: i, .failed, detail: "The session this agent copied no longer exists.")
+            return
+        }
         incoming[i].state = .running
-        bump(call.id)
+        // On disk before the process starts: a crash right after must not
+        // leave it queued, to run a second time without a new Allow.
+        guard bump(call.id) else {
+            finish(at: i, .failed, detail: "The owner's Mac could not save the call, so it did not run.")
+            return
+        }
         let request = TeamRunRequest(
             agent: agent, prompt: call.prompt, sessionId: call.threadId, resume: call.resume,
             callerName: call.peerName, callerProject: call.origin?.project
@@ -403,7 +617,7 @@ final class TeamCalls {
     private func setActivity(_ id: String, _ tool: String) {
         guard let i = incoming.firstIndex(where: { $0.id == id }), incoming[i].state == .running else { return }
         incoming[i].activity = String(tool.prefix(60))
-        bump(id)
+        bump(id, durable: false)
     }
 
     private func completed(_ id: String, _ outcome: Result<TeamRunResult, Error>) {
@@ -476,18 +690,35 @@ final class TeamCalls {
             changed = true
         }
         if changed { onPendingChange() }
-        incoming.removeAll { call in
-            guard let done = call.finishedAt, now.timeIntervalSince(done) > Self.keepFinished else { return false }
-            versions[call.id] = nil
-            return true
-        }
-        // Answers stay for `team check` a day after they arrived.
-        outgoing.removeAll { call in
-            guard let done = call.finishedAt, now.timeIntervalSince(done) > Self.defaultDeliveryWindow else { return false }
-            versions[call.id] = nil
-            return true
+        let countBefore = incoming.count + outgoing.count
+        incoming = Self.trimmed(incoming, now: now, finishedAt: \.finishedAt, start: \.receivedAt)
+        outgoing = Self.trimmed(outgoing, now: now, finishedAt: \.finishedAt, start: \.createdAt)
+        if incoming.count + outgoing.count != countBefore {
+            let alive = Set(incoming.map(\.id) + outgoing.map(\.id))
+            versions = versions.filter { alive.contains($0.key) }
+            scheduleSave()
         }
         return incoming.isEmpty && outgoing.isEmpty
+    }
+
+    /// History older than `keepFinished`, and the oldest beyond
+    /// `maxHistory`, goes; calls still open always stay.
+    private static func trimmed<Call>(_ calls: [Call], now: Date, finishedAt: KeyPath<Call, Date?>, start: KeyPath<Call, Date>) -> [Call] {
+        var kept = calls.filter { call in
+            guard let done = call[keyPath: finishedAt] else { return true }
+            return now.timeIntervalSince(done) <= keepFinished
+        }
+        let finished = kept.filter { $0[keyPath: finishedAt] != nil }
+        if finished.count > maxHistory {
+            let cutoff = finished.map { $0[keyPath: start] }.sorted(by: >)[maxHistory - 1]
+            kept.removeAll { call in
+                guard let done = call[keyPath: finishedAt] else { return false }
+                // Acknowledged: the caller has it, nothing needs the record (D-7).
+                let settled = (call as? Incoming)?.acknowledged == true || now.timeIntervalSince(done) > protocolWindow
+                return call[keyPath: start] < cutoff && settled
+            }
+        }
+        return kept
     }
 
     // MARK: Caller
@@ -533,6 +764,8 @@ final class TeamCalls {
         e.description = String(e.description.prefix(1000))
         e.skills = e.skills.prefix(20).map { String($0.prefix(60)) }
         e.remotes = e.remotes.prefix(10).map { String($0.prefix(200)) }
+        e.kind = e.kind == "session" ? "session" : "agent"
+        e.session = e.session.map { String(TeamInviteLink.sanitizedName($0).prefix(120)) }
         return e
     }
 
@@ -552,30 +785,30 @@ final class TeamCalls {
         guard prompt.utf8.count <= Self.maxPromptBytes else { throw TeamError.refused("too_large") }
         if let threadId, UUID(uuidString: threadId) == nil { throw TeamError.storage("a thread id is a UUID") }
         let now = Date()
+        let id = UUID().uuidString.lowercased()
         let call = Outgoing(
-            id: UUID().uuidString.lowercased(), peer: contact.id, colleague: contact.displayName, agent: parts[0],
+            id: id, peer: contact.id, colleague: contact.displayName, agent: parts[0],
             prompt: prompt, createdAt: now, deliverBy: deliverBy ?? now.addingTimeInterval(Self.defaultDeliveryWindow),
-            report: TeamCallReport(callId: "", state: .queued), note: nil
+            report: TeamCallReport(callId: id, state: .queued), note: nil,
+            thread: threadId?.lowercased(), origin: origin
         )
-        var stored = call
-        stored.report.callId = call.id
+        let stored = call
         outgoing.append(stored)
-        bump(call.id)
-        let start = TeamMessage(
-            type: .callStart, callId: call.id, agent: call.agent, prompt: prompt, threadId: threadId?.lowercased(),
-            from: origin, deliverBy: call.deliverBy, waitSeconds: 0
-        )
-        deliveries[call.id] = Task { [weak self] in await self?.deliver(call.id, start: start) }
+        // On disk before it leaves: a restart must still know to follow it.
+        guard bump(call.id) else {
+            outgoing.removeAll { $0.id == call.id }
+            throw TeamError.storage("the call could not be saved, so it was not sent")
+        }
+        startDelivery(call)
         startSweeper()
         return stored
     }
 
     /// Delivers `call.start`, then asks for news until the call ends.
     private func deliver(_ id: String, start: TeamMessage) async {
-        defer { deliveries[id] = nil }
         let backoff: [Double] = [5, 15, 30, 60]
         var failures = 0
-        var delivered = false
+        var delivered = outgoing.first { $0.id == id }?.delivered ?? false
         var lastAsked = ContinuousClock.now - .seconds(10)
         while !Task.isCancelled, let call = outgoing.first(where: { $0.id == id }), !call.report.state.isFinal {
             guard let service else { return }
@@ -606,7 +839,8 @@ final class TeamCalls {
                 switch reply.type {
                 case .callStatus where reply.call?.callId == id:
                     delivered = true
-                    update(id) { $0.report = Self.clean(reply.call!); $0.note = nil }
+                    let saved = update(id) { $0.report = Self.clean(reply.call!); $0.note = nil; $0.delivered = true }
+                    if reply.call!.state.isFinal, saved { acknowledge(id) }
                 case .error:
                     let code = reply.code ?? "error"
                     update(id) {
@@ -621,7 +855,7 @@ final class TeamCalls {
                 if Task.isCancelled { return }
                 failures += 1
                 update(id) { $0.note = "\(call.colleague) is not reachable; trying again (attempt \(failures + 1))" }
-                try? await Task.sleep(for: .seconds(backoff[min(failures - 1, backoff.count - 1)]))
+                await waitForRetry(seconds: backoff[min(failures - 1, backoff.count - 1)])
             }
         }
     }
@@ -634,11 +868,22 @@ final class TeamCalls {
         return r
     }
 
-    private func update(_ id: String, _ change: (inout Outgoing) -> Void) {
-        guard let i = outgoing.firstIndex(where: { $0.id == id }) else { return }
+    @discardableResult
+    private func update(_ id: String, _ change: (inout Outgoing) -> Void) -> Bool {
+        guard let i = outgoing.firstIndex(where: { $0.id == id }) else { return false }
+        let before = (outgoing[i].report, outgoing[i].delivered, outgoing[i].hidden)
         change(&outgoing[i])
         if outgoing[i].report.state.isFinal, outgoing[i].finishedAt == nil { outgoing[i].finishedAt = Date() }
-        bump(id)
+        // Anything the owner reported is written at once; a note can wait.
+        let after = (outgoing[i].report, outgoing[i].delivered, outgoing[i].hidden)
+        let durable = before != after
+        let saved = bump(id, durable: durable)
+        // Told only once it is on disk: an unsaved cancel is rolled back,
+        // and any other end is told when a later write succeeds.
+        if !before.0.state.isFinal, after.0.state.isFinal {
+            if saved { onOutgoingFinished(outgoing[i]) } else { unannounced.insert(id) }
+        }
+        return durable && saved
     }
 
     /// The call this Mac sent, after waiting up to `seconds` for a change.
@@ -652,22 +897,63 @@ final class TeamCalls {
         guard let call = outgoing.first(where: { $0.id == id.lowercased() }) else { return nil }
         guard !call.report.state.isFinal else { return call }
         deliveries.removeValue(forKey: call.id)?.cancel()
-        let reply = try? await service?.send(TeamMessage(type: .callCancel, callId: call.id), to: call.peer, timeout: .seconds(15))
-        update(call.id) {
-            if let report = reply?.call, reply?.type == .callStatus, report.callId == call.id, report.state.isFinal {
-                $0.report = Self.clean(report)
-            } else {
-                $0.report.state = .cancelled
-                $0.report.detail = "Cancelled here; \(call.colleague)'s Mac did not confirm it stopped."
-            }
+        // Cancelled here first, on disk: quitting while the other Mac is
+        // asked must not bring the call back after a restart. If that cannot
+        // be written, the cancel does not happen and says so.
+        let saved = update(call.id) {
+            $0.report.state = .cancelled
+            $0.report.detail = "Cancelled here; \(call.colleague)'s Mac did not confirm it stopped."
             $0.note = nil
+        }
+        guard saved else {
+            unannounced.remove(call.id)
+            if let i = outgoing.firstIndex(where: { $0.id == call.id }) {
+                outgoing[i] = call
+                outgoing[i].note = "The cancel could not be saved, so the call goes on."
+                bump(call.id, durable: false)
+            }
+            if service?.isOn == true { startDelivery(call) }
+            return outgoing.first { $0.id == call.id }
+        }
+        let reply = try? await service?.send(TeamMessage(type: .callCancel, callId: call.id), to: call.peer, timeout: .seconds(15))
+        if let report = reply?.call, reply?.type == .callStatus, report.callId == call.id, report.state.isFinal {
+            if update(call.id, { $0.report = Self.clean(report); $0.delivered = true }) { acknowledge(call.id) }
         }
         return outgoing.first { $0.id == call.id }
     }
 
+    /// The owner may now let its record go (D-7). Sent only for an outcome
+    /// received from the owner and saved here; best effort.
+    private func acknowledge(_ id: String) {
+        guard let call = outgoing.first(where: { $0.id == id }), let service else { return }
+        Task { _ = try? await service.send(TeamMessage(type: .callAck, callId: call.id), to: call.peer, timeout: .seconds(15)) }
+    }
+
+    /// The colleague came online, the Mac woke up or the network changed:
+    /// every delivery waiting to retry tries now (D-3).
+    func nudge() { nudges += 1 }
+
+    private func waitForRetry(seconds: Double) async {
+        let seen = nudges
+        let deadline = ContinuousClock.now + .seconds(seconds)
+        while ContinuousClock.now < deadline, nudges == seen, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
     // MARK: Waiting
 
-    private func bump(_ id: String) { versions[id, default: 0] += 1 }
+    /// A change to a call: waiters notice, and the log is written — at once
+    /// for a new state (a crash must not undo a cancel or a decision), a
+    /// moment later for activity and notes.
+    @discardableResult
+    private func bump(_ id: String, durable: Bool = true) -> Bool {
+        versions[id, default: 0] += 1
+        // A failed write schedules its own retry (`saveNow`).
+        if durable { return saveNow() }
+        scheduleSave()
+        return true
+    }
 
     private func waitForChange(_ id: String, seconds: Int) async {
         guard seconds > 0 else { return }

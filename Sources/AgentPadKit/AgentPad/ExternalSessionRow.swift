@@ -138,6 +138,9 @@ struct ExternalSessionRow: View {
             Button("Go to Terminal Window", action: onFocus)
             if let onShowFiles { Button("Show Files", action: onShowFiles) }
             Button("Move Here", action: onTakeOver).disabled(!session.canTakeOver)
+            // AgentPad: team work.
+            Divider()
+            TeamPublishMenu(sessionId: session.sessionId, title: session.displayTitle)
         }
         .help(helpText)
     }

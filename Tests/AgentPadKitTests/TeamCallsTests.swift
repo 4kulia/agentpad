@@ -357,6 +357,149 @@ final class TeamCallsTests: XCTestCase {
         try await waitUntil { owner.calls.incoming.first?.state == .cancelled }
     }
 
+    // MARK: Calls on disk
+
+    func testCallsSurviveARestartOfBothMacs() async throws {
+        let runner = FakeTeamRunner()
+        let (owner, caller) = try await pairedPair(runner: runner)
+        // One call runs, one waits for a decision; the caller sent both.
+        let running = try caller.calls.ask("backend@andrey", prompt: "first", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        owner.calls.decide(running.id, allow: true)
+        try await waitUntil { runner.waiting == 1 }
+        let waiting = try caller.calls.ask("backend@andrey", prompt: "second", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 && caller.calls.outgoing.last?.report.state == .awaitingApproval }
+        // Quit: what was saved at that moment is copied aside, as if the
+        // apps had stopped there; the new ones start from those copies.
+        owner.calls.saveNow()
+        caller.calls.saveNow()
+        for name in ["owner", "caller"] {
+            let from = root.appendingPathComponent(name), to = root.appendingPathComponent("\(name)-2")
+            try FileManager.default.copyItem(at: from, to: to)
+        }
+        try await owner.disable(); try await caller.disable()
+        let owner2 = service("owner-2", id: "aaaa", runner: FakeTeamRunner())
+        let caller2 = service("caller-2", id: "bbbb")
+        await owner2.load(); await caller2.load()
+        XCTAssertEqual(owner2.calls.incoming.first { $0.id == running.id }?.state, .failed, "its process ended with the app")
+        XCTAssertEqual(owner2.calls.incoming.first { $0.id == waiting.id }?.state, .awaitingApproval)
+        XCTAssertEqual(caller2.calls.outgoing.count, 2)
+
+        // Team work comes back on: the caller follows its calls again.
+        await owner2.enable(displayName: "Andrey"); await caller2.enable(displayName: "Masha Petrova")
+        owner2.calls.decide(waiting.id, allow: false, reason: "later")
+        try await waitUntil { caller2.calls.outgoing.first { $0.id == waiting.id }?.report.state == .denied }
+        try await waitUntil { caller2.calls.outgoing.first { $0.id == running.id }?.report.state == .failed }
+    }
+
+    func testAColleagueComingOnlineIsTriedAtOnce() async throws {
+        let runner = FakeTeamRunner()
+        runner.autoAnswer = "hi"
+        let (owner, caller) = try await pairedPair(runner: runner)
+        var finished: TeamCalls.Outgoing?
+        caller.calls.onOutgoingFinished = { finished = $0 }
+        // The owner's Mac is unreachable: the first try fails, the next one
+        // would be five seconds later.
+        network.unregister("aaaa")
+        let sent = try caller.calls.ask("backend@andrey", prompt: "hello?", threadId: nil, origin: nil)
+        try await waitUntil { caller.calls.outgoing.first?.note != nil }
+        try await owner.disable(); await owner.enable(displayName: "Andrey")
+        let back = ContinuousClock.now
+        caller.calls.nudge()
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        XCTAssertLessThan(ContinuousClock.now - back, .seconds(3), "tried at once, not at the next retry")
+        owner.calls.decide(sent.id, allow: true)
+        try await waitUntil { caller.calls.outgoing.first?.report.state == .done }
+        XCTAssertEqual(finished?.report.text, "hi", "the user hears about the answer")
+        try await waitUntil { owner.calls.incoming.first?.acknowledged == true }
+    }
+
+    func testClearHistoryKeepsOpenCalls() async throws {
+        let (owner, caller) = try await pairedPair(runner: FakeTeamRunner())
+        let first = try caller.calls.ask("backend@andrey", prompt: "one", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        owner.calls.decide(first.id, allow: false)
+        _ = try caller.calls.ask("backend@andrey", prompt: "two", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        owner.calls.clearHistory()
+        XCTAssertEqual(owner.calls.incoming.filter { $0.hidden != true }.map(\.prompt), ["two"])
+        // The caller can still learn how its first call ended.
+        let late = await owner.handle(TeamMessage(type: .callAttach, callId: first.id), from: "bbbb")
+        XCTAssertEqual(late.call?.state, .denied)
+    }
+
+    // MARK: Session agents
+
+    private func makeSession(_ id: String, cwd: String) throws -> URL {
+        let dir = root.appendingPathComponent("claude-projects/-some-project")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("\(id).jsonl")
+        try "{\"type\":\"summary\"}\n{\"type\":\"user\",\"cwd\":\"\(cwd)\"}\n".write(to: file, atomically: true, encoding: .utf8)
+        return file
+    }
+
+    func testSessionAgentLivesAsLongAsItsConversation() async throws {
+        let runner = FakeTeamRunner()
+        runner.autoAnswer = "from the copy"
+        let (owner, caller) = try await pairedPair(runner: runner)
+        owner.calls.sessionFilesRoot = root.appendingPathComponent("claude-projects")
+        let session = UUID().uuidString.lowercased()
+        let file = try makeSession(session, cwd: project.path)
+        var agent = TeamPublishedAgent(name: "fix-login", description: "The login fix", folder: "/ignored")
+        agent.sessionId = session
+        agent.sessionTitle = "Fix login"
+        try await owner.calls.save(agent)
+        XCTAssertEqual(owner.calls.agents(forSession: session).first?.folder, project.path, "the folder is where the conversation ran")
+
+        let items = await caller.calls.catalog()
+        XCTAssertEqual(items.first { $0.entry.name == "fix-login" }?.entry.kind, "session")
+        XCTAssertEqual(items.first { $0.entry.name == "backend" }?.entry.kind, "agent")
+
+        let sent = try caller.calls.ask("fix-login@andrey", prompt: "why?", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        owner.calls.decide(sent.id, allow: true)
+        try await waitUntil { caller.calls.outgoing.first?.report.state == .done }
+        let request = try XCTUnwrap(runner.received.first)
+        XCTAssertEqual(request.agent.sessionId, session)
+        XCTAssertFalse(request.resume)
+
+        try FileManager.default.removeItem(at: file)
+        let after = await caller.calls.catalog()
+        XCTAssertNil(after.first { $0.entry.name == "fix-login" }, "a deleted conversation takes its agent along")
+        XCTAssertTrue(owner.calls.agents(forSession: session).isEmpty)
+    }
+
+    func testPublishingBothIsAllOrNothing() async throws {
+        let (owner, _) = try await pairedPair(runner: FakeTeamRunner())
+        owner.calls.sessionFilesRoot = root.appendingPathComponent("claude-projects")
+        let session = UUID().uuidString.lowercased()
+        _ = try makeSession(session, cwd: project.path)
+        var asSession = TeamPublishedAgent(name: "the-session", description: "d", folder: "/x", access: .read)
+        asSession.sessionId = session
+        // "backend" is taken by another agent: the session is not published either.
+        let asFolder = TeamPublishedAgent(name: "backend", description: "d", folder: root.path, access: .read)
+        do { try await owner.calls.save([asSession, asFolder]); XCTFail("accepted") } catch {}
+        XCTAssertTrue(owner.calls.agents(forSession: session).isEmpty)
+    }
+
+    func testSessionAgentForksTheConversation() {
+        var agent = TeamPublishedAgent(name: "s", description: "d", folder: "/p", access: .read)
+        agent.sessionId = "11111111-2222-3333-4444-555555555555"
+        let first = ClaudeCodeRunner.arguments(for: TeamRunRequest(agent: agent, prompt: "q", sessionId: "t1", resume: false, callerName: "M", callerProject: nil))
+        XCTAssertEqual(value(after: "--resume", in: first), "11111111-2222-3333-4444-555555555555")
+        XCTAssertTrue(first.contains("--fork-session"), "the owner's own session is never written to")
+        XCTAssertEqual(value(after: "--session-id", in: first), "t1")
+        let next = ClaudeCodeRunner.arguments(for: TeamRunRequest(agent: agent, prompt: "q", sessionId: "t1", resume: true, callerName: "M", callerProject: nil))
+        XCTAssertEqual(value(after: "--resume", in: next), "t1")
+        XCTAssertFalse(next.contains("--fork-session"))
+    }
+
+    func testSuggestedNamesAreAddresses() {
+        XCTAssertEqual(TeamPublishedAgent.suggestedName("Починить логин"), "pocinit-login")
+        XCTAssertEqual(TeamPublishedAgent.suggestedName("Fix the API: v2!"), "fix-the-api-v2")
+        XCTAssertTrue(TeamPublishedAgent.isValidName(TeamPublishedAgent.suggestedName(String(repeating: "очень длинное имя ", count: 5))))
+    }
+
     // MARK: The runner's command line
 
     private func request(_ access: TeamAccessProfile, resume: Bool = false) -> TeamRunRequest {

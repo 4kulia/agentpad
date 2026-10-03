@@ -17,6 +17,7 @@ struct TeamStorage: Sendable {
     var invitesURL: URL { directory.appendingPathComponent("invites.json") }
     var agentsURL: URL { directory.appendingPathComponent("agents.json") }
     var threadsURL: URL { directory.appendingPathComponent("threads.json") }
+    var callsURL: URL { directory.appendingPathComponent("calls.json") }
 
     func prepareDirectory() throws {
         do {
@@ -81,8 +82,16 @@ struct TeamStorage: Sendable {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(value).write(to: url, options: [.atomic])
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            // Written and made private beside the target, then put in its
+            // place in one rename: the file is either the old one or the
+            // complete new one, never a new one that a later step failed on.
+            let temp = directory.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+            defer { try? FileManager.default.removeItem(at: temp) }
+            let data = try encoder.encode(value)
+            guard FileManager.default.createFile(atPath: temp.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            guard rename(temp.path, url.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         } catch {
             throw TeamError.storage("cannot write \(url.lastPathComponent): \(error.localizedDescription)")
         }

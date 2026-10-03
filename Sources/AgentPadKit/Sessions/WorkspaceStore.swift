@@ -101,6 +101,8 @@ enum SidebarMode: String, Codable, Equatable, Sendable {
 enum SidebarContent: String, Codable, Equatable, Sendable {
     case workspaces
     case files
+    /// AgentPad: team calls received and sent (Team/TeamCallsSidebar.swift).
+    case team
 }
 
 /// What the right sidebar shows in full mode — live agents, on-disk history,
@@ -341,7 +343,7 @@ final class WorkspaceStore {
         // The rename popover anchors to a workspace row — flip the sidebar
         // back to the list, or the parked request sits unconsumed in files
         // mode and fires stale on the next toggle.
-        if sidebarContent == .files { setSidebarContent(.workspaces) }
+        if sidebarContent == .files || sidebarContent == .team { setSidebarContent(.workspaces) }
         pendingRenameWorkspace = active
     }
 
@@ -2807,7 +2809,9 @@ final class WorkspaceStore {
             activeWorkspaceId: activeWorkspaceId,
             sidebarMode: sidebarMode,
             rightSidebarMode: rightSidebarMode,
-            sidebarContent: sidebarContent,
+            // AgentPad: saved as the list, so an older build can still read
+            // the state file (it does not know `.team`).
+            sidebarContent: sidebarContent == .team ? .workspaces : sidebarContent,
             rightSidebarContent: rightSidebarContent,
             sidebarWidth: Double(sidebarWidth),
             rightSidebarWidth: Double(rightSidebarWidth),

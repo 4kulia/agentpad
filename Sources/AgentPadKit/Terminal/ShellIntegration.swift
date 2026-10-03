@@ -531,6 +531,23 @@ enum AgentPadShellIntegration {
         hooksDirectory.appendingPathComponent("claude.json").path
     }()
 
+    /// AgentPad: the MCP config that gives Claude Code sessions the team
+    /// tools (`agentpad-cli mcp`). Present only while team work is on; the
+    /// claude wrapper adds `--mcp-config` when it exists (TEAM.md 7.5).
+    static let teamMCPConfigPath: String = {
+        hooksDirectory.appendingPathComponent("agentpad-team-mcp.json").path
+    }()
+
+    static func writeTeamMCPConfig() {
+        writeJSON(at: teamMCPConfigPath, object: ["mcpServers": [
+            "agentpad-team": ["type": "stdio", "command": agentPadCLIBinaryPath, "args": ["mcp"]],
+        ]])
+    }
+
+    static func removeTeamMCPConfig() {
+        try? FileManager.default.removeItem(atPath: teamMCPConfigPath)
+    }
+
     /// Path to the agentpad-managed Gemini system-defaults file. Surfaced to
     /// gemini-cli via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`. Hook arrays merge
     /// with CONCAT semantics across tiers (verified in google-gemini/gemini-cli
@@ -704,6 +721,7 @@ enum AgentPadShellIntegration {
         var env: [String: String] = [
             "AGENTPAD_SURFACE_ID": sessionId.uuidString,
             "AGENTPAD_HOOKS_PATH": hooksPath,
+            "AGENTPAD_TEAM_MCP_PATH": teamMCPConfigPath,
             "AGENTPAD_BIN_DIR": agentPadBinDirectory,
             "AGENTPAD_HOOK_BIN": agentPadHookBinaryPath,
             "AGENTPAD_KIRO_ACP_RECORD_PATH": kiroRecordPath,
@@ -1303,6 +1321,11 @@ enum AgentPadShellIntegration {
             hooks["SessionStart"] = [start]
             object["hooks"] = hooks
         }
+        // AgentPad: the team tools that only read are allowed without a
+        // prompt; team_ask sends text to another person, so it asks (7.5).
+        object["permissions"] = ["allow": [
+            "mcp__agentpad-team__team_agents", "mcp__agentpad-team__team_check",
+        ]]
         return object
     }
 
@@ -1607,8 +1630,24 @@ enum AgentPadShellIntegration {
             fi
         done
         unset _agentpad_arg
+        # AgentPad: team tools while team work is on, unless the user asked
+        # for their own MCP servers only. --mcp-config takes several values,
+        # so --settings must follow it, or the user's prompt would be read
+        # as a config path.
+        _agentpad_team=()
+        if [[ -n "$AGENTPAD_SURFACE_ID" && -n "$AGENTPAD_TEAM_MCP_PATH" && -f "$AGENTPAD_TEAM_MCP_PATH" ]]; then
+            _agentpad_team=(--mcp-config "$AGENTPAD_TEAM_MCP_PATH")
+            for _agentpad_arg in "$@"; do
+                [[ "$_agentpad_arg" == "--" ]] && break
+                if [[ "$_agentpad_arg" == "--strict-mcp-config" || "$_agentpad_arg" == "--bare" ]]; then
+                    _agentpad_team=()
+                    break
+                fi
+            done
+            unset _agentpad_arg
+        fi
         if [[ -n "$AGENTPAD_SURFACE_ID" && -n "$AGENTPAD_HOOKS_PATH" ]]; then
-            "$real" --settings "$AGENTPAD_HOOKS_PATH" "$@"
+            "$real" ${_agentpad_team[@]+"${_agentpad_team[@]}"} --settings "$AGENTPAD_HOOKS_PATH" "$@"
         else
             "$real" "$@"
         fi

@@ -95,6 +95,13 @@ struct UnifiedSessionsView: View {
                     ExternalTreeRoot.for(store).clear()
                     monitor.onActivate(entry.id)
                 }
+                .contextMenu {
+                    TeamPublishMenu(
+                        sessionId: (entry.agent.id == AgentTemplate.claudeCodeID || entry.agent.baseAgentId == AgentTemplate.claudeCodeID)
+                            ? entry.conversationId : nil,
+                        title: entry.tabTitle
+                    )
+                }
         case .external(let session):
             ExternalSessionRow(
                 session: session,
@@ -109,6 +116,12 @@ struct UnifiedSessionsView: View {
             )
         case .recent(let record):
             RecentSessionRow(record: record) { resume(record) }
+                .contextMenu {
+                    TeamPublishMenu(
+                        sessionId: record.agentId == AgentTemplate.claudeCodeID ? record.conversationId : nil,
+                        title: record.title
+                    )
+                }
         }
     }
 

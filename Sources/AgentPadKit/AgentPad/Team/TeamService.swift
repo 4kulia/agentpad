@@ -68,6 +68,9 @@ final class TeamService {
     /// Called when a join request arrives. Returns the user's answer, or nil
     /// when the answer comes later through `decide` (the right panel).
     var approvePairing: @MainActor (PendingPairing) async -> Bool? = { _ in nil }
+    /// Team work started or stopped: new Claude Code sessions get the team
+    /// tools only while it is on (stage 3).
+    var onTeamToolsChange: @MainActor (Bool) -> Void = { _ in }
     /// Fires when `pendingPairings` changes, for the Dock badge.
     var onPendingChange: @MainActor () -> Void = {}
 
@@ -107,6 +110,7 @@ final class TeamService {
 
     /// Reads saved state and starts the endpoint if team work was left on.
     func load() async {
+        calls.beginLoading()
         do {
             config = try storage.load(TeamConfig.self, from: storage.configURL, default: TeamConfig())
             contacts = try storage.load([TeamContact].self, from: storage.contactsURL, default: [])
@@ -189,6 +193,8 @@ final class TeamService {
         transport = made
         status = .on(localId: made.localId)
         startPresence()
+        onTeamToolsChange(true)
+        calls.resume()
     }
 
     private func stopEndpoint() async {
@@ -202,6 +208,7 @@ final class TeamService {
             pendingPairings = []
             onPendingChange()
         }
+        onTeamToolsChange(false)
         let current = transport
         transport = nil
         await current?.stop()
@@ -378,6 +385,9 @@ final class TeamService {
 
     private func markSeen(_ id: String, name: String?) {
         guard let i = contacts.firstIndex(where: { $0.id == id }) else { return }
+        // Back online: calls waiting to reach them try now, not at the next
+        // retry (D-3).
+        if !contacts[i].isOnline() { calls.nudge() }
         contacts[i].lastSeen = Date()
         if let name = name.map(TeamInviteLink.sanitizedName), !name.isEmpty { contacts[i].name = name }
         try? storage.save(contacts, to: storage.contactsURL)
@@ -398,7 +408,7 @@ final class TeamService {
             return handlePairCommit(message, from: peer)
         case .pairRequest:
             return await handlePairRequest(message, from: peer)
-        case .catalogGet, .callStart, .callAttach, .callCancel:
+        case .catalogGet, .callStart, .callAttach, .callCancel, .callAck:
             // A request accepted just before team work was turned off is
             // answered, not queued.
             guard isOn, config.enabled else { return .error("shutting_down") }

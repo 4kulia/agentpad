@@ -210,6 +210,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         AttentionCoordinator.shared.start()
         // AgentPad: team work — off unless the user turned it on.
         TeamUI.install()
+        TeamWindows.showCallsTab = { [weak self] in
+            guard let store = self?.activeStore else { return }
+            if store.sidebarMode != .full { store.setSidebarMode(.full) }
+            store.setSidebarContent(.team)
+            NSApp.activate(ignoringOtherApps: true)
+        }
         // AgentPad: correct own Claude tabs whose hooks left a stale state.
         ExternalSessionMonitor.shared.onOwnSessions = { [weak self] own in
             for controller in self?.windowControllers ?? [] {
@@ -1111,6 +1117,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // AgentPad: a colleague's call running here must not outlive the app
         // that enforces its time limit and Stop button.
         TeamProcesses.shared.killAll()
+        TeamService.shared.calls.saveNow()
+        // New sessions in a still-open terminal (tmux) must not get the
+        // tools of an app that is gone.
+        AgentPadShellIntegration.removeTeamMCPConfig()
         terminationFallback?.cancel()
         terminationFallback = nil
         systemAppearanceObservation = nil
@@ -1275,6 +1285,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         mainMenu.addItem(submenu(buildMenu(title: "Team", entries: [
             selfRow("Colleagues…", #selector(handleTeamColleagues)),
             selfRow("Published Agents…", #selector(handleTeamAgents)),
+            selfRow("Calls…", #selector(handleTeamCalls)),
             .separator,
             selfRow("Invite Colleague…", #selector(handleTeamInvite)),
             selfRow("Join with Link…", #selector(handleTeamJoin)),
@@ -1877,6 +1888,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     // AgentPad: Team menu.
     @objc private func handleTeamColleagues() { TeamUI.showColleagues() }
     @objc private func handleTeamAgents() { TeamUI.showAgents() }
+    @objc private func handleTeamCalls() { TeamWindows.showCalls() }
     @objc private func handleTeamInvite() { TeamUI.invite() }
     @objc private func handleTeamJoin() { TeamUI.joinFromPrompt() }
     @objc private func handleTeamToggle() { TeamUI.toggleTeamWork() }

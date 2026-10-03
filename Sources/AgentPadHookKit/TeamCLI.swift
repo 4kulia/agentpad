@@ -29,9 +29,13 @@ public struct AgentPadCLITeamInfo: Codable, Equatable, Sendable {
         public var description: String
         public var access: String
         public var sameProject: Bool
-        public init(address: String, colleague: String, description: String, access: String, sameProject: Bool) {
+        /// "agent" or "session" (a copy of the colleague's conversation).
+        public var kind: String?
+        public var session: String?
+        public init(address: String, colleague: String, description: String, access: String, sameProject: Bool,
+                    kind: String? = nil, session: String? = nil) {
             self.address = address; self.colleague = colleague; self.description = description
-            self.access = access; self.sameProject = sameProject
+            self.access = access; self.sameProject = sameProject; self.kind = kind; self.session = session
         }
     }
 
@@ -256,7 +260,8 @@ extension AgentPadHookKit {
         if let agents = info.agents {
             var lines: [String] = []
             for agent in agents {
-                lines.append("\(plain(agent.address))  [\(plain(agent.access))]\(agent.sameProject ? "  same project" : "")")
+                let kind = agent.kind == "session" ? "  session" + (agent.session.map { ": \(plain($0))" } ?? "") : ""
+                lines.append("\(plain(agent.address))  [\(plain(agent.access))]\(agent.sameProject ? "  same project" : "")\(kind)")
                 if !agent.description.isEmpty { lines.append("    \(plain(agent.description))") }
             }
             let offline = info.colleagues.filter { colleague in !colleague.online && !agents.contains { $0.colleague == colleague.name } }

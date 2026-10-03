@@ -66,6 +66,8 @@ struct TeamMessage: Codable, Equatable, Sendable {
         case catalogGet = "catalog.get", catalog
         case callStart = "call.start", callAttach = "call.attach", callCancel = "call.cancel"
         case callStatus = "call.status"
+        /// The caller has the outcome; the owner may let the record age out (D-7).
+        case callAck = "call.ack"
         case error
     }
 

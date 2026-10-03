@@ -7,12 +7,14 @@ import SwiftUI
 /// while there is something to show.
 struct TeamPanelSection: View {
     var service = TeamService.shared
+    /// The Team tab lists calls itself and shows only join requests here.
+    var showsCalls = true
     @State private var expanded: String?
 
     private var calls: TeamCalls { service.calls }
-    private var waiting: [TeamCalls.Incoming] { calls.awaitingDecision }
-    private var active: [TeamCalls.Incoming] { calls.incoming.filter { $0.state == .queued || $0.state == .running } }
-    private var sent: [TeamCalls.Outgoing] { calls.outgoing.filter { !$0.report.state.isFinal } }
+    private var waiting: [TeamCalls.Incoming] { showsCalls ? calls.awaitingDecision : [] }
+    private var active: [TeamCalls.Incoming] { showsCalls ? calls.incoming.filter { $0.state == .queued || $0.state == .running } : [] }
+    private var sent: [TeamCalls.Outgoing] { showsCalls ? calls.outgoing.filter { !$0.report.state.isFinal } : [] }
 
     var body: some View {
         let needsYou = service.pendingPairings.count + waiting.count
@@ -28,6 +30,9 @@ struct TeamPanelSection: View {
             }
             if !active.isEmpty || !sent.isEmpty {
                 SessionSectionLabel(title: "team · in progress", count: active.count + sent.count)
+                    .contentShape(Rectangle())
+                    .onTapGesture { TeamWindows.showCalls() }
+                    .help("Open Team → Calls…")
                 ForEach(active) { call in
                     incomingRow(call)
                 }

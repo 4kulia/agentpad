@@ -33,6 +33,44 @@ enum TeamUI {
                 body: String(preview.prefix(160)) + (preview.count > 160 ? "…" : "")
             )
         }
+        // An answer, or a call that ended without one, when AgentPad is in
+        // the background (D-4).
+        service.calls.onOutgoingFinished = { call in
+            guard !NSApp.isActive, AgentPadSettingsModel.shared.notificationsEnabled else { return }
+            let title: String
+            switch call.report.state {
+            case .done: title = "\(call.address) answered"
+            case .denied: title = "\(call.colleague) declined your call"
+            case .expired:
+                title = call.delivered
+                    ? "\(call.colleague) did not decide on your call in time"
+                    : "Your call to \(call.address) was not delivered"
+            case .cancelled: title = "Your call to \(call.address) was cancelled"
+            default: title = "Your call to \(call.address) failed"
+            }
+            let body = (call.report.state == .done ? call.report.text : call.report.detail) ?? ""
+            AttentionCoordinator.shared.notificationManager?.postTeam(
+                title: title, body: String(body.replacingOccurrences(of: "\n", with: " ").prefix(160))
+            )
+        }
+        // Waking up or a new network: retry deliveries now (D-3).
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in
+                service.calls.nudge()
+                await service.pingContacts()
+            }
+        }
+        TeamNetworkWatch.shared.start {
+            service.calls.nudge()
+            Task { await service.pingContacts() }
+        }
+        service.onTeamToolsChange = { on in
+            if on { AgentPadShellIntegration.writeTeamMCPConfig() } else { AgentPadShellIntegration.removeTeamMCPConfig() }
+        }
+        // Off until it starts: a file left by a crash must not outlive it.
+        AgentPadShellIntegration.removeTeamMCPConfig()
         loading = Task { await service.load() }
     }
 
@@ -91,6 +129,20 @@ enum TeamUI {
 
     static func showColleagues() {
         TeamWindows.showColleagues()
+    }
+
+    static func stopPublishing(_ agents: [TeamPublishedAgent]) async {
+        let alert = NSAlert()
+        alert.messageText = agents.count == 1 ? "Stop publishing \(agents[0].name)?" : "Stop publishing this session?"
+        alert.informativeText = "Colleagues can no longer call it. Calls already allowed finish."
+        alert.addButton(withTitle: "Stop Publishing")
+        alert.addButton(withTitle: "Cancel")
+        guard await present(alert) == .alertFirstButtonReturn else { return }
+        do {
+            for agent in agents { try service.calls.unpublish(agent.id) }
+        } catch {
+            await showError("Not all was unpublished", error)
+        }
     }
 
     static func showAgents() {
@@ -231,6 +283,25 @@ enum TeamWindows {
     private static var invite: NSWindow?
     private static var waiting: NSWindow?
     private static var agents: NSWindow?
+    private static var publishSession: NSWindow?
+    /// The Team tab of the front window's left sidebar.
+    static var showCallsTab: @MainActor () -> Void = {}
+
+    static func showCalls() { showCallsTab() }
+
+    static func showPublishSession(sessionId: String, title: String, audience: [String]?) {
+        publishSession?.close()
+        // Closing is bound to this window: a save that ends after it was
+        // replaced must not close the next one.
+        final class Handle { weak var window: NSWindow? }
+        let handle = Handle()
+        let made = window(title: "Publish to Team", content: TeamPublishSessionView(
+            sessionId: sessionId, title: title, audience: audience, service: .shared
+        ) { handle.window?.close() })
+        handle.window = made
+        publishSession = made
+        present(made)
+    }
 
     static func showAgents() {
         if agents == nil {

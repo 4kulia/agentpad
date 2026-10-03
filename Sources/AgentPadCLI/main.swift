@@ -97,6 +97,37 @@ func printSuccess(_ response: AgentPadCLIResponse, for command: AgentPadCLIComma
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 
+// AgentPad: `agentpad-cli mcp` — the team tools as an MCP server on stdio,
+// started by Claude Code sessions in AgentPad (TeamMCPServer.swift).
+if arguments == ["mcp"] {
+    let socket = AgentPadHookKit.socketPath
+    let out = FileHandle.standardOutput
+    let server = AgentPadTeamMCPServer(
+        cwd: FileManager.default.currentDirectoryPath,
+        version: AgentPadCLIProtocol.version.description,
+        send: { request, timeout in
+            guard let line = request.encodedLine() else { return .failure(.init("internal error: request encoding failed")) }
+            switch AgentPadCLITransport.roundTrip(line: line, socketPath: socket, timeout: timeout) {
+            case .success(let data):
+                guard let response = AgentPadCLIResponse.decode(from: data) else { return .failure(.init("AgentPad sent a reply this tool cannot read; update AgentPad.")) }
+                return .success(response)
+            case .failure(.connectFailed):
+                return .failure(.init("AgentPad is not running, so team work is not available."))
+            case .failure:
+                return .failure(.init("AgentPad did not answer in time."))
+            }
+        },
+        write: { data in out.write(data) }
+    )
+    while let line = readLine(strippingNewline: true) {
+        guard !line.isEmpty else { continue }
+        server.handle(line: Data(line.utf8))
+    }
+    // stdin closed: the session is gone. Let replies already made go out.
+    server.drain()
+    exit(0)
+}
+
 let parsed: AgentPadCLICommand
 switch AgentPadHookKit.parseCLICommand(arguments) {
 case .success(let value): parsed = value

@@ -53,7 +53,7 @@ struct TeamAgentsView: View {
                 .frame(width: 8, height: 8)
                 .padding(.top, 5)
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(agent.name) · \(agent.access.title)")
+                Text("\(agent.name) · \(agent.isSession ? "session · " : "")\(agent.access.title)")
                     .font(Theme.display(13, weight: .medium))
                 Text(agent.description)
                     .font(Theme.display(11))

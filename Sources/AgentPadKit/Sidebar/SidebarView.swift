@@ -183,6 +183,9 @@ struct SidebarView: View {
             // list; the file tree (and its footer toggle) are full-mode only.
             if fileTreeIsMounted {
                 FileTreeView(store: store, model: store.fileTree)
+            } else if store.sidebarContent == .team && !isCompact {
+                // AgentPad: team calls (Team/TeamCallsSidebar.swift).
+                TeamCallsSidebar()
             } else {
                 ScrollViewReader { proxy in
                     list(isCompact: isCompact, proxy: proxy)
@@ -475,6 +478,13 @@ struct SidebarView: View {
         HStack(spacing: Theme.chromeControlSpacing) {
             segment(.workspaces, systemName: "rectangle.stack", help: "Workspaces")
             segment(.files, systemName: "folder", help: "Files")
+            // AgentPad: team calls, with a dot while any waits for you.
+            segment(.team, systemName: "person.2", help: "Team")
+                .overlay(alignment: .topTrailing) {
+                    if !TeamService.shared.calls.awaitingDecision.isEmpty || !TeamService.shared.pendingPairings.isEmpty {
+                        Circle().fill(agentStateWordColor(.attention)).frame(width: 6, height: 6).offset(x: -3, y: 3)
+                    }
+                }
             Spacer(minLength: 0)
         }
         // The first segment is 26pt wide; align its centre to the shared

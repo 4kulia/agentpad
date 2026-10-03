@@ -76,7 +76,7 @@ Click a file to preview it under the terminal. Drag the divider to resize the pr
 
 ## Team work
 
-*In progress: pairing, presence and calling a colleague's agents from the command line work today; tools for agents inside Claude Code sessions come next.*
+*In progress: pairing, presence, publishing agents and calling a colleague's agents work today; calls and their history are kept for 30 days, also across restarts.*
 
 Pair AgentPad with a colleague's, and see when they are online:
 
@@ -87,9 +87,15 @@ Pair AgentPad with a colleague's, and see when they are online:
 
 Let your colleague's agents ask yours:
 
-1. **Team → Published Agents… → Publish Agent…**: a name, what to ask it about, a project folder, and its rights — *Read*, *Read and git*, or *Edit*. Files with secrets (`.env`, keys) are excluded from reading by default.
-2. A colleague's agent calls it: `agentpad-cli team agents` lists what you may call, `agentpad-cli team ask backend@masha "How does auth work in your branch?"` waits for the answer.
-3. Each call shows up at the top of the right panel with its full text. Nothing runs until the owner clicks **Allow**; then Claude Code runs in the agent's folder with those rights, as a separate `claude -p`, and the answer goes back. `--thread <id>` continues the conversation.
+- **Team → Published Agents… → Publish Agent…**: a name, what to ask it about, a project folder, and its rights — *Read*, *Read and git* (a repository's top folder), or *Edit*. Files with secrets (`.env`, keys) are excluded from reading by default.
+- Or right-click a Claude Code session in the right panel → **Publish to Team ▸ Everyone / a colleague / Choose People…**, and publish the session itself (each call works on a copy of its conversation, which stays untouched; the agent disappears when the conversation is deleted), a fresh agent in its folder, or both.
+
+Every call shows up at the top of the right panel with its full text. Nothing runs until the owner clicks **Allow**; then Claude Code runs in the agent's folder with those rights only — the owner's own Claude Code settings and MCP servers are not used — and the answer goes back. **Team → Calls…** lists the calls received and sent, with their state and answers, and Allow / Decline / Stop / Cancel.
+
+Calling a colleague's agent:
+
+- **From a Claude Code session in AgentPad**, just ask: "ask Masha's backend agent how auth works in her branch". While team work is on, every new session gets the tools `team_agents`, `team_ask`, `team_check` and `team_cancel` (an MCP server passed at launch; your configuration is not changed). `team_ask` asks for your permission, since it sends text to another person.
+- **From the command line**, for any other agent: `agentpad-cli team agents`, `agentpad-cli team ask backend@masha "How does auth work in your branch?"` (`--thread <id>` continues the conversation).
 
 The two Macs connect directly over QUIC, end-to-end encrypted, and find each other by public key; when a direct path is impossible, traffic goes through the public relays of [iroh](https://www.iroh.computer). The invitation carries no IP addresses. Turning team work off closes all connections. Everything team work stores lives in `~/Library/Application Support/agentpad/team/`; deleting that folder resets it.
 

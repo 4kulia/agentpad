@@ -51,6 +51,14 @@ struct TeamPublishedAgent: Codable, Equatable, Identifiable, Sendable {
     var enabled = true
     /// The folder's git remotes, normalized; refreshed on every save.
     var remotes: [String] = []
+    /// A session agent: the Claude Code conversation each call continues a
+    /// copy of (`--resume <id> --fork-session`). Nil for a folder agent.
+    /// Optional fields, so agents saved before them still load.
+    var sessionId: String?
+    /// The session's title when it was published, for the catalog.
+    var sessionTitle: String?
+
+    var isSession: Bool { sessionId != nil }
 
     static let defaultDeniedPaths = [
         ".env", ".env.*", "*.pem", "*.key", "id_rsa*", "~/.ssh/**", "~/.aws/**", "~/.config/gh/**",
@@ -68,7 +76,24 @@ struct TeamPublishedAgent: Codable, Equatable, Identifiable, Sendable {
     }
 
     var catalogEntry: TeamCatalogEntry {
-        TeamCatalogEntry(name: name, description: description, access: access, remotes: remotes)
+        TeamCatalogEntry(
+            name: name, description: description, access: access, remotes: remotes,
+            kind: isSession ? "session" : "agent", session: isSession ? sessionTitle : nil
+        )
+    }
+
+    /// An ASCII name for an address: transliterated, lowercase, dashes —
+    /// "Починить логин" → `pochinit-login`. Empty when nothing is left.
+    static func suggestedName(_ text: String) -> String {
+        let latin = text.applyingTransform(.toLatin, reverse: false)?
+            .applyingTransform(.stripDiacritics, reverse: false) ?? text
+        var out = ""
+        for ch in latin.lowercased() {
+            if ch.isASCII && (ch.isLetter || ch.isNumber) { out.append(ch) } else if !out.isEmpty && out.last != "-" { out.append("-") }
+        }
+        while out.hasSuffix("-") { out.removeLast() }
+        while out.count > 32 { out = String(out.prefix(32)); while out.hasSuffix("-") { out.removeLast() } }
+        return out
     }
 }
 
@@ -82,6 +107,44 @@ struct TeamCatalogEntry: Codable, Equatable, Sendable {
     var access: TeamAccessProfile
     var remotes: [String]
     var approval = "ask"
+    /// "agent" (a fresh run in a folder) or "session" (a copy of a live
+    /// conversation). Optional: older AgentPads do not send it.
+    var kind: String?
+    /// session: the conversation's title.
+    var session: String?
+}
+
+/// Claude Code's conversation files, `~/.claude/projects/<folder>/<id>.jsonl`.
+enum TeamSessionFiles {
+    static var root: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects") }
+
+    static func isValidId(_ id: String) -> Bool { UUID(uuidString: id) != nil }
+
+    /// The conversation's file, or nil once it is gone.
+    static func file(for sessionId: String, root: URL = root) -> URL? {
+        guard isValidId(sessionId),
+              let projects = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        else { return nil }
+        let name = "\(sessionId.lowercased()).jsonl"
+        return projects.lazy.map { $0.appendingPathComponent(name) }.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    static func exists(_ sessionId: String, root: URL = root) -> Bool { file(for: sessionId, root: root) != nil }
+
+    /// The folder the conversation ran in, from its first lines: resuming
+    /// it only works from there.
+    static func workingDirectory(of sessionId: String, root: URL = root) -> String? {
+        guard let url = file(for: sessionId, root: root), let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let head = (try? handle.read(upToCount: 256 * 1024)) ?? Data()
+        for line in head.split(separator: 0x0A).prefix(200) {
+            if let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+               let cwd = object["cwd"] as? String, !cwd.isEmpty {
+                return cwd
+            }
+        }
+        return nil
+    }
 }
 
 /// Where a call comes from, as the caller describes it.

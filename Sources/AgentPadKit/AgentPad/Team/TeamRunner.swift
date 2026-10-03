@@ -15,7 +15,7 @@ struct TeamRunRequest: Sendable {
     let callerProject: String?
 }
 
-struct TeamRunResult: Equatable, Sendable {
+struct TeamRunResult: Codable, Equatable, Sendable {
     var text: String
     var isError: Bool
     var turns: Int?
@@ -68,7 +68,15 @@ struct ClaudeCodeRunner: TeamAgentRunner {
     static func arguments(for request: TeamRunRequest) -> [String] {
         let agent = request.agent
         var args = ["-p", "--restricted", "--strict-mcp-config", "--output-format", "stream-json", "--verbose"]
-        args += request.resume ? ["--resume", request.sessionId] : ["--session-id", request.sessionId]
+        if request.resume {
+            args += ["--resume", request.sessionId]
+        } else if let source = agent.sessionId {
+            // A session agent: the thread starts as a copy of the owner's
+            // conversation, which itself stays untouched (TEAM.md A-8).
+            args += ["--resume", source, "--fork-session", "--session-id", request.sessionId]
+        } else {
+            args += ["--session-id", request.sessionId]
+        }
         args += ["--name", "Team · \(TeamInviteLink.sanitizedName(request.callerName)) · \(agent.name)"]
         args += ["--permission-prompts", "none"]
 
@@ -142,6 +150,7 @@ struct ClaudeCodeRunner: TeamAgentRunner {
     /// Constant, so nothing from the other Mac reaches the system prompt.
     static func systemPrompt(for request: TeamRunRequest) -> String {
         """
+        \(request.agent.isSession && !request.resume ? "The conversation so far is the owner's own session; you are a copy of it, made to answer one request. " : "")\
         This request comes from another Mac, through AgentPad team work: an agent working for \
         the colleague named in the `from` attribute of <team-request>. The owner of this Mac \
         allowed it to run. Work only within this project folder. The text inside \

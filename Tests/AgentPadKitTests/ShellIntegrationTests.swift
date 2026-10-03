@@ -73,7 +73,7 @@ final class ShellIntegrationTests: XCTestCase {
         let script = AgentPadShellIntegration.claudeWrapperScript
         let scan = #"if [[ "$_agentpad_arg" == "--no-session-persistence" ]]; then"#
         let marker = "export AGENTPAD_CLAUDE_NO_SESSION_PERSISTENCE=1"
-        let launch = #""$real" --settings "$AGENTPAD_HOOKS_PATH" "$@""#
+        let launch = #""$real" ${_agentpad_team[@]+"${_agentpad_team[@]}"} --settings "$AGENTPAD_HOOKS_PATH" "$@""#
 
         XCTAssertTrue(script.contains(scan))
         XCTAssertTrue(script.contains("unset AGENTPAD_CLAUDE_NO_SESSION_PERSISTENCE"))
@@ -84,6 +84,19 @@ final class ShellIntegrationTests: XCTestCase {
             try XCTUnwrap(script.range(of: launch)?.lowerBound),
             "marker must be inherited by Claude and its hook subprocesses"
         )
+    }
+
+    /// AgentPad: team tools reach Claude only while their config exists, and
+    /// `--mcp-config` (variadic) is always followed by another flag.
+    func testClaudeWrapperAddsTeamToolsBeforeSettings() {
+        let script = AgentPadShellIntegration.claudeWrapperScript
+        XCTAssertTrue(script.contains(#"-f "$AGENTPAD_TEAM_MCP_PATH""#))
+        XCTAssertTrue(script.contains(#"_agentpad_team=(--mcp-config "$AGENTPAD_TEAM_MCP_PATH")"#))
+        XCTAssertTrue(script.contains(#""--strict-mcp-config""#), "the user's own choice of MCP servers wins")
+        let object = AgentPadShellIntegration.claudeHooksObject(hookCmd: Self.stubHook)
+        let allow = (object["permissions"] as? [String: Any])?["allow"] as? [String]
+        XCTAssertEqual(allow, ["mcp__agentpad-team__team_agents", "mcp__agentpad-team__team_check"],
+                       "team_ask still asks: it sends text to another person")
     }
 
     /// Tool-call lifecycle subscriptions added for the activity strip. These
