@@ -100,6 +100,7 @@ private struct TeamAgentEditor: View {
     let onClose: () -> Void
 
     @State private var deniedText = ""
+    @State private var extraText = ""
     @State private var commandsText = ""
     @State private var everyone = true
     @State private var chosen: Set<String> = []
@@ -115,6 +116,7 @@ private struct TeamAgentEditor: View {
         self.onSave = onSave
         self.onClose = onClose
         _deniedText = State(initialValue: agent.deniedPaths.joined(separator: "\n"))
+        _extraText = State(initialValue: (agent.extraFolders ?? []).joined(separator: "\n"))
         _commandsText = State(initialValue: agent.allowedCommands.joined(separator: "\n"))
         _everyone = State(initialValue: agent.audience == nil)
         _chosen = State(initialValue: Set(agent.audience ?? []))
@@ -144,6 +146,11 @@ private struct TeamAgentEditor: View {
                 if agent.access == .edit {
                     TextField("Allowed commands, one per line", text: $commandsText, prompt: Text("swift test"), axis: .vertical)
                         .lineLimit(2...5)
+                }
+                HStack(alignment: .top) {
+                    TextField("More folders, one per line", text: $extraText, prompt: Text("e.g. a second checkout"), axis: .vertical)
+                        .lineLimit(1...4)
+                    Button("Add…") { if let path = TeamUI.chooseFolder() { extraText += (extraText.isEmpty ? "" : "\n") + path } }
                 }
                 TextField("Never read, one per line", text: $deniedText, axis: .vertical)
                     .lineLimit(3...6)
@@ -202,6 +209,7 @@ private struct TeamAgentEditor: View {
             text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         }
         next.deniedPaths = lines(deniedText)
+        next.extraFolders = lines(extraText)
         next.allowedCommands = lines(commandsText)
         next.audience = everyone ? nil : Array(chosen)
         next.model = modelText.trimmingCharacters(in: .whitespaces).isEmpty ? nil : modelText.trimmingCharacters(in: .whitespaces)

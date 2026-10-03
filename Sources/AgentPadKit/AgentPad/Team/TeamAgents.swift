@@ -57,6 +57,9 @@ struct TeamPublishedAgent: Codable, Equatable, Identifiable, Sendable {
     var sessionId: String?
     /// The session's title when it was published, for the catalog.
     var sessionTitle: String?
+    /// More folders the agent may work in besides `folder` (`--add-dir`),
+    /// e.g. a second checkout or a shared knowledge repository.
+    var extraFolders: [String]?
 
     var isSession: Bool { sessionId != nil }
 

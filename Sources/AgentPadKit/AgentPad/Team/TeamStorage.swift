@@ -18,6 +18,10 @@ struct TeamStorage: Sendable {
     var agentsURL: URL { directory.appendingPathComponent("agents.json") }
     var threadsURL: URL { directory.appendingPathComponent("threads.json") }
     var callsURL: URL { directory.appendingPathComponent("calls.json") }
+    /// `runs/<callId>.jsonl`: what each call's agent did, for watching it.
+    func runLogURL(callId: String) -> URL {
+        directory.appendingPathComponent("runs", isDirectory: true).appendingPathComponent("\(callId.lowercased()).jsonl")
+    }
 
     func prepareDirectory() throws {
         do {

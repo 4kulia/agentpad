@@ -90,7 +90,9 @@ Let your colleague's agents ask yours:
 - **Team → Published Agents… → Publish Agent…**: a name, what to ask it about, a project folder, and its rights — *Read*, *Read and git* (a repository's top folder), or *Edit*. Files with secrets (`.env`, keys) are excluded from reading by default.
 - Or right-click a Claude Code session in the right panel → **Publish to Team ▸ Everyone / a colleague / Choose People…**, and publish the session itself (each call works on a copy of its conversation, which stays untouched; the agent disappears when the conversation is deleted), a fresh agent in its folder, or both.
 
-Every call shows up at the top of the right panel with its full text. Nothing runs until the owner clicks **Allow**; then Claude Code runs in the agent's folder with those rights only — the owner's own Claude Code settings and MCP servers are not used — and the answer goes back. **Team → Calls…** lists the calls received and sent, with their state and answers, and Allow / Decline / Stop / Cancel.
+An agent can be given more folders than its project (a second checkout, a shared knowledge repository). While it works, it can also ask for another folder: the request appears in the Team tab and the right panel with **Allow Once**, **Always** (added to the agent for good) and **Deny**, and the conversation goes on with the folder once allowed.
+
+Every call shows up at the top of the right panel with its full text. Nothing runs until the owner clicks **Allow**; then Claude Code runs in the agent's folder with those rights only — the owner's own Claude Code settings and MCP servers are not used — and the answer goes back. The **Team** tab in the left sidebar lists the calls received and sent, with their state and answers, and Allow / Decline / Stop / Cancel; **Watch** opens a tab that shows, live, what the agent working on a call does, and **Continue…** opens its conversation for you to carry on.
 
 Calling a colleague's agent:
 

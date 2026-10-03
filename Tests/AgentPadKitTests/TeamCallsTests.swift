@@ -414,6 +414,87 @@ final class TeamCallsTests: XCTestCase {
         try await waitUntil { owner.calls.incoming.first?.acknowledged == true }
     }
 
+    func testAgentAsksForAFolderAndGoesOnWithIt() async throws {
+        let runner = FakeTeamRunner()
+        let (owner, caller) = try await pairedPair(runner: runner)
+        let other = root.appendingPathComponent("other-checkout")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        try "x".write(to: other.appendingPathComponent("REPORT.md"), atomically: true, encoding: .utf8)
+        var asked: TeamCalls.AccessRequest?
+        owner.calls.onAccessRequest = { request, _ in asked = request }
+
+        let sent = try caller.calls.ask("backend@andrey", prompt: "read the report", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        owner.calls.decide(sent.id, allow: true)
+        try await waitUntil { runner.waiting == 1 }
+        // Inside its own folder: nothing to ask.
+        let inside = try await owner.calls.requestAccess(callId: sent.id, path: project.path, reason: "r")
+        XCTAssertEqual(inside.state, .already)
+        // A file elsewhere: its folder is asked for.
+        let request = try await owner.calls.requestAccess(callId: sent.id, path: other.appendingPathComponent("REPORT.md").path, reason: "the report is there")
+        XCTAssertEqual(request.state, .pending)
+        XCTAssertEqual(request.path, other.resolvingSymlinksInPath().path)
+        XCTAssertEqual(asked?.id, request.id)
+        XCTAssertEqual(owner.calls.pendingAccess.count, 1)
+        await owner.calls.decideAccess(request.id, .once)
+        XCTAssertTrue(owner.calls.pendingAccess.isEmpty)
+
+        // The first run ends; the conversation goes on with the folder.
+        runner.release("granted, continuing")
+        try await waitUntil { runner.received.count == 2 }
+        let next = try XCTUnwrap(runner.received.last)
+        XCTAssertTrue(next.resume)
+        XCTAssertTrue(next.continuesLog)
+        XCTAssertEqual(next.agent.extraFolders, [other.resolvingSymlinksInPath().path])
+        XCTAssertTrue(next.prompt.contains("granted access"))
+        XCTAssertEqual(owner.calls.incoming.first?.state, .running)
+        runner.release("the report says x")
+        try await waitUntil { caller.calls.outgoing.first?.report.state == .done }
+        XCTAssertEqual(caller.calls.outgoing.first?.report.text, "the report says x")
+        XCTAssertNil(owner.calls.agents.first?.extraFolders, "once is not for good")
+    }
+
+    func testAlwaysAddsTheFolderToTheAgent() async throws {
+        let runner = FakeTeamRunner()
+        let (owner, caller) = try await pairedPair(runner: runner)
+        let other = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let sent = try caller.calls.ask("backend@andrey", prompt: "q", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        owner.calls.decide(sent.id, allow: true)
+        try await waitUntil { runner.waiting == 1 }
+        let request = try await owner.calls.requestAccess(callId: sent.id, path: other.path, reason: "kb")
+        await owner.calls.decideAccess(request.id, .always)
+        XCTAssertEqual(owner.calls.agents.first { $0.name == "backend" }?.extraFolders, [other.resolvingSymlinksInPath().path])
+        // A denied or unknown request cannot be decided again.
+        let again = await owner.calls.decideAccess(request.id, .denied)
+        XCTAssertNil(again)
+        XCTAssertEqual(owner.calls.accessRequests.first?.state, .always)
+        do { _ = try await owner.calls.requestAccess(callId: UUID().uuidString, path: other.path, reason: "x"); XCTFail("accepted") } catch {}
+    }
+
+    func testGitRightsCannotBeGivenASubfolderEvenOnce() async throws {
+        let runner = FakeTeamRunner()
+        let (owner, caller) = try await pairedPair(runner: runner)
+        // The published agent reads git; a subfolder of another repository
+        // would open that whole repository through git show.
+        var agent = try XCTUnwrap(owner.calls.agents.first { $0.name == "backend" })
+        agent.access = .readGit
+        try await owner.calls.save(agent)
+        let repo = root.appendingPathComponent("other-repo"), sub = repo.appendingPathComponent("public")
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        let git = Process()
+        git.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        git.arguments = ["init", "-q", repo.path]
+        try git.run(); git.waitUntilExit()
+        let sent = try caller.calls.ask("backend@andrey", prompt: "q", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        owner.calls.decide(sent.id, allow: true)
+        try await waitUntil { runner.waiting == 1 }
+        do { _ = try await owner.calls.requestAccess(callId: sent.id, path: sub.path, reason: "x"); XCTFail("accepted") } catch {}
+        runner.release("done")
+    }
+
     func testClearHistoryKeepsOpenCalls() async throws {
         let (owner, caller) = try await pairedPair(runner: FakeTeamRunner())
         let first = try caller.calls.ask("backend@andrey", prompt: "one", threadId: nil, origin: nil)
@@ -540,6 +621,21 @@ final class TeamCallsTests: XCTestCase {
         XCTAssertFalse(args.contains("Bash(swift test)"), "commands are for the edit profile only")
         XCTAssertEqual(value(after: "--resume", in: args), "s1")
         XCTAssertFalse(args.contains("--session-id"))
+    }
+
+    func testRunsGetOnlyTheirOwnToolsServer() {
+        var agent = request(.read).agent
+        agent.extraFolders = ["/Users/me/kb"]
+        var req = TeamRunRequest(agent: agent, prompt: "hi", sessionId: "s1", resume: false, callerName: "Masha", callerProject: nil)
+        req.runToolsCallId = "11111111-2222-3333-4444-555555555555"
+        let args = ClaudeCodeRunner.arguments(for: req)
+        let config = try! XCTUnwrap(value(after: "--mcp-config", in: args))
+        XCTAssertTrue(config.contains("run-tools") && config.contains("11111111-2222-3333-4444-555555555555"))
+        let i = try! XCTUnwrap(args.firstIndex(of: "--mcp-config"))
+        XCTAssertTrue(args[i + 2].hasPrefix("--"), "a flag follows --mcp-config, which takes several values")
+        XCTAssertTrue(args.contains("--strict-mcp-config"))
+        XCTAssertTrue(args.contains("mcp__agentpad-run__request_folder_access"))
+        XCTAssertEqual(value(after: "--add-dir", in: args), "/Users/me/kb")
     }
 
     func testEditProfileAcceptsEditsAndListedCommands() {

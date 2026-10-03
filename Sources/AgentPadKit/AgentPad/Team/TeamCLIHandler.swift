@@ -97,6 +97,17 @@ enum TeamCLIHandler {
                 try await service.calls.save(agent)
                 let published = published(service)
                 extra = { $0.published = published }
+            case .access:
+                guard let callId = request.teamCall, let path = request.teamFolder else { return .failure("access needs a call and a path") }
+                let made = try await service.calls.requestAccess(callId: callId, path: path, reason: request.teamDescription ?? "")
+                extra = { $0.access = .init(id: made.id, state: made.state.rawValue, path: made.path) }
+            case .accessCheck:
+                guard let id = request.teamAgent,
+                      let found = await service.calls.accessStatus(id, wait: min(max(request.teamWaitSeconds ?? 0, 0), AgentPadHookKit.teamCheckRoundSeconds))
+                else { return .failure("no such access request") }
+                extra = { $0.access = .init(id: found.id, state: found.state.rawValue, path: found.path) }
+            case .watch:
+                return .failure("team watch runs in the CLI itself; update agentpad-cli")
             case .unpublish:
                 guard let name = request.teamAgent, let agent = service.calls.agents.first(where: { $0.name == name.lowercased() }) else {
                     return .failure("no published agent by that name")

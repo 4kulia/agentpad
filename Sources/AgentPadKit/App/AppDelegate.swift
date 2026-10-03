@@ -210,6 +210,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         AttentionCoordinator.shared.start()
         // AgentPad: team work — off unless the user turned it on.
         TeamUI.install()
+        TeamUI.openTab = { [weak self] cwd, command, title in
+            self?.cliController.handle(
+                AgentPadCLIRequest(verb: .open, cwd: cwd, command: command, title: title)
+            ) { response in
+                if !response.ok {
+                    Task { await TeamUI.showError("The tab could not be opened", TeamError.storage(response.error ?? "unknown")) }
+                }
+            }
+        }
         TeamWindows.showCallsTab = { [weak self] in
             guard let store = self?.activeStore else { return }
             if store.sidebarMode != .full { store.setSidebarMode(.full) }

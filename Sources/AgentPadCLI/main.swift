@@ -99,12 +99,17 @@ let arguments = Array(CommandLine.arguments.dropFirst())
 
 // AgentPad: `agentpad-cli mcp` — the team tools as an MCP server on stdio,
 // started by Claude Code sessions in AgentPad (TeamMCPServer.swift).
-if arguments == ["mcp"] {
+// AgentPad: `agentpad-cli run-tools <call-id>` — the same server for a
+// colleague's call running here: it may ask the owner for another folder.
+let runToolsCallId: String? = arguments.count == 2 && arguments[0] == "run-tools" && UUID(uuidString: arguments[1]) != nil
+    ? arguments[1].lowercased() : nil
+if arguments == ["mcp"] || runToolsCallId != nil {
     let socket = AgentPadHookKit.socketPath
     let out = FileHandle.standardOutput
     let server = AgentPadTeamMCPServer(
         cwd: FileManager.default.currentDirectoryPath,
         version: AgentPadCLIProtocol.version.description,
+        runCallId: runToolsCallId,
         send: { request, timeout in
             guard let line = request.encodedLine() else { return .failure(.init("internal error: request encoding failed")) }
             switch AgentPadCLITransport.roundTrip(line: line, socketPath: socket, timeout: timeout) {
@@ -167,6 +172,17 @@ case .team(var team):
     command = .team(team)
 default:
     command = parsed
+}
+
+// AgentPad: `team watch` reads the run's log on disk; the app is not asked.
+if case .team(let team) = command, team.action == .watch {
+    guard let id = team.call, let path = AgentPadTeamWatch.logPath(callId: id) else { fail("a call id is a UUID") }
+    setvbuf(stdout, nil, _IONBF, 0)
+    let session = AgentPadTeamWatch.follow(path: path) { print($0) }
+    if let session {
+        print("\nTo continue this conversation yourself: claude --resume \(AgentPadHookKit.plain(session))")
+    }
+    exit(0)
 }
 
 guard var request = AgentPadHookKit.cliRequest(for: command) else {

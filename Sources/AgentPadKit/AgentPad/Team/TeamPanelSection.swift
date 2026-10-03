@@ -17,7 +17,8 @@ struct TeamPanelSection: View {
     private var sent: [TeamCalls.Outgoing] { showsCalls ? calls.outgoing.filter { !$0.report.state.isFinal } : [] }
 
     var body: some View {
-        let needsYou = service.pendingPairings.count + waiting.count
+        let access = calls.pendingAccess
+        let needsYou = service.pendingPairings.count + waiting.count + access.count
         VStack(alignment: .leading, spacing: 0) {
             if needsYou > 0 {
                 SessionSectionLabel(title: "team · needs you", count: needsYou)
@@ -26,6 +27,9 @@ struct TeamPanelSection: View {
                 }
                 ForEach(waiting) { call in
                     incomingRow(call)
+                }
+                ForEach(access) { request in
+                    accessRow(request)
                 }
             }
             if !active.isEmpty || !sent.isEmpty {
@@ -123,6 +127,7 @@ struct TeamPanelSection: View {
                             Button("Decline") { calls.decide(call.id, allow: false) }
                         } else {
                             Button("Stop") { calls.stop(call.id) }
+                            Button("Watch") { TeamUI.watch(call) }
                         }
                         Spacer()
                     }
@@ -145,6 +150,41 @@ struct TeamPanelSection: View {
         if let project = call.origin?.project { parts.append("Sent from project \(project).") }
         if call.resume { parts.append("Continues an earlier conversation.") }
         return parts.joined(separator: " ")
+    }
+
+    // MARK: Folder requests
+
+    private func accessRow(_ request: TeamCalls.AccessRequest) -> some View {
+        let call = calls.incoming.first { $0.id == request.callId }
+        return VStack(alignment: .leading, spacing: 8) {
+            header(
+                key: "access-\(request.id)", icon: "folder.badge.questionmark",
+                title: "\(call?.agentName ?? "An agent") asks for a folder",
+                subtitle: request.path, status: "waiting", attention: true
+            )
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Working on \(call?.peerName ?? "a colleague")'s call. \(request.reason)")
+                    .font(Theme.display(11))
+                    .foregroundStyle(Theme.chromeMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(request.path)
+                    .font(Theme.mono(10))
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                HStack(spacing: 8) {
+                    Button("Allow Once") { Task { await TeamUI.decideAccess(request.id, .once) } }
+                    Button("Always") { Task { await TeamUI.decideAccess(request.id, .always) } }
+                        .help("Add this folder to the agent for good")
+                    Button("Deny") { Task { await TeamUI.decideAccess(request.id, .denied) } }
+                    Spacer()
+                }
+                .controlSize(.small)
+            }
+            .padding(.leading, 26)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, Theme.sidebarRowVerticalPadding)
     }
 
     // MARK: Calls this Mac sent

@@ -151,6 +151,14 @@ struct TeamCallsSidebar: View {
                         default:
                             EmptyView()
                         }
+                        if TeamUI.canWatch(call) {
+                            Button("Watch") { TeamUI.watch(call) }
+                                .help("Open a tab that shows what this agent does, live")
+                        }
+                        if call.state == .done {
+                            Button("Continue…") { TeamUI.continueYourself(call) }
+                                .help("Open this conversation in a tab and carry on with it yourself")
+                        }
                         Spacer()
                     }
                     .controlSize(.small)

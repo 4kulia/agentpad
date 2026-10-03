@@ -86,6 +86,17 @@ final class TeamCalls {
         let createdAt: Date
     }
 
+    /// A running call's agent asks for a folder outside its own (R-12).
+    struct AccessRequest: Identifiable, Equatable {
+        enum State: String { case pending, deciding, once, always, denied, already }
+        let id: String
+        let callId: String
+        let path: String
+        let reason: String
+        var state: State
+        let at: Date
+    }
+
     /// What `team agents` lists.
     struct CatalogItem: Equatable, Sendable {
         let address: String
@@ -157,6 +168,20 @@ final class TeamCalls {
     /// The running delivery per call, so a late-ending old one cannot
     /// unregister its successor.
     private var deliveryTokens: [String: UUID] = [:]
+    /// Folder requests of running calls, newest last; in memory only — they
+    /// end with their run.
+    private(set) var accessRequests: [AccessRequest] = []
+    /// Folders granted to a call that its next run will get, with the rights
+    /// the agent had when they were checked.
+    private var grants: [String: [String]] = [:]
+    private var grantAccess: [String: TeamAccessProfile] = [:]
+    private var continuations: [String: Int] = [:]
+    /// How many of a call's grants its runs already had.
+    private var grantsUsed: [String: Int] = [:]
+    static let maxContinuations = 3
+    /// Fires when an agent asks for a folder, for the notification.
+    var onAccessRequest: @MainActor (AccessRequest, Incoming) -> Void = { _, _ in }
+    var pendingAccess: [AccessRequest] { accessRequests.filter { $0.state == .pending } }
     /// Calls whose end is not yet on disk, to be told once it is.
     private var unannounced: Set<String> = []
     /// Bumped by `nudge`: deliveries waiting for their next retry go now.
@@ -376,8 +401,35 @@ final class TeamCalls {
            URL(fileURLWithPath: top).resolvingSymlinksInPath().path != URL(fileURLWithPath: agent.folder).resolvingSymlinksInPath().path {
             throw TeamError.storage("\(agent.folder) is inside the repository \(top): with git, publish the repository's top folder, or choose the Read rights")
         }
+        // More folders: absolute, existing, distinct; with git rights each
+        // is a repository's top folder too.
+        var extra: [String] = []
+        let stored = Set(agents.first { $0.id == agent.id }?.extraFolders ?? [])
+        for raw in agent.extraFolders ?? [] {
+            guard !raw.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            let path = try await Self.checkedFolder(raw, access: agent.access, allowFile: false)
+            // A folder given earlier was stored with its links resolved; if
+            // it leads elsewhere now, that is not the folder the owner gave.
+            if stored.contains(raw), path != raw {
+                throw TeamError.storage("\(raw) now leads to \(path); remove it, or add the folder you mean")
+            }
+            if path != agent.folder, !extra.contains(path) { extra.append(path) }
+        }
+        agent.extraFolders = extra.isEmpty ? nil : extra
         agent.remotes = await TeamGitRemote.remotes(of: agent.folder)
         return agent
+    }
+
+    /// Adds an already checked folder to the agent as it is now — no wait in
+    /// between, so a pause, new rules or lower rights saved meanwhile stay.
+    private func addFolder(_ path: String, to agentId: UUID) throws {
+        guard let i = agents.firstIndex(where: { $0.id == agentId }) else { throw TeamError.storage("the agent is gone") }
+        var next = agents
+        if !(next[i].extraFolders ?? []).contains(path), next[i].folder != path {
+            next[i].extraFolders = (next[i].extraFolders ?? []) + [path]
+        }
+        try storage.save(next, to: storage.agentsURL)
+        agents = next
     }
 
     /// Session agents whose conversation was deleted stop existing (the
@@ -593,10 +645,19 @@ final class TeamCalls {
             finish(at: i, .failed, detail: "The owner's Mac could not save the call, so it did not run.")
             return
         }
-        let request = TeamRunRequest(
-            agent: agent, prompt: call.prompt, sessionId: call.threadId, resume: call.resume,
-            callerName: call.peerName, callerProject: call.origin?.project
+        launch(call, agent: agent, prompt: call.prompt, resume: call.resume, continuing: false)
+    }
+
+    /// Starts a run of `call`: its first one, or a continuation after the
+    /// owner granted folders.
+    private func launch(_ call: Incoming, agent: TeamPublishedAgent, prompt: String, resume: Bool, continuing: Bool) {
+        var request = TeamRunRequest(
+            agent: agent, prompt: prompt, sessionId: call.threadId, resume: resume,
+            callerName: call.peerName, callerProject: call.origin?.project,
+            logURL: storage.runLogURL(callId: call.id)
         )
+        request.runToolsCallId = call.id
+        request.continuesLog = continuing
         let runner = self.runner
         let callId = call.id
         let onActivity: @Sendable (String) -> Void = { [weak self] tool in
@@ -625,6 +686,27 @@ final class TeamCalls {
         runAgents.removeValue(forKey: id)
         defer { pump() }
         guard let i = incoming.firstIndex(where: { $0.id == id }), incoming[i].state == .running else { return }
+        // Folders were granted during the run: the conversation goes on with
+        // them, as the agent was told, without a new Allow.
+        if case .success(let answer) = outcome, !answer.isError, let dirs = grants[id], dirs.count > grantsUsed[id, default: 0],
+           continuations[id, default: 0] < Self.maxContinuations,
+           var agent = agents.first(where: { $0.id == incoming[i].agentId }), agent.isOpen(to: incoming[i].peer),
+           // A folder checked under other rights is not given under these:
+           // with git now allowed, a subfolder would open its whole repository.
+           grantAccess[id] == agent.access {
+            continuations[id, default: 0] += 1
+            let fresh = Array(dirs.dropFirst(grantsUsed[id, default: 0]))
+            grantsUsed[id] = grants[id]?.count ?? 0
+            // Every folder granted during the call so far, not only the last.
+            agent.extraFolders = (agent.extraFolders ?? []) + dirs.filter { !(agent.extraFolders ?? []).contains($0) }
+            incoming[i].activity = nil
+            bump(id, durable: false)
+            let list = fresh.joined(separator: ", ")
+            launch(incoming[i], agent: agent,
+                   prompt: "The owner of this Mac granted access to: \(list). Continue with the colleague's request.",
+                   resume: true, continuing: true)
+            return
+        }
         switch outcome {
         case .success(var answer):
             let truncated = answer.text.utf8.count > Self.maxAnswerBytes
@@ -650,6 +732,17 @@ final class TeamCalls {
     }
 
     private func finish(at i: Int, _ state: TeamCallState, detail: String?) {
+        let id = incoming[i].id
+        if accessRequests.contains(where: { $0.callId == id && $0.state == .pending }) {
+            for j in accessRequests.indices where accessRequests[j].callId == id && accessRequests[j].state == .pending {
+                accessRequests[j].state = .denied
+            }
+            onPendingChange()
+        }
+        grants[id] = nil
+        grantAccess[id] = nil
+        grantsUsed[id] = nil
+        continuations[id] = nil
         incoming[i].state = state
         incoming[i].detail = detail
         incoming[i].activity = nil
@@ -691,10 +784,15 @@ final class TeamCalls {
         }
         if changed { onPendingChange() }
         let countBefore = incoming.count + outgoing.count
+        let incomingBefore = Set(incoming.map(\.id))
         incoming = Self.trimmed(incoming, now: now, finishedAt: \.finishedAt, start: \.receivedAt)
         outgoing = Self.trimmed(outgoing, now: now, finishedAt: \.finishedAt, start: \.createdAt)
         if incoming.count + outgoing.count != countBefore {
             let alive = Set(incoming.map(\.id) + outgoing.map(\.id))
+            // A call's run log goes with its record.
+            for id in incomingBefore where !alive.contains(id) {
+                try? FileManager.default.removeItem(at: storage.runLogURL(callId: id))
+            }
             versions = versions.filter { alive.contains($0.key) }
             scheduleSave()
         }
@@ -920,6 +1018,134 @@ final class TeamCalls {
             if update(call.id, { $0.report = Self.clean(report); $0.delivered = true }) { acknowledge(call.id) }
         }
         return outgoing.first { $0.id == call.id }
+    }
+
+    // MARK: Folder access (R-12)
+
+    /// A folder as the agent will get it: absolute, existing, its symlinks
+    /// resolved (so what the owner allowed cannot later point elsewhere),
+    /// a file's folder when `allowFile`; with git rights, a repository's top
+    /// folder, since git reads the whole repository from any folder in it.
+    /// Checked off the main actor, bounded in time: a path on a dead network
+    /// volume must not freeze the app.
+    static func checkedFolder(_ raw: String, access: TeamAccessProfile, allowFile: Bool) async throws -> String {
+        let expanded = (raw.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { throw TeamError.storage("\(raw) is not an absolute path") }
+        let probe: (String, Bool)? = (try? await teamDeadline(.seconds(3)) {
+            await Task.detached { () -> (String, Bool)? in
+                let url = URL(fileURLWithPath: expanded).standardizedFileURL.resolvingSymlinksInPath()
+                var isFolder: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isFolder) else { return nil }
+                return (url.path, isFolder.boolValue)
+            }.value
+        }) ?? nil
+        guard let (resolved, isFolder) = probe else { throw TeamError.storage("\(expanded) does not exist or does not answer") }
+        guard isFolder || allowFile else { throw TeamError.storage("\(resolved) is not a folder") }
+        let path = isFolder ? resolved : URL(fileURLWithPath: resolved).deletingLastPathComponent().path
+        if access != .read, let top = try await TeamGitRemote.topLevel(of: path),
+           URL(fileURLWithPath: top).resolvingSymlinksInPath().path != path {
+            throw TeamError.storage("\(path) is inside the repository \(top): with git rights, only a repository's top folder can be given")
+        }
+        return path
+    }
+
+    /// A running call's agent asks for `path`. Already reachable folders are
+    /// answered at once; otherwise the owner decides.
+    func requestAccess(callId: String, path raw: String, reason: String) async throws -> AccessRequest {
+        guard let call = incoming.first(where: { $0.id == callId.lowercased() }), call.state == .running,
+              let agent = agents.first(where: { $0.id == call.agentId })
+        else { throw TeamError.storage("no running call \(callId)") }
+        // Past the last continuation a grant could not take effect.
+        guard continuations[call.id, default: 0] < Self.maxContinuations else {
+            throw TeamError.storage("this call cannot be given more folders")
+        }
+        let path = try await Self.checkedFolder(raw, access: agent.access, allowFile: true)
+        guard incoming.first(where: { $0.id == call.id })?.state == .running else { throw TeamError.storage("the call ended") }
+        let reachable = [agent.folder] + (agent.extraFolders ?? []) + (grants[call.id] ?? [])
+        // Stored folders are already resolved: compared as strings, without
+        // touching the disk on the main actor.
+        let inside = reachable.contains { root in
+            path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+        }
+        let mine = accessRequests.filter { $0.callId == call.id }
+        guard mine.filter({ $0.state == .pending }).count < 3, mine.count < 10 else {
+            throw TeamError.storage("too many folder requests for one call")
+        }
+        let request = AccessRequest(
+            id: UUID().uuidString.lowercased(), callId: call.id, path: path,
+            reason: String(TeamInviteLink.sanitizedName(reason).prefix(300)),
+            state: inside ? .already : .pending, at: Date()
+        )
+        accessRequests.append(request)
+        bump(request.id, durable: false)
+        if !inside {
+            onAccessRequest(request, call)
+            onPendingChange()
+        }
+        return request
+    }
+
+    /// The owner's answer: once for this call, always for this agent, or no.
+    /// The folder is checked again first (it may have changed since it was
+    /// asked for); one that fails the check is not granted at all.
+    @discardableResult
+    func decideAccess(_ id: String, _ state: AccessRequest.State) async -> String? {
+        guard let i = accessRequests.firstIndex(where: { $0.id == id }), accessRequests[i].state == .pending,
+              [.once, .always, .denied].contains(state)
+        else { return nil }
+        let request = accessRequests[i]
+        guard state != .denied else {
+            accessRequests[i].state = .denied
+            bump(id, durable: false)
+            onPendingChange()
+            return nil
+        }
+        // No second answer while this one is being checked and saved.
+        accessRequests[i].state = .deciding
+        onPendingChange()
+        var problem: String?
+        var granted = false
+        var checkedUnder: TeamAccessProfile?
+        if let call = incoming.first(where: { $0.id == request.callId }),
+           let before = agents.first(where: { $0.id == call.agentId }) {
+            do {
+                let access = before.access
+                let path = try await Self.checkedFolder(request.path, access: access, allowFile: false)
+                guard path == request.path else { throw TeamError.storage("\(request.path) now leads elsewhere (\(path))") }
+                // Read again after the wait, and given only under the rights
+                // it was checked for.
+                guard let agent = agents.first(where: { $0.id == call.agentId }), agent.access == access else {
+                    throw TeamError.storage("the agent's rights changed meanwhile; ask again")
+                }
+                if state == .always { try addFolder(path, to: agent.id) }
+                checkedUnder = access
+                granted = true
+            } catch {
+                problem = (error as? LocalizedError)?.errorDescription ?? "The folder could not be given."
+            }
+        } else {
+            problem = "The call or its agent is gone."
+        }
+        guard let j = accessRequests.firstIndex(where: { $0.id == id }) else { return problem }
+        accessRequests[j].state = granted ? state : .denied
+        if granted, incoming.contains(where: { $0.id == request.callId && $0.state == .running }), let access = checkedUnder {
+            // All of a call's grants are checked under the same rights.
+            if let earlier = grantAccess[request.callId], earlier != access {
+                grants[request.callId] = []
+                grantsUsed[request.callId] = 0
+            }
+            grantAccess[request.callId] = access
+            grants[request.callId, default: []].append(request.path)
+        }
+        bump(id, durable: false)
+        onPendingChange()
+        return problem
+    }
+
+    func accessStatus(_ id: String, wait seconds: Int) async -> AccessRequest? {
+        guard let request = accessRequests.first(where: { $0.id == id }) else { return nil }
+        if request.state == .pending || request.state == .deciding { await waitForChange(id, seconds: seconds) }
+        return accessRequests.first { $0.id == id }
     }
 
     /// The owner may now let its record go (D-7). Sent only for an outcome

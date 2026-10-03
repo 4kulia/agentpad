@@ -76,6 +76,28 @@ final class TeamMCPServerTests: XCTestCase {
         XCTAssertEqual(tools.compactMap { $0["name"] as? String }, ["team_agents", "team_ask", "team_check", "team_cancel"])
     }
 
+    func testRunToolsOfferOnlyFolderAccess() throws {
+        let app = FakeApp(), out = Output()
+        app.answer = { request in
+            var response = AgentPadCLIResponse(ok: true)
+            var team = AgentPadCLITeamInfo(status: "on", detail: nil, name: "Me", id: "k", colleagues: [], pending: [])
+            team.access = .init(id: "a1", state: request.teamAction == "access" ? "pending" : "once", path: "/kb")
+            response.team = team
+            return response
+        }
+        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", runCallId: "c1", send: { request, _ in .success(app.send(request)) }, write: { out.append($0) })
+        call(server, id: 1, method: "initialize")
+        call(server, id: 2, method: "tools/list")
+        let tools = ((try wait(out, for: 2)["result"] as? [String: Any])?["tools"] as? [[String: Any]])?.compactMap { $0["name"] as? String }
+        XCTAssertEqual(tools, ["request_folder_access"])
+        call(server, id: 3, method: "tools/call", params: ["name": "team_ask", "arguments": ["agent": "a@b", "prompt": "x"]])
+        XCTAssertEqual(((try wait(out, for: 3))["result"] as? [String: Any])?["isError"] as? Bool, true, "a call's agent cannot call colleagues")
+        call(server, id: 4, method: "tools/call", params: ["name": "request_folder_access", "arguments": ["path": "/kb", "reason": "notes"]])
+        XCTAssertTrue(text(try wait(out, for: 4)).contains("granted"))
+        XCTAssertEqual(app.requests.first?.teamCall, "c1")
+        XCTAssertEqual(app.requests.first?.teamFolder, "/kb")
+    }
+
     func testAgentsAsksFromTheSessionsFolder() throws {
         let app = FakeApp(), out = Output()
         app.answer = { _ in self.info(agents: [.init(address: "backend@masha", colleague: "Masha", description: "API", access: "read", sameProject: true, kind: "session", session: "Fix auth")]) }

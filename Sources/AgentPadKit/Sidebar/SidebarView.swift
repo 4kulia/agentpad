@@ -481,7 +481,8 @@ struct SidebarView: View {
             // AgentPad: team calls, with a dot while any waits for you.
             segment(.team, systemName: "person.2", help: "Team")
                 .overlay(alignment: .topTrailing) {
-                    if !TeamService.shared.calls.awaitingDecision.isEmpty || !TeamService.shared.pendingPairings.isEmpty {
+                    if !TeamService.shared.calls.awaitingDecision.isEmpty || !TeamService.shared.pendingPairings.isEmpty
+                        || !TeamService.shared.calls.pendingAccess.isEmpty {
                         Circle().fill(agentStateWordColor(.attention)).frame(width: 6, height: 6).offset(x: -3, y: 3)
                     }
                 }

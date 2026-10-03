@@ -73,6 +73,8 @@ struct TeamPublishSessionView: View {
     @State private var everyone: Bool
     @State private var chosen: Set<String>
     @State private var folder: String?
+    @State private var extraText = ""
+    @State private var commandsText = ""
     @State private var error: String?
     @State private var saving = false
 
@@ -86,6 +88,8 @@ struct TeamPublishSessionView: View {
         _sessionName = State(initialValue: existing?.name ?? (suggested.isEmpty ? "session-\(sessionId.prefix(6).lowercased())" : suggested))
         _description = State(initialValue: existing?.description ?? title)
         _access = State(initialValue: existing?.access ?? .read)
+        _extraText = State(initialValue: (existing?.extraFolders ?? []).joined(separator: "\n"))
+        _commandsText = State(initialValue: (existing?.allowedCommands ?? []).joined(separator: "\n"))
         _everyone = State(initialValue: audience == nil)
         _chosen = State(initialValue: Set(audience ?? []))
     }
@@ -119,6 +123,10 @@ struct TeamPublishSessionView: View {
                     .font(Theme.display(10.5))
                     .foregroundStyle(Theme.chromeMuted)
                     .fixedSize(horizontal: false, vertical: true)
+                if access == .edit {
+                    TextField("Allowed commands, one per line", text: $commandsText, prompt: Text("git commit\ncodex exec"), axis: .vertical)
+                        .lineLimit(2...5)
+                }
                 Toggle("Every colleague", isOn: $everyone)
                 if !everyone {
                     ForEach(service.contacts) { contact in
@@ -127,6 +135,11 @@ struct TeamPublishSessionView: View {
                             set: { if $0 { chosen.insert(contact.id) } else { chosen.remove(contact.id) } }
                         ))
                     }
+                }
+                HStack(alignment: .top) {
+                    TextField("More folders, one per line", text: $extraText, prompt: Text("e.g. a second checkout"), axis: .vertical)
+                        .lineLimit(1...4)
+                    Button("Add…") { if let path = TeamUI.chooseFolder() { extraText += (extraText.isEmpty ? "" : "\n") + path } }
                 }
                 LabeledContent("Folder") {
                     Text(folder ?? "…")
@@ -181,6 +194,10 @@ struct TeamPublishSessionView: View {
         // Fixed now: the form may change while the save waits.
         let mode = self.mode, access = self.access
         let sessionName = self.sessionName, folderName = self.folderName
+        let extra = extraText.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let commands = access == .edit
+            ? commandsText.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            : []
         let audience: [String]? = everyone ? nil : Array(chosen)
         if audience?.isEmpty == true {
             error = "Choose at least one colleague, or Every colleague."
@@ -202,6 +219,8 @@ struct TeamPublishSessionView: View {
             agent.audience = audience
             agent.sessionId = sessionId
             agent.sessionTitle = title
+            agent.extraFolders = extra
+            agent.allowedCommands = commands
             agent.enabled = true
             batch.append(agent)
         }
@@ -214,6 +233,8 @@ struct TeamPublishSessionView: View {
             agent.folder = folder
             agent.access = access
             agent.audience = audience
+            agent.extraFolders = extra
+            agent.allowedCommands = commands
             agent.enabled = true
             batch.append(agent)
         }

@@ -87,6 +87,15 @@ public struct AgentPadCLITeamInfo: Codable, Equatable, Sendable {
     /// This Mac's own join waiting for an answer, with the code to compare.
     public var outgoing: Pending?
     public var agents: [Agent]?
+    /// A folder access request of a running call (run tools).
+    public struct Access: Codable, Equatable, Sendable {
+        public var id: String
+        /// pending, once, always, denied, already
+        public var state: String
+        public var path: String
+        public init(id: String, state: String, path: String) { self.id = id; self.state = state; self.path = path }
+    }
+    public var access: Access?
     public var published: [Published]?
     public var call: Call?
 
@@ -99,7 +108,9 @@ public struct AgentPadCLITeamInfo: Codable, Equatable, Sendable {
 /// The `team` subcommands.
 public enum AgentPadCLITeamAction: String, Sendable, CaseIterable {
     case status, on, off, invite, join, approve, deny, remove
-    case agents, ask, check, cancel, publish, unpublish
+    case agents, ask, check, cancel, publish, unpublish, watch
+    /// Internal, for the run tools of a colleague's call (not on the command line).
+    case access, accessCheck = "access-check"
 }
 
 /// `team <action>` with its values.
@@ -163,6 +174,7 @@ extension AgentPadHookKit {
            agentpad-cli team cancel <call-id> [--json]
            agentpad-cli team publish <name> --folder <dir> --description "<what to ask it>" [--access read|read-git|edit]
            agentpad-cli team unpublish <name>
+           agentpad-cli team watch <call-id>      (a call to this Mac's agents, live)
     """
 
     static func parseTeamCommand(_ args: [String]) -> Result<AgentPadCLICommand, AgentPadCLIParseFailure> {
@@ -214,10 +226,13 @@ extension AgentPadHookKit {
             guard let minutes = Int(wait), minutes >= 0, minutes <= 24 * 60 else { return failure("--wait takes minutes, 0 to 1440.") }
             command.waitMinutes = minutes
         }
+        if action == .access || action == .accessCheck {
+            return failure("\(action.rawValue) is used by AgentPad itself.")
+        }
         let expected: Int
         switch action {
         case .ask: expected = 2
-        case .check, .cancel, .publish, .unpublish: expected = 1
+        case .check, .cancel, .publish, .unpublish, .watch: expected = 1
         default: expected = 0
         }
         guard positional.count == expected else {
@@ -231,7 +246,7 @@ extension AgentPadHookKit {
         case .ask:
             command.agent = positional[0]
             command.prompt = positional[1]
-        case .check, .cancel:
+        case .check, .cancel, .watch:
             command.call = positional[0]
         case .publish:
             command.agent = positional[0]

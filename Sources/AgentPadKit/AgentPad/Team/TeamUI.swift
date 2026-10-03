@@ -24,6 +24,14 @@ enum TeamUI {
         // Colleagues' calls wait there too; when AgentPad is in the
         // background a notification says who calls which agent (R-1).
         service.calls.onPendingChange = { AttentionCoordinator.shared.refreshBadge() }
+        service.calls.onAccessRequest = { request, call in
+            NSApp.requestUserAttention(.criticalRequest)
+            guard !NSApp.isActive, AgentPadSettingsModel.shared.notificationsEnabled else { return }
+            AttentionCoordinator.shared.notificationManager?.postTeam(
+                title: "\(call.agentName) asks for a folder",
+                body: "\(request.path) — for \(call.peerName)'s call"
+            )
+        }
         service.calls.onIncomingCall = { call in
             NSApp.requestUserAttention(.criticalRequest)
             guard !NSApp.isActive, AgentPadSettingsModel.shared.notificationsEnabled else { return }
@@ -143,6 +151,53 @@ enum TeamUI {
         } catch {
             await showError("Not all was unpublished", error)
         }
+    }
+
+    static func decideAccess(_ id: String, _ state: TeamCalls.AccessRequest.State) async {
+        if let problem = await service.calls.decideAccess(id, state) {
+            await showError("The folder was not given", TeamError.storage(problem))
+        }
+    }
+
+    // MARK: Watching a call
+
+    /// Opens a tab: (working directory, shell command, title).
+    static var openTab: @MainActor (String, String, String) -> Void = { _, _, _ in }
+
+    /// A call that ran or will run has a log to watch.
+    static func canWatch(_ call: TeamCalls.Incoming) -> Bool {
+        switch call.state {
+        case .queued, .running: true
+        case .done, .failed, .cancelled: FileManager.default.fileExists(atPath: TeamStorage.standard.runLogURL(callId: call.id).path)
+        default: false
+        }
+    }
+
+    /// A tab with `agentpad-cli team watch`: what the agent does, live.
+    static func watch(_ call: TeamCalls.Incoming) {
+        let folder = service.calls.agents.first { $0.id == call.agentId }?.folder ?? NSHomeDirectory()
+        let cli = shellQuoted(AgentPadShellIntegration.agentPadCLIBinaryPath)
+        openTab(folder, "\(cli) team watch \(call.id)", "Team · \(call.peerName) → \(call.agentName)")
+    }
+
+    /// The owner carries on with the call's conversation in a normal tab.
+    static func continueYourself(_ call: TeamCalls.Incoming) {
+        guard UUID(uuidString: call.threadId) != nil,
+              let folder = service.calls.agents.first(where: { $0.id == call.agentId })?.folder
+        else { return }
+        openTab(folder, "claude --resume \(call.threadId)", "Team · \(call.peerName) → \(call.agentName) · yours")
+    }
+
+    static func chooseFolder() -> String? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        return panel.runModal() == .OK ? panel.url?.path : nil
+    }
+
+    private static func shellQuoted(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     static func showAgents() {

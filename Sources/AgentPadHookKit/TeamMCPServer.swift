@@ -55,7 +55,12 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
     /// must not hold the reading of stdin, where cancels and EOF arrive.
     private let output = DispatchQueue(label: "agentpad.team.mcp.out")
 
-    public init(cwd: String, version: String, send: @escaping Send, write: @escaping @Sendable (Data) -> Void) {
+    /// Nil: the team tools of a user's session. A call id: the tools of a
+    /// colleague's call running on this Mac — only `request_folder_access`.
+    private let runCallId: String?
+
+    public init(cwd: String, version: String, runCallId: String? = nil, send: @escaping Send, write: @escaping @Sendable (Data) -> Void) {
+        self.runCallId = runCallId
         self.cwd = cwd
         self.version = version
         self.send = send
@@ -89,18 +94,18 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
                 "protocolVersion": asked.flatMap { Self.supportedVersions.contains($0) ? $0 : nil } ?? Self.supportedVersions[0],
                 "capabilities": ["tools": ["listChanged": false]],
                 "serverInfo": ["name": Self.serverName, "version": version],
-                "instructions": Self.instructions,
+                "instructions": runCallId == nil ? Self.instructions : Self.runInstructions,
             ])
         case "ping":
             reply(id: id, result: [:])
         case "tools/list":
             guard lock.withLock({ initialized }) else { return reply(id: id, error: (-32002, "not initialized")) }
-            reply(id: id, result: ["tools": Self.tools])
+            reply(id: id, result: ["tools": runCallId == nil ? Self.tools : Self.runTools])
         case "tools/call":
             guard lock.withLock({ initialized }) else { return reply(id: id, error: (-32002, "not initialized")) }
             guard let key = Self.key(id) else { return reply(id: NSNull(), error: (-32600, "invalid request id")) }
             let name = params["name"] as? String ?? ""
-            let waits = name == "team_ask" || name == "team_check"
+            let waits = name == "team_ask" || name == "team_check" || name == "request_folder_access"
             let admitted: Bool = lock.withLock {
                 guard !active.contains(key) else { return false }
                 if waits {
@@ -217,7 +222,68 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
         ],
     ] }
 
+    static let runInstructions = """
+    You run on this Mac for a colleague's call, inside the project folders the owner allowed. \
+    If the request needs a folder outside them, call request_folder_access with its path and why.
+    """
+
+    static var runTools: [[String: Any]] { [[
+        "name": "request_folder_access",
+        "description": "Ask this Mac's owner for access to a folder outside your allowed folders. Waits for the owner's decision. If access is granted, end your turn at once with one short line saying what you will do next: AgentPad continues this conversation right away, with the folder available.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "path": ["type": "string", "description": "Absolute path of the folder (or of a file in it)."],
+                "reason": ["type": "string", "description": "Why the request needs it, in one or two sentences for the owner."],
+            ],
+            "required": ["path", "reason"],
+            "additionalProperties": false,
+        ],
+    ]] }
+
+    /// Asks the app, then waits in short rounds for the owner (up to 15 min).
+    private func requestFolderAccess(callId: String, path: String, reason: String, requestKey: String) -> (String, Bool) {
+        var request = AgentPadCLIRequest(verb: .team)
+        request.teamAction = AgentPadCLITeamAction.access.rawValue
+        request.teamCall = callId
+        request.teamFolder = path
+        request.teamDescription = reason
+        guard case .success(let first) = send(request, 15), first.ok, var access = first.team?.access else {
+            return ("The access request could not be made.", true)
+        }
+        let deadline = Date().addingTimeInterval(15 * 60)
+        // "deciding": the owner answered and the folder is being checked.
+        while access.state == "pending" || access.state == "deciding", Date() < deadline, !isCancelled(requestKey) {
+            var check = AgentPadCLIRequest(verb: .team)
+            check.teamAction = AgentPadCLITeamAction.accessCheck.rawValue
+            check.teamAgent = access.id
+            check.teamWaitSeconds = AgentPadHookKit.teamCheckRoundSeconds
+            guard case .success(let next) = send(check, TimeInterval(AgentPadHookKit.teamCheckRoundSeconds + 20)), next.ok,
+                  let updated = next.team?.access
+            else { return ("Lost the owner's decision; assume access was not granted.", true) }
+            access = updated
+        }
+        switch access.state {
+        case "once", "always":
+            return ("Access to \(access.path) is granted. End your turn now with one short line; AgentPad continues this conversation with the folder available.", false)
+        case "already":
+            return ("\(access.path) is already within your allowed folders.", false)
+        case "denied":
+            return ("The owner declined access to \(access.path). Answer without it, and say what you could not do.", true)
+        default:
+            return ("The owner did not decide in time; access to \(access.path) was not granted.", true)
+        }
+    }
+
     func callTool(_ name: String, arguments: [String: Any], requestKey: String, progressToken: Any?) -> (String, Bool) {
+        if let runCallId {
+            guard name == "request_folder_access" else { return ("Unknown tool \(name).", true) }
+            guard let path = arguments["path"] as? String, !path.isEmpty,
+                  let reason = arguments["reason"] as? String,
+                  arguments.keys.allSatisfy({ ["path", "reason"].contains($0) })
+            else { return ("request_folder_access needs path and reason.", true) }
+            return requestFolderAccess(callId: runCallId, path: path, reason: String(reason.prefix(1000)), requestKey: requestKey)
+        }
         let allowed: Set<String>
         switch name {
         case "team_agents": allowed = []
