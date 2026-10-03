@@ -61,6 +61,9 @@ cp .build/release/agentpad-cli "${APP}/Contents/MacOS/agentpad-cli"
 # (= Contents/Resources/), so the resource bundle has to live there or
 # the running .app will silently fall back to .build/release/ on disk.
 cp -R .build/release/AgentPad_AgentPadKit.bundle "${APP}/Contents/Resources/"
+# AgentPad: the MIT license and notices (kooky's copyright among them) travel
+# with every copy of the app.
+cp LICENSE NOTICE.md "${APP}/Contents/Resources/"
 # AgentPad: Sparkle (in-app updates). SwiftPM leaves the binary framework next
 # to the products; the app finds it through the @executable_path/../Frameworks
 # rpath set in Package.swift.
@@ -208,6 +211,10 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     <string>GI91mksQoiDK94V9mzUTevEqkXEKJMdT0j5PCVa9HOw=</string>
     <key>SUEnableAutomaticChecks</key>
     <true/>
+    <!-- AgentPad: look for a new version every 6 hours (Sparkle's default
+         is daily); a found one is offered with its notes and Install. -->
+    <key>SUScheduledCheckInterval</key>
+    <integer>21600</integer>
     <key>LSMinimumSystemVersion</key>
     <string>14.5</string>
     <key>NSHighResolutionCapable</key>

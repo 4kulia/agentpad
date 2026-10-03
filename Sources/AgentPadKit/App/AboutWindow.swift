@@ -45,18 +45,6 @@ struct AboutView: View {
             ))
                 .font(Theme.mono(9))
                 .foregroundStyle(Theme.chromeFaint)
-            // AgentPad: credit for the project AgentPad is forked from.
-            HStack(spacing: 0) {
-                Text(String(localized: "Based on ", bundle: .agentPadResources))
-                    .font(Theme.mono(9))
-                    .foregroundStyle(Theme.chromeFaint)
-                aboutLink(
-                    "\(AgentPadApp.upstreamName) by \(AgentPadApp.upstreamAuthor)",
-                    url: AgentPadApp.upstreamURL,
-                    font: Theme.mono(9)
-                )
-            }
-            .padding(.top, 4)
         }
         .padding(.horizontal, 36)
         .padding(.top, 44)

@@ -20,11 +20,14 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
 
     public static let serverName = "agentpad-team"
     /// How long `team_ask` waits before handing back a call id (C-6).
-    public static let askWaitMinutes = 30
+    /// A colleague may be away for days. In Claude Code the wait does not
+    /// hold the session: after two minutes the call moves to the background
+    /// and its answer arrives as a notification when it comes.
+    public static let askWaitMinutes = 7 * 24 * 60 + 4 * 60
     public static let maxCheckWaitMinutes = 30
     /// Tools that wait (team_ask, team_check) and quick ones (team_agents,
     /// team_cancel) are counted apart, so four long waits never block a cancel.
-    static let maxWaitingCalls = 4
+    static let maxWaitingCalls = 16
     static let maxQuickCalls = 4
     /// Versions without JSON-RPC batches: 2025-03-26 requires them, and this
     /// server takes one message per line.
@@ -184,7 +187,7 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
         ],
         [
             "name": "team_ask",
-            "description": "Ask a colleague's agent a question or give it a task. It runs on the colleague's Mac in their project after they allow it, and its answer comes back here. Waits up to \(askWaitMinutes) minutes; if there is no answer by then, returns a call id for team_check. Pass thread from an earlier answer to continue that conversation.",
+            "description": "Ask a colleague's agent a question or give it a task. It runs on the colleague's Mac in their project after they allow it, which can take minutes or days. The call keeps waiting for the answer; in Claude Code's main session it moves to the background after two minutes, so carry on or end your turn and the answer arrives when it comes. If the session closes first, fetch the answer later with team_check. Pass thread from an earlier answer to continue that conversation.",
             "inputSchema": [
                 "type": "object",
                 "properties": [

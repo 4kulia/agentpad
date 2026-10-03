@@ -114,7 +114,8 @@ final class TeamCalls {
     static let maxRunningPerMac = 2
     static let maxCallsPerHour = 20
     static let maxUndecidedPerPeer = 5
-    static let defaultDeliveryWindow: TimeInterval = 24 * 60 * 60
+    /// A colleague may be away for days: a call waits a week to be delivered.
+    static let defaultDeliveryWindow: TimeInterval = 7 * 24 * 60 * 60
     /// Finished calls are kept as long as their caller may still come back
     /// for the answer, and to recognize a start delivered again (D-5).
     /// Finished calls stay in the history this long (J-2) — longer than any
@@ -969,8 +970,11 @@ final class TeamCalls {
     @discardableResult
     private func update(_ id: String, _ change: (inout Outgoing) -> Void) -> Bool {
         guard let i = outgoing.firstIndex(where: { $0.id == id }) else { return false }
+        let unchanged = outgoing[i]
         let before = (outgoing[i].report, outgoing[i].delivered, outgoing[i].hidden)
         change(&outgoing[i])
+        // A poll that brought nothing new writes nothing.
+        if outgoing[i] == unchanged { return true }
         if outgoing[i].report.state.isFinal, outgoing[i].finishedAt == nil { outgoing[i].finishedAt = Date() }
         // Anything the owner reported is written at once; a note can wait.
         let after = (outgoing[i].report, outgoing[i].delivered, outgoing[i].hidden)

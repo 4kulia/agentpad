@@ -540,7 +540,11 @@ enum AgentPadShellIntegration {
 
     static func writeTeamMCPConfig() {
         writeJSON(at: teamMCPConfigPath, object: ["mcpServers": [
-            "agentpad-team": ["type": "stdio", "command": agentPadCLIBinaryPath, "args": ["mcp"]],
+            // Eight days per tool call, above team_ask's own wait (a week and
+            // four hours), so the call ends with its answer or its call id,
+            // never with Claude's timeout. After two minutes Claude Code moves
+            // the call to the background and the answer arrives on its own.
+            "agentpad-team": ["type": "stdio", "command": agentPadCLIBinaryPath, "args": ["mcp"], "timeout": 8 * 24 * 60 * 60 * 1000],
         ]])
     }
 

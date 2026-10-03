@@ -343,7 +343,6 @@
 "Version %@" = "版本 %@";
 "A minimal modern terminal for AI coding" = "为 AI 编程打造的简洁现代终端";
 "© %@ %@ · MIT License" = "© %@ %@ · MIT 许可证";
-"Based on " = "基于 ";
 "All your coding-agent sessions in one window." = "所有编程智能体会话，尽在一个窗口。";
 "About %@" = "关于 %@";
 
