@@ -7,6 +7,11 @@ import XCTest
 /// `PersistenceTests`.
 @MainActor
 final class WindowFramePersistenceTests: XCTestCase {
+    private var teamScope: TeamServiceTestScope!
+
+    override func setUp() async throws { teamScope = TeamServiceTestScope() }
+    override func tearDown() async throws { teamScope.close(); teamScope = nil }
+
     private let main = NSRect(x: 0, y: 0, width: 1512, height: 950)
     private let external = NSRect(x: 1512, y: 0, width: 2560, height: 1415)
     private let minSize = NSSize(width: 600, height: 300)

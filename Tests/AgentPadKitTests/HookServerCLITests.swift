@@ -67,7 +67,7 @@ final class HookServerCLITests: XCTestCase {
     }
 
     func testCLIRequestGetsOneResponseLine() throws {
-        startServer(onCLIRequest: { request, _, completion in
+        startServer(onCLIRequest: { request, _, _, completion in
             XCTAssertEqual(request.verb, "status")
             completion(AgentPadCLIResponse(ok: true, appVersion: "test-1.0"))
         })
@@ -79,9 +79,12 @@ final class HookServerCLITests: XCTestCase {
 
     func testShellCommandTravelsOverTheSocketInsteadOfThePTY() throws {
         let engine = TestEngine()
-        engine.foregroundPid = 123
+        // AgentPad: the shell is this process — the app checks the caller is the
+        // shell it names or runs under it (Y4).
+        let shell = getpid()
+        engine.foregroundPid = shell
         let session = Session(engine: engine, currentDirectory: URL(fileURLWithPath: "/tmp"), agent: .terminal)
-        session.consumeShellControlTitle("agentpad-shell-control:available:123")
+        session.consumeShellControlTitle("agentpad-shell-control:available:\(shell)")
         startServer(onCLIRequest: nil)
         server?.onShellCommandRequest = { request in
             guard request.surface == session.id else { return nil }
@@ -89,10 +92,10 @@ final class HookServerCLITests: XCTestCase {
         }
         XCTAssertTrue(session.runShellCommand("git switch '中文'"))
         engine.sendInput("X")
-        let wrongSession = AgentPadShellCommandRequest(surface: UUID(), shellPID: 123)
+        let wrongSession = AgentPadShellCommandRequest(surface: UUID(), shellPID: shell)
         let wrongReply = try XCTUnwrap(roundTrip(XCTUnwrap(AgentPadCLIProtocol.encodeLine(wrongSession)))).get()
         XCTAssertNil(AgentPadCLIProtocol.decodeLine(AgentPadShellCommandResponse.self, from: wrongReply)?.command)
-        let line = try XCTUnwrap(AgentPadCLIProtocol.encodeLine(AgentPadShellCommandRequest(surface: session.id, shellPID: 123)))
+        let line = try XCTUnwrap(AgentPadCLIProtocol.encodeLine(AgentPadShellCommandRequest(surface: session.id, shellPID: shell)))
         let reply = try XCTUnwrap(roundTrip(line)).get()
         XCTAssertEqual(AgentPadCLIProtocol.decodeLine(AgentPadShellCommandResponse.self, from: reply)?.command, "git switch '中文'")
         let duplicate = try XCTUnwrap(roundTrip(line)).get()
@@ -116,7 +119,7 @@ final class HookServerCLITests: XCTestCase {
         // 4 KiB is the server's per-read buffer; a long `open -e` command
         // must cross it intact via the read-to-newline loop.
         let command = String(repeating: "x", count: 8_000)
-        startServer(onCLIRequest: { request, _, completion in
+        startServer(onCLIRequest: { request, _, _, completion in
             completion(AgentPadCLIResponse(ok: true, note: "len:\(request.command?.count ?? -1)"))
         })
         let line = try XCTUnwrap(AgentPadCLIRequest(verb: .open, cwd: "/tmp", command: command).encodedLine())
@@ -126,7 +129,7 @@ final class HookServerCLITests: XCTestCase {
     }
 
     func testMalformedCLILineIsAnsweredNotDropped() throws {
-        startServer(onCLIRequest: { _, _, completion in completion(AgentPadCLIResponse(ok: true)) })
+        startServer(onCLIRequest: { _, _, _, completion in completion(AgentPadCLIResponse(ok: true)) })
         let line = Data("{\"kind\":\"cli\",\"verb\":42}\n".utf8)
         let response = try decodeReply(roundTrip(line))
         XCTAssertFalse(response.ok)
@@ -137,7 +140,7 @@ final class HookServerCLITests: XCTestCase {
         // A breaking v2 is exactly what fails the typed decode — the
         // version peek must answer "update AgentPad" before decode gets a
         // chance to call it malformed.
-        startServer(onCLIRequest: { _, _, completion in completion(AgentPadCLIResponse(ok: true)) })
+        startServer(onCLIRequest: { _, _, _, completion in completion(AgentPadCLIResponse(ok: true)) })
         let line = Data("{\"kind\":\"cli\",\"protocolVersion\":99,\"verb\":42}\n".utf8)
         let response = try decodeReply(roundTrip(line))
         XCTAssertFalse(response.ok)
@@ -150,7 +153,7 @@ final class HookServerCLITests: XCTestCase {
         // server truncates at the request cap and must still answer with
         // the real reason, not hang up (which the CLI would misreport as
         // "AgentPad may be older than this agentpad-cli").
-        startServer(onCLIRequest: { _, _, completion in completion(AgentPadCLIResponse(ok: true)) })
+        startServer(onCLIRequest: { _, _, _, completion in completion(AgentPadCLIResponse(ok: true)) })
         var padded = Data("{\"kind\":\"cli\",\"pad\":\"".utf8)
         padded.append(Data(repeating: 0x61, count: AgentPadCLIProtocol.maxRequestLineBytes))
         let line = padded
@@ -175,7 +178,7 @@ final class HookServerCLITests: XCTestCase {
         // reaches the handler and gets NO reply (the server closes without
         // writing, which the transport reports as closedWithoutReply).
         let received = expectation(description: "hook message delivered")
-        startServer(onCLIRequest: { _, _, completion in completion(AgentPadCLIResponse(ok: true)) }) { message in
+        startServer(onCLIRequest: { _, _, _, completion in completion(AgentPadCLIResponse(ok: true)) }) { message in
             if case .agent(let agent, let event, let sessionId, _) = message {
                 XCTAssertEqual(agent.id, "claude-code")
                 XCTAssertEqual(event, .running)
@@ -191,7 +194,9 @@ final class HookServerCLITests: XCTestCase {
         var line = try JSONSerialization.data(withJSONObject: payload)
         line.append(0x0A)
         let reply = try XCTUnwrap(roundTrip(line, timeout: 3))
-        XCTAssertEqual(reply, .failure(.closedWithoutReply))
+        // AgentPad: a hook gets a bare acknowledgement (one newline, no
+        // response line) the moment its sender is placed (review C2-20).
+        XCTAssertEqual(reply, .success(Data()))
         wait(for: [received], timeout: 2)
     }
 
@@ -263,7 +268,7 @@ final class HookServerCLITests: XCTestCase {
     func testResponseToAClientThatLeftMidRequestDoesNotKillTheProcess() throws {
         let pendingBox = PendingBox()
         let received = expectation(description: "server got the request")
-        startServer(onCLIRequest: { _, _, completion in
+        startServer(onCLIRequest: { _, _, _, completion in
             guard !pendingBox.captured else {
                 completion(AgentPadCLIResponse(ok: true, appVersion: "test"))
                 return
@@ -314,7 +319,7 @@ final class HookServerCLITests: XCTestCase {
     /// runs a command whose invoker was told it failed, and may have retried.
     func testRequestFromAClientThatLeftIsNeverDispatched() throws {
         let box = PendingBox()   // `captured` doubles as "was it dispatched"
-        startServer(onCLIRequest: { _, _, completion in
+        startServer(onCLIRequest: { _, _, _, completion in
             box.captured = true
             completion(AgentPadCLIResponse(ok: true, appVersion: "test"))
         })

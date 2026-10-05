@@ -370,6 +370,8 @@ final class WorkspaceStore {
     /// that returns nil so unit tests stay independent of the developer's
     /// real `~/.agentpad/settings.json`.
     private let optionsProvider: @MainActor (String) -> String?
+    var conversationVisibility: () -> ChannelConversationFilter = { .current() }
+    var claudeProjectsRoot: URL
     /// Reads `AgentPadSettingsModel.shared.resumeConversations` at spawn time;
     /// tests inject a static value (typically `true`) for the same reason
     /// as `optionsProvider`.
@@ -451,6 +453,8 @@ final class WorkspaceStore {
         /// Captured conversation id so `⌘⇧T` resumes the agent session
         /// the user just closed (subject to `resumeConversations` setting).
         let conversationId: String?
+        // AgentPad: a closed channel tab comes back a channel tab; no title kept.
+        var channel: ChannelRef? = nil
     }
 
     /// LIFO stack of recently-closed tabs for ⌘⇧T (reopen). Capped at
@@ -505,7 +509,8 @@ final class WorkspaceStore {
         peerStores: @escaping @MainActor () -> [WorkspaceStore] = { [] },
         moveToNewWindow: @escaping @MainActor (UUID) -> Void = { _ in },
         onSessionAlert: @escaping @MainActor (UUID, SessionAlertKind) -> Void = { _, _ in },
-        noteRecentFolder: @escaping @MainActor (URL) -> Void = { _ in }
+        noteRecentFolder: @escaping @MainActor (URL) -> Void = { _ in },
+        claudeProjectsRoot: URL = TeamSessionFiles.root
     ) {
         self.persistence = persistence
         self.engineFactory = engineFactory
@@ -515,6 +520,7 @@ final class WorkspaceStore {
         self.moveToNewWindow = moveToNewWindow
         self.onSessionAlert = onSessionAlert
         self.noteRecentFolder = noteRecentFolder
+        self.claudeProjectsRoot = claudeProjectsRoot
         if let saved = persistence.load(), !saved.workspaces.isEmpty {
             restore(from: saved)
         } else {
@@ -1118,6 +1124,8 @@ final class WorkspaceStore {
     @discardableResult
     func duplicateTab(_ session: Session, in workspace: Workspace) -> Session? {
         guard let pane = pane(containing: session, in: workspace) else { return nil }
+        // AgentPad: duplicating a channel tab opens the same channel.
+        if let channel = session.channel { return openChannelTab(channel, in: workspace, pane: pane) }
         return addTab(in: workspace, pane: pane, template: session.agent, initialCwd: session.currentDirectory)
     }
 
@@ -1148,7 +1156,8 @@ final class WorkspaceStore {
     @discardableResult
     func resumeAgentSession(agentId: String, conversationId: String, cwd: URL) -> Result<Session, ResumeRefusal> {
         if let refusal = Self.resumeRefusal(
-            agentId: agentId, conversationId: conversationId, options: optionsProvider
+            agentId: agentId, conversationId: conversationId, options: optionsProvider,
+            visibility: conversationVisibility(), claudeProjectsRoot: claudeProjectsRoot
         ) {
             return .failure(refusal)
         }
@@ -1166,8 +1175,8 @@ final class WorkspaceStore {
     }
 
     /// Why a resume was refused, decided before any session exists.
-    /// Whether a resume would be refused — WITHOUT touching any store, so
-    /// callers can decide before they cause side effects. The deep-link and
+    /// Whether a resume would be refused without creating a workspace/tab;
+    /// Claude checks the run journal and an exact local transcript. The deep-link and
     /// CLI paths ask first, because reaching `resumeAgentSession` may already
     /// have built a window to land in, and a window created for a request
     /// that then fails is one the user has to close (and one the persistence
@@ -1183,8 +1192,11 @@ final class WorkspaceStore {
     static func resumeRefusal(
         agentId: String,
         conversationId: String,
-        options: @MainActor (String) -> String? = { AgentPadSettingsModel.shared.agentOptions[$0] }
+        options: @MainActor (String) -> String? = { AgentPadSettingsModel.shared.agentOptions[$0] },
+        visibility: ChannelConversationFilter = .current(),
+        claudeProjectsRoot: URL = TeamSessionFiles.root
     ) -> ResumeRefusal? {
+        guard visibility.allows(agentId: agentId, conversationId: conversationId) else { return .channelConversation }
         guard let template = AgentTemplate.builtin(id: agentId), template.supportsResume else {
             return .agentCannotResume
         }
@@ -1194,6 +1206,10 @@ final class WorkspaceStore {
         guard template.normalizedConversationId(conversationId) != nil else {
             return .unusableConversationId
         }
+        if agentId == AgentTemplate.claudeCodeID,
+           case .failure(let refusal) = ClaudeSessionResume.resolve(conversationId, root: claudeProjectsRoot, visibility: visibility) {
+            return .claudeResume(refusal)
+        }
         return nil
     }
 
@@ -1201,6 +1217,8 @@ final class WorkspaceStore {
         case agentCannotResume
         case launchOptionsDisablePersistence
         case unusableConversationId
+        case channelConversation
+        case claudeResume(ClaudeSessionResume.Refusal)
 
         func message(agentId: String, conversationId: String) -> String {
             switch self {
@@ -1210,6 +1228,10 @@ final class WorkspaceStore {
                 return "the launch options for '\(agentId)' disable session persistence, so the conversation could not be resumed"
             case .unusableConversationId:
                 return "'\(conversationId)' is not a conversation id \(agentId) can resume"
+            case .channelConversation:
+                return "This conversation is only available through its channel."
+            case .claudeResume(let refusal):
+                return refusal.message
             }
         }
     }
@@ -1314,6 +1336,11 @@ final class WorkspaceStore {
     /// can resume from History) versus duplicate-resuming a live one.
     func findOpenConversation(agentId: String, conversationId: String)
         -> (workspace: Workspace, session: Session)? {
+        guard conversationVisibility().allows(agentId: agentId, conversationId: conversationId) else { return nil }
+        if agentId == AgentTemplate.claudeCodeID,
+           case .failure = ClaudeSessionResume.resolve(conversationId, root: claudeProjectsRoot, visibility: conversationVisibility()) {
+            return nil
+        }
         for workspace in workspaces {
             for pane in workspace.root.allPanes {
                 for session in pane.tabs {
@@ -1331,6 +1358,8 @@ final class WorkspaceStore {
     /// Set or clear a user-provided tab title. Empty / whitespace input clears
     /// the override so the title resumes tracking the working directory.
     func renameTab(_ session: Session, to newTitle: String) {
+        // AgentPad: a channel tab takes its channel's name (DESIGN-F2).
+        guard session.channel == nil else { return }
         let next = normalizedTitle(newTitle)
         guard session.customTitle != next else { return }
         session.customTitle = next
@@ -1386,6 +1415,8 @@ final class WorkspaceStore {
     private func attachSession(_ session: Session, to destPane: Pane, at destIndex: Int, in workspace: Workspace) {
         let insertIndex = min(max(destIndex, 0), destPane.tabs.count)
         destPane.tabs.insert(session, at: insertIndex)
+        // AgentPad: a channel tab's Close now goes to this store.
+        holdChannelClose(session)
         destPane.activeTabId = session.id
         workspace.activePaneId = destPane.id
         // Promoting to active mirrors `activateTab` so the sidebar title and
@@ -1526,10 +1557,11 @@ final class WorkspaceStore {
         recentlyClosed.append(ClosedTabState(
             agent: session.agent,
             cwd: session.currentDirectory,
-            customTitle: session.customTitle,
+            customTitle: session.channel == nil ? session.customTitle : nil,
             workspaceId: workspace.id,
             paneId: pane.id,
-            conversationId: session.conversationId
+            conversationId: session.conversationId,
+            channel: session.channel
         ))
         if recentlyClosed.count > Self.closedTabHistoryLimit {
             recentlyClosed.removeFirst(recentlyClosed.count - Self.closedTabHistoryLimit)
@@ -1554,6 +1586,12 @@ final class WorkspaceStore {
             ?? workspace.activePane
             ?? workspace.root.firstPane
         let cwd = resolvedSpawnCwd(state.cwd.path)
+        if let channel = state.channel, let pane {
+            let session = openChannelTab(channel, in: workspace, pane: pane)
+            activateWorkspace(workspace)
+            activateTab(session, in: workspace)
+            return session
+        }
         let session = addTab(
             in: workspace,
             pane: pane,
@@ -2118,6 +2156,11 @@ final class WorkspaceStore {
         case .pane(let p):
             let pane = Pane(id: p.id)
             for tab in p.tabs {
+                // AgentPad: a channel tab comes back without a terminal process.
+                if let channel = tab.channel {
+                    pane.tabs.append(makeChannelSession(channel, id: tab.id, cwd: resolvedSpawnCwd(tab.currentDirectoryPath)))
+                    continue
+                }
                 let agent = AgentTemplate.all.first { $0.id == tab.agentId } ?? .terminal
                 let session = spawnSession(
                     template: agent,
@@ -2148,6 +2191,61 @@ final class WorkspaceStore {
         }
     }
 
+    // AgentPad: channel tabs (probe V1).
+    private func makeChannelSession(_ ref: ChannelRef, id: UUID = UUID(), cwd: URL) -> Session {
+        let session = Session(id: id, engine: ChannelTabEngine(ref: ref), currentDirectory: cwd, agent: .terminal)
+        session.channel = ref
+        holdChannelClose(session)
+        return session
+    }
+
+    /// A channel tab's own Close goes to the store that holds it now: set
+    /// when it is made here and again when it moves here (review F2b-p2-3).
+    private func holdChannelClose(_ session: Session) {
+        (session.engine as? ChannelTabEngine)?.onClose = { [weak self, weak session] in
+            guard let self, let session,
+                  let workspace = self.workspaces.first(where: { ws in ws.root.allPanes.contains { $0.tabs.contains { $0 === session } } })
+            else { return }
+            self.closeTab(session, in: workspace)
+        }
+    }
+
+    /// The tab of `ref` in this window, the whole ref compared (review F2b-3).
+    func channelTab(_ ref: ChannelRef) -> (Session, Workspace)? {
+        for workspace in workspaces {
+            for pane in workspace.root.allPanes {
+                if let session = pane.tabs.first(where: { $0.channel == ref }) { return (session, workspace) }
+            }
+        }
+        return nil
+    }
+
+    /// Brings `ref`'s tab forward, or opens one in the active workspace.
+    @discardableResult
+    func showChannel(_ ref: ChannelRef, newTab: Bool = false) -> Session? {
+        if !newTab, let (session, workspace) = channelTab(ref) {
+            activateWorkspace(workspace)
+            activateTab(session, in: workspace)
+            return session
+        }
+        guard let workspace = active ?? workspaces.first else { return nil }
+        return openChannelTab(ref, in: workspace)
+    }
+
+    @discardableResult
+    func openChannelTab(_ ref: ChannelRef, in workspace: Workspace, pane: Pane? = nil) -> Session {
+        guard let target = pane ?? workspace.activePane ?? workspace.root.firstPane else {
+            preconditionFailure("workspace has no panes")
+        }
+        let session = makeChannelSession(ref, cwd: workspace.workingDirectory)
+        wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: nil)
+        target.tabs.append(session)
+        target.activeTabId = session.id
+        if workspace.activePaneId != target.id { workspace.activePaneId = target.id }
+        scheduleSave()
+        return session
+    }
+
     /// Spawns the engine + Session. Caller wires `onPwdChange` / `onFocus`
     /// after a workspace ref is available — `restore` builds sessions before
     /// the workspace exists, so callbacks can't capture it here.
@@ -2166,10 +2264,16 @@ final class WorkspaceStore {
         // `forceResume` bypasses the gate: picking a session from the History
         // list is an explicit ask, not the automatic relaunch the setting
         // exists to switch off.
+        let visibility = conversationVisibility()
         var normalizedConversationId = persistsConversation
             ? template.normalizedConversationId(conversationId)
             : nil
         let resumeId = (forceResume || resumeProvider()) ? normalizedConversationId : nil
+        var checkedResumeId = resumeId
+        if template.rosterId == AgentTemplate.claudeCodeID, let id = resumeId {
+            checkedResumeId = try? ClaudeSessionResume.resolve(id, root: claudeProjectsRoot, visibility: visibility).get()
+            normalizedConversationId = checkedResumeId
+        }
         // Grok accepts a caller-assigned UUID for a fresh session. Generate it
         // before launch and persist the same value immediately, eliminating
         // the hook/file-discovery race every other agent has to solve. When
@@ -2193,7 +2297,9 @@ final class WorkspaceStore {
             newSessionId: newSessionId,
             initialPrompt: initialPrompt,
             sshHost: sshHost,
-            rawLaunchCommand: rawLaunchCommand
+            rawLaunchCommand: rawLaunchCommand,
+            claudeProjectsRoot: claudeProjectsRoot,
+            visibility: visibility
         )
         config.workingDirectory = initialCwd.path
         // A Claude-Code-based custom agent with an env block hands `claude`
@@ -2221,7 +2327,7 @@ final class WorkspaceStore {
         // without a resume strategy never emits one at all.
         let promptSuppressesResume = !(initialPrompt?.isEmpty ?? true)
         session.resumedConversationId = (sshHost == nil && !promptSuppressesResume && template.supportsResume)
-            ? resumeId : nil
+            ? checkedResumeId : nil
         session.spawnsInBackground = spawnInBackground
         if let sshHost {
             session.sshWorkspaceHost = sshHost

@@ -834,17 +834,33 @@ final class CLIControllerTests: XCTestCase {
 
     // MARK: resume
 
+    func testClaudeResumeRejectsSearchAndPartialIdsBeforeCallingThePipeline() async throws {
+        let store = makeStore()
+        let controller = makeController(stores: [store])
+        for id in ["billing", "aa000000", "aa000000-0000-4000", "aa000000000040008000000000000001"] {
+            let request = AgentPadCLIRequest(verb: .resume, cwd: dirA, agent: "claude-code", conversationId: id)
+            let response = await respond(controller, request)
+            XCTAssertFalse(response.ok)
+            XCTAssertEqual(response.error, ClaudeSessionResume.Refusal.fullIdRequired.message)
+            let link = try XCTUnwrap(AgentPadDeepLink.resumeURL(agentId: "claude-code", conversationId: id, cwd: dirA))
+            XCTAssertEqual(AgentPadDeepLink.parse(link), .invalid(reason: ClaudeSessionResume.Refusal.fullIdRequired.message))
+        }
+        XCTAssertTrue(resumeCalls.isEmpty)
+        XCTAssertEqual(activations, 0)
+        XCTAssertTrue(revealed.isEmpty)
+    }
+
     func testResumeForwardsValidatedFieldsToThePipeline() async {
         let controller = makeController(stores: [makeStore()], resumeOutcome: .opened)
         let response = await respond(
             controller,
-            AgentPadCLIRequest(verb: .resume, cwd: dirA, agent: "Claude-Code", conversationId: "abc-123")
+            AgentPadCLIRequest(verb: .resume, cwd: dirA, agent: "Claude-Code", conversationId: "aa000000-0000-4000-8000-000000000002")
         )
         XCTAssertTrue(response.ok)
         XCTAssertEqual(response.note, "resumed in a new tab")
         XCTAssertEqual(resumeCalls.count, 1)
         XCTAssertEqual(resumeCalls.first?.agent, "claude-code", "agent id lowercases exactly like the deep link")
-        XCTAssertEqual(resumeCalls.first?.id, "abc-123")
+        XCTAssertEqual(resumeCalls.first?.id, "aa000000-0000-4000-8000-000000000002")
         XCTAssertEqual(resumeCalls.first?.cwd, dirA)
         XCTAssertEqual(activations, 1)
     }

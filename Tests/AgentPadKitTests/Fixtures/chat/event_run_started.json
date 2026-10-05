@@ -1,0 +1,23 @@
+{
+  "stream": "member:0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10:1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+  "seq": 6,
+  "id": "5b0c2f7e-0a8d-4f4e-9e57-2d4c1f9b6a34",
+  "type": "run.started",
+  "actor": {
+    "account_id": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+    "session_id": "4f1d6a62-2d0e-4b8e-9d6b-5f0e6c3b8f11"
+  },
+  "body": {
+    "request_id": "7e1f2a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b",
+    "state": "running",
+    "version": 5,
+    "run_id": "9c8b7a6f-5e4d-4c3b-9a2f-1e0d9c8b7a6f",
+    "decline_reason": null,
+    "failure_reason": null
+  },
+  "command_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a07",
+  "at": "2026-10-04T18:20:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null
+}

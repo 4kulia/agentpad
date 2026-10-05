@@ -7,17 +7,16 @@ let package = Package(
     platforms: [
         // .v14 floor — `@Observable` macro requires Sonoma+. Dropping further
         // would mean reverting all session models to ObservableObject + @Published.
-        // AgentPad: 14.5 — IrohLib (team work transport) requires it.
+        // AgentPad: 14.5, as released (LSMinimumSystemVersion).
         .macOS("14.5")
     ],
     dependencies: [
-        // AgentPad: peer-to-peer QUIC between colleagues' Macs, dialed by
-        // public key (docs/agentpad/TEAM.md, 7.1). Pinned: n0's public relays
-        // support only the latest stable iroh, so updates are deliberate.
-        .package(url: "https://github.com/n0-computer/iroh-ffi", exact: "1.1.0"),
         // AgentPad: in-app updates ("Install and Relaunch"), verified with an
-        // EdDSA key and a Developer ID signature. Pinned like iroh.
+        // EdDSA key and a Developer ID signature. Pinned: updates are deliberate.
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
+        // AgentPad: the server mode's local cache and run journal (SQLite,
+        // docs/agentpad/CHAT-PLAN.md C4). MIT. Pinned like the others.
+        .package(url: "https://github.com/groue/GRDB.swift", exact: "7.11.1"),
     ],
     targets: [
         // Thin executable: main.swift only. Everything else lives in AgentPadKit so
@@ -69,9 +68,8 @@ let package = Package(
                 // both ends so the protocol can't drift. One-way dependency;
                 // AgentPadHookKit stays Foundation/Darwin-only.
                 "AgentPadHookKit",
-                // AgentPad: team work transport (Sources/AgentPadKit/AgentPad/Team).
-                .product(name: "IrohLib", package: "iroh-ffi"),
                 .product(name: "Sparkle", package: "Sparkle"),
+                .product(name: "GRDB", package: "GRDB.swift"),
             ],
             path: "Sources/AgentPadKit",
             resources: [
@@ -104,7 +102,10 @@ let package = Package(
             // AgentPadHookKit is listed so socket integration tests can drive
             // HookServer with the real CLI transport client.
             dependencies: ["AgentPadKit", "AgentPadHookKit"],
-            path: "Tests/AgentPadKitTests"
+            path: "Tests/AgentPadKitTests",
+            // AgentPad: the server's API samples, read from disk by the
+            // chat tests (scripts/sync-chat-fixtures.sh).
+            exclude: ["Fixtures"]
         ),
         .testTarget(
             name: "AgentPadHookKitTests",

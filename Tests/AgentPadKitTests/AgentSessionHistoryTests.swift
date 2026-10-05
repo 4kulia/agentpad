@@ -562,12 +562,19 @@ final class AgentSessionScannerTests: XCTestCase {
 
 @MainActor
 final class AgentSessionResumeTests: XCTestCase {
+    private var fixture: ClaudeResumeFixture!
+    override func setUp() async throws {
+        fixture = try ClaudeResumeFixture(id: "11111111-2222-3333-4444-555555555555")
+    }
+    override func tearDown() async throws { fixture = nil }
+
     private func makeStore(resumeSetting: Bool) -> WorkspaceStore {
         WorkspaceStore(
             persistence: InMemoryPersistence(),
             engineFactory: { TestEngine() },
             optionsProvider: { _ in nil },
-            resumeProvider: { resumeSetting }
+            resumeProvider: { resumeSetting },
+            claudeProjectsRoot: fixture.root
         )
     }
 

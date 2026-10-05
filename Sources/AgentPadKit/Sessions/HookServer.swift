@@ -98,6 +98,8 @@ final class HookServer {
     /// otherwise still get a tab spawned and its `-e` command executed.
     typealias CLIHandler = @MainActor (
         _ request: AgentPadCLIRequest,
+        // AgentPad: the sender, by its PID (Y4).
+        _ origin: AgentPadCallerOrigin,
         _ isCallerWaiting: @escaping @MainActor () -> Bool,
         _ completion: @escaping @MainActor (AgentPadCLIResponse) -> Void
     ) -> Void
@@ -111,6 +113,26 @@ final class HookServer {
     /// refusal rather than silence, so a misassembled build still fails loud.
     var onCLIRequest: CLIHandler?
     var onShellCommandRequest: ((AgentPadShellCommandRequest) -> String?)?
+    /// AgentPad: how a connection's sender is placed (Y4), read off the main
+    /// thread at accept; the properties below replace them in tests.
+    private let gate = OriginGate()
+    /// AgentPad: reads the client's PID (`LOCAL_PEERPID`).
+    var readPeerPID: @Sendable (Int32) -> pid_t? {
+        get { gate.get().readPeerPID }
+        set { gate.set { $0.readPeerPID = newValue } }
+    }
+    /// AgentPad: who that PID is (Y4).
+    var originOf: @Sendable (pid_t?) -> AgentPadCallerOrigin {
+        get { gate.get().originOf }
+        set { gate.set { $0.originOf = newValue } }
+    }
+    /// AgentPad: the shell a `shellCommand` names is the caller or its ancestor.
+    var isSelfOrAncestor: @Sendable (pid_t, pid_t) -> Bool {
+        get { gate.get().isSelfOrAncestor }
+        set { gate.set { $0.isSelfOrAncestor = newValue } }
+    }
+    /// AgentPad: accept and read run here, not on the main queue (review C2-20).
+    private let acceptQueue = DispatchQueue(label: "agentpad.hookserver.accept")
 
     /// `socketPath` is injectable so integration tests can bind a throwaway
     /// path instead of racing a live AgentPad's production socket.
@@ -158,15 +180,18 @@ final class HookServer {
         // open tabs and run commands through it), so don't leave it at the
         // umask default 0755 even though the parent dir is already 0700.
         chmod(path, 0o600)
-        guard listen(fd, 8) == 0 else {
+        // AgentPad: room for many hooks at once (review C3-15).
+        guard listen(fd, 64) == 0 else {
             NSLog("agentpad: HookServer listen() failed errno=\(errno)")
             close(fd)
             return
         }
 
         listenFd = fd
-        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
-        src.setEventHandler { [weak self] in self?.acceptOne() }
+        // AgentPad: accepted and read off the main queue; a hook is answered
+        // there at once, the rest goes to the main queue (review C2-20).
+        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: acceptQueue)
+        src.setEventHandler(handler: Self.acceptHandler(listenFd: fd, gate: gate, server: WeakServer(self)))
         src.resume()
         source = src
     }
@@ -221,18 +246,66 @@ final class HookServer {
         try? FileManager.default.removeItem(atPath: path)
     }
 
-    private func acceptOne() {
-        let clientFd = accept(listenFd, nil, nil)
-        guard clientFd >= 0 else { return }
+    /// AgentPad: the server, reachable from the accepting queue only to hop
+    /// back to the main queue.
+    private final class WeakServer: @unchecked Sendable {
+        weak var server: HookServer?
+        init(_ server: HookServer) { self.server = server }
+    }
+
+    /// Not isolated to the main actor: it runs on the accepting queue.
+    private nonisolated static func acceptHandler(listenFd: Int32, gate: OriginGate, server: WeakServer) -> @Sendable () -> Void {
+        {
+            // Accepting and placing are quick; each connection is then read
+            // on its own, so one silent client holds up no other (review C3-15).
+            let hooks = gate.get()
+            let clientFd = accept(listenFd, nil, nil)
+            guard clientFd >= 0 else { return }
+            let peerPID = hooks.readPeerPID(clientFd)
+            let origin = hooks.originOf(peerPID)
+            DispatchQueue.global(qos: .userInitiated).async {
+                serve(clientFd: clientFd, peerPID: peerPID, origin: origin, hooks: hooks) { received in
+                    DispatchQueue.main.async { MainActor.assumeIsolated { server.server?.dispatch(received) } }
+                }
+            }
+        }
+    }
+
+    /// AgentPad: what the accepting queue hands the main queue.
+    private enum Received: @unchecked Sendable {
+        case hook([String: Any])
+        case shellCommand(AgentPadShellCommandRequest?, fd: Int32)
+        case cli(dict: [String: Any], data: Data, fd: Int32, origin: AgentPadCallerOrigin)
+    }
+
+    /// AgentPad: the placing functions, copied for the accepting queue.
+    struct OriginHooks: Sendable {
+        var readPeerPID: @Sendable (Int32) -> pid_t? = AgentPadCallerOrigin.peerPID(of:)
+        var originOf: @Sendable (pid_t?) -> AgentPadCallerOrigin = { AgentPadCallerOrigin.of(peerPID: $0) }
+        var isSelfOrAncestor: @Sendable (pid_t, pid_t) -> Bool = TeamProcesses.isSelfOrAncestor
+    }
+
+    final class OriginGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var hooks = OriginHooks()
+        func get() -> OriginHooks { lock.withLock { hooks } }
+        func set(_ change: (inout OriginHooks) -> Void) { lock.withLock { change(&hooks) } }
+    }
+
+    /// Runs off the main queue for one accepted connection, its sender
+    /// already placed at accept (Y4): read the line; a hook is acknowledged
+    /// and closed here, everything else is handed on.
+    private nonisolated static func serve(clientFd: Int32, peerPID: pid_t?, origin: AgentPadCallerOrigin, hooks: OriginHooks,
+                                          deliver: @escaping @Sendable (Received) -> Void) {
         var ownsFd = true
         defer { if ownsFd { close(clientFd) } }
 
-        // We run on the main queue, so a client that connects and then
-        // stalls must not hang the UI. SO_RCVTIMEO/SNDTIMEO bound one
-        // syscall; the wall-clock deadlines on the loops below bound the
-        // whole exchange — without them a byte-dripping client would reset
-        // the 1s each iteration. Real clients (AgentPadHook, agentpad-cli) write
-        // immediately and read immediately.
+        // A client that connects and then stalls must not hold the queue.
+        // SO_RCVTIMEO/SNDTIMEO bound one syscall; the wall-clock deadlines
+        // on the loops below bound the whole exchange — without them a
+        // byte-dripping client would reset the 1s each iteration. Real
+        // clients (AgentPadHook, agentpad-cli) write immediately and read
+        // immediately.
         var tv = timeval(tv_sec: 1, tv_usec: 0)
         setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
@@ -288,12 +361,14 @@ final class HookServer {
 
         if dict["kind"] as? String == AgentPadShellCommandRequest.kind {
             ownsFd = false
-            let request = AgentPadCLIProtocol.decodeLine(AgentPadShellCommandRequest.self, from: data)
-            let command = !Self.peerHasHungUp(clientFd)
-                ? request.flatMap { onShellCommandRequest?($0) } : nil
-            Self.writeResponseAndClose(
-                AgentPadCLIProtocol.encodeLine(AgentPadShellCommandResponse(command: command)), fd: clientFd
-            )
+            // AgentPad: only a shell's own process, outside any team run, may
+            // take its tab's pending command (Y4).
+            var request = AgentPadCLIProtocol.decodeLine(AgentPadShellCommandRequest.self, from: data)
+            if let claimed = request?.shellPID {
+                let ownShell = origin == .outside && peerPID.map { hooks.isSelfOrAncestor(claimed, $0) } == true
+                if !ownShell { request = nil }
+            }
+            deliver(.shellCommand(request, fd: clientFd))
             return
         }
 
@@ -301,16 +376,35 @@ final class HookServer {
             // Request/response branch: fd ownership moves to the response
             // writer; the handler's completion is what closes it.
             ownsFd = false
-            answerCLIRequest(dict: dict, data: data, fd: clientFd)
+            deliver(.cli(dict: dict, data: data, fd: clientFd, origin: origin))
             return
         }
 
-        guard let message = Self.parseMessage(dict) else { return }
-        handler(message)
+        // AgentPad: a confirmed team run never speaks for a tab (Y4). Queued
+        // for the main queue before the sender is answered, so its next
+        // message cannot overtake it (review C4-12).
+        if case .teamRun = origin {} else { deliver(.hook(dict)) }
+        // AgentPad: the sender waits for this byte, not for the main queue.
+        var ack: UInt8 = 0x0A
+        _ = write(clientFd, &ack, 1)
+    }
+
+    /// AgentPad: the main-queue half of a connection.
+    private func dispatch(_ received: Received) {
+        switch received {
+        case .hook(let dict):
+            guard let message = Self.parseMessage(dict) else { return }
+            handler(message)
+        case .shellCommand(let request, let fd):
+            let command = !Self.peerHasHungUp(fd) ? request.flatMap { onShellCommandRequest?($0) } : nil
+            Self.writeResponseAndClose(AgentPadCLIProtocol.encodeLine(AgentPadShellCommandResponse(command: command)), fd: fd)
+        case .cli(let dict, let data, let fd, let origin):
+            answerCLIRequest(dict: dict, data: data, fd: fd, origin: origin)
+        }
     }
 
     /// Answers one CLI request line and closes the fd on every path.
-    private func answerCLIRequest(dict: [String: Any], data: Data, fd: Int32) {
+    private func answerCLIRequest(dict: [String: Any], data: Data, fd: Int32, origin: AgentPadCallerOrigin) {
         // Version peek BEFORE the typed decode: a future breaking protocol
         // change is exactly what would fail the decode, and "malformed"
         // must never shadow the real message.
@@ -356,7 +450,7 @@ final class HookServer {
         let isCallerWaiting: @MainActor () -> Bool = {
             !completed && !Self.peerHasHungUp(fd)
         }
-        onCLIRequest(request, isCallerWaiting) { response in
+        onCLIRequest(request, origin, isCallerWaiting) { response in
             guard !completed else {
                 NSLog("agentpad: CLI handler completed twice; extra response dropped")
                 return
@@ -370,16 +464,16 @@ final class HookServer {
     /// consumed at this point, so a zero-length peek means EOF — the peer
     /// closed — while `EAGAIN` means the connection is simply idle, which is
     /// what a healthy client waiting for its answer looks like.
-    private static func peerHasHungUp(_ fd: Int32) -> Bool {
+    private nonisolated static func peerHasHungUp(_ fd: Int32) -> Bool {
         var byte: UInt8 = 0
         return recv(fd, &byte, 1, Int32(MSG_PEEK) | Int32(MSG_DONTWAIT)) == 0
     }
 
-    private static func writeCLIResponseAndClose(_ response: AgentPadCLIResponse, fd: Int32) {
+    private nonisolated static func writeCLIResponseAndClose(_ response: AgentPadCLIResponse, fd: Int32) {
         writeResponseAndClose(response.encodedLine(), fd: fd)
     }
 
-    private static func writeResponseAndClose(_ line: Data?, fd: Int32) {
+    private nonisolated static func writeResponseAndClose(_ line: Data?, fd: Int32) {
         defer { close(fd) }
         guard let line else { return }
         let deadline = ContinuousClock.now + .seconds(3)

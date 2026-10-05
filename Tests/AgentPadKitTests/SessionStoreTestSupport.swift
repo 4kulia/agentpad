@@ -6,13 +6,34 @@ import Foundation
 /// (DeepLink / PaneTreeHost / CLIController) earned it the shared home —
 /// a new WorkspaceStore injection seam lands here once, not per file.
 @MainActor
-func makeTestStore(persistence: any Persistence = InMemoryPersistence()) -> WorkspaceStore {
+func makeTestStore(persistence: any Persistence = InMemoryPersistence(), claudeProjectsRoot: URL = FileManager.default.temporaryDirectory.appendingPathComponent("agentpad-no-claude-sessions")) -> WorkspaceStore {
     WorkspaceStore(
         persistence: persistence,
         engineFactory: { TestEngine() },
         optionsProvider: { _ in nil },
-        resumeProvider: { true }
+        resumeProvider: { true },
+        claudeProjectsRoot: claudeProjectsRoot
     )
+}
+
+/// An actual transcript for resume tests, entirely outside the user's stores.
+final class ClaudeResumeFixture {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("claude-resume-\(UUID().uuidString)")
+    let id: String
+
+    init(id: String = UUID().uuidString.lowercased()) throws {
+        self.id = id
+        try add(id)
+    }
+
+    @discardableResult
+    func add(_ id: String) throws -> URL {
+        try SessionStoreFixtures.writeFile("\(id).jsonl", in: root.appendingPathComponent("-tmp"), lines: [
+            #"{"type":"user","cwd":"/tmp","message":{"content":"fixture"}}"#
+        ])
+    }
+
+    deinit { try? FileManager.default.removeItem(at: root) }
 }
 
 /// Shared fixture helpers for the session-store tests and benchmarks.

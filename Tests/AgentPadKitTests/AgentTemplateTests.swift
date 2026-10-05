@@ -210,14 +210,16 @@ final class AgentTemplateTests: XCTestCase {
         XCTAssertFalse(ids.contains("preset-a"), "terminal presets are shells too")
     }
 
-    func testMakeSessionConfigInjectsResumeFlagForClaude() {
-        let config = AgentTemplate.claudeCode.makeSessionConfig(resumeId: "abc-123")
-        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "claude --resume abc-123")
+    func testMakeSessionConfigInjectsResumeFlagForClaude() throws {
+        let fixture = try ClaudeResumeFixture()
+        let config = AgentTemplate.claudeCode.makeSessionConfig(resumeId: fixture.id, claudeProjectsRoot: fixture.root)
+        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "claude --resume \(fixture.id)")
     }
 
-    func testMakeSessionConfigCombinesResumeAndExtras() {
-        let config = AgentTemplate.claudeCode.makeSessionConfig(extraOptions: "--model opus", resumeId: "abc-123")
-        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "claude --resume abc-123 --model opus")
+    func testMakeSessionConfigCombinesResumeAndExtras() throws {
+        let fixture = try ClaudeResumeFixture()
+        let config = AgentTemplate.claudeCode.makeSessionConfig(extraOptions: "--model opus", resumeId: fixture.id, claudeProjectsRoot: fixture.root)
+        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "claude --resume \(fixture.id) --model opus")
     }
 
     func testClaudeNoSessionPersistenceDisablesConversationPersistence() {
@@ -272,9 +274,9 @@ final class AgentTemplateTests: XCTestCase {
         )
     }
 
-    func testMakeSessionConfigSkipsResumeWhenIdEmpty() {
+    func testMakeSessionConfigRefusesEmptyResumeId() {
         let config = AgentTemplate.claudeCode.makeSessionConfig(resumeId: "")
-        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "claude")
+        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], ClaudeSessionResume.Refusal.fullIdRequired.shellCommand)
     }
 
     func testMakeSessionConfigInjectsAgentSpecificResumeArguments() {
@@ -314,11 +316,12 @@ final class AgentTemplateTests: XCTestCase {
         XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "codex resume 'id; echo injected'")
     }
 
-    func testMakeSessionConfigInjectsResumeForClaudeBasedCustom() {
+    func testMakeSessionConfigInjectsResumeForClaudeBasedCustom() throws {
+        let fixture = try ClaudeResumeFixture()
         let custom = CustomAgentData(id: "claude-opus", baseAgentId: "claude-code")
         let template = AgentTemplate.fromCustom(custom)
-        let config = template.makeSessionConfig(resumeId: "xyz")
-        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "claude --resume xyz")
+        let config = template.makeSessionConfig(resumeId: fixture.id, claudeProjectsRoot: fixture.root)
+        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "claude --resume \(fixture.id)")
     }
 
     func testMakeSessionConfigInjectsResumeForPi() {
@@ -370,10 +373,10 @@ final class AgentTemplateTests: XCTestCase {
         )
     }
 
-    func testMakeSessionConfigDoesNotNormalizeClaudeConversationId() {
+    func testMakeSessionConfigRejectsLegacyPiIdForClaude() {
         let id = "2026-07-14T19-24-02-459Z_019f6216-161b-737e-ba6b-0f974a7b7b8c"
         let config = AgentTemplate.claudeCode.makeSessionConfig(resumeId: id)
-        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "claude --resume \(id)")
+        XCTAssertEqual(config.environment["AGENTPAD_AGENT"], ClaudeSessionResume.Refusal.fullIdRequired.shellCommand)
     }
 
     func testReportsToolCallsOnlyForToolFeedingAgents() {
@@ -594,11 +597,12 @@ final class AgentTemplateTests: XCTestCase {
         XCTAssertEqual(config.environment["AGENTPAD_AGENT"], "claude -- 'new question'")
     }
 
-    func testEmptyInitialPromptIgnored() {
+    func testEmptyInitialPromptIgnored() throws {
+        let fixture = try ClaudeResumeFixture()
         let blankConfig = AgentTemplate.claudeCode.makeSessionConfig(initialPrompt: "   ")
         XCTAssertEqual(blankConfig.environment["AGENTPAD_AGENT"], "claude")
-        let resumeConfig = AgentTemplate.claudeCode.makeSessionConfig(resumeId: "abc", initialPrompt: "")
-        XCTAssertEqual(resumeConfig.environment["AGENTPAD_AGENT"], "claude --resume abc")
+        let resumeConfig = AgentTemplate.claudeCode.makeSessionConfig(resumeId: fixture.id, initialPrompt: "", claudeProjectsRoot: fixture.root)
+        XCTAssertEqual(resumeConfig.environment["AGENTPAD_AGENT"], "claude --resume \(fixture.id)")
     }
 
     func testFromCustomInheritsPromptLaunchFlagFromCopilotBase() {

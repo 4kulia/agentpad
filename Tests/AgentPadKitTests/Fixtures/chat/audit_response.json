@@ -1,0 +1,23 @@
+{
+  "records": [
+    {
+      "id": 1042,
+      "at": "2026-10-04T18:20:00.123456Z",
+      "actor_account_id": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+      "actor_session_id": "4f1d6a62-2d0e-4b8e-9d6b-5f0e6c3b8f11",
+      "action": "team.create",
+      "object": "team:6a1c9e2b-7d3f-4a5e-8b1c-2d3e4f5a6b7c",
+      "result": "ok"
+    },
+    {
+      "id": 1041,
+      "at": "2026-10-04T18:19:00.123456Z",
+      "actor_account_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+      "actor_session_id": "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b",
+      "action": "team.create",
+      "object": null,
+      "result": "denied"
+    }
+  ],
+  "next": 1041
+}

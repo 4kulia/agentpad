@@ -416,10 +416,8 @@ final class TeamCLICommandTests: XCTestCase {
     func testParsesTeamSubcommands() {
         XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", "status", "--json"]).get(),
                        .team(AgentPadCLITeamCommand(action: .status, json: true)))
-        XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", "join", "--link", "agentpad://team/join?t=a"]).get(),
-                       .team(AgentPadCLITeamCommand(action: .join, link: "agentpad://team/join?t=a")))
-        XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", "approve", "--peer", "abc"]).get(),
-                       .team(AgentPadCLITeamCommand(action: .approve, peer: "abc")))
+        XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", "watch", "abc"]).get(),
+                       .team(AgentPadCLITeamCommand(action: .watch, call: "abc")))
     }
 
     func testParsesCallsAndPublishing() {
@@ -437,6 +435,65 @@ final class TeamCLICommandTests: XCTestCase {
             try AgentPadHookKit.parseCLICommand(["team", "publish", "backend", "--folder", "/p", "--description", "API", "--access", "read"]).get(),
             .team(AgentPadCLITeamCommand(action: .publish, agent: "backend", folder: "/p", description: "API", access: "read"))
         )
+    }
+
+    /// C7: the server actions, each form; `--team` repeats; the role is
+    /// member or admin; invite needs an address (the direct-mode form is gone).
+    func testParsesServerActions() throws {
+        for action in [AgentPadCLITeamAction.status, .login, .logout, .members] {
+            XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", action.rawValue]).get(), .team(AgentPadCLITeamCommand(action: action)))
+            XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", action.rawValue, "--json"]).get(),
+                           .team(AgentPadCLITeamCommand(action: action, json: true)))
+        }
+        var invite = AgentPadCLITeamCommand(action: .invite, json: true)
+        invite.email = "b@example.com"
+        invite.role = "admin"
+        invite.teams = ["Ops", "Design team"]
+        XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", "invite", "b@example.com", "--role", "admin", "--team", "Ops",
+                                                            "--team", "Design team", "--json"]).get(), .team(invite))
+        var plain = AgentPadCLITeamCommand(action: .invite)
+        plain.email = "b@example.com"
+        XCTAssertEqual(try AgentPadHookKit.parseCLICommand(["team", "invite", "b@example.com"]).get(), .team(plain))
+        for bad in [["team", "invite"], ["team", "invite", "not-an-address"], ["team", "invite", "b@example.com", "--role", "owner"],
+                    ["team", "members", "--team", "Ops"], ["team", "invite", "b@example.com", "--team"], ["team", "logout", "x"]] {
+            XCTAssertThrowsError(try AgentPadHookKit.parseCLICommand(bad).get(), "\(bad)")
+        }
+        let request = try XCTUnwrap(AgentPadHookKit.cliRequest(for: .team(invite)))
+        XCTAssertEqual(request.teamAction, "invite")
+        XCTAssertEqual(request.teamEmail, "b@example.com")
+        XCTAssertEqual(request.teamRole, "admin")
+        XCTAssertEqual(request.teamTeams, ["Ops", "Design team"])
+        XCTAssertEqual(AgentPadCLITeamCommand(action: .logout).replyTimeout, 120)
+    }
+
+    /// C7: every outcome of a server action is one JSON object; a change
+    /// with no reliable answer is an unknown outcome, not a failure.
+    func testServerActionResultsAreJSON() throws {
+        var info = AgentPadCLITeamInfo(status: "server", detail: "queued")
+        info.outcome = "queued"
+        let ok = try JSONSerialization.jsonObject(with: Data(AgentPadHookKit.renderCLITeamResultJSON(ok: true, outcome: nil, message: nil, info: info).utf8)) as? [String: Any]
+        XCTAssertEqual(ok?["ok"] as? Bool, true)
+        XCTAssertEqual(ok?["outcome"] as? String, "queued")
+        XCTAssertEqual(ok?["message"] as? String, "queued")
+        let failed = try JSONSerialization.jsonObject(with: Data(AgentPadHookKit.renderCLITeamResultJSON(ok: false, outcome: "usage", message: "bad").utf8)) as? [String: Any]
+        XCTAssertEqual(failed?["ok"] as? Bool, false)
+        XCTAssertEqual(failed?["outcome"] as? String, "usage")
+        XCTAssertTrue(AgentPadHookKit.teamActionChanges(.logout))
+        XCTAssertTrue(AgentPadHookKit.teamActionChanges(.invite))
+        XCTAssertFalse(AgentPadHookKit.teamActionChanges(.members))
+        XCTAssertEqual(Set(AgentPadCLITeamAction.allCases.filter(AgentPadHookKit.teamActionIsServer)),
+                       [.status, .login, .logout, .members, .invite], "status too: its JSON on every outcome (C7 review p1-1)")
+        // One line; the contract's names; a refusal without the app's word still has both.
+        var doubt = AgentPadCLITeamInfo(status: "server", detail: nil)
+        doubt.rightsInDoubt = true
+        let line = AgentPadHookKit.renderCLITeamResultJSON(ok: true, outcome: "members", message: "m", info: doubt)
+        XCTAssertFalse(line.contains("\n"), line)
+        let decoded = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        XCTAssertEqual(decoded?["rights_in_doubt"] as? Bool, true)
+        XCTAssertNil(decoded?["rightsInDoubt"])
+        let refused = try JSONSerialization.jsonObject(with: Data(AgentPadHookKit.renderCLITeamResultJSON(ok: false, outcome: nil, message: nil).utf8)) as? [String: Any]
+        XCTAssertEqual(refused?["outcome"] as? String, "refused")
+        XCTAssertEqual(refused?["message"] as? String, "refused")
     }
 
     func testRequestMayStartWithADashAfterDoubleDash() {
@@ -464,18 +521,26 @@ final class TeamCLICommandTests: XCTestCase {
     }
 
     func testRejectsIncompleteTeamCommands() {
-        for args in [["team"], ["team", "fly"], ["team", "join"], ["team", "remove"], ["team", "status", "--bogus"],
+        for args in [["team"], ["team", "fly"], ["team", "status", "--bogus"],
                      ["team", "ask", "backend@masha"], ["team", "check"], ["team", "ask", "a@b", "x", "--wait", "soon"],
                      ["team", "publish", "x", "--access", "root"], ["team", "status", "extra"]] {
             if case .success = AgentPadHookKit.parseCLICommand(args) { XCTFail("\(args) must fail") }
         }
     }
 
+    /// Direct mode's commands are gone with it (stage E).
+    func testDirectModeCommandsAreGone() {
+        for args in [["team", "on"], ["team", "off"], ["team", "invite"], ["team", "join", "--link", "agentpad://team/join?t=a"],
+                     ["team", "approve", "--peer", "abc"], ["team", "deny", "--peer", "abc"], ["team", "remove", "--peer", "abc"]] {
+            if case .success = AgentPadHookKit.parseCLICommand(args) { XCTFail("\(args) must fail") }
+        }
+    }
+
     func testTeamRequestCarriesTheSubcommand() throws {
-        let request = try XCTUnwrap(AgentPadHookKit.cliRequest(for: .team(AgentPadCLITeamCommand(action: .invite))))
+        let request = try XCTUnwrap(AgentPadHookKit.cliRequest(for: .team(AgentPadCLITeamCommand(action: .status))))
         XCTAssertEqual(request.verb, "team")
-        XCTAssertEqual(request.teamAction, "invite")
+        XCTAssertEqual(request.teamAction, "status")
         let line = try XCTUnwrap(request.encodedLine())
-        XCTAssertEqual(AgentPadCLIRequest.decode(from: line.dropLast())?.teamAction, "invite")
+        XCTAssertEqual(AgentPadCLIRequest.decode(from: line.dropLast())?.teamAction, "status")
     }
 }

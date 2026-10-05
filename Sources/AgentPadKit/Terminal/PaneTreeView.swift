@@ -93,7 +93,9 @@ private struct PaneView: View {
                         transaction.animation = nil
                     }
                     .padding(8)
+                    // AgentPad: a channel tab has no terminal menu (DESIGN-F2).
                     .overlay(RightClickCatcher { unit in
+                        guard active.channel == nil else { return }
                         // Promote this pane to the workspace's active one —
                         // RightClickCatcher swallows rightMouseDown before
                         // libghostty sees it, so `engine.onFocus` never
@@ -120,7 +122,7 @@ private struct PaneView: View {
                     .overlay(alignment: .topTrailing) {
                         // Per-pane: multiple panes can search simultaneously,
                         // each with their own needle and result count.
-                        if active.searchActive {
+                        if active.searchActive, active.channel == nil {
                             PaneSearchBar(
                                 session: active,
                                 isWorkspaceActive: store.activeWorkspaceId == workspace.id,
@@ -133,7 +135,7 @@ private struct PaneView: View {
                     .overlay(alignment: .bottom) {
                         // ⌘L composer rises from the bottom like a chat box.
                         // Per-pane / per-session, same as search.
-                        if active.composerActive {
+                        if active.composerActive, active.channel == nil {
                             PaneComposerBar(
                                 session: active,
                                 pane: pane,
@@ -446,12 +448,15 @@ private struct PaneStatusBar: View {
                     }
                 }
             }
-            StatusBarIconButton(
-                systemName: "long.text.page.and.pencil",
-                isActive: session.composerActive,
-                help: "Compose (⌘L)"
-            ) {
-                session.composerActive.toggle()
+            // AgentPad: no composer in a channel tab (DESIGN-F2).
+            if session.channel == nil {
+                StatusBarIconButton(
+                    systemName: "long.text.page.and.pencil",
+                    isActive: session.composerActive,
+                    help: "Compose (⌘L)"
+                ) {
+                    session.composerActive.toggle()
+                }
             }
             // Tool-call activity pill — Claude-only, shows the latest
             // tool call + click-to-popover for history. Sits on the left

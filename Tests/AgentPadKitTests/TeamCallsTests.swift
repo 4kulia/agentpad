@@ -15,8 +15,15 @@ final class FakeTeamRunner: TeamAgentRunner, @unchecked Sendable {
     var received: [TeamRunRequest] { lock.withLock { requests } }
     var waiting: Int { lock.withLock { gates.count } }
 
+    /// The last run's activity callback.
+    var lastOnActivity: (@Sendable (String) -> Void)? { lock.withLock { _lastOnActivity } }
+    private var _lastOnActivity: (@Sendable (String) -> Void)?
+
     func run(_ request: TeamRunRequest, onActivity: @escaping @Sendable (String) -> Void) async throws -> TeamRunResult {
-        lock.withLock { requests.append(request) }
+        lock.withLock {
+            requests.append(request)
+            _lastOnActivity = onActivity
+        }
         onActivity("Grep")
         if let answer = lock.withLock({ autoAnswer }) {
             return TeamRunResult(text: answer, isError: false, turns: 2, durationMs: 10)
@@ -38,11 +45,31 @@ final class FakeTeamRunner: TeamAgentRunner, @unchecked Sendable {
     }
 }
 
+/// Stands in for the server's delivery (D8, D4–D6): carries calls between
+/// `TeamCalls` of this process, as the colleague `me`.
+@MainActor
+final class FakeCallLink: TeamCallLink {
+    let me: TeamCaller
+    var colleagues: [TeamCaller] = []
+    var peers: [String: TeamCalls] = [:]
+    /// The other Mac cannot be reached.
+    var down = false
+    init(me: TeamCaller) { self.me = me }
+
+    func send(_ message: TeamMessage, to colleague: String, timeout: Duration) async throws -> TeamMessage {
+        guard !down, let peer = peers[colleague] else { throw TeamError.timedOut }
+        return await peer.handle(message, from: me)
+    }
+}
+
 @MainActor
 final class TeamCallsTests: XCTestCase {
     private var root: URL!
     private var project: URL!
-    private let network = FakeTeamNetwork()
+    /// Links are weak in `TeamCalls`; the test keeps them.
+    private var links: [FakeCallLink] = []
+    private let andrey = TeamCaller(id: "aaaa", displayName: "Andrey")
+    private let masha = TeamCaller(id: "bbbb", displayName: "Masha Petrova")
 
     override func setUp() async throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("team-calls-\(UUID().uuidString)")
@@ -51,24 +78,38 @@ final class TeamCallsTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        links = []
         try? FileManager.default.removeItem(at: root)
     }
 
-    private func service(_ name: String, id: String, runner: TeamAgentRunner = FakeTeamRunner()) -> TeamService {
-        let network = self.network
-        return TeamService(storage: TeamStorage(directory: root.appendingPathComponent(name)), runner: runner) { _ in
-            FakeTeamTransport(id: id, network: network)
-        }
+    private func service(_ name: String, runner: TeamAgentRunner = FakeTeamRunner()) async -> TeamService {
+        let service = TeamService(storage: TeamStorage(directory: root.appendingPathComponent(name)), runner: runner)
+        await service.load(mode: .server)
+        // The queue of 1.0.x these tests describe, through the fake link:
+        // switched on explicitly — the app never opens it (review D8e-p1-1).
+        service.calls.serverMode = false
+        return service
+    }
+
+    /// Andrey's and Masha's Macs reach each other.
+    @discardableResult
+    private func connect(owner: TeamService, caller: TeamService) -> (owner: FakeCallLink, caller: FakeCallLink) {
+        let ownerLink = FakeCallLink(me: andrey), callerLink = FakeCallLink(me: masha)
+        ownerLink.colleagues = [masha]
+        ownerLink.peers[masha.id] = caller.calls
+        callerLink.colleagues = [andrey]
+        callerLink.peers[andrey.id] = owner.calls
+        owner.calls.link = ownerLink
+        caller.calls.link = callerLink
+        links += [ownerLink, callerLink]
+        owner.calls.resume(); caller.calls.resume()
+        return (ownerLink, callerLink)
     }
 
     /// Andrey (aaaa) owns agents; Masha (bbbb) calls them.
     private func pairedPair(runner: FakeTeamRunner) async throws -> (owner: TeamService, caller: TeamService) {
-        let owner = service("owner", id: "aaaa", runner: runner), caller = service("caller", id: "bbbb")
-        await owner.enable(displayName: "Andrey"); await caller.enable(displayName: "Masha Petrova")
-        owner.approvePairing = { _ in true }
-        let url = try await owner.createInvite()
-        let link = try XCTUnwrap(try TeamInviteLink.parse(url))
-        try await caller.join(try caller.prepareJoin(link))
+        let owner = await service("owner", runner: runner), caller = await service("caller")
+        connect(owner: owner, caller: caller)
         try await owner.calls.save(TeamPublishedAgent(name: "backend", description: "Shop API", folder: project.path))
         return (owner, caller)
     }
@@ -84,8 +125,7 @@ final class TeamCallsTests: XCTestCase {
     // MARK: Publishing and the catalog
 
     func testPublishingChecksNameAndFolder() async throws {
-        let a = service("a", id: "aaaa")
-        await a.enable(displayName: "A")
+        let a = await service("a")
         for bad in ["", "Back End", "-x", String(repeating: "a", count: 33)] {
             do {
                 try await a.calls.save(TeamPublishedAgent(name: bad, description: "d", folder: project.path))
@@ -113,16 +153,70 @@ final class TeamCallsTests: XCTestCase {
         XCTAssertEqual(items.first?.entry.description, "Shop API")
     }
 
-    func testStrangersGetNoCatalogAndCannotCall() async throws {
-        let (owner, _) = try await pairedPair(runner: FakeTeamRunner())
-        let catalog = await owner.handle(TeamMessage(type: .catalogGet), from: "ffff")
-        XCTAssertEqual(catalog.code, "not_paired")
-        let call = await owner.handle(TeamMessage(type: .callStart, callId: UUID().uuidString, agent: "backend", prompt: "hi"), from: "ffff")
-        XCTAssertEqual(call.code, "not_paired")
-        XCTAssertTrue(owner.calls.incoming.isEmpty)
+    /// Stage E: no direct transport; until the server's delivery is in,
+    /// calls to colleagues say they need a server, and nothing is kept.
+    func testCallsToColleaguesNeedAServer() async throws {
+        let caller = await service("caller")
+        XCTAssertThrowsError(try caller.calls.ask("backend@andrey", prompt: "hi", threadId: nil, origin: nil)) {
+            XCTAssertEqual($0 as? TeamError, .notConnected)
+        }
+        XCTAssertTrue(caller.calls.outgoing.isEmpty)
+        let catalog = await caller.calls.catalog()
+        XCTAssertTrue(catalog.isEmpty)
+        // The owner's side works without it: agents are published here.
+        try await caller.calls.save(TeamPublishedAgent(name: "backend", description: "d", folder: project.path))
+        XCTAssertEqual(caller.calls.agents.map(\.name), ["backend"])
     }
 
     // MARK: A call end to end
+
+    /// A run's activity stays with the calls it began in: after a move to
+    /// a server's calls, its late activity and the one in memory do not
+    /// land on the server's call of the same id (review D8h-p2-9).
+    func testARunsActivityStaysWithItsStore() async throws {
+        let runner = FakeTeamRunner()
+        runner.ignoresCancel = true
+        let (owner, caller) = try await pairedPair(runner: runner)
+        let sent = try caller.calls.ask("backend@andrey", prompt: "x", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        owner.calls.decide(sent.id, allow: true)
+        try await waitUntil { owner.calls.incoming.first?.activity == "Grep" }
+        let key = ChatOrgKey(server: try ChatServerAddress(parsing: "https://chat.example.com"), accountId: CallJSON.anna,
+                             orgId: "0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10")
+        let store = try ChatStore.open(files: ChatFiles(directory: root.appendingPathComponent("chat")), key: key).store
+        try store.apply(ChatSnapshot(cursors: [:], requests: [CallJSON.wire(CallJSON.request(sent.id, state: "running", version: 5, onThisDevice: true))]))
+        owner.calls.useServer(store.calls, key: key)
+        XCTAssertNil(owner.calls.incoming.first { $0.id == sent.id }?.activity, "not carried into the server's call")
+        // The run, cancelled but slow to die, reports more.
+        let onActivity = try XCTUnwrap(runner.lastOnActivity)
+        onActivity("Edit")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertNil(owner.calls.incoming.first { $0.id == sent.id }?.activity)
+        owner.calls.reload()
+        XCTAssertNil(owner.calls.incoming.first { $0.id == sent.id }?.activity)
+    }
+
+    /// A colleague's wait on a call (the old protocol) ends with no answer
+    /// when the calls here changed meanwhile: the server's call of the same
+    /// id is not theirs (review D8h-p2-7).
+    func testAnOldProtocolWaitDoesNotAnswerFromOtherCalls() async throws {
+        let (owner, caller) = try await pairedPair(runner: FakeTeamRunner())
+        let sent = try caller.calls.ask("backend@andrey", prompt: "x", threadId: nil, origin: nil)
+        try await waitUntil { owner.calls.awaitingDecision.count == 1 }
+        let attach = TeamMessage(type: .callAttach, callId: sent.id, waitSeconds: 2,
+                                 call: TeamCallReport(callId: sent.id, state: .awaitingApproval, activity: nil))
+        let waiting = Task { await owner.calls.handle(attach, from: self.masha) }
+        try await Task.sleep(for: .milliseconds(50))
+        let key = ChatOrgKey(server: try ChatServerAddress(parsing: "https://chat.example.com"), accountId: CallJSON.anna,
+                             orgId: "0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10")
+        let store = try ChatStore.open(files: ChatFiles(directory: root.appendingPathComponent("chat")), key: key).store
+        try store.apply(ChatSnapshot(cursors: [:], requests: [CallJSON.wire(CallJSON.request(sent.id, state: "running", version: 5, onThisDevice: true))]))
+        owner.calls.serverMode = true
+        owner.calls.useServer(store.calls, key: key)
+        let answer = await waiting.value
+        XCTAssertEqual(answer.type, .error)
+        XCTAssertEqual(answer.code, "unknown_call")
+    }
 
     func testCallWaitsForTheOwnerThenRunsAndAnswers() async throws {
         let runner = FakeTeamRunner()
@@ -145,7 +239,7 @@ final class TeamCallsTests: XCTestCase {
         XCTAssertFalse(runner.received.first?.resume ?? true)
         runner.release("JWT in middleware/auth.ts")
 
-        let done = await caller.calls.check(sent.id, wait: 0)
+        let done = try await caller.calls.check(sent.id, wait: 0)
         try await waitUntil { caller.calls.outgoing.first?.report.state == .done }
         let report = try XCTUnwrap(caller.calls.outgoing.first?.report)
         XCTAssertNotNil(done)
@@ -198,12 +292,12 @@ final class TeamCallsTests: XCTestCase {
         let (owner, _) = try await pairedPair(runner: FakeTeamRunner())
         let id = UUID().uuidString.lowercased()
         let start = TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi")
-        _ = await owner.handle(start, from: "bbbb")
-        let again = await owner.handle(start, from: "bbbb")
+        _ = await owner.calls.handle(start, from: masha)
+        let again = await owner.calls.handle(start, from: masha)
         XCTAssertEqual(again.call?.state, .awaitingApproval)
         XCTAssertEqual(owner.calls.incoming.count, 1)
         // Another Mac cannot take over that call id.
-        let stolen = await owner.calls.handle(TeamMessage(type: .callAttach, callId: id), from: TeamContact(id: "cccc", name: "C", addedAt: Date()))
+        let stolen = await owner.calls.handle(TeamMessage(type: .callAttach, callId: id), from: TeamCaller(id: "cccc", displayName: "C"))
         XCTAssertEqual(stolen.code, "unknown_call")
     }
 
@@ -211,8 +305,8 @@ final class TeamCallsTests: XCTestCase {
         let runner = FakeTeamRunner()
         let (owner, _) = try await pairedPair(runner: runner)
         let first = UUID().uuidString, second = UUID().uuidString
-        _ = await owner.handle(TeamMessage(type: .callStart, callId: first, agent: "backend", prompt: "one"), from: "bbbb")
-        _ = await owner.handle(TeamMessage(type: .callStart, callId: second, agent: "backend", prompt: "two"), from: "bbbb")
+        _ = await owner.calls.handle(TeamMessage(type: .callStart, callId: first, agent: "backend", prompt: "one"), from: masha)
+        _ = await owner.calls.handle(TeamMessage(type: .callStart, callId: second, agent: "backend", prompt: "two"), from: masha)
         owner.calls.decide(first, allow: true)
         owner.calls.decide(second, allow: true)
         try await waitUntil { runner.waiting == 1 }
@@ -230,8 +324,8 @@ final class TeamCallsTests: XCTestCase {
         runner.ignoresCancel = true
         let (owner, _) = try await pairedPair(runner: runner)
         let first = UUID().uuidString, second = UUID().uuidString
-        _ = await owner.handle(TeamMessage(type: .callStart, callId: first, agent: "backend", prompt: "one"), from: "bbbb")
-        _ = await owner.handle(TeamMessage(type: .callStart, callId: second, agent: "backend", prompt: "two"), from: "bbbb")
+        _ = await owner.calls.handle(TeamMessage(type: .callStart, callId: first, agent: "backend", prompt: "one"), from: masha)
+        _ = await owner.calls.handle(TeamMessage(type: .callStart, callId: second, agent: "backend", prompt: "two"), from: masha)
         owner.calls.decide(first, allow: true)
         owner.calls.decide(second, allow: true)
         try await waitUntil { runner.waiting == 1 }
@@ -247,9 +341,9 @@ final class TeamCallsTests: XCTestCase {
     func testCancelThatOvertakesItsStartWins() async throws {
         let (owner, _) = try await pairedPair(runner: FakeTeamRunner())
         let id = UUID().uuidString
-        let cancel = await owner.handle(TeamMessage(type: .callCancel, callId: id), from: "bbbb")
+        let cancel = await owner.calls.handle(TeamMessage(type: .callCancel, callId: id), from: masha)
         XCTAssertEqual(cancel.call?.state, .cancelled)
-        let start = await owner.handle(TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi"), from: "bbbb")
+        let start = await owner.calls.handle(TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi"), from: masha)
         XCTAssertEqual(start.call?.state, .cancelled)
         XCTAssertTrue(owner.calls.incoming.isEmpty, "never shown to the owner")
     }
@@ -258,26 +352,24 @@ final class TeamCallsTests: XCTestCase {
         let runner = FakeTeamRunner()
         let (owner, _) = try await pairedPair(runner: runner)
         let id = UUID().uuidString
-        _ = await owner.handle(TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi", deliverBy: Date().addingTimeInterval(0.2)), from: "bbbb")
+        _ = await owner.calls.handle(TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi", deliverBy: Date().addingTimeInterval(0.2)), from: masha)
         try await Task.sleep(for: .milliseconds(300))
         owner.calls.decide(id, allow: true)
         XCTAssertEqual(owner.calls.incoming.first?.state, .expired)
         XCTAssertTrue(runner.received.isEmpty)
-        let late = await owner.handle(TeamMessage(type: .callStart, callId: UUID().uuidString, agent: "backend", prompt: "hi", deliverBy: Date().addingTimeInterval(-1)), from: "bbbb")
+        let late = await owner.calls.handle(TeamMessage(type: .callStart, callId: UUID().uuidString, agent: "backend", prompt: "hi", deliverBy: Date().addingTimeInterval(-1)), from: masha)
         XCTAssertEqual(late.code, "expired")
     }
 
     func testPublishingRejectsRuleBreakingEntries() async throws {
-        let a = service("a", id: "aaaa")
-        await a.enable(displayName: "A")
+        let a = await service("a")
         var agent = TeamPublishedAgent(name: "x", description: "d", folder: project.path)
         agent.allowedCommands = ["swift test) Bash(rm"]
         do { try await a.calls.save(agent); XCTFail("accepted") } catch {}
     }
 
     func testGitProfilesPublishARepositoryRootOnly() async throws {
-        let a = service("a", id: "aaaa")
-        await a.enable(displayName: "A")
+        let a = await service("a")
         let repo = project.appendingPathComponent("repo"), sub = repo.appendingPathComponent("sub")
         try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
         let git = Process()
@@ -295,15 +387,19 @@ final class TeamCallsTests: XCTestCase {
 
     func testStoppingAGroupTakesItsBackgroundChildren() async throws {
         let marker = root.appendingPathComponent("survived")
-        let sh = Process()
-        sh.executableURL = URL(fileURLWithPath: "/bin/sh")
-        // The child ignores SIGTERM and outlives its parent.
-        sh.arguments = ["-c", "(trap '' TERM; sleep 7; touch '\(marker.path)') & exit 0"]
-        try sh.run()
-        sh.waitUntilExit()
-        XCTAssertTrue(TeamProcesses.groupAlive(sh.processIdentifier))
-        await TeamProcesses.stopGroup(sh.processIdentifier)
-        XCTAssertFalse(TeamProcesses.groupAlive(sh.processIdentifier))
+        // The child ignores SIGTERM and outlives its parent, the run's leader;
+        // the leader is held unreaped, so its group is still the run's.
+        let sh = try TeamSpawn.suspended(path: "/bin/sh", arguments: ["-c", "(trap '' TERM; sleep 7; touch '\(marker.path)') & exit 0"],
+                                         environment: [:], directory: root.path, stdin: Pipe(), stdout: Pipe(), stderr: Pipe())
+        let ended = TeamExit()
+        sh.onExit { ended.finish($0) }
+        kill(sh.pid, SIGCONT)
+        _ = await ended.wait(timeout: .seconds(5))
+        let seen = TeamPidSet()
+        XCTAssertEqual(TeamProcesses.liveness(sh.identity, also: seen, holder: sh), .alive)
+        let gone = await TeamProcesses.stop(sh, also: seen) == .stopped
+        XCTAssertTrue(gone)
+        sh.release()
         // It ignored SIGTERM, so only the SIGKILL after five seconds stopped
         // it — before its seven seconds were up.
         try await Task.sleep(for: .seconds(3))
@@ -314,7 +410,7 @@ final class TeamCallsTests: XCTestCase {
         let (owner, _) = try await pairedPair(runner: FakeTeamRunner())
         var last: TeamMessage?
         for i in 0...TeamCalls.maxCallsPerHour {
-            let reply = await owner.handle(TeamMessage(type: .callStart, callId: UUID().uuidString, agent: "backend", prompt: "q\(i)"), from: "bbbb")
+            let reply = await owner.calls.handle(TeamMessage(type: .callStart, callId: UUID().uuidString, agent: "backend", prompt: "q\(i)"), from: masha)
             if reply.type == .callStatus, let id = reply.callId { owner.calls.decide(id, allow: false) }
             last = reply
         }
@@ -326,11 +422,11 @@ final class TeamCallsTests: XCTestCase {
         runner.autoAnswer = "ok"
         let (owner, _) = try await pairedPair(runner: runner)
         let id = UUID().uuidString
-        _ = await owner.handle(TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi"), from: "bbbb")
+        _ = await owner.calls.handle(TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi"), from: masha)
         owner.calls.decide(id, allow: true)
         try await waitUntil { owner.calls.incoming.first?.state == .done }
         let thread = try XCTUnwrap(owner.calls.incoming.first?.threadId)
-        let ivan = TeamContact(id: "cccc", name: "Ivan", addedAt: Date())
+        let ivan = TeamCaller(id: "cccc", displayName: "Ivan")
         let hijack = await owner.calls.handle(
             TeamMessage(type: .callStart, callId: UUID().uuidString, agent: "backend", prompt: "and?", threadId: thread), from: ivan
         )
@@ -340,21 +436,10 @@ final class TeamCallsTests: XCTestCase {
     func testUndecidedCallExpires() async throws {
         let (owner, _) = try await pairedPair(runner: FakeTeamRunner())
         let id = UUID().uuidString
-        _ = await owner.handle(TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi", deliverBy: Date().addingTimeInterval(60)), from: "bbbb")
+        _ = await owner.calls.handle(TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi", deliverBy: Date().addingTimeInterval(60)), from: masha)
         owner.calls.sweep(now: Date().addingTimeInterval(120))
         XCTAssertEqual(owner.calls.incoming.first?.state, .expired)
         XCTAssertTrue(owner.calls.awaitingDecision.isEmpty)
-    }
-
-    func testRemovingAColleagueStopsTheirCalls() async throws {
-        let runner = FakeTeamRunner()
-        let (owner, _) = try await pairedPair(runner: runner)
-        let id = UUID().uuidString
-        _ = await owner.handle(TeamMessage(type: .callStart, callId: id, agent: "backend", prompt: "hi"), from: "bbbb")
-        owner.calls.decide(id, allow: true)
-        try await waitUntil { runner.waiting == 1 }
-        try owner.remove("bbbb")
-        try await waitUntil { owner.calls.incoming.first?.state == .cancelled }
     }
 
     // MARK: Calls on disk
@@ -377,16 +462,16 @@ final class TeamCallsTests: XCTestCase {
             let from = root.appendingPathComponent(name), to = root.appendingPathComponent("\(name)-2")
             try FileManager.default.copyItem(at: from, to: to)
         }
-        try await owner.disable(); try await caller.disable()
-        let owner2 = service("owner-2", id: "aaaa", runner: FakeTeamRunner())
-        let caller2 = service("caller-2", id: "bbbb")
-        await owner2.load(); await caller2.load()
+        owner.calls.stopAll(); caller.calls.stopAll()
+        await owner.calls.drain(); await caller.calls.drain()
+        let owner2 = await service("owner-2", runner: FakeTeamRunner())
+        let caller2 = await service("caller-2")
         XCTAssertEqual(owner2.calls.incoming.first { $0.id == running.id }?.state, .failed, "its process ended with the app")
         XCTAssertEqual(owner2.calls.incoming.first { $0.id == waiting.id }?.state, .awaitingApproval)
         XCTAssertEqual(caller2.calls.outgoing.count, 2)
 
-        // Team work comes back on: the caller follows its calls again.
-        await owner2.enable(displayName: "Andrey"); await caller2.enable(displayName: "Masha Petrova")
+        // The server is reached again: the caller follows its calls again.
+        connect(owner: owner2, caller: caller2)
         owner2.calls.decide(waiting.id, allow: false, reason: "later")
         try await waitUntil { caller2.calls.outgoing.first { $0.id == waiting.id }?.report.state == .denied }
         try await waitUntil { caller2.calls.outgoing.first { $0.id == running.id }?.report.state == .failed }
@@ -400,10 +485,11 @@ final class TeamCallsTests: XCTestCase {
         caller.calls.onOutgoingFinished = { finished = $0 }
         // The owner's Mac is unreachable: the first try fails, the next one
         // would be five seconds later.
-        network.unregister("aaaa")
+        let callerLink = try XCTUnwrap(caller.calls.link as? FakeCallLink)
+        callerLink.down = true
         let sent = try caller.calls.ask("backend@andrey", prompt: "hello?", threadId: nil, origin: nil)
         try await waitUntil { caller.calls.outgoing.first?.note != nil }
-        try await owner.disable(); await owner.enable(displayName: "Andrey")
+        callerLink.down = false
         let back = ContinuousClock.now
         caller.calls.nudge()
         try await waitUntil { owner.calls.awaitingDecision.count == 1 }
@@ -505,7 +591,7 @@ final class TeamCallsTests: XCTestCase {
         owner.calls.clearHistory()
         XCTAssertEqual(owner.calls.incoming.filter { $0.hidden != true }.map(\.prompt), ["two"])
         // The caller can still learn how its first call ended.
-        let late = await owner.handle(TeamMessage(type: .callAttach, callId: first.id), from: "bbbb")
+        let late = await owner.calls.handle(TeamMessage(type: .callAttach, callId: first.id), from: masha)
         XCTAssertEqual(late.call?.state, .denied)
     }
 
@@ -563,15 +649,17 @@ final class TeamCallsTests: XCTestCase {
         XCTAssertTrue(owner.calls.agents(forSession: session).isEmpty)
     }
 
-    func testSessionAgentForksTheConversation() {
+    func testSessionAgentForksTheConversation() throws {
+        let fixture = try ClaudeResumeFixture(id: "11111111-2222-3333-4444-555555555555")
+        try fixture.add("aa111111-2222-4333-8444-555555555555")
         var agent = TeamPublishedAgent(name: "s", description: "d", folder: "/p", access: .read)
         agent.sessionId = "11111111-2222-3333-4444-555555555555"
-        let first = ClaudeCodeRunner.arguments(for: TeamRunRequest(agent: agent, prompt: "q", sessionId: "t1", resume: false, callerName: "M", callerProject: nil))
+        let first = try ClaudeCodeRunner.arguments(for: TeamRunRequest(agent: agent, prompt: "q", sessionId: "aa111111-2222-4333-8444-555555555555", resume: false, callerName: "M", callerProject: nil), sessionFilesRoot: fixture.root)
         XCTAssertEqual(value(after: "--resume", in: first), "11111111-2222-3333-4444-555555555555")
         XCTAssertTrue(first.contains("--fork-session"), "the owner's own session is never written to")
-        XCTAssertEqual(value(after: "--session-id", in: first), "t1")
-        let next = ClaudeCodeRunner.arguments(for: TeamRunRequest(agent: agent, prompt: "q", sessionId: "t1", resume: true, callerName: "M", callerProject: nil))
-        XCTAssertEqual(value(after: "--resume", in: next), "t1")
+        XCTAssertEqual(value(after: "--session-id", in: first), "aa111111-2222-4333-8444-555555555555")
+        let next = try ClaudeCodeRunner.arguments(for: TeamRunRequest(agent: agent, prompt: "q", sessionId: "aa111111-2222-4333-8444-555555555555", resume: true, callerName: "M", callerProject: nil), sessionFilesRoot: fixture.root)
+        XCTAssertEqual(value(after: "--resume", in: next), "aa111111-2222-4333-8444-555555555555")
         XCTAssertFalse(next.contains("--fork-session"))
     }
 
@@ -586,29 +674,30 @@ final class TeamCallsTests: XCTestCase {
     private func request(_ access: TeamAccessProfile, resume: Bool = false) -> TeamRunRequest {
         var agent = TeamPublishedAgent(name: "backend", description: "d", folder: "/p", access: access)
         agent.allowedCommands = ["swift test"]
-        return TeamRunRequest(agent: agent, prompt: "hi", sessionId: "s1", resume: resume, callerName: "Masha", callerProject: nil)
+        return TeamRunRequest(agent: agent, prompt: "hi", sessionId: "bb111111-2222-4333-8444-555555555555", resume: resume, callerName: "Masha", callerProject: nil)
     }
 
     private func value(after flag: String, in args: [String]) -> String? {
         args.firstIndex(of: flag).map { args[$0 + 1] }
     }
 
-    func testReadProfileHasNoShell() {
-        let args = ClaudeCodeRunner.arguments(for: request(.read))
+    func testReadProfileHasNoShell() throws {
+        let args = try ClaudeCodeRunner.arguments(for: request(.read))
         XCTAssertEqual(value(after: "--tools", in: args), "Read,Glob,Grep")
         XCTAssertTrue(args.contains("--restricted"), "the owner's settings must not widen the profile")
         XCTAssertTrue(args.contains("--strict-mcp-config"), "nor the owner's MCP servers")
         XCTAssertFalse(args.contains("--allowedTools"), "reads inside the folder need no rule; outside they are refused")
         XCTAssertEqual(value(after: "--permission-mode", in: args), "dontAsk")
         XCTAssertEqual(value(after: "--permission-prompts", in: args), "none")
-        XCTAssertEqual(value(after: "--session-id", in: args), "s1")
+        XCTAssertEqual(value(after: "--session-id", in: args), "bb111111-2222-4333-8444-555555555555")
         XCTAssertFalse(args.contains { $0.hasPrefix("Bash") }, "no shell, so no shell rules either")
         XCTAssertTrue(args.contains("Read(**/.env)"))
         XCTAssertTrue(args.contains("Read(~/.ssh/**)"))
     }
 
-    func testReadGitAllowsOnlyGitReads() {
-        let args = ClaudeCodeRunner.arguments(for: request(.readGit, resume: true))
+    func testReadGitAllowsOnlyGitReads() throws {
+        let fixture = try ClaudeResumeFixture(id: "bb111111-2222-4333-8444-555555555555")
+        let args = try ClaudeCodeRunner.arguments(for: request(.readGit, resume: true), sessionFilesRoot: fixture.root)
         XCTAssertEqual(value(after: "--tools", in: args), "Read,Glob,Grep,Bash")
         XCTAssertTrue(args.contains("Bash(git log *)"))
         XCTAssertTrue(args.contains("Bash(git status)"))
@@ -619,16 +708,16 @@ final class TeamCallsTests: XCTestCase {
         XCTAssertTrue(args.contains("Bash(git * /*)"), "so can diff given a path outside the work tree")
         XCTAssertFalse(args.contains("Read"), "no unconditional read rule")
         XCTAssertFalse(args.contains("Bash(swift test)"), "commands are for the edit profile only")
-        XCTAssertEqual(value(after: "--resume", in: args), "s1")
+        XCTAssertEqual(value(after: "--resume", in: args), "bb111111-2222-4333-8444-555555555555")
         XCTAssertFalse(args.contains("--session-id"))
     }
 
-    func testRunsGetOnlyTheirOwnToolsServer() {
+    func testRunsGetOnlyTheirOwnToolsServer() throws {
         var agent = request(.read).agent
         agent.extraFolders = ["/Users/me/kb"]
-        var req = TeamRunRequest(agent: agent, prompt: "hi", sessionId: "s1", resume: false, callerName: "Masha", callerProject: nil)
+        var req = TeamRunRequest(agent: agent, prompt: "hi", sessionId: "bb111111-2222-4333-8444-555555555555", resume: false, callerName: "Masha", callerProject: nil)
         req.runToolsCallId = "11111111-2222-3333-4444-555555555555"
-        let args = ClaudeCodeRunner.arguments(for: req)
+        let args = try ClaudeCodeRunner.arguments(for: req)
         let config = try! XCTUnwrap(value(after: "--mcp-config", in: args))
         XCTAssertTrue(config.contains("run-tools") && config.contains("11111111-2222-3333-4444-555555555555"))
         let i = try! XCTUnwrap(args.firstIndex(of: "--mcp-config"))
@@ -638,8 +727,8 @@ final class TeamCallsTests: XCTestCase {
         XCTAssertEqual(value(after: "--add-dir", in: args), "/Users/me/kb")
     }
 
-    func testEditProfileAcceptsEditsAndListedCommands() {
-        let args = ClaudeCodeRunner.arguments(for: request(.edit))
+    func testEditProfileAcceptsEditsAndListedCommands() throws {
+        let args = try ClaudeCodeRunner.arguments(for: request(.edit))
         XCTAssertEqual(value(after: "--permission-mode", in: args), "acceptEdits")
         XCTAssertTrue(args.contains("Bash(swift test *)"))
         XCTAssertEqual(value(after: "--max-turns", in: args), "30")
@@ -660,7 +749,7 @@ final class TeamCallsTests: XCTestCase {
 
     func testAbsoluteDeniedPathsMeanTheDiskRoot() {
         XCTAssertEqual(ClaudeCodeRunner.denyRules(["/Users/me/secrets/**", "~/.aws/**", ".env"]),
-                       ["Read(//Users/me/secrets/**)", "Read(~/.aws/**)", "Read(**/.env)"])
+                       ["Read(//Users/me/secrets/**)", "Read(~/.aws/**)", "Read(**/.env)", "Read(//**/.env)"])
     }
 
     func testEnvironmentDropsTabVariables() {
@@ -705,14 +794,15 @@ final class TeamCallsTests: XCTestCase {
 
     func testHandlesResolveColleagues() {
         let contacts = [
-            TeamContact(id: "aaaa1111", name: "Alexander Eliseenko", addedAt: Date()),
-            TeamContact(id: "bbbb2222", name: "Masha", alias: "Маша", addedAt: Date()),
+            TeamCaller(id: "aaaa1111", displayName: "Alexander Eliseenko"),
+            TeamCaller(id: "bbbb2222", displayName: "Маша"),
+            TeamCaller(id: "cccc3333", displayName: "Masha"),
         ]
         XCTAssertEqual(TeamHandle.make("Alexander Eliseenko"), "alexander-eliseenko")
         XCTAssertEqual(TeamHandle.resolve("alexander-eliseenko", in: contacts)?.id, "aaaa1111")
         XCTAssertEqual(TeamHandle.resolve("alexander", in: contacts)?.id, "aaaa1111")
         XCTAssertEqual(TeamHandle.resolve("маша", in: contacts)?.id, "bbbb2222")
-        XCTAssertEqual(TeamHandle.resolve("masha", in: contacts)?.id, "bbbb2222")
+        XCTAssertEqual(TeamHandle.resolve("masha", in: contacts)?.id, "cccc3333")
         XCTAssertEqual(TeamHandle.resolve("bbbb2222", in: contacts)?.id, "bbbb2222")
         XCTAssertNil(TeamHandle.resolve("ivan", in: contacts))
     }

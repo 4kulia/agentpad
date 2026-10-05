@@ -1,0 +1,28 @@
+{
+  "stream": "org-admin:0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10",
+  "seq": 3,
+  "id": "5b0c2f7e-0a8d-4f4e-9e57-2d4c1f9b6a40",
+  "type": "invitation.create",
+  "actor": {
+    "account_id": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+    "session_id": "4f1d6a62-2d0e-4b8e-9d6b-5f0e6c3b8f11"
+  },
+  "body": {
+    "invitation_id": "3f2e1d0c-9b8a-4765-8432-10fedcba9876",
+    "email": "boris@example.com",
+    "role": "member",
+    "team_ids": [
+      "3b4c5d6e-7f8a-4b9c-8d0e-1f2a3b4c5d6e",
+      "6a1c9e2b-7d3f-4a5e-8b1c-2d3e4f5a6b7c"
+    ],
+    "invited_by": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+    "created_at": "2026-10-04T18:20:00.123456Z",
+    "expires_at": "2026-10-11T18:20:00.123456Z",
+    "replaced": false
+  },
+  "command_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a60",
+  "at": "2026-10-04T18:20:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null
+}

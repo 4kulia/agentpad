@@ -76,19 +76,17 @@ Click a file to preview it under the terminal. Drag the divider to resize the pr
 
 ## Team work
 
-*In progress: pairing, presence, publishing agents and calling a colleague's agents work today; calls and their history are kept for 30 days, also across restarts.*
+*In progress: team work moves to an AgentPad server. Connecting and publishing agents work today; calls to colleagues come back once the server delivers them. Team settings of AgentPad 1.0.x (direct pairing) are not carried over: set them up again.*
 
-Pair AgentPad with a colleague's, and see when they are online:
+Team work goes through an AgentPad server your team shares:
 
-1. **Team → Turn Team Work On or Off…** and choose the name colleagues will see.
-2. **Team → Invite Colleague…** creates a link that works once, for 24 hours. Send it in a private message.
-3. Your colleague opens the link. Both of you see the same six-digit code; you allow the request if the codes match.
-4. **Team → Colleagues…** shows who is online.
+1. **Team → Connect to a Server…**: the server's address and your email; enter the code the server mails you.
+2. **Team → Team…** shows the connection and anything that needs you; **Team → Disconnect from the Server…** turns team work off.
 
 Let your colleague's agents ask yours:
 
 - **Team → Published Agents… → Publish Agent…**: a name, what to ask it about, a project folder, and its rights — *Read*, *Read and git* (a repository's top folder), or *Edit*. Files with secrets (`.env`, keys) are excluded from reading by default.
-- Or right-click a Claude Code session in the right panel → **Publish to Team ▸ Everyone / a colleague / Choose People…**, and publish the session itself (each call works on a copy of its conversation, which stays untouched; the agent disappears when the conversation is deleted), a fresh agent in its folder, or both.
+- Or right-click a Claude Code session in the right panel → **Publish to Team ▸ Publish…**, and publish the session itself (each call works on a copy of its conversation, which stays untouched; the agent disappears when the conversation is deleted), a fresh agent in its folder, or both.
 
 An agent can be given more folders than its project (a second checkout, a shared knowledge repository). While it works, it can also ask for another folder: the request appears in the Team tab and the right panel with **Allow Once**, **Always** (added to the agent for good) and **Deny**, and the conversation goes on with the folder once allowed.
 
@@ -96,10 +94,10 @@ Every call shows up at the top of the right panel with its full text. Nothing ru
 
 Calling a colleague's agent:
 
-- **From a Claude Code session in AgentPad**, just ask: "ask Masha's backend agent how auth works in her branch". While team work is on, every new session gets the tools `team_agents`, `team_ask`, `team_check` and `team_cancel` (an MCP server passed at launch; your configuration is not changed). `team_ask` asks for your permission, since it sends text to another person.
+- **From a Claude Code session in AgentPad**, just ask: "ask Masha's backend agent how auth works in her branch". While connected to a server, every new session gets the tools `team_agents`, `team_ask`, `team_check` and `team_cancel` (an MCP server passed at launch; your configuration is not changed). `team_ask` asks for your permission, since it sends text to another person.
 - **From the command line**, for any other agent: `agentpad-cli team agents`, `agentpad-cli team ask backend@masha "How does auth work in your branch?"` (`--thread <id>` continues the conversation).
 
-The two Macs connect directly over QUIC, end-to-end encrypted, and find each other by public key; when a direct path is impossible, traffic goes through the public relays of [iroh](https://www.iroh.computer). The invitation carries no IP addresses. Turning team work off closes all connections. Everything team work stores lives in `~/Library/Application Support/agentpad/team/`; deleting that folder resets it.
+AgentPad connects only to the server you chose, over HTTPS; the sign-in is kept in the macOS keychain. Disconnecting closes the connection. Published agents and calls live in `~/Library/Application Support/agentpad/team-server/`, the connection in `…/agentpad/chat/`; the `team/` folder of 1.0.x is no longer used and can be deleted.
 
 ## Where the data comes from
 
@@ -115,10 +113,10 @@ Claude Code's session files are an internal format. AgentPad treats them defensi
 
 ## Privacy
 
-There are no accounts, no telemetry and no sync. Conversations and files stay on your Mac. AgentPad makes no network requests on its own, with two exceptions:
+There is no telemetry, and no accounts or sync unless you connect to a team server. Conversations and files stay on your Mac. AgentPad makes no network requests on its own, with two exceptions:
 
 - **Updates.** Once a day, and when you choose **Check for Updates…**, AgentPad reads the list of releases (`appcast.xml`) from this repository's latest GitHub release. Nothing about you or your Mac is sent.
-- **Team work**, while turned on, connects to the colleagues you paired with (see below).
+- **Team work**, while connected, talks to the AgentPad server you connected to (see above), and to nothing else.
 
 ## Install
 

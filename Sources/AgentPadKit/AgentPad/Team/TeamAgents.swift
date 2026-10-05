@@ -6,6 +6,9 @@ import Foundation
 /// What an agent may do on this Mac, chosen by its owner (A-2).
 enum TeamAccessProfile: String, Codable, CaseIterable, Identifiable, Sendable {
     case read
+    /// Edit and Write without a shell (owner's decision after Y1: profiles
+    /// without Bash).
+    case editFiles = "edit-files"
     case readGit = "read-git"
     case edit
 
@@ -14,6 +17,7 @@ enum TeamAccessProfile: String, Codable, CaseIterable, Identifiable, Sendable {
     var title: String {
         switch self {
         case .read: "Read"
+        case .editFiles: "Edit files (no shell)"
         case .readGit: "Read and git"
         case .edit: "Edit"
         }
@@ -22,9 +26,32 @@ enum TeamAccessProfile: String, Codable, CaseIterable, Identifiable, Sendable {
     var summary: String {
         switch self {
         case .read: "Reads and searches files in the folder. Nothing else."
+        case .editFiles: "Reads, edits and creates files in its folders. Runs no commands."
         case .readGit: "Reads files and runs git log, diff, show, status, blame and branch."
         case .edit: "Reads, edits and creates files in the folder; runs git read commands and the commands you list."
         }
+    }
+
+    /// The agent gets a shell (Bash): the Y1 report found its limits do not hold.
+    var runsShell: Bool { self == .readGit || self == .edit }
+    /// The agent runs git, which reads the whole repository: published only
+    /// at a repository's top folder.
+    var usesGit: Bool { self == .readGit || self == .edit }
+    /// The owner lists the commands the agent may run.
+    var takesCommands: Bool { self == .edit }
+
+    /// Said when an agent with a shell is published and on its decision card (Y1).
+    static let shellWarning = "Shell commands can reach outside the project folder, read your environment variables, and run code from the repository's settings and from your shell's configuration. Choose \"Read\" or \"Edit files (no shell)\" if the agent does not need to run commands."
+    static let editFilesWarning = "The agent reads, edits and creates files in its folders, including CLAUDE.md, Makefile, package.json and build scripts, which you or your next Claude Code session may later run: check its changes. It runs no commands."
+
+    /// The profiles the server takes (its `agents.access` check): every one
+    /// since the server's migration for `editFiles` (server fdb6b70).
+    static let serverAccepts = Set(TeamAccessProfile.allCases)
+
+    /// Why `agents` cannot be published to the server yet, or nil.
+    static func notOnServerYet(_ agents: [TeamPublishedAgent]) -> String? {
+        guard let agent = agents.first(where: { !serverAccepts.contains($0.access) }) else { return nil }
+        return "\(agent.name) is not published: the server does not take the \"\(agent.access.title)\" rights yet; choose Read for now"
     }
 }
 
@@ -124,8 +151,8 @@ enum TeamSessionFiles {
     static func isValidId(_ id: String) -> Bool { UUID(uuidString: id) != nil }
 
     /// The conversation's file, or nil once it is gone.
-    static func file(for sessionId: String, root: URL = root) -> URL? {
-        guard isValidId(sessionId),
+    static func file(for sessionId: String, root: URL = root, visibility: ChannelConversationFilter = .current()) -> URL? {
+        guard visibility.allows(conversationId: sessionId), isValidId(sessionId),
               let projects = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
         else { return nil }
         let name = "\(sessionId.lowercased()).jsonl"
@@ -160,10 +187,13 @@ enum TeamCallState: String, Codable, Sendable {
     case queued
     case awaitingApproval = "awaiting_approval"
     case running, done, failed, denied, cancelled, expired
+    /// A server's state this AgentPad does not know: not final, nothing to
+    /// do, said so (server `docs/api.md`).
+    case unknown
 
     var isFinal: Bool {
         switch self {
-        case .queued, .awaitingApproval, .running: false
+        case .queued, .awaitingApproval, .running, .unknown: false
         case .done, .failed, .denied, .cancelled, .expired: true
         }
     }
@@ -251,7 +281,7 @@ enum TeamGitRemote {
             do { try process.run() } catch { return nil }
             let timedOut = TeamOnce()
             let timer = DispatchWorkItem {
-                if process.isRunning, timedOut.claim() { TeamProcesses.signal(process.processIdentifier, SIGKILL) }
+                if process.isRunning, timedOut.claim() { kill(process.processIdentifier, SIGKILL) }
             }
             DispatchQueue.global().asyncAfter(deadline: .now() + 3, execute: timer)
             let data = out.fileHandleForReading.readDataToEndOfFile()
@@ -277,16 +307,13 @@ enum TeamHandle {
 
     /// The colleague an address names: by handle of their shown or own name,
     /// by first name when only one colleague has it, or by key prefix.
-    static func resolve(_ handle: String, in contacts: [TeamContact]) -> TeamContact? {
+    static func resolve(_ handle: String, in contacts: [TeamCaller]) -> TeamCaller? {
         let h = make(handle)
         guard !h.isEmpty else { return nil }
-        let exact = contacts.filter { make($0.displayName) == h || make($0.name) == h }
+        let exact = contacts.filter { make($0.displayName) == h }
         if exact.count == 1 { return exact[0] }
         if exact.count > 1 { return nil }
-        let first = contacts.filter {
-            make($0.displayName).split(separator: "-").first.map(String.init) == h
-                || make($0.name).split(separator: "-").first.map(String.init) == h
-        }
+        let first = contacts.filter { make($0.displayName).split(separator: "-").first.map(String.init) == h }
         if first.count == 1 { return first[0] }
         if handle.count >= 8, handle.allSatisfy(\.isHexDigit) {
             let byKey = contacts.filter { $0.id.hasPrefix(handle.lowercased()) }

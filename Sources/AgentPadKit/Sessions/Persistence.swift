@@ -261,14 +261,18 @@ struct PersistedTab: Codable, Equatable {
     /// `decodeIfPresent` so state.json files written by pre-resume AgentPad
     /// versions still load.
     var conversationId: String?
+    // AgentPad: set for a channel tab; older files have none and read as terminals.
+    var channel: ChannelRef?
 
     @MainActor
     init(_ session: Session) {
         self.id = session.id
         self.agentId = session.agent.id
         self.currentDirectoryPath = session.currentDirectory.path
-        self.customTitle = session.customTitle
+        // AgentPad: a channel tab keeps no title — its name is its card's (DESIGN-F2).
+        self.customTitle = session.channel == nil ? session.customTitle : nil
         self.conversationId = session.conversationId
+        self.channel = session.channel
     }
 
     init(id: UUID, agentId: String, currentDirectoryPath: String, customTitle: String? = nil, conversationId: String? = nil) {
@@ -294,6 +298,14 @@ protocol Persistence {
 final class AppPersistence {
     /// The real `state.json`. Tests inject a temp path via `init(fileURL:)`.
     static var defaultFileURL: URL {
+        // AgentPad: a debug build may keep its state elsewhere — to run beside
+        // the working app, e.g. to check a channel tab starts no process
+        // (DESIGN-F2). A release build never reads it.
+        #if DEBUG
+        if let path = ProcessInfo.processInfo.environment["AGENTPAD_DEBUG_STATE_PATH"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        #endif
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let dir = support.appendingPathComponent(AppIdentity.supportDirectoryName, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

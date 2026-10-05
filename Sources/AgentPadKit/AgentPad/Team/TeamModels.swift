@@ -1,66 +1,71 @@
-import CryptoKit
 import Foundation
 
-// Team work, stage 1: identity, invitations, the list of colleagues and
-// whether each one is online (docs/agentpad/TEAM.md, 6.1 and 7.1–7.3).
+// The calls' messages and the small helpers team work shares.
 
-/// A colleague this Mac has paired with. Identified by the public key of
-/// their AgentPad's endpoint — never by name, so another Mac calling itself
-/// by the same name gets none of their rights.
-struct TeamContact: Codable, Equatable, Identifiable, Sendable {
-    /// Endpoint public key, lowercase hex.
+/// Someone calling this Mac's agents: an id and the name shown for them.
+/// (Direct mode's paired colleagues are gone; the server names callers from D8 on.)
+struct TeamCaller: Equatable, Sendable {
     let id: String
-    /// The name they gave their AgentPad, as received at pairing.
-    var name: String
-    /// A local name for them, if the user set one.
-    var alias: String?
-    /// Their home relay when last known — a dialing hint only; the key is
-    /// enough to find them.
-    var relayURL: String?
-    let addedAt: Date
-    var lastSeen: Date?
+    let displayName: String
+}
 
-    var displayName: String { alias?.isEmpty == false ? alias! : name }
-
-    /// Answering within two presence rounds (`TeamService.presenceInterval`)
-    /// counts as online.
-    static let onlineWindow: TimeInterval = 150
-
-    /// Online means answered within the last presence round or two.
-    func isOnline(now: Date = Date()) -> Bool {
-        guard let lastSeen else { return false }
-        return now.timeIntervalSince(lastSeen) < Self.onlineWindow
+/// Names and short texts from another Mac: no control characters, line
+/// breaks or direction marks, trimmed, at most 64 characters.
+enum TeamText {
+    static func sanitizedName(_ raw: String) -> String {
+        let kept = raw.unicodeScalars.filter { scalar in
+            !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.newlines.contains(scalar)
+                && !(0x2028...0x2029).contains(scalar.value)   // line / paragraph separator
+                && !(0x200E...0x200F).contains(scalar.value)   // direction marks
+                && !(0x202A...0x202E).contains(scalar.value)   // direction overrides
+                && !(0x2066...0x2069).contains(scalar.value)   // direction isolates
+        }
+        return String(String.UnicodeScalarView(kept)).trimmingCharacters(in: .whitespaces).prefix(64).description
     }
 }
 
-/// What this Mac stores about an invitation it issued: only a hash of the
-/// secret, so the file alone cannot be used to join.
-struct TeamInviteRecord: Codable, Equatable, Sendable {
-    let secretHash: String
-    let createdAt: Date
-    let expiresAt: Date
-    var usedBy: String?
-
-    static func hash(_ secret: String) -> String {
-        SHA256.hash(data: Data(secret.utf8)).map { String(format: "%02x", $0) }.joined()
+final class TeamOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
 
-/// Team settings kept beside the rest of the team state, so deleting the team
-/// folder fully resets team work.
-struct TeamConfig: Codable, Equatable, Sendable {
-    var enabled = false
-    /// How this Mac introduces itself to colleagues.
-    var displayName = ""
+/// `operation`, or `TeamError.timedOut` after `timeout`, whichever comes first.
+func teamDeadline<T: Sendable>(
+    _ timeout: Duration,
+    onTimeout: (@Sendable () -> Void)? = nil,
+    _ operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    let gate = TeamOnce()
+    return try await withCheckedThrowingContinuation { continuation in
+        Task {
+            do {
+                let value = try await operation()
+                if gate.claim() { continuation.resume(returning: value) }
+            } catch {
+                if gate.claim() { continuation.resume(throwing: error) }
+            }
+        }
+        Task {
+            try? await Task.sleep(for: timeout)
+            if gate.claim() {
+                onTimeout?()
+                continuation.resume(throwing: TeamError.timedOut)
+            }
+        }
+    }
 }
 
-/// One message on the wire. Each request is one bidirectional stream: one
-/// JSON line up, one JSON line back (TEAM.md 7.3).
+/// One message of the calls' protocol (TEAM.md 7.3): a request and its
+/// answer. The server carries them from D8 on.
 struct TeamMessage: Codable, Equatable, Sendable {
     enum Kind: String, Codable, Sendable {
-        case hello, helloOK = "hello.ok"
-        case pairCommit = "pair.commit", pairNonce = "pair.nonce"
-        case pairRequest = "pair.request", pairOK = "pair.ok", pairDenied = "pair.denied"
         // Stage 2: the catalog and calls (TEAM.md 7.3). Every call message is
         // answered with `call.status`, which carries the call as it stands.
         case catalogGet = "catalog.get", catalog
@@ -73,16 +78,7 @@ struct TeamMessage: Codable, Equatable, Sendable {
 
     var type: Kind
     var protocolVersion: Int = TeamWire.version
-    /// Sender's display name (hello, pair.*).
-    var name: String?
-    /// Invitation secret (pair.commit, pair.request).
-    var secret: String?
-    /// pair.commit: hash of the joiner's nonce. pair.nonce: the inviter's
-    /// nonce. pair.request: the joiner's nonce, revealed (TEAM.md 7.2).
-    var commitment: String?
-    var nonce: String?
-    var appVersion: String?
-    /// Machine-readable reason for `error` / `pair.denied`.
+    /// Machine-readable reason for `error`.
     var code: String?
     /// catalog: the agents this colleague may call.
     var agents: [TeamCatalogEntry]?
@@ -106,57 +102,31 @@ struct TeamMessage: Codable, Equatable, Sendable {
 
 enum TeamWire {
     static let version = 1
-    static let alpn = "agentpad/team/1"
-    /// Upper bound for one message, enforced while reading. Holds the
-    /// largest answer (`TeamCalls.maxAnswerBytes`) with room to spare.
-    static let maxMessageBytes = 1024 * 1024
-
-    static func encode(_ message: TeamMessage) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        var data = try encoder.encode(message)
-        data.append(0x0A)
-        return data
-    }
-
-    /// Exactly one UTF-8 JSON line, terminated by a newline; anything else is
-    /// refused, so a truncated message can never pass as a complete one.
-    static func decode(_ data: Data) throws -> TeamMessage {
-        guard data.count <= maxMessageBytes else { throw TeamError.protocolViolation("message too large") }
-        guard let newline = data.firstIndex(of: 0x0A), newline == data.index(before: data.endIndex) else {
-            throw TeamError.protocolViolation("expected one complete line")
-        }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(TeamMessage.self, from: data[data.startIndex..<newline])
-    }
 }
 
-/// Where to dial a peer: a ticket from an invitation link, or a known key.
-enum TeamPeerAddress: Equatable, Sendable {
-    case ticket(String)
-    case endpoint(id: String, relayURL: String?)
-}
 
 enum TeamError: Error, Equatable, LocalizedError {
-    case notEnabled
-    case identity(String)
     case storage(String)
-    case invalidLink(String)
-    case protocolViolation(String)
     case timedOut
-    case unreachable(String)
     case refused(String)
+    /// Something of team work still runs here: the move to a server waits (C0).
+    case teamWorkOn
+    /// Calls to colleagues go through a server; none is connected (or its
+    /// delivery is not in yet: D8, D4–D6).
+    case notConnected
+    /// Not done through a server yet (`TeamServerCore`): the text as it is.
+    case notYet(String)
+    /// A check's calls are no longer the current ones (review D8h-p2-7).
+    case scopeChanged
 
     var errorDescription: String? {
         switch self {
-        case .notEnabled: "Team work is turned off."
-        case .identity(let detail): "Team identity key: \(detail)"
+        case .teamWorkOn: "A team call is still running here; wait until it ends."
+        case .notConnected: "Calls to colleagues are available after connecting to a server."
+        case .notYet(let text): text
+        case .scopeChanged: "Team work moved to other calls (another organization, server or account) while this call was followed; it is no longer followed here."
         case .storage(let detail): "Team data: \(detail)"
-        case .invalidLink(let detail): "Invitation link: \(detail)"
-        case .protocolViolation(let detail): "Unexpected message from the other Mac: \(detail)"
         case .timedOut: "The other Mac did not answer in time."
-        case .unreachable(let detail): "Could not reach the other Mac: \(detail)"
         case .refused(let reason): Self.refusalText(reason)
         }
     }
@@ -164,12 +134,7 @@ enum TeamError: Error, Equatable, LocalizedError {
     static func refusalText(_ code: String) -> String {
         switch code {
         case "denied": return "Your colleague declined the request."
-        case "invite_invalid": return "The invitation is unknown, already used, or expired. Ask for a new one."
-        case "not_paired": return "That Mac does not know this one. Pair again with a new invitation."
-        case "busy": return "Your colleague has another join request open. Try again in a minute."
-        case "join_in_progress": return "A join is already waiting for an answer."
         case "protocol_too_new": return "The other AgentPad is older. Ask your colleague to update."
-        case "storage": return "The other Mac could not save the pairing. Try again."
         case "unknown_agent": return "Your colleague has no agent by that name open to you."
         case "unknown_call": return "Your colleague's Mac does not know this call (it may have restarted)."
         case "unknown_thread": return "That thread is unknown on your colleague's Mac; start a new one."

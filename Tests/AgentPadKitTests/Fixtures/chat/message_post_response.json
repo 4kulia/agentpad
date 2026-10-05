@@ -1,0 +1,14 @@
+{
+  "events": [
+    {
+      "stream": "channel:3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+      "seq": 12,
+      "id": "5b0c2f7e-0a8d-4f4e-9e57-2d4c1f9b6a41"
+    }
+  ],
+  "result": {
+    "message_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01",
+    "revision": 1,
+    "seq": 12
+  }
+}

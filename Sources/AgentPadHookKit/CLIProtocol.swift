@@ -104,19 +104,22 @@ public struct AgentPadCLIRequest: Codable, Equatable, Sendable {
     /// AgentPad, `team`: the subcommand and its values. Optional on the wire,
     /// like every field added after v1.
     public var teamAction: String?
-    public var teamName: String?
-    public var teamLink: String?
-    public var teamPeer: String?
     public var teamAgent: String?
     public var teamPrompt: String?
     public var teamThread: String?
     public var teamCall: String?
     /// check: seconds the app may hold the request waiting for news.
     public var teamWaitSeconds: Int?
+    /// check: the calls the follow began in (`Call.scope`); others refuse.
+    public var teamScope: String?
     public var teamFolder: String?
     public var teamDescription: String?
     public var teamAccess: String?
     public var teamMine: Bool?
+    /// invite (C7): the address, the role, the teams by name.
+    public var teamEmail: String?
+    public var teamRole: String?
+    public var teamTeams: [String]?
     /// The caller's working directory, for the project it is in.
     public var teamCwd: String?
 
@@ -227,14 +230,18 @@ public struct AgentPadCLITabInfo: Codable, Equatable, Sendable {
     public var agent: String
     /// running / waiting / failed / idle — only for agent tabs.
     public var agentState: String?
+    /// A channel tab (`agent` "channel"): its channel, only while the user
+    /// may see it — the title is then its name, else "Channel".
+    public var channelId: String?
 
-    public init(id: String, title: String, cwd: String, isActive: Bool, agent: String, agentState: String?) {
+    public init(id: String, title: String, cwd: String, isActive: Bool, agent: String, agentState: String?, channelId: String? = nil) {
         self.id = id
         self.title = title
         self.cwd = cwd
         self.isActive = isActive
         self.agent = agent
         self.agentState = agentState
+        self.channelId = channelId
     }
 }
 

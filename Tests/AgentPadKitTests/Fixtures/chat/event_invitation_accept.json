@@ -1,0 +1,16 @@
+{
+  "stream": "org-admin:0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10",
+  "seq": 5,
+  "id": "5b0c2f7e-0a8d-4f4e-9e57-2d4c1f9b6a40",
+  "type": "invitation.accept",
+  "actor": null,
+  "body": {
+    "invitation_id": "3f2e1d0c-9b8a-4765-8432-10fedcba9876",
+    "account_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+  },
+  "command_id": null,
+  "at": "2026-10-04T18:20:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null
+}

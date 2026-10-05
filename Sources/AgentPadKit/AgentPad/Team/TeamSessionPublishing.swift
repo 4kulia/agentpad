@@ -2,9 +2,10 @@ import AppKit
 import SwiftUI
 
 /// Right-click on a Claude Code session in the right panel → Publish to
-/// Team ▸ Everyone / a colleague / Choose People…, then a short window to
-/// confirm what is published: the session itself (calls continue a copy of
-/// its conversation), a fresh agent in its folder, or both.
+/// Team ▸ Publish…, then a short window to confirm what is published: the
+/// session itself (calls continue a copy of its conversation), a fresh agent
+/// in its folder, or both. Every colleague may call it until the server's
+/// teams decide who may (D stage).
 struct TeamPublishMenu: View {
     /// The Claude Code conversation; nil for other agents, which shows nothing.
     let sessionId: String?
@@ -12,24 +13,9 @@ struct TeamPublishMenu: View {
     var service = TeamService.shared
 
     var body: some View {
-        if let sessionId, TeamSessionFiles.isValidId(sessionId) {
+        if let sessionId, TeamSessionFiles.isValidId(sessionId), ChannelConversationFilter.current().allows(conversationId: sessionId) {
             Menu("Publish to Team") {
-                if !service.isOn {
-                    Button("Turn On Team Work…") { TeamUI.toggleTeamWork() }
-                } else {
-                    Button("Everyone…") { open(sessionId, audience: nil) }
-                    if !service.contacts.isEmpty {
-                        Divider()
-                        ForEach(service.contacts) { contact in
-                            Button("\(contact.displayName)…") { open(sessionId, audience: [contact.id]) }
-                        }
-                        if service.contacts.count > 1 {
-                            Button("Choose People…") { open(sessionId, audience: []) }
-                        }
-                    } else {
-                        Button("Invite Colleague…") { TeamUI.invite() }
-                    }
-                }
+                Button("Publish…") { TeamWindows.showPublishSession(sessionId: sessionId, title: title) }
                 let published = service.calls.agents(forSession: sessionId)
                 if !published.isEmpty {
                     Divider()
@@ -39,10 +25,6 @@ struct TeamPublishMenu: View {
                 }
             }
         }
-    }
-
-    private func open(_ sessionId: String, audience: [String]?) {
-        TeamWindows.showPublishSession(sessionId: sessionId, title: title, audience: audience)
     }
 }
 
@@ -70,15 +52,22 @@ struct TeamPublishSessionView: View {
     @State private var folderName = ""
     @State private var description: String
     @State private var access: TeamAccessProfile = .read
-    @State private var everyone: Bool
-    @State private var chosen: Set<String>
     @State private var folder: String?
     @State private var extraText = ""
     @State private var commandsText = ""
     @State private var error: String?
     @State private var saving = false
+    /// Server mode: the organization fixed when the window opened (state,
+    /// kept over the view's rebuilds: review D3b-p1-2), the member's teams
+    /// and those chosen (D3), General first.
+    @State private var key: ChatOrgKey?
+    @State private var teams: [ChatSnapshot.Team]?
+    @State private var chosen: Set<String>
+    /// The agents whose teams `chosen` was last restored from: restored
+    /// again only when the agent edited changes (review D3c-p2-3).
+    @State private var restoredFor: [UUID]?
 
-    init(sessionId: String, title: String, audience: [String]?, service: TeamService, onClose: @escaping () -> Void) {
+    init(sessionId: String, title: String, service: TeamService, onClose: @escaping () -> Void) {
         self.sessionId = sessionId.lowercased()
         self.title = title
         self.service = service
@@ -90,8 +79,11 @@ struct TeamPublishSessionView: View {
         _access = State(initialValue: existing?.access ?? .read)
         _extraText = State(initialValue: (existing?.extraFolders ?? []).joined(separator: "\n"))
         _commandsText = State(initialValue: (existing?.allowedCommands ?? []).joined(separator: "\n"))
-        _everyone = State(initialValue: audience == nil)
-        _chosen = State(initialValue: Set(audience ?? []))
+        let key = service.calls.serverMode ? service.calls.serverKey : nil
+        let teams = key.map { ChatService.shared.myTeams($0) }
+        _key = State(initialValue: key)
+        _teams = State(initialValue: teams)
+        _chosen = State(initialValue: Set((teams ?? []).filter(\.isGeneral).map(\.teamId)))
     }
 
     var body: some View {
@@ -104,6 +96,8 @@ struct TeamPublishSessionView: View {
                     ForEach(TeamPublishMode.allCases) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.radioGroup)
+                .onChange(of: mode) { restoreTeams() }
+                .onChange(of: folderName) { restoreTeams() }
                 Text(modeExplanation)
                     .font(Theme.display(10.5))
                     .foregroundStyle(Theme.chromeMuted)
@@ -123,23 +117,29 @@ struct TeamPublishSessionView: View {
                     .font(Theme.display(10.5))
                     .foregroundStyle(Theme.chromeMuted)
                     .fixedSize(horizontal: false, vertical: true)
-                if access == .edit {
+                if access.takesCommands {
                     TextField("Allowed commands, one per line", text: $commandsText, prompt: Text("git commit\ncodex exec"), axis: .vertical)
                         .lineLimit(2...5)
-                }
-                Toggle("Every colleague", isOn: $everyone)
-                if !everyone {
-                    ForEach(service.contacts) { contact in
-                        Toggle(contact.displayName, isOn: Binding(
-                            get: { chosen.contains(contact.id) },
-                            set: { if $0 { chosen.insert(contact.id) } else { chosen.remove(contact.id) } }
-                        ))
-                    }
                 }
                 HStack(alignment: .top) {
                     TextField("More folders, one per line", text: $extraText, prompt: Text("e.g. a second checkout"), axis: .vertical)
                         .lineLimit(1...4)
                     Button("Add…") { if let path = TeamUI.chooseFolder() { extraText += (extraText.isEmpty ? "" : "\n") + path } }
+                }
+                if let teams {
+                    Section("Publish to") {
+                        ForEach(teams, id: \.teamId) { team in
+                            Toggle(team.name, isOn: Binding(
+                                get: { chosen.contains(team.teamId) },
+                                set: { on in if on { chosen.insert(team.teamId) } else { chosen.remove(team.teamId) } }
+                            ))
+                        }
+                        let names = teams.filter { chosen.contains($0.teamId) }.map(\.name)
+                        ForEach(TeamPublishWarnings.lines(access: access, fromSession: mode != .folder, teamNames: names), id: \.self) { line in
+                            Text(line).font(Theme.display(10.5)).foregroundStyle(Theme.chromeMuted)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
                 }
                 LabeledContent("Folder") {
                     Text(folder ?? "…")
@@ -172,10 +172,47 @@ struct TeamPublishSessionView: View {
             folder = await Task.detached { TeamSessionFiles.workingDirectory(of: id) }.value
             if let folder {
                 if folderName.isEmpty { folderName = TeamPublishedAgent.suggestedName(URL(fileURLWithPath: folder).lastPathComponent) }
+                restoreTeams()
             } else {
                 error = "This conversation's file was not found in ~/.claude/projects, so it cannot be published."
             }
         }
+    }
+
+    /// The teams the owner chose for the agents this mode publishes — the
+    /// session's, the folder's (found as `publish` finds it) — else General
+    /// (review D3-p1-4, D3b-p1-4).
+    private func restoreTeams() {
+        guard let key, let teams else { return }
+        let edited = Self.edited(mode: mode, sessionId: sessionId, folderName: folderName, folder: folder, calls: service.calls)
+        if let next = Self.restored(edited: edited, previous: restoredFor, general: teams.filter(\.isGeneral).map(\.teamId),
+                                    earlier: { ChatService.shared.chosenTeams($0, key: key) }) {
+            chosen = next
+        }
+        restoredFor = edited.map(\.id)
+    }
+
+    /// The teams to show when the agents edited are `edited` (they were
+    /// `previous`): theirs — General only for a new publication — or nil
+    /// when the agent edited did not change, so the owner's own choice stays.
+    static func restored(edited: [TeamPublishedAgent], previous: [UUID]?, general: [String],
+                         earlier: (UUID) -> [String]?) -> Set<String>? {
+        guard edited.map(\.id) != previous else { return nil }
+        return Set(edited.compactMap { earlier($0.id) }.first ?? general)
+    }
+
+    /// The existing agents a publication in `mode` changes.
+    static func edited(mode: TeamPublishMode, sessionId: String, folderName: String, folder: String?,
+                       calls: TeamCalls) -> [TeamPublishedAgent] {
+        var out: [TeamPublishedAgent] = []
+        if mode != .folder, let agent = calls.agents(forSession: sessionId).first { out.append(agent) }
+        if mode != .session, let folder, let agent = folderAgent(name: folderName, folder: folder, calls: calls) { out.append(agent) }
+        return out
+    }
+
+    /// The folder agent of this session's folder by that name: an update of it.
+    static func folderAgent(name: String, folder: String, calls: TeamCalls) -> TeamPublishedAgent? {
+        calls.agents.first { $0.name == name.lowercased() && !$0.isSession && $0.folder == folder }
     }
 
     private var modeExplanation: String {
@@ -195,14 +232,9 @@ struct TeamPublishSessionView: View {
         let mode = self.mode, access = self.access
         let sessionName = self.sessionName, folderName = self.folderName
         let extra = extraText.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        let commands = access == .edit
+        let commands = access.takesCommands
             ? commandsText.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             : []
-        let audience: [String]? = everyone ? nil : Array(chosen)
-        if audience?.isEmpty == true {
-            error = "Choose at least one colleague, or Every colleague."
-            return
-        }
         let text = description.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             error = "Say what to ask it: colleagues' agents read this to decide."
@@ -216,7 +248,6 @@ struct TeamPublishSessionView: View {
             agent.name = sessionName
             agent.description = text
             agent.access = access
-            agent.audience = audience
             agent.sessionId = sessionId
             agent.sessionTitle = title
             agent.extraFolders = extra
@@ -227,12 +258,11 @@ struct TeamPublishSessionView: View {
         if mode != .session {
             // Same name and folder: an update. A name taken by another
             // agent is refused by `save`.
-            var agent = service.calls.agents.first { $0.name == folderName.lowercased() && !$0.isSession && $0.folder == folder }
+            var agent = Self.folderAgent(name: folderName, folder: folder, calls: service.calls)
                 ?? TeamPublishedAgent(name: folderName, description: text, folder: folder)
             agent.description = text
             agent.folder = folder
             agent.access = access
-            agent.audience = audience
             agent.extraFolders = extra
             agent.allowedCommands = commands
             agent.enabled = true
@@ -241,8 +271,13 @@ struct TeamPublishSessionView: View {
         saving = true
         defer { saving = false }
         do {
-            // Both or neither.
-            try await service.calls.save(batch)
+            // Both or neither on this Mac; through a server each is published
+            // on its own, and the Published Agents window says how each went.
+            if let teams, let key {
+                try await service.calls.saveAndPublish(batch, teams: teams.filter { chosen.contains($0.teamId) }.map(\.teamId), key: key)
+            } else {
+                try await service.calls.save(batch)
+            }
             onClose()
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? String(describing: error)

@@ -90,6 +90,9 @@ enum AgentPadDeepLink: Equatable {
         guard isValidConversationId(id) else {
             return .invalid(reason: "conversation id contains characters \(AppIdentity.appName) refuses")
         }
+        if agent.lowercased() == AgentTemplate.claudeCodeID, !ClaudeSessionResume.isFullId(id) {
+            return .invalid(reason: ClaudeSessionResume.Refusal.fullIdRequired.message)
+        }
         let cwd = rawCwd.flatMap(normalizedTitle)
         if let cwd {
             // Length-capped like the id: these strings reach the failure

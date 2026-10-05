@@ -1,0 +1,18 @@
+{
+  "sessions": [
+    {
+      "session_id": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+      "device_name": "Anna's Mac mini",
+      "created_at": "2026-10-03T18:00:00.000000Z",
+      "last_seen_at": "2026-10-04T09:00:00.000000Z",
+      "current": false
+    },
+    {
+      "session_id": "4f1d6a62-2d0e-4b8e-9d6b-5f0e6c3b8f11",
+      "device_name": "Anna's MacBook Pro",
+      "created_at": "2026-10-04T18:20:00.123456Z",
+      "last_seen_at": "2026-10-04T18:25:00.000000Z",
+      "current": true
+    }
+  ]
+}

@@ -1,85 +1,62 @@
 import SwiftUI
 
-/// The top of the right panel: team work in progress (docs/agentpad/TEAM.md
-/// R-2, R-3). "Needs you": join requests and colleagues' calls waiting for
-/// this user's decision, each with its details and Allow / Decline in place.
-/// "In progress": calls running here and calls this Mac sent. Shown only
-/// while there is something to show.
+/// The top of the right panel: only what waits for this user's decision
+/// (docs/agentpad/TEAM.md R-2, R-3; CHAT-PLAN decision 25) — join requests
+/// and colleagues' calls, each with its details and Allow / Decline in
+/// place. Calls in progress are in the Team tab of the left panel. Shown
+/// only while there is something to show.
 struct TeamPanelSection: View {
     var service = TeamService.shared
-    /// The Team tab lists calls itself and shows only join requests here.
+    /// The Team tab lists calls itself and shows only folder requests here.
     var showsCalls = true
     @State private var expanded: String?
 
     private var calls: TeamCalls { service.calls }
     private var waiting: [TeamCalls.Incoming] { showsCalls ? calls.awaitingDecision : [] }
-    private var active: [TeamCalls.Incoming] { showsCalls ? calls.incoming.filter { $0.state == .queued || $0.state == .running } : [] }
-    private var sent: [TeamCalls.Outgoing] { showsCalls ? calls.outgoing.filter { !$0.report.state.isFinal } : [] }
+    /// Incoming calls under way: every state not final that is not waiting
+    /// for a decision — also one this build does not know (review D8i-p3-6).
+    /// The right panel shows only what needs a decision (decision 25); calls
+    /// under way are the Team tab's, by this rule.
+    static func activeIncoming(_ calls: TeamCalls) -> [TeamCalls.Incoming] {
+        calls.incoming.filter { !$0.state.isFinal && $0.state != .awaitingApproval }
+    }
 
     var body: some View {
         let access = calls.pendingAccess
-        let needsYou = service.pendingPairings.count + waiting.count + access.count
+        let versions = ClaudeVersionApprovals.shared.pending
+        let needsYou = waiting.count + access.count + versions.count
         VStack(alignment: .leading, spacing: 0) {
             if needsYou > 0 {
                 SessionSectionLabel(title: "team · needs you", count: needsYou)
-                ForEach(service.pendingPairings) { pending in
-                    pairingRow(pending)
-                }
                 ForEach(waiting) { call in
                     incomingRow(call)
                 }
                 ForEach(access) { request in
                     accessRow(request)
                 }
-            }
-            if !active.isEmpty || !sent.isEmpty {
-                SessionSectionLabel(title: "team · in progress", count: active.count + sent.count)
-                    .contentShape(Rectangle())
-                    .onTapGesture { TeamWindows.showCalls() }
-                    .help("Open Team → Calls…")
-                ForEach(active) { call in
-                    incomingRow(call)
-                }
-                ForEach(sent) { call in
-                    outgoingRow(call)
-                }
+                ForEach(versions) { item in versionRow(item) }
             }
         }
     }
 
-    // MARK: Join requests
-
-    private func pairingRow(_ pending: TeamService.PendingPairing) -> some View {
-        let key = "pair-\(pending.id)"
-        let isOpen = expanded == key
+    private func versionRow(_ item: ClaudeVersionApprovals.Pending) -> some View {
+        let key = "version-\(item.id)"
         return VStack(alignment: .leading, spacing: 8) {
-            header(
-                key: key, icon: "person.badge.plus",
-                title: "\(pending.name) wants to join", subtitle: "code \(pending.code)", status: "waiting", attention: true
-            )
-            if isOpen {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Allow only if \(pending.name) sees the same code: \(pending.code). Once allowed, you see each other's presence and can call each other's published agents — always with the owner's approval.")
-                        .font(Theme.display(11))
-                        .foregroundStyle(Theme.chromeMuted)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(pending.peerId)
-                        .font(Theme.mono(9.5))
-                        .foregroundStyle(Theme.chromeMuted.opacity(0.75))
-                        .textSelection(.enabled)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    HStack(spacing: 8) {
-                        Button("Allow") { service.decide(attempt: pending.attempt, approve: true) }
-                            .keyboardShortcut(.defaultAction)
-                        Button("Decline") { service.decide(attempt: pending.attempt, approve: false) }
-                        Spacer()
-                    }
-                    .controlSize(.small)
+            header(key: key, icon: "exclamationmark.shield", title: "\(item.agentName) · Claude Code \(item.grant.version)",
+                   subtitle: item.grant.profile.title, status: "waiting", attention: true)
+            if expanded == key {
+                Text(item.message).fixedSize(horizontal: false, vertical: true)
+                Text("Выбранное имя: \(item.executable.selectedPath)").textSelection(.enabled)
+                Text("Конечный файл: \(item.executable.file.resolvedPath)").textSelection(.enabled)
+                if item.grant.profile.runsShell { Text(TeamAccessProfile.shellWarning) }
+                HStack {
+                    Button(item.allowTitle) { ClaudeVersionApprovals.shared.decide(item.id, allow: true) }
+                    Button(ClaudeVersionApprovals.Pending.declineTitle) { ClaudeVersionApprovals.shared.decide(item.id, allow: false) }
                 }
-                .padding(.leading, 26)
+                .controlSize(.small)
             }
         }
+        .font(Theme.display(11))
         .padding(.horizontal, 14)
         .padding(.vertical, Theme.sidebarRowVerticalPadding)
         .onAppear { if expanded == nil { expanded = key } }
@@ -90,19 +67,16 @@ struct TeamPanelSection: View {
     private func incomingRow(_ call: TeamCalls.Incoming) -> some View {
         let key = "in-\(call.id)"
         let isOpen = expanded == key
-        let agent = calls.agents.first { $0.id == call.agentId }
-        let status: String = switch call.state {
-        case .awaitingApproval: "waiting"
-        case .queued: "queued"
-        case .running: call.activity.map { "running · \($0)" } ?? "running"
-        default: call.state.rawValue
-        }
+        let agent = calls.localAgent(for: call)
+        let status = call.serverState == nil
+            ? (call.state == .awaitingApproval ? "waiting" : TeamCallsSidebar.word(call.state, activity: call.activity))
+            : TeamCallsSidebar.word(call.state, serverState: call.serverState, activity: call.activity)
         return VStack(alignment: .leading, spacing: 8) {
             header(
                 key: key, icon: "person.2.wave.2",
                 title: "\(call.peerName) → \(call.agentName)",
                 subtitle: call.prompt.replacingOccurrences(of: "\n", with: " "),
-                status: status, attention: call.state == .awaitingApproval
+                status: status, attention: call.needsDecisionHere
             )
             if isOpen {
                 VStack(alignment: .leading, spacing: 8) {
@@ -116,18 +90,24 @@ struct TeamPanelSection: View {
                     .padding(6)
                     .background(Theme.chromeHover)
                     .clipShape(RoundedRectangle(cornerRadius: 5))
-                    Text(details(call, agent: agent))
+                    Text(Self.details(call, agent: agent))
                         .font(Theme.display(10.5))
                         .foregroundStyle(Theme.chromeMuted)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 8) {
-                        if call.state == .awaitingApproval {
+                        // Each action's gate, mirrored: a server's request is decided
+                        // here on its executor (D4); stopping it is D4b.
+                        if let refusal = calls.refusal(call.state == .awaitingApproval ? .decide : .stop, for: call) {
+                            Text(refusal)
+                                .font(Theme.display(10.5))
+                                .foregroundStyle(Theme.chromeMuted)
+                        } else if call.state == .awaitingApproval {
                             Button("Allow") { calls.decide(call.id, allow: true) }
                                 .keyboardShortcut(.defaultAction)
                             Button("Decline") { calls.decide(call.id, allow: false) }
                         } else {
                             Button("Stop") { calls.stop(call.id) }
-                            Button("Watch") { TeamUI.watch(call) }
+                            if TeamUI.canWatch(call) { Button("Watch") { TeamUI.watch(call) } }
                         }
                         Spacer()
                     }
@@ -138,13 +118,18 @@ struct TeamPanelSection: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, Theme.sidebarRowVerticalPadding)
-        .onAppear { if expanded == nil, call.state == .awaitingApproval { expanded = key } }
+        .onAppear { if expanded == nil, call.needsDecisionHere { expanded = key } }
     }
 
-    private func details(_ call: TeamCalls.Incoming, agent: TeamPublishedAgent?) -> String {
+    /// What the card says of an incoming call: the state's explanation
+    /// first, then the run's terms (review D8h-p3-5).
+    static func details(_ call: TeamCalls.Incoming, agent: TeamPublishedAgent?) -> String {
         var parts: [String] = []
+        if let detail = call.detail, !detail.isEmpty { parts.append(detail) }
         if let agent {
             parts.append("Runs Claude Code in \(agent.folder) with “\(agent.access.title)” rights: \(agent.access.summary)")
+            // What a shell may do, said where the owner decides (AG-3, track Y).
+            if agent.access.runsShell { parts.append(TeamAccessProfile.shellWarning) }
             parts.append("Up to \(agent.maxTurns) steps and \(agent.timeoutMinutes) minutes.")
         }
         if let project = call.origin?.project { parts.append("Sent from project \(project).") }
@@ -187,37 +172,10 @@ struct TeamPanelSection: View {
         .padding(.vertical, Theme.sidebarRowVerticalPadding)
     }
 
-    // MARK: Calls this Mac sent
-
-    private func outgoingRow(_ call: TeamCalls.Outgoing) -> some View {
-        let key = "out-\(call.id)"
-        let isOpen = expanded == key
-        let status = call.note == nil
-            ? (call.report.activity.map { "running · \($0)" } ?? call.report.state.rawValue.replacingOccurrences(of: "_", with: " "))
-            : "retrying"
-        return VStack(alignment: .leading, spacing: 8) {
-            header(
-                key: key, icon: "paperplane",
-                title: "You → \(call.address)",
-                subtitle: call.prompt.replacingOccurrences(of: "\n", with: " "),
-                status: status, attention: false
-            )
-            if isOpen {
-                VStack(alignment: .leading, spacing: 8) {
-                    if let note = call.note {
-                        Text(note).font(Theme.display(10.5)).foregroundStyle(Theme.chromeMuted)
-                    }
-                    HStack {
-                        Button("Cancel Call") { Task { _ = await calls.cancel(call.id) } }
-                        Spacer()
-                    }
-                    .controlSize(.small)
-                }
-                .padding(.leading, 26)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, Theme.sidebarRowVerticalPadding)
+    /// What the card says of a call this Mac sent: its note, and the
+    /// state's explanation (review D8h-p3-5).
+    static func outgoingDetails(_ call: TeamCalls.Outgoing) -> [String] {
+        [call.note, call.report.detail].compactMap { $0 }.filter { !$0.isEmpty }
     }
 
     // MARK: Shared

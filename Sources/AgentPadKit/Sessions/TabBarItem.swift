@@ -80,9 +80,12 @@ struct TabBarItem: View {
                     onMoveToNewWindow()
                 }
                 AgentPadMenuDivider()
-                AgentPadMenuRow(title: "Rename Tab…", shortcut: "⌘R") {
-                    isContextMenuOpen = false
-                    beginRename(deferred: true)
+                // AgentPad: a channel tab takes its channel's name (DESIGN-F2).
+                if tab.channel == nil {
+                    AgentPadMenuRow(title: "Rename Tab…", shortcut: "⌘R") {
+                        isContextMenuOpen = false
+                        beginRename(deferred: true)
+                    }
                 }
                 AgentPadMenuRow(title: "Duplicate Tab") {
                     isContextMenuOpen = false
@@ -116,7 +119,8 @@ struct TabBarItem: View {
     /// anchor glitch; the ⌘R path opens synchronously. Skips when already open
     /// so a re-trigger mid-edit can't wipe what the user is typing.
     private func beginRename(deferred: Bool) {
-        guard !isRenameOpen else { return }
+        // AgentPad: never for a channel tab — its title is its card's (review F2-p1-3).
+        guard !isRenameOpen, tab.channel == nil else { return }
         pendingRename = tab.customTitle ?? tab.title
         if deferred {
             DispatchQueue.main.async { isRenameOpen = true }

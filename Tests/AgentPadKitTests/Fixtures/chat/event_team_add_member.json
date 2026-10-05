@@ -1,0 +1,16 @@
+{
+  "stream": "team:6a1c9e2b-7d3f-4a5e-8b1c-2d3e4f5a6b7c",
+  "seq": 1,
+  "id": "5b0c2f7e-0a8d-4f4e-9e57-2d4c1f9b6a33",
+  "type": "team.add_member",
+  "actor": null,
+  "body": {
+    "team_id": "6a1c9e2b-7d3f-4a5e-8b1c-2d3e4f5a6b7c",
+    "account_id": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40"
+  },
+  "command_id": null,
+  "at": "2026-10-03T18:20:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null
+}

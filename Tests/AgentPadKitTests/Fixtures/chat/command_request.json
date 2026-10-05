@@ -1,0 +1,8 @@
+{
+  "command_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+  "org": "0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10",
+  "type": "member.set_name",
+  "args": {
+    "name": "Anna"
+  }
+}

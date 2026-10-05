@@ -1,0 +1,15 @@
+{
+  "stream": "account:8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+  "seq": 1,
+  "id": "5b0c2f7e-0a8d-4f4e-9e57-2d4c1f9b6a33",
+  "type": "account.membership_changed",
+  "actor": null,
+  "body": {
+    "org_id": "0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10"
+  },
+  "command_id": null,
+  "at": "2026-10-03T18:20:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null
+}

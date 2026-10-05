@@ -185,7 +185,7 @@ struct SidebarView: View {
                 FileTreeView(store: store, model: store.fileTree)
             } else if store.sidebarContent == .team && !isCompact {
                 // AgentPad: team calls (Team/TeamCallsSidebar.swift).
-                TeamCallsSidebar()
+                TeamCallsSidebar(openChannel: { store.showChannel($0, newTab: $1) })
             } else {
                 ScrollViewReader { proxy in
                     list(isCompact: isCompact, proxy: proxy)
@@ -481,8 +481,7 @@ struct SidebarView: View {
             // AgentPad: team calls, with a dot while any waits for you.
             segment(.team, systemName: "person.2", help: "Team")
                 .overlay(alignment: .topTrailing) {
-                    if !TeamService.shared.calls.awaitingDecision.isEmpty || !TeamService.shared.pendingPairings.isEmpty
-                        || !TeamService.shared.calls.pendingAccess.isEmpty {
+                    if !TeamService.shared.calls.awaitingDecision.isEmpty || !TeamService.shared.calls.pendingAccess.isEmpty || !ClaudeVersionApprovals.shared.pending.isEmpty {
                         Circle().fill(agentStateWordColor(.attention)).frame(width: 6, height: 6).offset(x: -3, y: 3)
                     }
                 }

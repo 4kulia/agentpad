@@ -24,8 +24,8 @@ final class DeepLinkTests: XCTestCase {
 
     func testParsesResumeLink() {
         XCTAssertEqual(
-            AgentPadDeepLink.parse(URL(string: "agentpad://resume?agent=claude-code&id=1234-abcd")!),
-            .resumeSession(agentId: "claude-code", conversationId: "1234-abcd", cwd: nil)
+            AgentPadDeepLink.parse(URL(string: "agentpad://resume?agent=claude-code&id=11111111-2222-4333-8444-555555555555")!),
+            .resumeSession(agentId: "claude-code", conversationId: "11111111-2222-4333-8444-555555555555", cwd: nil)
         )
         XCTAssertEqual(
             AgentPadDeepLink.parse(URL(string: "agentpad://resume?agent=codex&id=abc&cwd=/Users/x/proj%20dir")!),
@@ -170,18 +170,19 @@ final class DeepLinkTests: XCTestCase {
 
     // MARK: - Open-conversation lookup
 
-    func testFindOpenConversationMatchesPersistedAndResumedIds() {
-        let store = makeStore()
+    func testFindOpenConversationMatchesPersistedAndResumedIds() throws {
+        let fixture = try ClaudeResumeFixture()
+        let store = makeTestStore(claudeProjectsRoot: fixture.root)
         let ws = store.workspaces[0]
         let hooked = store.addTab(in: ws, template: .claudeCode)
-        hooked.conversationId = "convo-hooked"
+        hooked.conversationId = fixture.id
         // gemini stands in for "agent with no id-reporting hook" — it leaves
         // conversationId nil so only resumedConversationId can match. (NOT
         // codex: addTab(.codex) starts the real ~/.codex usage monitor.)
         let resumed = store.addTab(in: ws, template: .gemini)
         resumed.resumedConversationId = "convo-resumed"
 
-        let hitA = store.findOpenConversation(agentId: "claude-code", conversationId: "convo-hooked")
+        let hitA = store.findOpenConversation(agentId: "claude-code", conversationId: fixture.id)
         XCTAssertEqual(hitA?.session.id, hooked.id)
         XCTAssertEqual(hitA?.workspace.id, ws.id)
         let hitB = store.findOpenConversation(agentId: AgentTemplate.gemini.id, conversationId: "convo-resumed")
@@ -194,19 +195,20 @@ final class DeepLinkTests: XCTestCase {
     /// stale spawn-time `resumedConversationId` must then STOP matching, or
     /// the deep link reveals a tab attached to a different conversation and
     /// the resume silently never happens.
-    func testFindOpenConversationPrefersLiveConversationIdOverStaleResumeId() {
-        let store = makeStore()
+    func testFindOpenConversationPrefersLiveConversationIdOverStaleResumeId() throws {
+        let fixture = try ClaudeResumeFixture()
+        let store = makeTestStore(claudeProjectsRoot: fixture.root)
         let ws = store.workspaces[0]
         let tab = store.addTab(in: ws, template: .claudeCode)
         tab.resumedConversationId = "convo-old"
-        tab.conversationId = "convo-new"   // hook reported a fresh conversation
+        tab.conversationId = fixture.id   // hook reported a fresh conversation
 
         XCTAssertNil(
             store.findOpenConversation(agentId: "claude-code", conversationId: "convo-old"),
             "stale resume id must not match once the hook reported a different live conversation"
         )
         XCTAssertEqual(
-            store.findOpenConversation(agentId: "claude-code", conversationId: "convo-new")?.session.id,
+            store.findOpenConversation(agentId: "claude-code", conversationId: fixture.id)?.session.id,
             tab.id
         )
     }
@@ -216,18 +218,19 @@ final class DeepLinkTests: XCTestCase {
     /// wrong tab), while a custom agent's tab matches under its BASE id —
     /// deep links speak the scanner's roster, which only knows builtins.
     /// Built via `fromCustom`, the path production custom agents take.
-    func testFindOpenConversationMatchesAgentByBaseId() {
-        let store = makeStore()
+    func testFindOpenConversationMatchesAgentByBaseId() throws {
+        let fixture = try ClaudeResumeFixture()
+        let store = makeTestStore(claudeProjectsRoot: fixture.root)
         let ws = store.workspaces[0]
         let custom = AgentTemplate.fromCustom(CustomAgentData(
             id: "my-claude", title: "My Claude", command: "claude", baseAgentId: "claude-code"
         ))
         let tab = store.addTab(in: ws, template: custom)
-        tab.conversationId = "convo-x"
+        tab.conversationId = fixture.id
 
-        XCTAssertNil(store.findOpenConversation(agentId: "codex", conversationId: "convo-x"))
+        XCTAssertNil(store.findOpenConversation(agentId: "codex", conversationId: fixture.id))
         XCTAssertEqual(
-            store.findOpenConversation(agentId: "claude-code", conversationId: "convo-x")?.session.id,
+            store.findOpenConversation(agentId: "claude-code", conversationId: fixture.id)?.session.id,
             tab.id
         )
     }

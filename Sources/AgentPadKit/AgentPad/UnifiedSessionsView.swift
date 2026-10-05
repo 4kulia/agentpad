@@ -193,11 +193,12 @@ enum SessionListModel {
     static func items(
         own: [AgentMonitor.Entry],
         external: [ExternalAgentSession],
-        history: [AgentSessionRecord]
+        history: [AgentSessionRecord],
+        visibility: ChannelConversationFilter = .current()
     ) -> [SessionListItem] {
         var live = Set<String>()
         var result: [SessionListItem] = []
-        for entry in own {
+        for entry in own where visibility.allows(agentId: entry.agent.rosterId, conversationId: entry.conversationId) {
             if let id = entry.conversationId { live.insert(id) }
             result.append(SessionListItem(
                 id: "own:\(entry.id.uuidString)",
@@ -208,7 +209,7 @@ enum SessionListModel {
                 date: nil
             ))
         }
-        for session in external {
+        for session in external where visibility.allows(conversationId: session.sessionId) {
             live.insert(session.sessionId)
             result.append(SessionListItem(
                 id: "ext:\(session.id)",
@@ -219,7 +220,7 @@ enum SessionListModel {
                 date: session.statusSince
             ))
         }
-        for record in history where !live.contains(record.conversationId) {
+        for record in visibility.apply(history) where !live.contains(record.conversationId) {
             result.append(SessionListItem(
                 id: "rec:\(record.id)",
                 kind: .recent(record),

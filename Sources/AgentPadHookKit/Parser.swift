@@ -15,6 +15,10 @@ public enum AgentPadHookKit {
 
     /// One-shot socket write. Returns true on success. `HookServer` accepts
     /// one payload per connection so each call opens / writes / closes.
+    /// AgentPad: everything a hook waits for — connecting, writing, the
+    /// app's acknowledgement — fits in this, then it goes on (review C3-15).
+    public static let hookDeadlineMilliseconds = 200
+
     public static func sendPayload(_ object: [String: String], to path: String) -> Bool {
         guard var payload = try? JSONSerialization.data(withJSONObject: object) else { return false }
         payload.append(0x0A)
@@ -22,14 +26,37 @@ public enum AgentPadHookKit {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { close(fd) }
+        // AgentPad: non-blocking, so no step can wait past the deadline.
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(hookDeadlineMilliseconds) * 1_000_000
+        func waitFor(_ events: Int32) -> Bool {
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now < deadline else { return false }
+            var pollFd = pollfd(fd: fd, events: Int16(events), revents: 0)
+            return poll(&pollFd, 1, Int32((deadline - now) / 1_000_000) + 1) > 0
+        }
 
         let connected = withUnixSocketAddress(path: path) { addr, len in
             connect(fd, addr, len)
         }
-        guard connected == 0 else { return false }
+        if connected != 0 {
+            guard errno == EINPROGRESS || errno == EAGAIN, waitFor(POLLOUT) else { return false }
+            var error: Int32 = 0
+            var length = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0, error == 0 else { return false }
+        }
 
-        let written = payload.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
-        return written >= 0
+        var offset = 0
+        while offset < payload.count {
+            let n = payload.withUnsafeBytes { write(fd, $0.baseAddress! + offset, $0.count - offset) }
+            if n > 0 { offset += n; continue }
+            guard n < 0, errno == EAGAIN, waitFor(POLLOUT) else { return false }
+        }
+        // AgentPad: the app acknowledges as soon as it placed this process
+        // (Y4); past the deadline the hook goes on without it.
+        shutdown(fd, SHUT_WR)
+        _ = waitFor(POLLIN)
+        return true
     }
 
     /// Builds the `sockaddr_un` for a unix socket path and hands it to

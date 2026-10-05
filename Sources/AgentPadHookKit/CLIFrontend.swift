@@ -235,9 +235,6 @@ extension AgentPadHookKit {
         case .team(let team):
             var request = AgentPadCLIRequest(verb: .team)
             request.teamAction = team.action.rawValue
-            request.teamName = team.name
-            request.teamLink = team.link
-            request.teamPeer = team.peer
             request.teamAgent = team.agent
             request.teamPrompt = team.prompt
             request.teamThread = team.thread
@@ -246,6 +243,9 @@ extension AgentPadHookKit {
             request.teamDescription = team.description
             request.teamAccess = team.access
             request.teamMine = team.mine ? true : nil
+            request.teamEmail = team.email
+            request.teamRole = team.role
+            request.teamTeams = team.teams.isEmpty ? nil : team.teams
             return request
         case .help:
             return nil
@@ -294,11 +294,10 @@ extension AgentPadHookKit {
                                   set a tab's title (clear it in-app)
           status [--json]         app version + protocol; exits 1 when
                                   AgentPad isn't running
-          team status|on|off|invite|join|approve|deny|remove|
-               agents|ask|check|cancel|publish|unpublish
-                                  team work: colleagues, invitations,
-                                  publishing agents and calling colleagues'
-                                  agents (`agentpad-cli team` for the options)
+          team status|agents|ask|check|cancel|publish|unpublish|watch
+                                  team work through a server: publishing
+                                  agents and calling colleagues' agents
+                                  (`agentpad-cli team` for the options)
 
         Exit code 0 means the request was accepted; anything else prints one
         reason line on stderr. Every command except `status` launches AgentPad

@@ -299,7 +299,9 @@ enum ExternalSessionSource {
 
     /// Transcript for a session id. The folder name is a lossy encoding of the
     /// cwd, so match on the file name across project folders instead.
-    static func transcript(for sessionId: String, under root: URL = projectsDirectory) -> URL? {
+    static func transcript(for sessionId: String, under root: URL = projectsDirectory,
+                           visibility: ChannelConversationFilter = .current()) -> URL? {
+        guard visibility.allows(conversationId: sessionId) else { return nil }
         guard let projects = try? FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: nil
         ) else { return nil }

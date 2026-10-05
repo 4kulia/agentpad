@@ -4,6 +4,11 @@ import XCTest
 
 @MainActor
 final class AgentPadWindowLayoutTests: XCTestCase {
+    private var teamScope: TeamServiceTestScope!
+
+    override func setUp() async throws { teamScope = TeamServiceTestScope() }
+    override func tearDown() async throws { teamScope.close(); teamScope = nil }
+
     func testSidebarLeadingAxisCentersCompactRail() {
         XCTAssertEqual(
             Theme.sidebarLeadingIconCenterX,

@@ -44,6 +44,8 @@ struct ToolCallEvent: Identifiable, Equatable {
 final class Session: Identifiable {
     let id: UUID
     let engine: any TerminalEngine
+    // AgentPad: a channel tab (probe V1) — its engine is a ChannelTabEngine.
+    var channel: ChannelRef?
     /// Initial template the tab was opened with. Promoted at runtime when an
     /// agent's hooks fire from a plain `terminal` session — e.g. user types
     /// `claude` inside a Terminal tab → upgraded to `.claudeCode` so the
@@ -468,6 +470,8 @@ final class Session: Identifiable {
     /// cwd path falls back to the agent name so a degenerate URL doesn't
     /// render as blank.
     var title: String {
+        // AgentPad: a channel tab shows its channel's name while it may be seen (DESIGN-F2).
+        if let channel { return ChannelTabs.title(channel) }
         if let custom = customTitle, !custom.isEmpty { return custom }
         if let reported = terminalTitle, !reported.isEmpty { return reported }
         if currentDirectory.standardizedFileURL.path == homeDirectoryPath { return "~" }

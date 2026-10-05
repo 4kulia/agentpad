@@ -7,6 +7,8 @@ import SwiftUI
 /// Allow / Decline / Stop / Cancel in place (docs/agentpad/TEAM.md R-2, R-3, J-1).
 struct TeamCallsSidebar: View {
     var service = TeamService.shared
+    /// AgentPad F2: opens a channel's tab in this window.
+    var openChannel: (ChannelRef, Bool) -> Void = { _, _ in }
     @State private var filter = Filter.all
     @State private var expanded: String?
 
@@ -24,7 +26,7 @@ struct TeamCallsSidebar: View {
         let outgoing: TeamCalls.Outgoing?
         var date: Date { incoming?.receivedAt ?? outgoing?.createdAt ?? .distantPast }
         var isFinal: Bool { incoming?.state.isFinal ?? outgoing?.report.state.isFinal ?? true }
-        var waitsForMe: Bool { incoming?.state == .awaitingApproval }
+        var waitsForMe: Bool { incoming?.needsDecisionHere == true }
     }
 
     private var items: [Item] {
@@ -46,14 +48,19 @@ struct TeamCallsSidebar: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Rectangle().fill(Theme.chromeHairline).frame(height: 1)
-            if !service.isOn && all.isEmpty {
-                empty("Team work is off.", action: ("Turn On…", { TeamUI.toggleTeamWork() }))
-            } else if all.isEmpty && service.pendingPairings.isEmpty {
+            // The organization and the user's teams (C6).
+            ChatOrgSidebarSection(openChannel: openChannel)
+            if service.mode != .server && all.isEmpty {
+                empty("Team work goes through a server.", action: ("Connect…", { ChatConnectWindow.show() }))
+            } else if let problem = calls.storeProblem {
+                // Not "no calls": they could not be read (review D8e-p3-10).
+                empty(problem, action: ("Try Again", { calls.reload() }))
+            } else if all.isEmpty {
                 empty(filter == .sent ? "You have not called a colleague's agent yet." : "No calls yet.", action: nil)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        // Join requests are decided here too.
+                        // Folder requests are decided here too.
                         TeamPanelSection(service: service, showsCalls: false)
                         if !waiting.isEmpty {
                             SessionSectionLabel(title: "needs you", count: waiting.count)
@@ -83,10 +90,12 @@ struct TeamCallsSidebar: View {
                 Spacer()
                 Menu {
                     Button("Published Agents…") { TeamUI.showAgents() }
-                    Button("Colleagues…") { TeamUI.showColleagues() }
-                    Button("Invite Colleague…") { TeamUI.invite() }
+                    Button("Team…") { TeamUI.showTeam() }
+                    Button("Organization…") { ChatOrgWindow.show() }
                     Divider()
-                    Button("Clear History") { calls.clearHistory() }
+                    Button("Clear History") {
+                        if !calls.clearHistory() { Task { await TeamUI.showError("History could not be cleared", TeamError.storage(calls.storeProblem ?? "the calls could not be saved")) } }
+                    }
                 } label: {
                     Image(systemName: "ellipsis.circle").font(.system(size: 12))
                 }
@@ -126,28 +135,45 @@ struct TeamCallsSidebar: View {
     }
 
     private func incomingRow(_ call: TeamCalls.Incoming, key: String) -> some View {
-        let agent = calls.agents.first { $0.id == call.agentId }
+        let agent = calls.localAgent(for: call)
         return VStack(alignment: .leading, spacing: 8) {
             header(key: key, icon: "arrow.down.left", title: "\(call.peerName) → \(call.agentName)",
-                   prompt: call.prompt, state: Self.word(call.state, activity: call.activity),
-                   attention: call.state == .awaitingApproval, date: call.receivedAt)
+                   prompt: call.prompt, state: Self.word(call.state, serverState: call.serverState, activity: call.activity),
+                   attention: call.needsDecisionHere, date: call.receivedAt)
             if expanded == key {
                 VStack(alignment: .leading, spacing: 8) {
                     facts([
-                        ("Agent", agent.map { "\($0.isSession ? "session · " : "")\($0.access.title) · \($0.folder)" } ?? "no longer published"),
+                        ("Agent", agent.map { "\($0.isSession ? "session · " : "")\($0.access.title) · \($0.folder)" }
+                            // A server's request run on another Mac of the owner: said so, not "gone" (review D8f-p3-9).
+                            ?? (call.onThisDevice == false ? "runs on \(call.executorDeviceName ?? "the owner's other Mac")" : "no longer published")),
                         ("Project", call.origin?.project),
                         ("Thread", call.resume ? "continues an earlier conversation" : nil),
                         ("Why", call.detail),
+                        ("Claude Code", ClaudeVersionApprovals.shared.admissions[call.id].map { "\($0.version) · \($0.basis)" }),
+                        ("Выбранное имя", ClaudeVersionApprovals.shared.admissions[call.id]?.executable.selectedPath),
+                        ("Конечный файл", ClaudeVersionApprovals.shared.admissions[call.id]?.executable.file.resolvedPath),
+                        // What a shell may do, said where the owner decides (AG-3, track Y).
+                        ("Shell", agent.flatMap { $0.access.runsShell ? TeamAccessProfile.shellWarning : nil }),
                     ])
                     block("Request", call.prompt)
                     if let answer = call.answer { block(call.truncated ? "Answer (truncated)" : "Answer", answer.text) }
                     HStack(spacing: 8) {
+                        // Each action's gate, mirrored: a server's request is
+                        // decided here on its executor (D4); stopping it is D4b.
                         switch call.state {
                         case .awaitingApproval:
-                            Button("Allow") { calls.decide(call.id, allow: true) }
-                            Button("Decline…") { Task { await decline(call) } }
+                            if let refusal = calls.refusal(.decide, for: call) {
+                                Text(refusal).foregroundStyle(.secondary)
+                            } else {
+                                Button("Allow") { calls.decide(call.id, allow: true) }
+                                Button("Decline…") { Task { await decline(call) } }
+                            }
                         case .queued, .running:
-                            Button("Stop") { calls.stop(call.id) }
+                            if let refusal = calls.refusal(.stop, for: call) {
+                                Text(refusal).foregroundStyle(.secondary)
+                            } else {
+                                Button("Stop") { calls.stop(call.id) }
+                            }
                         default:
                             EmptyView()
                         }
@@ -155,8 +181,12 @@ struct TeamCallsSidebar: View {
                             Button("Watch") { TeamUI.watch(call) }
                                 .help("Open a tab that shows what this agent does, live")
                         }
-                        if call.state == .done {
-                            Button("Continue…") { TeamUI.continueYourself(call) }
+                        if call.state == .done, !calls.refuses(call) {
+                            Button("Continue…") {
+                                if let refusal = TeamUI.continueYourself(call) {
+                                    Task { await TeamUI.showError("The conversation could not be opened", TeamError.storage(refusal)) }
+                                }
+                            }
                                 .help("Open this conversation in a tab and carry on with it yourself")
                         }
                         Spacer()
@@ -173,7 +203,7 @@ struct TeamCallsSidebar: View {
     private func outgoingRow(_ call: TeamCalls.Outgoing, key: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             header(key: key, icon: "arrow.up.right", title: "You → \(call.address)", prompt: call.prompt,
-                   state: call.note == nil ? Self.word(call.report.state, activity: call.report.activity) : "retrying",
+                   state: call.note == nil ? Self.word(call.report.state, serverState: call.serverState, activity: call.report.activity) : "retrying",
                    attention: false, date: call.createdAt)
             if expanded == key {
                 VStack(alignment: .leading, spacing: 8) {
@@ -189,7 +219,11 @@ struct TeamCallsSidebar: View {
                     }
                     HStack(spacing: 8) {
                         if !call.report.state.isFinal {
-                            Button("Cancel Call") { Task { _ = await calls.cancel(call.id) } }
+                            if let refusal = calls.refusal(.cancel, for: call) {
+                                Text(refusal).foregroundStyle(.secondary)
+                            } else {
+                                Button("Cancel Call") { Task { _ = await calls.cancel(call.id) } }
+                            }
                         }
                         if let text = call.report.text {
                             Button("Copy Answer") {
@@ -243,11 +277,24 @@ struct TeamCallsSidebar: View {
         .buttonStyle(.plain)
     }
 
-    static func word(_ state: TeamCallState, activity: String?) -> String {
+    /// A row's word: the server's state when there is one (D10's words,
+    /// DESIGN-D6 §7.4) — a call that finished waits for its result, one
+    /// being stopped says so — else the state of 1.0.x.
+    static func word(_ state: TeamCallState, serverState: String? = nil, activity: String?) -> String {
+        if let serverState {
+            switch serverState {
+            case "awaiting_decision": return "waiting for approval"
+            case "running": return activity.map { "running · \($0)" } ?? "running"
+            case "starting": return activity ?? "starting"
+            case "finished": return state == .done ? "done" : "finished · waiting for its result"
+            case "resyncing": return "being read again"
+            default: return serverState.replacingOccurrences(of: "_", with: " ")
+            }
+        }
         switch state {
-        case .awaitingApproval: "waiting for approval"
-        case .running: activity.map { "running · \($0)" } ?? "running"
-        default: state.rawValue.replacingOccurrences(of: "_", with: " ")
+        case .awaitingApproval: return "waiting for approval"
+        case .running: return activity.map { "running · \($0)" } ?? "running"
+        default: return state.rawValue.replacingOccurrences(of: "_", with: " ")
         }
     }
 

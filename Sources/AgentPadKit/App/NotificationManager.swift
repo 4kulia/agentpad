@@ -89,6 +89,46 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
 
+    /// AgentPad (F4): a chat notice — a title only, nothing of what it is
+    /// about (no text, channel, author or organization); `id` lets it be
+    /// taken back, shown or still pending.
+    func postChat(id: String, title: String) {
+        guard isAvailable else { return }
+        requestAuthorizationIfNeeded()
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.sound = .default
+        center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+    }
+
+    /// AgentPad (F4): takes back chat notices by id, or every one whose id
+    /// starts with `prefix` — pending and shown alike.
+    func removeChat(ids: [String] = [], prefix: String? = nil) {
+        guard isAvailable else { return }
+        if !ids.isEmpty {
+            center.removePendingNotificationRequests(withIdentifiers: ids)
+            center.removeDeliveredNotifications(withIdentifiers: ids)
+        }
+        guard let prefix else { return }
+        center.getPendingNotificationRequests { requests in
+            let ids = requests.map(\.identifier).filter { $0.hasPrefix(prefix) }
+            UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ids)
+        }
+        center.getDeliveredNotifications { notes in
+            let ids = notes.map(\.request.identifier).filter { $0.hasPrefix(prefix) }
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ids)
+        }
+    }
+
+    /// AgentPad (F4): ids of chat notices shown or pending, to reconcile them.
+    func chatIds() async -> [String] {
+        guard isAvailable else { return [] }
+        let center = UNUserNotificationCenter.current()
+        let pending = await center.pendingNotificationRequests().map(\.identifier)
+        let shown = await center.deliveredNotifications().map(\.request.identifier)
+        return (pending + shown).filter { $0.hasPrefix("chat:") }
+    }
+
     /// Requests banner/sound permission once, on the first notification AgentPad
     /// actually wants to deliver — so the OS prompt only ever appears for a
     /// user who has notifications enabled and just hit a notifiable event.

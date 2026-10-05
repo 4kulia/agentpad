@@ -1,20 +1,43 @@
 import Darwin
 import Foundation
 
-/// Team state on disk, in `Application Support/agentpad/team/` (TEAM.md 7.7).
-/// The folder is 0700 and every file 0600. Deleting the folder returns the
-/// app to "team work not set up".
+/// Team state on disk: the agents published here, the calls they served and
+/// their run logs, in `Application Support/agentpad/team-server/`. The folder
+/// is 0700 and every file 0600. The `team/` folder of AgentPad 1.0.x (direct
+/// mode) is neither read nor moved.
 struct TeamStorage: Sendable {
     let directory: URL
 
-    static var standard: TeamStorage {
-        TeamStorage(directory: AgentPadShellIntegration.agentPadAppSupport("team", isDirectory: true))
+    init(directory: URL) {
+        // Fail before any read, write, or eager TeamService initialization.
+        // Never silently redirect a test that forgot to inject its storage.
+        precondition(!Self.isTestProcess || Self.testDirectoryIsSafe(directory),
+                     "Tests must use temporary TeamStorage outside ~/Library/Application Support/agentpad")
+        self.directory = directory
     }
 
-    var identityURL: URL { directory.appendingPathComponent("identity.key") }
-    var configURL: URL { directory.appendingPathComponent("config.json") }
-    var contactsURL: URL { directory.appendingPathComponent("contacts.json") }
-    var invitesURL: URL { directory.appendingPathComponent("invites.json") }
+    static var isTestProcess: Bool { NSClassFromString("XCTestCase") != nil }
+
+    static func testDirectoryIsSafe(_ directory: URL) -> Bool {
+        let path = directory.standardizedFileURL.resolvingSymlinksInPath().path
+        // Include the account's actual home even when the test process uses
+        // CFFIXED_USER_HOME to isolate other application support files.
+        let homes = [FileManager.default.homeDirectoryForCurrentUser,
+                     URL(fileURLWithPath: String(cString: getpwuid(getuid())!.pointee.pw_dir))]
+        return homes.allSatisfy { home in
+            let profile = home.appendingPathComponent("Library/Application Support/agentpad")
+                .standardizedFileURL.resolvingSymlinksInPath().path
+            return path != profile && !path.hasPrefix(profile + "/")
+        }
+    }
+
+    static var standard: TeamStorage {
+        TeamStorage(directory: AgentPadShellIntegration.agentPadAppSupport(directoryName, isDirectory: true))
+    }
+
+    /// Also known to `agentpad-cli team watch` (AgentPadTeamWatch).
+    static let directoryName = "team-server"
+
     var agentsURL: URL { directory.appendingPathComponent("agents.json") }
     var threadsURL: URL { directory.appendingPathComponent("threads.json") }
     var callsURL: URL { directory.appendingPathComponent("calls.json") }
@@ -32,39 +55,6 @@ struct TeamStorage: Sendable {
         } catch {
             throw TeamError.storage("cannot prepare \(directory.path): \(error.localizedDescription)")
         }
-    }
-
-    // MARK: Identity
-
-    /// The endpoint's 32-byte secret key. The identity colleagues know this
-    /// Mac by survives only as long as this file does, so any doubt about it
-    /// stops team work instead of quietly replacing it with a new key. A new
-    /// key is created with O_EXCL, so two starts cannot end up with two keys.
-    func loadOrCreateIdentity(generate: () -> Data) throws -> Data {
-        let path = identityURL.path
-        var info = stat()
-        if lstat(path, &info) == 0 {
-            guard (info.st_mode & S_IFMT) == S_IFREG else { throw TeamError.identity("\(path) is not a regular file") }
-            guard info.st_uid == getuid() else { throw TeamError.identity("\(path) belongs to another user") }
-            guard info.st_mode & 0o077 == 0 else {
-                throw TeamError.identity("\(path) is readable by other users; run chmod 600 on it")
-            }
-            guard let data = FileManager.default.contents(atPath: path) else { throw TeamError.identity("cannot read \(path)") }
-            guard data.count == 32 else { throw TeamError.identity("\(path) holds \(data.count) bytes, not a 32-byte key") }
-            return data
-        }
-        guard errno == ENOENT else {
-            throw TeamError.identity("cannot inspect \(path): \(String(cString: strerror(errno)))")
-        }
-        try prepareDirectory()
-        let key = generate()
-        guard key.count == 32 else { throw TeamError.identity("generated key has \(key.count) bytes") }
-        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
-        guard fd >= 0 else { throw TeamError.identity("cannot create \(path): \(String(cString: strerror(errno)))") }
-        defer { close(fd) }
-        let written = key.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
-        guard written == key.count, fsync(fd) == 0 else { throw TeamError.identity("cannot write \(path)") }
-        return key
     }
 
     // MARK: JSON files

@@ -18,6 +18,7 @@ final class AgentMonitor {
 
     /// Every live window's store. Injected by `AppDelegate` (it owns the set).
     var storesProvider: @MainActor () -> [WorkspaceStore] = { [] }
+    var conversationVisibility: () -> ChannelConversationFilter = { .current() }
     /// Jump to a session's tab (cross-window). Injected by `AppDelegate` —
     /// reuses the notification center's reveal seam.
     var onActivate: @MainActor (UUID) -> Void = { _ in }
@@ -148,9 +149,11 @@ final class AgentMonitor {
     /// `Session` reverts to `.terminal` (a shell) when its agent ends, so an
     /// ended agent naturally drops off — this is "agents alive right now".
     var entries: [Entry] {
-        sessionsWithWorkspace.compactMap { item -> Entry? in
+        let visibility = conversationVisibility()
+        return sessionsWithWorkspace.compactMap { item -> Entry? in
             let agent = item.session.displayAgent
-            guard !agent.isShell else { return nil }
+            guard !agent.isShell, visibility.allows(agentId: agent.rosterId,
+                conversationId: item.session.conversationId ?? item.session.resumedConversationId) else { return nil }
             return Entry(
                 id: item.session.id,
                 agent: agent,

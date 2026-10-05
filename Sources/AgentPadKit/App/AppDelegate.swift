@@ -25,6 +25,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// open via the dedicated delegate — the menu itself is a stable shell.
     private let openRecentMenu = NSMenu(title: "Open Recent")
     private let openRecentMenuDelegate = OpenRecentMenuDelegate()
+    /// AgentPad: the Dock menu's submenu fillers, kept while it may show.
+    private var dockMenuFillers: [DockTabMenuFiller] = []
     private var windowControllers: [AgentPadWindowController] = [] {
         // Every window add/remove flows through this one property, so bump the
         // agent monitor here — the right sidebar re-aggregates over the new
@@ -150,6 +152,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         AgentIconStore.wireForApp()
         AgentIconStore.prune(keeping: settings.customAgents)
 
+        // Before the windows come back: their Claude sessions read the team
+        // tools' config once, at their start (DESIGN-D6 §7.2).
+        TeamUI.prepareTeamTools()
         restoreWindows()
 
         NSApp.setActivationPolicy(.regular)
@@ -160,13 +165,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // the same discipline as the deep-link path: during the ⌘Q drain a
         // request must not spawn a tab into a store that's already flushed
         // (the second persistence flush would write the phantom tab).
-        hookServer.onCLIRequest = { [weak self] request, isCallerWaiting, completion in
+        hookServer.onCLIRequest = { [weak self] request, origin, isCallerWaiting, completion in
             guard let self, !self.isTerminating else {
                 completion(.failure("\(AppIdentity.appName) is shutting down"))
                 return
             }
             self.cliController.handle(
                 request,
+                origin: origin, // AgentPad: Y4
                 isCallerWaiting: isCallerWaiting,
                 completion: completion
             )
@@ -414,6 +420,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// automatic per-window list — picking a tab raises the window that owns
     /// it, selects the workspace, and focuses the tab.
     public func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        dockMenuFillers = []
         let menu = NSMenu()
         let newWindow = NSMenuItem(
             title: String(localized: "New Window", bundle: .agentPadResources),
@@ -449,12 +456,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         return workspace.title
     }
 
-    /// One item per tab; used when a workspace has more than one.
+    /// One item per tab; used when a workspace has more than one. AgentPad:
+    /// filled each time it is shown, from the tabs as they are then — no
+    /// title is kept in the menu between shows (a channel tab's name may
+    /// no longer be the user's to see; review F2b-p1-2).
     private func dockTabSubmenu(for tabs: [Session]) -> NSMenu {
         let submenu = NSMenu()
-        for session in tabs {
-            submenu.addItem(dockTabItem(title: session.title, sessionId: session.id))
+        let filler = DockTabMenuFiller(sessions: tabs.map { tab -> () -> Session? in { [weak tab] in tab } }) { [weak self] title, id in
+            self?.dockTabItem(title: title, sessionId: id)
         }
+        submenu.delegate = filler
+        dockMenuFillers.append(filler)
         return submenu
     }
 
@@ -526,9 +538,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // terminated, so acting would spawn into a dying app (and the second
         // persistence flush would write the phantom tab to state.json).
         guard !isTerminating else { return }
-        // AgentPad: team invitation links (Team/TeamUI.swift); everything
-        // else goes through the usual deep link parser.
-        let links = urls.filter { !TeamUI.handleLink($0) }.compactMap(AgentPadDeepLink.parse)
+        let links = urls.compactMap(AgentPadDeepLink.parse)
         guard deepLinksReady else {
             pendingDeepLinks.append(contentsOf: links)
             return
@@ -567,8 +577,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// pipeline, so SSH-workspace fallback rides along for free. Spawn-cwd
     /// precedence: the scanner record's cwd while it still exists (local
     /// store is first-hand), else the caller's validated cwd (covers a moved
-    /// project AND conversations beyond the scanner's per-agent cap — the
-    /// agent itself rejects an id it doesn't know, visibly in the tab), else
+    /// project AND conversations beyond the scanner's per-agent cap), else
     /// the record's dead cwd (`resolvedSpawnCwd` falls back to `$HOME`, the
     /// History row's behavior).
     ///
@@ -604,6 +613,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // whose session stores AgentPad itself reads.
         guard AgentSessionScanner.supportedAgentIds.contains(agentId) else {
             completion(.failed("unknown agent '\(agentId)'"))
+            return
+        }
+        let requestedId = conversationId
+        let conversationId: String
+        if agentId == AgentTemplate.claudeCodeID {
+            switch ClaudeSessionResume.resolve(requestedId) {
+            case .success(let fullId): conversationId = fullId
+            case .failure(let refusal):
+                completion(.failed(refusal.message))
+                return
+            }
+        } else {
+            conversationId = requestedId
+        }
+        guard ChannelConversationFilter.current().allows(agentId: agentId, conversationId: conversationId) else {
+            completion(.failed(WorkspaceStore.ResumeRefusal.channelConversation.message(agentId: agentId, conversationId: conversationId)))
             return
         }
         if revealOpenConversation(agentId: agentId, conversationId: conversationId) {
@@ -679,6 +704,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             // while the scan ran. Everything below fronts or builds a window.
             guard isCallerWaiting() else {
                 completion(.dropped("the caller stopped waiting"))
+                return
+            }
+            if let refusal = WorkspaceStore.resumeRefusal(agentId: agentId, conversationId: conversationId) {
+                completion(.failed(refusal.message(agentId: agentId, conversationId: conversationId)))
                 return
             }
             // Re-check after the async hop: a double-fired request's first
@@ -1125,6 +1154,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     public func applicationWillTerminate(_ notification: Notification) {
         // AgentPad: a colleague's call running here must not outlive the app
         // that enforces its time limit and Stop button.
+        // AgentPad: server-mode runs end with their outcome and fact in the journal (D11).
+        ChatService.shared.stopper?.stopAllAtQuit()
         TeamProcesses.shared.killAll()
         TeamService.shared.calls.saveNow()
         // New sessions in a still-open terminal (tmux) must not get the
@@ -1292,20 +1323,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
         // AgentPad: team work (Team/TeamUI.swift).
         mainMenu.addItem(submenu(buildMenu(title: "Team", entries: [
-            selfRow("Colleagues…", #selector(handleTeamColleagues)),
+            selfRow("Team…", #selector(handleTeamWindow)),
             selfRow("Published Agents…", #selector(handleTeamAgents)),
             selfRow("Calls…", #selector(handleTeamCalls)),
+            // AgentPad: the server connection (Chat/ChatConnectUI.swift, C5).
             .separator,
-            selfRow("Invite Colleague…", #selector(handleTeamInvite)),
-            selfRow("Join with Link…", #selector(handleTeamJoin)),
-            .separator,
-            selfRow("Turn Team Work On or Off…", #selector(handleTeamToggle)),
+            selfRow("Organization…", #selector(handleChatOrganization)),
+            selfRow("Connect to a Server…", #selector(handleChatConnect)),
+            selfRow("Disconnect from the Server…", #selector(handleChatDisconnect)),
         ])))
 
         #if DEBUG
 
         mainMenu.addItem(submenu(buildMenu(title: "Debug", entries: [
             selfRow("Cycle Activity", #selector(handleCycleActivity), "a", modifiers: [.command, .shift]),
+            // AgentPad: the server connection by hand, until its window (C5).
+            .separator,
+            selfRow("Server: Set Display Name…", #selector(handleChatDebugSetName)),
+            selfRow("Server: Disconnect", #selector(handleChatDebugDisconnect)),
         ])))
         #endif
 
@@ -1513,7 +1548,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 )
             },
             anchor: activeController?.window,
-            onActivate: { [weak self] item in self?.activate(item) }
+            onActivate: { [weak self] item in self?.activate(item) },
+            // AgentPad: the index copies titles; a channel tab's may stop being
+            // the user's to see while the palette is open — it closes then (DESIGN-F2).
+            watch: { [weak self] in
+                self?.windowControllers.flatMap { $0.store.workspaces }.flatMap { $0.root.allPanes.flatMap(\.tabs) }
+                    .filter { $0.channel != nil }.map(\.title) ?? []
+            }
         )
     }
 
@@ -1728,7 +1769,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             #selector(handleJumpToPreviousPrompt),
             #selector(handleJumpToNextPrompt)
         ) {
-            return terminalWindowIsKey && activeStore?.active?.activeSession != nil
+            // AgentPad: none of these is for a channel tab (DESIGN-F2).
+            guard let session = activeStore?.active?.activeSession else { return false }
+            return terminalWindowIsKey && session.channel == nil
         }
 
         if menuItemMatches(
@@ -1900,12 +1943,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     // AgentPad: Team menu.
-    @objc private func handleTeamColleagues() { TeamUI.showColleagues() }
+    @objc private func handleTeamWindow() { TeamUI.showTeam() }
     @objc private func handleTeamAgents() { TeamUI.showAgents() }
     @objc private func handleTeamCalls() { TeamWindows.showCalls() }
-    @objc private func handleTeamInvite() { TeamUI.invite() }
-    @objc private func handleTeamJoin() { TeamUI.joinFromPrompt() }
-    @objc private func handleTeamToggle() { TeamUI.toggleTeamWork() }
+    @objc private func handleChatConnect() { ChatConnectWindow.show() }
+    @objc private func handleChatOrganization() { ChatOrgWindow.show() }
+    @objc private func handleChatDisconnect() { ChatConnectWindow.disconnect() }
 
     @objc private func handleOpenSettings() {
         // Pass a live resolver, not a snapshot — the Settings window is a
@@ -1943,6 +1986,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     #if DEBUG
+    // AgentPad: Chat/ChatDebugMenu.swift.
+    @objc private func handleChatDebugSetName() { ChatDebugMenu.setName() }
+    @objc private func handleChatDebugDisconnect() { ChatDebugMenu.disconnect() }
+
     /// Cycles through every dot state in precedence order: idle → running
     /// → failure → attention → idle. Used to preview the dot palette without
     /// running real agents / commands.
@@ -1989,5 +2036,44 @@ private final class OpenRecentMenuDelegate: NSObject, NSMenuDelegate {
         action: UnsafeMutablePointer<Selector?>
     ) -> Bool {
         false // recent items never carry key equivalents
+    }
+}
+
+/// AgentPad: fills a Dock tab submenu when it is about to show, with each
+/// tab's title as it is at that moment (DESIGN-F2).
+@MainActor
+final class DockTabMenuFiller: NSObject, NSMenuDelegate {
+    let sessions: [() -> Session?]
+    let item: (String, UUID) -> NSMenuItem?
+
+    init(sessions: [() -> Session?], item: @escaping (String, UUID) -> NSMenuItem?) {
+        self.sessions = sessions
+        self.item = item
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        for session in sessions.compactMap({ $0() }) {
+            if let made = item(session.title, session.id) { menu.addItem(made) }
+        }
+    }
+
+    /// Closes an open submenu: AppKit by default; tests count it.
+    var cancel: (NSMenu) -> Void = { $0.cancelTracking() }
+    private var watch: TitleWatch?
+
+    /// While it shows, a change of its titles — a channel no longer the
+    /// user's to see — closes it; the next show fills it anew (review F2c-p2-1).
+    func menuWillOpen(_ menu: NSMenu) {
+        watch?.stop()
+        watch = TitleWatch(read: { [weak self] in self?.sessions.compactMap { $0()?.title } ?? [] }) { [weak self, weak menu] in
+            guard let self, let menu else { return }
+            self.cancel(menu)
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        watch?.stop()
+        watch = nil
     }
 }

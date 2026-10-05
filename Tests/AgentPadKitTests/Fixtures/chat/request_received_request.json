@@ -1,0 +1,8 @@
+{
+  "command_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a03",
+  "org": "0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10",
+  "type": "request.received",
+  "args": {
+    "request_id": "7e1f2a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b"
+  }
+}

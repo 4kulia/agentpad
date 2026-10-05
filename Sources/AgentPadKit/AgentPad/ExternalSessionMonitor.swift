@@ -47,6 +47,7 @@ final class ExternalSessionMonitor {
             ExternalSessionSource.readSessionFiles() ?? ExternalSessionSource.runAgentsCommand() ?? []
         }.value
     }
+    var conversationVisibility: () -> ChannelConversationFilter = { .current() }
 
     init() {}
 
@@ -67,10 +68,13 @@ final class ExternalSessionMonitor {
 
     func refresh() async {
         let raw = await snapshotProvider()
+        let visibility = conversationVisibility()
+        titleCache = titleCache.filter { visibility.allows(conversationId: $0.key) }
         let ownPid = getpid()
         var result: [ExternalAgentSession] = []
         var own: [ExternalAgentSession] = []
         for var session in raw {
+            guard visibility.allows(conversationId: session.sessionId) else { continue }
             // Session files outlive crashed processes; only keep the ones whose
             // PID still is that session's claude.
             guard let info = processInfo(session.pid),
@@ -90,7 +94,7 @@ final class ExternalSessionMonitor {
         // half-written and drop it. Keep the last good row while its exact
         // process is still alive, instead of flickering (and re-notifying).
         let seen = Set(result.map(\.id))
-        for previous in sessions where !seen.contains(previous.id) {
+        for previous in sessions where !seen.contains(previous.id) && visibility.allows(conversationId: previous.sessionId) {
             if let start = previous.processStart, processInfo(previous.pid)?.startTime == start,
                !raw.contains(where: { $0.pid == previous.pid }) {
                 result.append(previous)
@@ -144,9 +148,10 @@ final class ExternalSessionMonitor {
     }
 
     private func applyTitles(_ titles: [(String, (parts: ExternalSessionParser.TitleParts, offset: UInt64, isFullRead: Bool)?)]) {
+        let visibility = conversationVisibility()
         var changed = false
         for (id, read) in titles {
-            guard let read, var entry = titleCache[id] else { continue }
+            guard visibility.allows(conversationId: id), let read, var entry = titleCache[id] else { continue }
             let previous = entry.parts
             // Incremental reads only ever see newer lines, so they override;
             // a full re-read (file rewritten) replaces outright.
@@ -189,18 +194,27 @@ final class ExternalSessionMonitor {
         // Ask before killing anything: a refusal after SIGTERM would leave the
         // user with neither the old session nor a new one.
         if let refusal = WorkspaceStore.resumeRefusal(
-            agentId: AgentTemplate.claudeCodeID, conversationId: session.sessionId
+            agentId: AgentTemplate.claudeCodeID, conversationId: session.sessionId,
+            visibility: conversationVisibility(), claudeProjectsRoot: store.claudeProjectsRoot
         ) {
             return .failure(.resumeRefused(Self.message(refusal, session)))
         }
+        let root = store.claudeProjectsRoot
+        let visibility = conversationVisibility()
         guard await Task.detached(priority: .userInitiated, operation: {
-            ExternalSessionSource.transcript(for: session.sessionId) != nil
+            ExternalSessionSource.transcript(for: session.sessionId, under: root, visibility: visibility) != nil
         }).value else {
             return .failure(.noTranscript)
         }
         // The last await. From the fresh status check to the signal below
         // everything is synchronous, so the user can't slip a prompt in between.
         let snapshot = await snapshotProvider()
+        if let refusal = WorkspaceStore.resumeRefusal(
+            agentId: AgentTemplate.claudeCodeID, conversationId: session.sessionId,
+            visibility: conversationVisibility(), claudeProjectsRoot: root
+        ) {
+            return .failure(.resumeRefused(Self.message(refusal, session)))
+        }
         guard let fresh = snapshot.first(where: { $0.pid == session.pid && $0.sessionId == session.sessionId }) else {
             return .failure(.changed)
         }

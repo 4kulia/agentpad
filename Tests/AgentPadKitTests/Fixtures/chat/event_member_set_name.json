@@ -1,0 +1,19 @@
+{
+  "stream": "org:0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10",
+  "seq": 7,
+  "id": "5b0c2f7e-0a8d-4f4e-9e57-2d4c1f9b6a33",
+  "type": "member.set_name",
+  "actor": {
+    "account_id": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+    "session_id": "4f1d6a62-2d0e-4b8e-9d6b-5f0e6c3b8f11"
+  },
+  "body": {
+    "account_id": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+    "name": "Anna"
+  },
+  "command_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+  "at": "2026-10-03T18:20:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null
+}

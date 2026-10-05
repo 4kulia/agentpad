@@ -258,7 +258,9 @@ struct AgentTemplate: Identifiable, Hashable {
         newSessionId: String? = nil,
         initialPrompt: String? = nil,
         sshHost: String? = nil,
-        rawLaunchCommand: String? = nil
+        rawLaunchCommand: String? = nil,
+        claudeProjectsRoot: URL = TeamSessionFiles.root,
+        visibility: ChannelConversationFilter = .current()
     ) -> TerminalSessionConfig {
         // Pick a shell that has a AgentPad integration wrapper. Plain terminal
         // sessions respect $SHELL where we have a wrapper (zsh/bash/fish); other
@@ -298,7 +300,9 @@ struct AgentTemplate: Identifiable, Hashable {
                 extraOptions: extraOptions,
                 resumeId: nil,
                 newSessionId: nil,
-                initialPrompt: initialPrompt
+                initialPrompt: initialPrompt,
+                claudeProjectsRoot: claudeProjectsRoot,
+                visibility: visibility
             )
                 .map { " -- \($0)" } ?? ""
             config.environment["AGENTPAD_AGENT"] = "agentpad-ssh \(AgentPadShellIntegration.quote(sshHost))\(agentSuffix)"
@@ -308,7 +312,9 @@ struct AgentTemplate: Identifiable, Hashable {
             extraOptions: extraOptions,
             resumeId: resumeId,
             newSessionId: newSessionId,
-            initialPrompt: initialPrompt
+            initialPrompt: initialPrompt,
+            claudeProjectsRoot: claudeProjectsRoot,
+            visibility: visibility
         ) {
             config.environment["AGENTPAD_AGENT"] = launch
         }
@@ -323,11 +329,21 @@ struct AgentTemplate: Identifiable, Hashable {
         extraOptions: String?,
         resumeId: String?,
         newSessionId: String?,
-        initialPrompt: String?
+        initialPrompt: String?,
+        claudeProjectsRoot: URL,
+        visibility: ChannelConversationFilter
     ) -> String? {
         guard let initialCommand else { return nil }
         let trimmedExtras = extraOptions?.trimmingCharacters(in: .whitespaces) ?? ""
         let trimmedPrompt = initialPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var resumeId = resumeId
+        if rosterId == Self.claudeCodeID, trimmedPrompt.isEmpty,
+           persistsConversation(extraOptions: extraOptions), let id = resumeId {
+            switch ClaudeSessionResume.resolve(id, root: claudeProjectsRoot, visibility: visibility) {
+            case .success(let fullId): resumeId = fullId
+            case .failure(let refusal): return refusal.shellCommand
+            }
+        }
         // Resume arguments go between binary name and user options
         // (`claude --resume <id> --model opus`). This is load-bearing for
         // subcommand-shaped resumes such as `codex resume <id>`.

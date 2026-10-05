@@ -127,9 +127,18 @@ enum AgentSessionScanner {
     /// skipping the 13-way dispatch and cross-store sort a full scan pays;
     /// `collect` sorts newest-first internally, so on duplicate ids the
     /// newest record wins — the same one a full scan would rank first.
-    static func findRecord(agentId: String, conversationId: String, root: URL) -> AgentSessionRecord? {
-        guard let store = stores.first(where: { $0.agentId == agentId }) else { return nil }
-        return store.collect(root).first { $0.conversationId == conversationId }
+    static func findRecord(agentId: String, conversationId: String, root: URL,
+                           visibility: ChannelConversationFilter = .current()) -> AgentSessionRecord? {
+        guard visibility.allows(agentId: agentId, conversationId: conversationId),
+              let store = stores.first(where: { $0.agentId == agentId }) else { return nil }
+        if agentId == AgentTemplate.claudeCodeID {
+            guard case .success(let id) = ClaudeSessionResume.resolve(conversationId, root: root, visibility: visibility),
+                  let file = claudeTranscript(conversationId: id, root: root),
+                  let mtime = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            else { return nil }
+            return claudeRecord(file: file, mtime: mtime)
+        }
+        return collect(store, root: root, visibility: visibility).first { $0.conversationId == conversationId }
     }
 
     /// Stores without an entry in `roots` are skipped; a missing/empty root
@@ -139,7 +148,7 @@ enum AgentSessionScanner {
     /// declined at 2 stores and revisited at 13). `concurrentPerform` keeps
     /// the call synchronous, so the detached refresh task and tests use it
     /// alike.
-    static func scan(roots: [String: URL]) -> [AgentSessionRecord] {
+    static func scan(roots: [String: URL], visibility: ChannelConversationFilter = .current()) -> [AgentSessionRecord] {
         final class Collector: @unchecked Sendable {
             private let lock = NSLock()
             private var slices: [(index: Int, records: [AgentSessionRecord])] = []
@@ -161,7 +170,7 @@ enum AgentSessionScanner {
         DispatchQueue.concurrentPerform(iterations: stores.count) { index in
             let store = stores[index]
             guard let root = roots[store.agentId] else { return }
-            collector.add(index, store.collect(root))
+            collector.add(index, collect(store, root: root, visibility: visibility))
         }
         return collector.ordered.sorted {
             $0.lastActivity != $1.lastActivity
@@ -181,7 +190,21 @@ enum AgentSessionScanner {
     }
 
     private static func collectClaude(root: URL) -> [AgentSessionRecord] {
-        scanStore(files: claudeSessionFiles(under: root), parse: claudeRecord)
+        collectClaude(root: root, visibility: .current())
+    }
+
+    private static func collect(_ store: Store, root: URL, visibility: ChannelConversationFilter) -> [AgentSessionRecord] {
+        store.agentId == AgentTemplate.claudeCodeID
+            ? collectClaude(root: root, visibility: visibility)
+            : visibility.apply(store.collect(root))
+    }
+
+    private static func collectClaude(root: URL, visibility: ChannelConversationFilter) -> [AgentSessionRecord] {
+        // Exclude before reading titles/context and before the history cap.
+        let files = claudeSessionFiles(under: root).filter {
+            visibility.allows(conversationId: $0.item.deletingPathExtension().lastPathComponent)
+        }
+        return scanStore(files: files, parse: claudeRecord)
     }
 
     private static func collectCodex(root: URL) -> [AgentSessionRecord] {
@@ -223,6 +246,37 @@ enum AgentSessionScanner {
         projectFiles(under: root) { file in
             UUID(uuidString: file.deletingPathExtension().lastPathComponent) != nil
         }
+    }
+
+    /// The same filename/layout/mtime lookup as History, without reading a
+    /// transcript or imposing the recent-list cap. Only this conversation.
+    static func claudeTranscript(conversationId: String, root: URL) -> URL? {
+        guard let id = UUID(uuidString: conversationId) else { return nil }
+        return claudeSessionFiles(under: root)
+            .filter { UUID(uuidString: $0.item.deletingPathExtension().lastPathComponent) == id }
+            .sorted { $0.mtime > $1.mtime }.first?.item
+    }
+
+    static func isRemovableClaudeTranscript(_ file: URL, conversationId: String, root: URL) -> Bool {
+        guard let id = UUID(uuidString: conversationId), file.pathExtension == "jsonl",
+              UUID(uuidString: file.deletingPathExtension().lastPathComponent) == id else { return false }
+        let base = root.standardizedFileURL.resolvingSymlinksInPath()
+        let resolved = file.standardizedFileURL.resolvingSymlinksInPath()
+        guard resolved.pathComponents.count == base.pathComponents.count + 2,
+              resolved.pathComponents.starts(with: base.pathComponents),
+              resolved.lastPathComponent == file.lastPathComponent,
+              (try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])).map({
+                  $0.isRegularFile == true && $0.isSymbolicLink != true
+              }) == true else { return false }
+        return true
+    }
+
+    static func eraseClaudeTranscript(conversationId: String, root: URL) {
+        guard let file = claudeTranscript(conversationId: conversationId, root: root),
+              isRemovableClaudeTranscript(file, conversationId: conversationId, root: root) else { return }
+        // unlink cannot recursively remove a directory, even if the entry was
+        // replaced since the check. Missing/unwritable files never block revoke.
+        _ = unlink(file.path)
     }
 
     private static let customTitleMarker = Data("custom-title".utf8)
@@ -412,6 +466,8 @@ enum AgentSessionScanner {
 @Observable
 final class AgentSessionHistory {
     static let shared = AgentSessionHistory()
+    @ObservationIgnored var visibility: () -> ChannelConversationFilter = { .current() }
+    @ObservationIgnored var scan: @Sendable () -> [AgentSessionRecord] = { AgentSessionScanner.scanDefaultRoots() }
     init() {}
     /// Appear-triggered refreshes within this window reuse the last result —
     /// every panel remount (agents↔history flip, hidden↔full) fires one, and
@@ -419,7 +475,8 @@ final class AgentSessionHistory {
     /// bypasses it with `force: true`.
     private static let minSecondsBetweenScans: TimeInterval = 30
 
-    private(set) var records: [AgentSessionRecord] = []
+    private var scannedRecords: [AgentSessionRecord] = []
+    var records: [AgentSessionRecord] { visibility().apply(scannedRecords) }
     /// True only until the FIRST scan lands — refreshes after that keep the
     /// stale list on screen instead of flashing a spinner over it.
     private(set) var isInitialLoad = true
@@ -436,15 +493,16 @@ final class AgentSessionHistory {
             return
         }
         isScanning = true
+        let scan = self.scan
         Task {
             let result = await Task.detached(priority: .utility) {
-                AgentSessionScanner.scanDefaultRoots()
+                scan()
             }.value
             // Equality gate: most rescans find nothing new, and an
             // `@Observable` write re-renders every window's History pane
             // regardless of change.
-            if records != result {
-                records = result
+            if scannedRecords != result {
+                scannedRecords = result
             }
             if isInitialLoad { isInitialLoad = false }
             lastScanCompleted = Date()

@@ -1,0 +1,33 @@
+{
+  "stream": "channel:3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+  "seq": 14,
+  "id": "5b0c2f7e-0a8d-4f4e-9e57-2d4c1f9b6a43",
+  "type": "message.delete",
+  "actor": {
+    "account_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+    "session_id": "4f1d6a62-2d0e-4b8e-9d6b-5f0e6c3b8f11"
+  },
+  "body": {
+    "message_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01",
+    "revision": 3,
+    "message_seq": 12
+  },
+  "command_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a13",
+  "at": "2026-10-05T09:00:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null,
+  "message": {
+    "message_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01",
+    "channel_id": "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+    "thread_root_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b00",
+    "author_account_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+    "text": "",
+    "mentions": [],
+    "revision": 3,
+    "seq": 12,
+    "created_at": "2026-10-05T09:00:00.123456Z",
+    "edited_at": "2026-10-05T09:00:00.123456Z",
+    "deleted_at": "2026-10-05T09:00:00.123456Z"
+  }
+}

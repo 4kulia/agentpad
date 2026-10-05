@@ -2,13 +2,13 @@ import Foundation
 
 // AgentPad: `agentpad-cli team watch <call-id>` — what a colleague's call is
 // doing on this Mac, live, in a tab of its own. Reads the copy of the run's
-// events the app keeps in `team/runs/<call-id>.jsonl` and prints it as text.
+// events the app keeps in `team-server/runs/<call-id>.jsonl` and prints it as text.
 
 public enum AgentPadTeamWatch {
     public static func logPath(callId: String) -> String? {
         guard UUID(uuidString: callId) != nil else { return nil }
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return support.appendingPathComponent("\(AppIdentity.supportDirectoryName)/team/runs/\(callId.lowercased()).jsonl").path
+        return support.appendingPathComponent("\(AppIdentity.supportDirectoryName)/team-server/runs/\(callId.lowercased()).jsonl").path
     }
 
     /// Where a watched run stands.

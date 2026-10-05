@@ -1734,15 +1734,17 @@ final class WorkspaceStoreTests: XCTestCase {
         )
     }
 
-    func testReopenLastClosedTabRestoresConversationId() {
+    func testReopenLastClosedTabRestoresConversationId() throws {
+        let fixture = try ClaudeResumeFixture()
         let store = makeStore()
+        store.claudeProjectsRoot = fixture.root
         let ws = store.addWorkspace(workingDirectory: projectA)
         let tab = store.addTab(in: ws, template: .claudeCode)
-        store.applyConversationId(conversationId: "convo-reopen", sessionId: tab.id)
+        store.applyConversationId(conversationId: fixture.id, sessionId: tab.id)
         store.closeTab(tab, in: ws)
 
         let reopened = store.reopenLastClosedTab()
-        XCTAssertEqual(reopened?.conversationId, "convo-reopen")
+        XCTAssertEqual(reopened?.conversationId, fixture.id)
     }
 
     func testAddTabPropagatesInitialPromptToSpawnedEngine() {
@@ -2962,8 +2964,9 @@ extension WorkspaceStoreTests {
 
     /// The deep-link / CLI paths ask this BEFORE building a window, so it
     /// has to answer without a store.
-    func testResumeRefusalDecidesWithoutAStore() {
-        let id = UUID().uuidString
+    func testResumeRefusalDecidesWithoutAStore() throws {
+        let fixture = try ClaudeResumeFixture()
+        let id = fixture.id
         XCTAssertEqual(
             WorkspaceStore.resumeRefusal(agentId: "no-such-agent", conversationId: id, options: { _ in nil }),
             .agentCannotResume
@@ -2977,16 +2980,18 @@ extension WorkspaceStoreTests {
         )
         XCTAssertNil(
             WorkspaceStore.resumeRefusal(
-                agentId: AgentTemplate.claudeCode.id, conversationId: id, options: { _ in nil }
+                agentId: AgentTemplate.claudeCode.id, conversationId: id, options: { _ in nil }, claudeProjectsRoot: fixture.root
             )
         )
     }
 
     func testResumeSucceedsWhenPersistenceIsOn() throws {
+        let fixture = try ClaudeResumeFixture()
         let store = makeStore()
+        store.claudeProjectsRoot = fixture.root
         let outcome = store.resumeAgentSession(
             agentId: AgentTemplate.claudeCode.id,
-            conversationId: UUID().uuidString,
+            conversationId: fixture.id,
             cwd: URL(fileURLWithPath: NSTemporaryDirectory())
         )
         let session = try XCTUnwrap(try? outcome.get())

@@ -1,0 +1,36 @@
+{
+  "channels": [
+    {
+      "channel_id": "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+      "team_id": "6a1c9e2b-7d3f-4a5e-8b1c-2d3e4f5a6b7c",
+      "name": "billing",
+      "created_by": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+      "created_at": "2026-10-05T09:00:00.123456Z",
+      "archived": false,
+      "archived_at": null,
+      "version": 1,
+      "head": 14,
+      "messages": [
+        {
+          "message_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01",
+          "channel_id": "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+          "thread_root_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b00",
+          "author_account_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+          "text": "The webhook retried twice — see invoice 1042.",
+          "mentions": [
+            {
+              "account_id": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40"
+            }
+          ],
+          "revision": 1,
+          "seq": 12,
+          "created_at": "2026-10-05T09:00:00.123456Z",
+          "edited_at": null,
+          "deleted_at": null
+        }
+      ],
+      "messages_before": 12
+    }
+  ],
+  "next": null
+}

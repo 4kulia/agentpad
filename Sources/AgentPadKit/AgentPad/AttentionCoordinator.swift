@@ -131,14 +131,16 @@ final class AttentionCoordinator {
         seenWaitingEpisodes = keys
     }
 
-    /// AgentPad: recount now, e.g. when a team join request arrives.
+    /// AgentPad: recount now, e.g. when a team call waits for a decision.
     func refreshBadge() { updateBadge(external: ExternalSessionMonitor.shared.sessions) }
 
     private func updateBadge(external: [ExternalAgentSession]) {
         let count = Self.waitingTargets(own: AgentMonitor.shared.entries, external: external).count
-            + TeamService.shared.pendingPairings.count
             + TeamService.shared.calls.awaitingDecision.count
             + TeamService.shared.calls.pendingAccess.count
+            + ClaudeVersionApprovals.shared.pending.count
+            // F4: mentions not read, of channels that may be seen.
+            + ChatNotifications.mentionsForBadge()
         let label = count > 0 ? "\(count)" : nil
         if NSApp.dockTile.badgeLabel != label { NSApp.dockTile.badgeLabel = label }
     }

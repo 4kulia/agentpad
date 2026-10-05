@@ -1,0 +1,10 @@
+{
+  "command_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a10",
+  "org": "0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10",
+  "type": "channel.create",
+  "args": {
+    "channel_id": "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+    "team_id": "6a1c9e2b-7d3f-4a5e-8b1c-2d3e4f5a6b7c",
+    "name": "billing"
+  }
+}

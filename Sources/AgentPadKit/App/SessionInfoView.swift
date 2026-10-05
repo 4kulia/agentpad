@@ -111,7 +111,8 @@ struct SessionInfoView: View {
                     }
                 }
 
-                SessionProcessesSection(store: store, session: session)
+                // AgentPad: a channel tab has no processes (DESIGN-F2).
+                if session.channel == nil { SessionProcessesSection(store: store, session: session) }
 
                 if hasRuntimeInfo(session) {
                     SessionInfoSection(title: SessionInfoRules.runtimeTitle, store: store) {

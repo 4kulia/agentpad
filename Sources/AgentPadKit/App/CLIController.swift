@@ -107,6 +107,8 @@ final class AgentPadCLIController {
     }
 
     private let appVersion: String
+    /// Resolved only for a team request; tests supply a temporary service.
+    private let teamService: @MainActor () -> TeamService
     private let windows: @MainActor () -> [WindowContext]
     /// Zero-window fallback (Settings/About can keep the app alive with no
     /// terminal window) — mirrors `deepLinkController()`, may create a
@@ -142,6 +144,7 @@ final class AgentPadCLIController {
         fallbackWindow: @escaping @MainActor () -> (context: WindowContext, builtWindow: Bool)?,
         activateApp: @escaping @MainActor () -> Void,
         isShuttingDown: @escaping @MainActor () -> Bool = { false },
+        teamService: @escaping @MainActor () -> TeamService = { .shared },
         templates: @escaping @MainActor () -> [AgentTemplate],
         resume: @escaping @MainActor (
             _ agentId: String,
@@ -152,6 +155,7 @@ final class AgentPadCLIController {
         ) -> Void
     ) {
         self.appVersion = appVersion
+        self.teamService = teamService
         self.windows = windows
         self.fallbackWindow = fallbackWindow
         self.activateApp = activateApp
@@ -164,6 +168,8 @@ final class AgentPadCLIController {
     /// the client fd (see `HookServer.CLIHandler`).
     func handle(
         _ request: AgentPadCLIRequest,
+        // AgentPad: who sent it (Team/TeamSocketOrigin.swift, Y4).
+        origin: AgentPadCallerOrigin = .outside,
         isCallerWaiting: @escaping @MainActor () -> Bool = { true },
         completion: @escaping @MainActor (AgentPadCLIResponse) -> Void
     ) {
@@ -177,6 +183,12 @@ final class AgentPadCLIController {
         }
         guard let verb = AgentPadCLIVerb(rawValue: request.verb) else {
             completion(refuse("unknown verb '\(request.verb)'"))
+            return
+        }
+        // AgentPad: a team run's code may not open tabs, run commands or
+        // change team work; an unknown caller may only read (Y4).
+        if let refusal = origin.refusal(for: request) {
+            completion(refuse(refusal))
             return
         }
         switch verb {
@@ -196,7 +208,7 @@ final class AgentPadCLIController {
             handleResume(request, isCallerWaiting: isCallerWaiting, completion: completion)
         case .team:
             // AgentPad: team work (Team/TeamCLIHandler.swift).
-            Task { @MainActor in completion(await TeamCLIHandler.handle(request, isCallerWaiting: isCallerWaiting)) }
+            Task { @MainActor in completion(await TeamCLIHandler.handle(request, service: teamService(), origin: origin, isCallerWaiting: isCallerWaiting)) }
         }
     }
 
@@ -280,6 +292,8 @@ final class AgentPadCLIController {
         guard let hit = locate(id) else {
             return refuse("no tab with id \(id.uuidString) — run `agentpad-cli list`")
         }
+        // AgentPad: DESIGN-F2.
+        guard hit.session.channel == nil else { return refuse("a channel tab takes its channel's name") }
         hit.context.store.renameTab(hit.session, to: title)
         return ok(note: "renamed")
     }
@@ -679,7 +693,16 @@ final class AgentPadCLIController {
                         isActive: store.activeWorkspaceId == workspace.id,
                         tabs: workspace.root.allPanes.flatMap { pane in
                             pane.tabs.map { tab in
-                                AgentPadCLITabInfo(
+                                // AgentPad: a channel tab tells its channel only while it may be seen (DESIGN-F2).
+                                if let channel = tab.channel {
+                                    let state = ChannelTabs.state(channel)
+                                    var channelId: String?
+                                    if case .ready = state { channelId = channel.channel }
+                                    return AgentPadCLITabInfo(id: tab.id.uuidString, title: state.title, cwd: tab.currentDirectory.path,
+                                                              isActive: pane.activeTabId == tab.id, agent: "channel", agentState: nil,
+                                                              channelId: channelId)
+                                }
+                                return AgentPadCLITabInfo(
                                     id: tab.id.uuidString,
                                     title: tab.title,
                                     cwd: tab.currentDirectory.path,

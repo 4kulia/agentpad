@@ -397,8 +397,11 @@ final class CommandPaletteWindowController: NSWindowController, DismissablePanel
         dismiss()
     }
 
-    func show(items: [PaletteItem], anchor: NSWindow?, onActivate: @escaping (PaletteItem) -> Void) {
+    func show(items: [PaletteItem], anchor: NSWindow?, onActivate: @escaping (PaletteItem) -> Void,
+              watch: (@MainActor () -> [String])? = nil) {
         guard let panel = window else { return }
+        titleWatch?.stop()
+        titleWatch = watch.map { TitleWatch(read: $0) { [weak self] in self?.dismiss() } }
         let view = CommandPaletteView(
             items: items,
             onActivate: { [weak self] item in
@@ -417,15 +420,24 @@ final class CommandPaletteWindowController: NSWindowController, DismissablePanel
         panel.makeKeyAndOrderFront(nil)
     }
 
-    func toggle(items: () -> [PaletteItem], anchor: NSWindow?, onActivate: @escaping (PaletteItem) -> Void) {
+    func toggle(items: () -> [PaletteItem], anchor: NSWindow?, onActivate: @escaping (PaletteItem) -> Void,
+                watch: (@MainActor () -> [String])? = nil) {
         if window?.isVisible == true {
             dismiss()
         } else {
-            show(items: items(), anchor: anchor, onActivate: onActivate)
+            show(items: items(), anchor: anchor, onActivate: onActivate, watch: watch)
         }
     }
 
+    /// AgentPad: the palette closes once the channel titles it was built
+    /// with change — they may name a channel the user may no longer see;
+    /// the next open builds them anew (review F2b-p1-1).
+    private var titleWatch: TitleWatch?
+
+
     func dismiss() {
+        titleWatch?.stop()
+        titleWatch = nil
         window?.orderOut(nil)
     }
 
@@ -525,5 +537,38 @@ struct SearchTriggerPill: View {
         .padding(.vertical, 5)
         .onHover { isHovered = $0 }
         .onTapGesture { onOpen() }
+    }
+}
+
+/// AgentPad: calls `changed` once what `read` returns differs from what it
+/// returned when armed; a change of something it reads that leaves the
+/// value as it was arms it again.
+@MainActor
+final class TitleWatch {
+    private let read: @MainActor () -> [String]
+    private let changed: @MainActor () -> Void
+    private var last: [String] = []
+    private var active = true
+
+    init(read: @escaping @MainActor () -> [String], changed: @escaping @MainActor () -> Void) {
+        self.read = read
+        self.changed = changed
+        arm()
+    }
+
+    func stop() { active = false }
+
+    private func arm() {
+        last = withObservationTracking { read() } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self, self.active else { return }
+                let before = self.last
+                self.arm()
+                if self.last != before {
+                    self.active = false
+                    self.changed()
+                }
+            }
+        }
     }
 }

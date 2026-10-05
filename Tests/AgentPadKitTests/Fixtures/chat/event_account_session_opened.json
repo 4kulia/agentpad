@@ -1,0 +1,16 @@
+{
+  "stream": "account:8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+  "seq": 2,
+  "id": "5b0c2f7e-0a8d-4f4e-9e57-2d4c1f9b6a33",
+  "type": "account.session_opened",
+  "actor": null,
+  "body": {
+    "session_id": "4f1d6a62-2d0e-4b8e-9d6b-5f0e6c3b8f11",
+    "device_name": "Anna's MacBook Pro"
+  },
+  "command_id": null,
+  "at": "2026-10-03T18:20:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null
+}

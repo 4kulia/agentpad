@@ -5,23 +5,6 @@ import Foundation
 // structs, like the rest of CLIProtocol.swift.
 
 public struct AgentPadCLITeamInfo: Codable, Equatable, Sendable {
-    public struct Colleague: Codable, Equatable, Sendable {
-        public var id: String
-        public var name: String
-        public var online: Bool
-        public var lastSeen: Date?
-        public init(id: String, name: String, online: Bool, lastSeen: Date?) {
-            self.id = id; self.name = name; self.online = online; self.lastSeen = lastSeen
-        }
-    }
-
-    public struct Pending: Codable, Equatable, Sendable {
-        public var peer: String
-        public var name: String
-        public var code: String
-        public init(peer: String, name: String, code: String) { self.peer = peer; self.name = name; self.code = code }
-    }
-
     /// A colleague's agent this Mac may call (`team agents`).
     public struct Agent: Codable, Equatable, Sendable {
         public var address: String
@@ -66,6 +49,17 @@ public struct AgentPadCLITeamInfo: Codable, Equatable, Sendable {
         public var note: String?
         public var turns: Int?
         public var durationMs: Int?
+        /// Server mode (D10): the request's own state (CHAT-PLAN 6.9) — `state`
+        /// keeps the values of 1.0.x, which scripts and agents rely on.
+        public var serverState: String?
+        /// The result came. With `answerTrimmed`, its text is no longer kept
+        /// on this Mac (history limit) and `text` says so.
+        public var answered: Bool?
+        public var answerTrimmed: Bool?
+        /// The calls it was read from (the app's `TeamCalls.scopeToken`): a
+        /// follow passes it back each round, so a wait never goes on in
+        /// another organization's calls (review D8h-p2-7).
+        public var scope: String?
         public init(id: String, address: String, state: String, final: Bool, text: String? = nil, truncated: Bool? = nil,
                     threadId: String? = nil, activity: String? = nil, detail: String? = nil, note: String? = nil,
                     turns: Int? = nil, durationMs: Int? = nil) {
@@ -75,17 +69,31 @@ public struct AgentPadCLITeamInfo: Codable, Equatable, Sendable {
         }
     }
 
-    /// off / starting / on / failed
+    /// A member of the organization (`team members`).
+    public struct Member: Codable, Equatable, Sendable {
+        public var name: String
+        public var handle: String
+        public var role: String
+        public var you: Bool
+        public init(name: String, handle: String, role: String, you: Bool) {
+            self.name = name; self.handle = handle; self.role = role; self.you = you
+        }
+    }
+
+    /// A team as the organization's window shows it (`team members`).
+    public struct Team: Codable, Equatable, Sendable {
+        public var name: String
+        public var members: [String]
+        public var mine: Bool
+        public var archived: Bool
+        public init(name: String, members: [String], mine: Bool, archived: Bool) {
+            self.name = name; self.members = members; self.mine = mine; self.archived = archived
+        }
+    }
+
+    /// off / server
     public var status: String
     public var detail: String?
-    public var name: String
-    public var id: String?
-    public var colleagues: [Colleague]
-    public var pending: [Pending]
-    /// `invite`: the new link. `join`: nil.
-    public var inviteURL: String?
-    /// This Mac's own join waiting for an answer, with the code to compare.
-    public var outgoing: Pending?
     public var agents: [Agent]?
     /// A folder access request of a running call (run tools).
     public struct Access: Codable, Equatable, Sendable {
@@ -98,16 +106,29 @@ public struct AgentPadCLITeamInfo: Codable, Equatable, Sendable {
     public var access: Access?
     public var published: [Published]?
     public var call: Call?
+    /// The server connection (C7): what `status` says of it.
+    public var outcome: String?
+    public var server: String?
+    public var account: String?
+    public var org: String?
+    /// signed in / connecting / closed / not a member / off
+    public var connection: String?
+    public var rightsInDoubt: Bool?
+    /// What stopped, as the app's Team window says it.
+    public var problems: [String]?
+    public var members: [Member]?
+    public var teams: [Team]?
 
-    public init(status: String, detail: String?, name: String, id: String?, colleagues: [Colleague], pending: [Pending], inviteURL: String? = nil, outgoing: Pending? = nil) {
-        self.status = status; self.detail = detail; self.name = name; self.id = id
-        self.colleagues = colleagues; self.pending = pending; self.inviteURL = inviteURL; self.outgoing = outgoing
+    public init(status: String, detail: String?) {
+        self.status = status; self.detail = detail
     }
 }
 
 /// The `team` subcommands.
 public enum AgentPadCLITeamAction: String, Sendable, CaseIterable {
-    case status, on, off, invite, join, approve, deny, remove
+    case status
+    /// The server connection and the organization (C7).
+    case login, logout, members, invite
     case agents, ask, check, cancel, publish, unpublish, watch
     /// Internal, for the run tools of a colleague's call (not on the command line).
     case access, accessCheck = "access-check"
@@ -116,9 +137,6 @@ public enum AgentPadCLITeamAction: String, Sendable, CaseIterable {
 /// `team <action>` with its values.
 public struct AgentPadCLITeamCommand: Equatable, Sendable {
     public var action: AgentPadCLITeamAction
-    public var name: String?
-    public var link: String?
-    public var peer: String?
     /// ask: `agent@colleague`. publish, unpublish: the agent's name.
     public var agent: String?
     /// ask: the request; "-" reads it from stdin.
@@ -134,12 +152,16 @@ public struct AgentPadCLITeamCommand: Equatable, Sendable {
     /// agents: list this Mac's own published agents.
     public var mine = false
     public var json = false
+    /// invite: the address, `--role`, the `--team` names.
+    public var email: String?
+    public var role: String?
+    public var teams: [String] = []
 
-    public init(action: AgentPadCLITeamAction, name: String? = nil, link: String? = nil, peer: String? = nil,
+    public init(action: AgentPadCLITeamAction,
                 agent: String? = nil, prompt: String? = nil, thread: String? = nil, call: String? = nil,
                 waitMinutes: Int? = nil, folder: String? = nil, description: String? = nil, access: String? = nil,
                 mine: Bool = false, json: Bool = false) {
-        self.action = action; self.name = name; self.link = link; self.peer = peer; self.agent = agent
+        self.action = action; self.agent = agent
         self.prompt = prompt; self.thread = thread; self.call = call; self.waitMinutes = waitMinutes
         self.folder = folder; self.description = description; self.access = access; self.mine = mine; self.json = json
     }
@@ -147,9 +169,10 @@ public struct AgentPadCLITeamCommand: Equatable, Sendable {
     /// How long one exchange with the app may take.
     public var replyTimeout: TimeInterval {
         switch action {
-        case .join: 170  // waits for the colleague's approval (up to 120 s)
         case .agents: 30  // asks every colleague, 15 s each, side by side
         case .check, .cancel, .publish: 45
+        // The window's confirmation (45 s) and the Disconnect (DESIGN-C7).
+        case .logout: 120
         default: 15
         }
     }
@@ -163,11 +186,10 @@ extension AgentPadHookKit {
 
     static let teamUsage = """
     usage: agentpad-cli team status [--json]
-           agentpad-cli team on [--name <name>]
-           agentpad-cli team off
-           agentpad-cli team invite
-           agentpad-cli team join --link <agentpad://team/join?…>
-           agentpad-cli team approve|deny|remove --peer <id>
+           agentpad-cli team login [--json]                   (opens the window to connect to a server)
+           agentpad-cli team logout [--json]                  (Disconnect, confirmed in the app's window)
+           agentpad-cli team members [--json]
+           agentpad-cli team invite <email> [--role member|admin] [--team <name>]... [--json]
            agentpad-cli team agents [--mine] [--json]
            agentpad-cli team ask <agent@colleague> [--thread <id>] [--wait <minutes>] [--json] [--] "<request>"|-
            agentpad-cli team check <call-id> [--wait <minutes>] [--json]
@@ -203,7 +225,10 @@ extension AgentPadHookKit {
                 command.json = true; i += 1
             case "--mine":
                 command.mine = true; i += 1
-            case "--name", "--link", "--peer", "--thread", "--wait", "--folder", "--description", "--access":
+            case "--team":
+                guard i + 1 < args.count else { return failure("--team expects a team's name.") }
+                command.teams.append(args[i + 1]); i += 2
+            case "--thread", "--wait", "--folder", "--description", "--access", "--role":
                 guard i + 1 < args.count else { return failure("\(arg) expects a value.") }
                 values[arg] = args[i + 1]; i += 2
             case "--help", "-h":
@@ -215,13 +240,17 @@ extension AgentPadHookKit {
                 positional.append(arg); i += 1
             }
         }
-        command.name = values["--name"]
-        command.link = values["--link"]
-        command.peer = values["--peer"]
         command.thread = values["--thread"]
         command.folder = values["--folder"]
         command.description = values["--description"]
         command.access = values["--access"]
+        command.role = values["--role"]
+        if action != .invite, command.role != nil || !command.teams.isEmpty {
+            return failure("--role and --team go with invite.")
+        }
+        if let role = command.role, !["member", "admin"].contains(role) {
+            return failure("--role is member or admin.")
+        }
         if let wait = values["--wait"] {
             guard let minutes = Int(wait), minutes >= 0, minutes <= 24 * 60 else { return failure("--wait takes minutes, 0 to 1440.") }
             command.waitMinutes = minutes
@@ -232,17 +261,13 @@ extension AgentPadHookKit {
         let expected: Int
         switch action {
         case .ask: expected = 2
-        case .check, .cancel, .publish, .unpublish, .watch: expected = 1
+        case .check, .cancel, .publish, .unpublish, .watch, .invite: expected = 1
         default: expected = 0
         }
         guard positional.count == expected else {
             return failure(expected == 0 ? "\(action.rawValue) takes no positional arguments." : "\(action.rawValue) expects \(expected) argument\(expected == 1 ? "" : "s").")
         }
         switch action {
-        case .join where command.link == nil:
-            return failure("--link is required.")
-        case .approve, .deny, .remove:
-            guard command.peer != nil else { return failure("--peer is required.") }
         case .ask:
             command.agent = positional[0]
             command.prompt = positional[1]
@@ -252,19 +277,19 @@ extension AgentPadHookKit {
             command.agent = positional[0]
         case .unpublish:
             command.agent = positional[0]
+        case .invite:
+            guard positional[0].contains("@") else { return failure("invite expects an email address.") }
+            command.email = positional[0]
         default:
             break
         }
-        if let access = command.access, !["read", "read-git", "edit"].contains(access) {
-            return failure("--access is read, read-git or edit.")
+        if let access = command.access, !["read", "edit-files", "read-git", "edit"].contains(access) {
+            return failure("--access is read, edit-files, read-git or edit.")
         }
         return .success(.team(command))
     }
 
     public static func renderCLITeam(_ info: AgentPadCLITeamInfo, action: String) -> String {
-        if action == AgentPadCLITeamAction.invite.rawValue, let url = info.inviteURL {
-            return plain(url)
-        }
         if let call = info.call { return renderCLITeamCall(call) }
         if let published = info.published {
             guard !published.isEmpty else { return "no published agents — add one with `agentpad-cli team publish`" }
@@ -279,33 +304,42 @@ extension AgentPadHookKit {
                 lines.append("\(plain(agent.address))  [\(plain(agent.access))]\(agent.sameProject ? "  same project" : "")\(kind)")
                 if !agent.description.isEmpty { lines.append("    \(plain(agent.description))") }
             }
-            let offline = info.colleagues.filter { colleague in !colleague.online && !agents.contains { $0.colleague == colleague.name } }
-            if !offline.isEmpty {
-                lines.append("not reachable now: " + offline.map { plain($0.name) }.joined(separator: ", "))
-            }
-            if agents.isEmpty && offline.isEmpty {
-                lines.append(info.colleagues.isEmpty ? "no colleagues yet" : "your colleagues have not opened any agents to you")
-            }
+            if agents.isEmpty { lines.append("no agents of colleagues to call") }
             return lines.joined(separator: "\n")
         }
+        if info.members != nil || info.teams != nil { return renderCLITeamMembers(info) }
+        if let outcome = info.outcome { return plain(info.detail ?? outcome) }
         var lines = ["team work: \(plain(info.status))" + (info.detail.map { " — \(plain($0))" } ?? "")]
-        if let id = info.id { lines.append("you: \(plain(info.name))  \(plain(id))") }
-        if let outgoing = info.outgoing {
-            lines.append("joining \(plain(outgoing.name)): waiting for approval, code \(plain(outgoing.code))")
+        if let connection = info.connection {
+            var line = "server: \(plain(info.server ?? "none")) — \(plain(connection))"
+            if let account = info.account { line += " — account \(plain(account))" }
+            lines.append(line)
         }
-        for pending in info.pending {
-            lines.append("join request: \(plain(pending.name))  code \(plain(pending.code))  peer \(plain(pending.peer))")
+        if let org = info.org {
+            lines.append("organization: \(plain(org))" + (info.rightsInDoubt == true ? " — your rights are being checked" : ""))
         }
-        if info.colleagues.isEmpty {
-            lines.append("no colleagues yet")
-        } else {
-            for colleague in info.colleagues {
-                let seen = colleague.online ? "online" : (colleague.lastSeen.map { "last seen \(ISO8601DateFormatter().string(from: $0))" } ?? "never seen")
-                lines.append("  \(colleague.online ? "●" : "○") \(plain(colleague.name))  \(seen)  \(plain(colleague.id))")
-            }
+        for problem in info.problems ?? [] { lines.append("! \(plain(problem))") }
+        return lines.joined(separator: "\n")
+    }
+
+    /// `team members`: the members and the teams, as the window shows them.
+    static func renderCLITeamMembers(_ info: AgentPadCLITeamInfo) -> String {
+        var lines: [String] = []
+        if let org = info.org { lines.append(plain(org)) }
+        if info.rightsInDoubt == true { lines.append("your rights are being checked with the server; only your own name is shown") }
+        for member in info.members ?? [] {
+            lines.append("  \(plain(member.name)) @\(plain(member.handle)) — \(plain(member.role))\(member.you ? " (you)" : "")")
+        }
+        for team in info.teams ?? [] {
+            var head = "# \(plain(team.name))"
+            if team.archived { head += " (archived)" }
+            if team.mine { head += " (you are in it)" }
+            lines.append(head)
+            if !team.members.isEmpty { lines.append("    " + team.members.map(plain).joined(separator: ", ")) }
         }
         return lines.joined(separator: "\n")
     }
+
 
     /// A call's outcome. The answer is marked as text from another machine,
     /// so an agent reading it does not take it for its user's words (C-9).
@@ -316,14 +350,17 @@ extension AgentPadHookKit {
                 "",
                 plainText(call.text ?? ""),
             ]
-            if call.truncated == true { lines.append("[answer truncated]") }
+            // A text the history limit took says so itself (`text`, also for an older CLI).
+            if call.answerTrimmed != true, call.truncated == true {
+                lines.append("[answer truncated]")
+            }
             lines.append("")
             if let thread = call.threadId {
                 lines.append("thread \(plain(thread)) — continue with: agentpad-cli team ask \(plain(call.address)) --thread \(plain(thread)) \"…\"")
             }
             return lines.joined(separator: "\n")
         }
-        var line = "call \(plain(call.id)) to \(plain(call.address)): \(plain(call.state.replacingOccurrences(of: "_", with: " ")))"
+        var line = "call \(plain(call.id)) to \(plain(call.address)): \(plain((call.serverState ?? call.state).replacingOccurrences(of: "_", with: " ")))"
         if let detail = call.detail { line += " — \(plain(detail))" }
         if let note = call.note { line += " — \(plain(note))" }
         if let activity = call.activity { line += " (using \(plain(activity)))" }
@@ -342,10 +379,52 @@ extension AgentPadHookKit {
 
     /// One line on stderr while `ask` waits.
     public static func renderCLITeamProgress(_ call: AgentPadCLITeamInfo.Call) -> String {
-        var line = "\(plain(call.address)): \(plain(call.state.replacingOccurrences(of: "_", with: " ")))"
+        // The server's own word when there is one (D10), else 1.0.x's.
+        let word = call.serverState ?? call.state
+        var line = "\(plain(call.address)): \(plain(word.replacingOccurrences(of: "_", with: " ")))"
         if let note = call.note { line += " — \(plain(note))" }
+        // What the state means, when the app says (stopping, a state it does not know).
+        if let detail = call.detail { line += " — \(plain(detail))" }
         if let activity = call.activity { line += " (using \(plain(activity)))" }
         return line
+    }
+
+    /// The exit code of `team ask` / `team check` (decision 21): 0 — the
+    /// answer came; 1 — the call ended without one; 2 — still under way.
+    public static func teamCallExitCode(_ call: AgentPadCLITeamInfo.Call) -> Int32 {
+        call.state == "done" ? 0 : call.final ? 1 : 2
+    }
+
+    /// `team … --json` of a server action (C7): one object for every outcome —
+    /// `ok`, `outcome`, `message`, and what the app told, if anything.
+    public static func renderCLITeamResultJSON(ok: Bool, outcome: String?, message: String?, info: AgentPadCLITeamInfo? = nil) -> String {
+        var object: [String: Any] = [:]
+        if let info, let data = try? JSONEncoder().encode(info),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            object = decoded
+        }
+        // The contract's names (DESIGN-C7).
+        if let doubt = object.removeValue(forKey: "rightsInDoubt") { object["rights_in_doubt"] = doubt }
+        object["ok"] = ok
+        // Every outcome has a name and a message, the refusals the app gives
+        // before any action (Y4, an old app) included.
+        object["outcome"] = outcome ?? info?.outcome ?? (ok ? "ok" : "refused")
+        object["message"] = message ?? info?.detail ?? (ok ? "ok" : "refused")
+        // One line: read line by line by scripts.
+        let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data("{}".utf8)
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Actions that change something: after the request went, no reliable
+    /// answer means an unknown outcome (exit 2), not a failure (DESIGN-C7).
+    public static func teamActionChanges(_ action: AgentPadCLITeamAction) -> Bool {
+        action == .logout || action == .invite
+    }
+
+    /// The actions of C7 — `status` among them — whose every outcome
+    /// `--json` renders as one object.
+    public static func teamActionIsServer(_ action: AgentPadCLITeamAction) -> Bool {
+        [.status, .login, .logout, .members, .invite].contains(action)
     }
 
     public static func renderCLITeamJSON(_ info: AgentPadCLITeamInfo) -> String {

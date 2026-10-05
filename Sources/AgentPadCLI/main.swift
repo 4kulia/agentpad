@@ -14,6 +14,8 @@ import AgentPadHookKit
 //       requested"; in-app confirmation rules still apply).
 //   1 — any failure: app couldn't be launched, bad arguments, unknown tab,
 //       refused request, timeout. One human-readable line on stderr.
+//   2 — AgentPad `team logout` / `team invite`: started or sent, the outcome
+//       not known (also `team ask` / `check`: still in progress).
 //
 // Every verb except `status` launches AgentPad first when it isn't running,
 // then waits (up to 10s) for the socket to come up.
@@ -133,10 +135,23 @@ if arguments == ["mcp"] || runToolsCallId != nil {
     exit(0)
 }
 
+// AgentPad: `team … --json` answers with one JSON object whatever happens,
+// and exits 2 when a change was asked for but its outcome is not known (C7).
+let teamJSON = arguments.first == "team" && arguments.contains("--json")
+
+func teamFail(_ outcome: String, _ message: String, exitCode: Int32 = 1) -> Never {
+    if teamJSON {
+        print(AgentPadHookKit.renderCLITeamResultJSON(ok: false, outcome: outcome, message: message))
+        exit(exitCode)
+    }
+    FileHandle.standardError.write(Data("agentpad-cli: \(AgentPadHookKit.plain(message))\n".utf8))
+    exit(exitCode)
+}
+
 let parsed: AgentPadCLICommand
 switch AgentPadHookKit.parseCLICommand(arguments) {
 case .success(let value): parsed = value
-case .failure(let error): fail(error.message)
+case .failure(let error): teamJSON ? teamFail("usage", error.message) : fail(error.message)
 }
 
 if parsed == .help {
@@ -174,13 +189,20 @@ default:
     command = parsed
 }
 
-// AgentPad: `team watch` reads the run's log on disk; the app is not asked.
+// AgentPad: `team watch` reads the run's log on disk, only once the app
+// said this call may be watched (a server's request may not yet): no
+// answer, or an unreadable one, is no (review D8e-p1-3).
 if case .team(let team) = command, team.action == .watch {
     guard let id = team.call, let path = AgentPadTeamWatch.logPath(callId: id) else { fail("a call id is a UUID") }
+    guard let check = AgentPadHookKit.cliRequest(for: command)?.encodedLine(),
+          case .success(let data) = AgentPadCLITransport.roundTrip(line: check, socketPath: AgentPadHookKit.socketPath, timeout: 5),
+          let answer = AgentPadCLIResponse.decode(from: data)
+    else { fail("\(AppIdentity.appName) did not answer whether this call may be watched; start it and try again") }
+    guard answer.ok else { fail(answer.error ?? "this call cannot be watched") }
     setvbuf(stdout, nil, _IONBF, 0)
     let session = AgentPadTeamWatch.follow(path: path) { print($0) }
-    if let session {
-        print("\nTo continue this conversation yourself: claude --resume \(AgentPadHookKit.plain(session))")
+    if let session, let id = UUID(uuidString: session), session.lowercased() == id.uuidString.lowercased() {
+        print("\nTo continue this conversation yourself: agentpad-cli resume --agent claude-code --id \(id.uuidString.lowercased())")
     }
     exit(0)
 }
@@ -230,7 +252,8 @@ if case .failure(.connectFailed) = result {
         return false
     }()
     guard launchAgentPad(background: backgroundLaunch) else {
-        fail("\(AppIdentity.appName) is not running and couldn't be launched")
+        teamJSON ? teamFail("unavailable", "\(AppIdentity.appName) is not running and couldn't be launched")
+            : fail("\(AppIdentity.appName) is not running and couldn't be launched")
     }
     let deadline = DispatchTime.now() + launchTimeout
     while true {
@@ -240,6 +263,35 @@ if case .failure(.connectFailed) = result {
             continue
         }
         break
+    }
+}
+
+// AgentPad: a change asked of the server (C7) with no reliable answer once
+// the request went: its outcome is unknown — exit 2, never "not done".
+if case .team(let team) = command, AgentPadHookKit.teamActionIsServer(team.action) {
+    let changes = AgentPadHookKit.teamActionChanges(team.action)
+    func unknown() -> Never {
+        changes ? teamFail("unknown", "the request went to \(AppIdentity.appName) but no answer came; its outcome is not known — see `agentpad-cli team status`", exitCode: 2)
+            : teamFail("unavailable", "\(AppIdentity.appName) did not answer")
+    }
+    switch result {
+    case .failure(.connectFailed):
+        teamFail("unavailable", "\(AppIdentity.appName) did not start listening within \(Int(launchTimeout))s")
+    case .failure(.writeFailed):
+        teamFail("unavailable", "couldn't send the request to \(AppIdentity.appName)")
+    case .failure:
+        unknown()
+    case .success(let data):
+        guard let response = AgentPadCLIResponse.decode(from: data) else { unknown() }
+        let outcome = response.team?.outcome
+        if team.json {
+            print(AgentPadHookKit.renderCLITeamResultJSON(ok: response.ok, outcome: outcome, message: response.error, info: response.team))
+        } else if response.ok {
+            printSuccess(response, for: command)
+        } else {
+            FileHandle.standardError.write(Data("agentpad-cli: \(AgentPadHookKit.plain(response.error ?? "request refused"))\n".utf8))
+        }
+        exit(!response.ok ? 1 : outcome == "started" ? 2 : 0)
     }
 }
 
@@ -293,6 +345,7 @@ func followTeamCall(_ first: AgentPadCLITeamInfo.Call, team: AgentPadCLITeamComm
         var check = AgentPadCLIRequest(verb: .team)
         check.teamAction = AgentPadCLITeamAction.check.rawValue
         check.teamCall = call.id
+        check.teamScope = call.scope
         check.teamWaitSeconds = min(AgentPadHookKit.teamCheckRoundSeconds, Int(remaining))
         guard let line = check.encodedLine() else { fail("internal error: request encoding failed") }
         let timeout = TimeInterval(AgentPadHookKit.teamCheckRoundSeconds + 20)
@@ -313,5 +366,5 @@ func followTeamCall(_ first: AgentPadCLITeamInfo.Call, team: AgentPadCLITeamComm
     } else {
         print(AgentPadHookKit.renderCLITeamCall(call))
     }
-    exit(call.state == "done" ? 0 : call.final ? 1 : 2)
+    exit(AgentPadHookKit.teamCallExitCode(call))
 }
