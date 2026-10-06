@@ -139,9 +139,17 @@ struct ChatRequestWire: Codable, Equatable, Sendable {
     var publication: String?
     var publishReason: String?
     var context: [ChatChannelContent.Reference]? = nil
+    var sourceMessageId: String? = nil
+    var sourceRevision: Int? = nil
+    var replyMode: String? = nil
+    var requestedPolicyId: String? = nil
+    var decisionBasis: String? = nil
+    var decisionPolicyId: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case kind, text, origin, state, version, result, cause, publication, context
+        case sourceMessageId = "source_message_id", sourceRevision = "source_revision", replyMode = "reply_mode"
+        case requestedPolicyId = "requested_policy_id", decisionBasis = "decision_basis", decisionPolicyId = "decision_policy_id"
         case requestId = "request_id", agentId = "agent_id", ownerAccountId = "owner_account_id"
         case executorDeviceName = "executor_device_name", initiatorAccountId = "initiator_account_id", threadId = "thread_id"
         case conditionsVersion = "conditions_version", deliverBy = "deliver_by", createdAt = "created_at", runId = "run_id"
@@ -208,6 +216,13 @@ struct ChatRequest: Equatable, Sendable {
     var publication: String?
     var publishReason: String?
 
+    var sourceMessageId: String?
+    var sourceRevision: Int?
+    var replyMode: String?
+    var requestedPolicyId: String?
+    var decisionBasis: String?
+    var decisionPolicyId: String?
+
     /// The result reached the initiator (D8: `answered`).
     var answered: Bool { result != nil }
 
@@ -247,6 +262,12 @@ struct ChatRequest: Equatable, Sendable {
         threadRootId = row["thread_root_id"]
         publication = row["publication"]
         publishReason = row["publish_reason"]
+        sourceMessageId = row["source_message_id"]
+        sourceRevision = row["source_revision"]
+        replyMode = row["reply_mode"]
+        requestedPolicyId = row["requested_policy_id"]
+        decisionBasis = row["decision_basis"]
+        decisionPolicyId = row["decision_policy_id"]
         self.result = result
     }
 }
@@ -448,7 +469,7 @@ final class ChatCallStore: Sendable {
 
     /// Event types this store applies.
     static let eventTypes: Set<String> = [
-        "request.create", "request.snapshot", "request.received", "request.decide", "run.start", "run.failed_to_start",
+        "request.create", "request.snapshot", "request.received", "request.decide", "request.decide_automatic", "run.start", "run.failed_to_start",
         "run.started", "run.finished", "run.failed", "result.deliver", "agent.publish", "agent.unpublish", "agent.disable",
         // Hardening (D2b, D7): the changing part of a request, applied the same way.
         "request.cancel", "request.stop", "run.stopped", "run.stop_failed", "request.expired",
@@ -545,6 +566,16 @@ final class ChatCallStore: Sendable {
             if wire.updatedAt == nil, let at {
                 try db.execute(sql: "UPDATE requests SET updated_at = ? WHERE request_id = ?", arguments: [at, wire.requestId])
             }
+        }
+        if wire.hasFixed, held == nil || (held?["has_fixed"] as Bool?) == false {
+            try db.execute(sql: """
+                UPDATE requests SET source_message_id = ?, source_revision = ?, reply_mode = ?, requested_policy_id = ?
+                WHERE request_id = ?
+                """, arguments: [wire.sourceMessageId, wire.sourceRevision, wire.replyMode, wire.requestedPolicyId, wire.requestId])
+        }
+        if held == nil || wire.version > (held?["version"] as Int? ?? 0) || (held?["generation"] as String?) != current {
+            try db.execute(sql: "UPDATE requests SET decision_basis = ?, decision_policy_id = ? WHERE request_id = ?",
+                           arguments: [wire.decisionBasis, wire.decisionPolicyId, wire.requestId])
         }
         if let onThisDevice {
             let was = try Bool.fetchOne(db, sql: "SELECT on_this_device FROM requests WHERE request_id = ?", arguments: [wire.requestId])

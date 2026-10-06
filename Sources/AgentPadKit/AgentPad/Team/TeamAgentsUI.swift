@@ -17,7 +17,7 @@ struct TeamAgentsView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Published agents")
                 .font(Theme.display(14, weight: .semibold))
-            Text("Colleagues' agents can call these. Every call waits for your Allow in the right panel, then runs Claude Code in the agent's folder with the rights you chose.")
+            Text("Colleagues' agents can call these. Personal calls wait for your Allow. Channel calls can run and publish automatically with your consent or channel trust, using the rights you chose.")
                 .font(Theme.display(11))
                 .foregroundStyle(Theme.chromeMuted)
                 .fixedSize(horizontal: false, vertical: true)

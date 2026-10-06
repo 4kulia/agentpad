@@ -114,6 +114,10 @@ enum ChatPublication {
             """, arguments: [run])
     }
 
+    static func isAutomatic(_ db: Database, command: String) throws -> Bool {
+        try Bool.fetchOne(db, sql: "SELECT automatic FROM publication_intents WHERE command_id = ?", arguments: [command]) ?? true
+    }
+
     static func inFlight(_ db: Database, run: String) throws -> ChatCommandRecord? {
         try ChatCommandRecord.fetchOne(db, sql: """
             SELECT o.* FROM outbox o JOIN publication_intents i ON i.command_id = o.command_id
@@ -296,10 +300,10 @@ extension ChatService {
         }
     }
 
-    /// Only the two owner buttons call this. C2 stores exact bytes, so a lost
-    /// answer repeats the same command id; a new session cannot auto-send it.
+    /// Owner decisions and the automatic publisher share C2's exact bytes.
+    /// A lost answer repeats the command; a new session needs a fresh decision.
     @discardableResult
-    func publishChannelResult(_ key: ChatOrgKey, requestId: String, publish: Bool) throws -> ChatCommandRecord {
+    func publishChannelResult(_ key: ChatOrgKey, requestId: String, publish: Bool, automatic: Bool = false) throws -> ChatCommandRecord {
         guard let run = channelPreview(key, requestId: requestId), let store = orgSessions[key]?.store,
               let request = try store.calls.request(requestId), request.state == .finished, request.publication == "awaiting_publish" else {
             throw ChatError.storage("This result is not awaiting publication here.")
@@ -309,16 +313,22 @@ extension ChatService {
         if publish { args["text"] = .string(try channelPublicationText(key, requestId: requestId) ?? "") }
         let prepared = try prepareCommand(key, type: publish ? "result.publish" : "result.withhold", args: .object(args))
         let made = try store.queue.write { db in
+            func confirmed(_ command: ChatCommandRecord) throws -> ChatCommandRecord {
+                if !automatic {
+                    try db.execute(sql: "UPDATE publication_intents SET automatic = 0 WHERE command_id = ?", arguments: [command.commandId])
+                }
+                return command
+            }
             let generation = try String.fetchOne(db, sql: "SELECT generation FROM meta WHERE id = 1")
             let previous = try ChatPublication.commands(db, run: run.runId)
             if let sending = try ChatPublication.inFlight(db, run: run.runId) {
-                if sending.type == prepared.record.type { return sending }
+                if sending.type == prepared.record.type { return try confirmed(sending) }
                 throw ChatError.storage("The earlier publication decision is still in flight. Wait for its answer.")
             }
             guard prepared.record.bodyBytes.count <= ChatPublication.maxBodyBytes else { throw ChatError.storage("The publication exceeds the server's size limit.") }
             if let current = try ChatPublication.current(db, run: run.runId), current.sessionId == prepared.record.sessionId,
                current.state == .pending || (current.state == .sent && current.sentGeneration == generation) {
-                if current.type == prepared.record.type, current.bodyBytes.count <= ChatPublication.maxBodyBytes { return current }
+                if current.type == prepared.record.type, current.bodyBytes.count <= ChatPublication.maxBodyBytes { return try confirmed(current) }
                 if current.state == .sent { throw ChatError.storage("The server already accepted the earlier publication decision.") }
             }
             // Intent and queue change together. Deletion also removes old
@@ -329,7 +339,7 @@ extension ChatService {
             var record = prepared.record
             record.orderKey = "publish:\(run.runId)"
             let made = try prepared.table.insert(db, record, seq: record.seq)
-            try db.execute(sql: "INSERT OR REPLACE INTO publication_intents (run_id, command_id) VALUES (?, ?)", arguments: [run.runId, made.commandId])
+            try db.execute(sql: "INSERT OR REPLACE INTO publication_intents (run_id, command_id, automatic) VALUES (?, ?, ?)", arguments: [run.runId, made.commandId, automatic])
             return made
         }
         prepared.sent()
@@ -353,6 +363,8 @@ extension ChatService {
     /// current rights can decide that a channel is gone. Erasure never waits
     /// for the server's fact chain; end() repeats it if a result arrives later.
     func reconcileChannelResults(revoked: ChatOrgKey? = nil) {
+        pruneChannelActivity()
+        defer { reconcileAutomaticChannels() }
         guard let journal else { return }
         // A transcript belongs to the thread, not to an individual result.
         // Retry confirmed revocations even offline, but preserve any UUID

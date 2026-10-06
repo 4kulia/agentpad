@@ -21,12 +21,16 @@ struct ChatMessageWire: Codable, Equatable, Sendable {
     /// F8: an agent's message — its agent and the run it answers.
     let authorAgentId: String?
     let runId: String?
+    let authorAgentName: String?
+    let authorSessionName: String?
+    let inReplyToMessageId: String?
 
     enum CodingKeys: String, CodingKey {
         case text, mentions, revision, seq
         case messageId = "message_id", channelId = "channel_id", threadRootId = "thread_root_id",
              authorAccountId = "author_account_id", createdAt = "created_at", editedAt = "edited_at", deletedAt = "deleted_at",
-             authorAgentId = "author_agent_id", runId = "run_id"
+             authorAgentId = "author_agent_id", runId = "run_id", authorAgentName = "author_agent_name",
+             authorSessionName = "author_session_name", inReplyToMessageId = "in_reply_to_message_id"
     }
 
     init(from decoder: Decoder) throws {
@@ -44,6 +48,9 @@ struct ChatMessageWire: Codable, Equatable, Sendable {
         deletedAt = try c.decodeIfPresent(String.self, forKey: .deletedAt)
         authorAgentId = try c.decodeIfPresent(String.self, forKey: .authorAgentId)
         runId = try c.decodeIfPresent(String.self, forKey: .runId)
+        authorAgentName = try c.decodeIfPresent(String.self, forKey: .authorAgentName)
+        authorSessionName = try c.decodeIfPresent(String.self, forKey: .authorSessionName)
+        inReplyToMessageId = try c.decodeIfPresent(String.self, forKey: .inReplyToMessageId)
     }
 }
 
@@ -73,6 +80,9 @@ struct ChatMessage: Equatable, Sendable, Identifiable {
     var deletedAt: String?
     /// F8: an agent's message (edited by nobody).
     var authorAgentId: String?
+    var authorAgentName: String?
+    var authorSessionName: String?
+    var inReplyToMessageId: String?
     /// A greater revision is known (a frame without the message): what shows is not current.
     var stale: Int?
     var localState: LocalState?
@@ -111,6 +121,9 @@ struct ChatMessage: Equatable, Sendable, Identifiable {
         editedAt = row["edited_at"]
         deletedAt = row["deleted_at"]
         authorAgentId = row["author_agent_id"]
+        authorAgentName = row["author_agent_name"]
+        authorSessionName = row["author_session_name"]
+        inReplyToMessageId = row["in_reply_to_message_id"]
         stale = row["stale"]
         localState = (row["local_state"] as String?).flatMap(LocalState.init)
         localError = row["local_error"]
@@ -153,6 +166,7 @@ enum ChatMessages {
         }
         let row = try Row.fetchOne(db, sql: "SELECT has_fixed, has_mutable, revision FROM messages WHERE message_id = ?", arguments: [m.messageId])
         var changed = false
+        // UX1 attribution and source are immutable, including text edits/deletions.
         if row == nil {
             // (A tombstone's text is "" already.)
             try db.execute(sql: """
@@ -161,9 +175,11 @@ enum ChatMessages {
                 VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?)
                 """, arguments: [m.messageId, m.channelId, m.threadRootId, m.authorAccountId, m.seq, m.createdAt,
                                  m.text, mentionsJSON(m), m.revision, m.editedAt, m.deletedAt, m.authorAgentId, m.runId])
+            try writeAttribution(db, m)
             return true
         }
         if let row, !(row["has_fixed"] as Bool) {
+            try writeAttribution(db, m)
             try db.execute(sql: """
                 UPDATE messages SET channel_id = ?, thread_root_id = ?, author_account_id = ?, seq = ?, created_at = ?, has_fixed = 1,
                     author_agent_id = ?, run_id = ?, local_state = NULL, local_error = NULL
@@ -183,6 +199,11 @@ enum ChatMessages {
             changed = true
         }
         return changed
+    }
+
+    private static func writeAttribution(_ db: Database, _ m: ChatMessageWire) throws {
+        try db.execute(sql: "UPDATE messages SET author_agent_name = ?, author_session_name = ?, in_reply_to_message_id = ? WHERE message_id = ?",
+                       arguments: [m.authorAgentName, m.authorSessionName, m.inReplyToMessageId, m.messageId])
     }
 
     private static func mentionsJSON(_ m: ChatMessageWire) -> String {

@@ -136,7 +136,7 @@ final class TeamSocketOriginTests: XCTestCase {
     func testOutsideCallerIsNotRefused() async throws {
         _ = try await startRun()
         let origin = AgentPadCallerOrigin.of(peerPID: getpid())
-        XCTAssertEqual(origin, .outside)
+        XCTAssertEqual(origin, .localProcess(pid: getpid(), startedAtUs: try XCTUnwrap(SessionProcessScanner.startTimeUs(of: getpid()))))
         for (name, request) in changingRequests {
             XCTAssertNil(origin.refusal(for: request), name)
             let response = await respond(request, origin: origin)

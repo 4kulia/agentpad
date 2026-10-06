@@ -3915,7 +3915,7 @@ final class ChatTeamCallsTests: XCTestCase {
         info.call = TeamCLIHandler.callInfo(call)
         reply.team = info
         let answer = reply, output = TeamValueBox<Data>()
-        let mcp = AgentPadTeamMCPServer(cwd: root.path, version: "1", send: { _, _ in .success(answer) }, write: { output.set($0) })
+        let mcp = AgentPadTeamMCPServer(cwd: root.path, version: "1", send: { _, _, _ in .success(answer) }, write: { output.set($0) })
         mcp.handle(line: try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 1, "method": "initialize"]))
         mcp.handle(line: try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": ["name": "team_check", "arguments": ["call_id": call.id, "wait_minutes": 0]]]))
@@ -4884,7 +4884,7 @@ final class ChatTeamCallsTests: XCTestCase {
         XCTAssertEqual(TeamPublishedAgent.fresh(serverMode: true).access, .read)
         let edit = TeamPublishWarnings.lines(access: .edit, fromSession: true, teamNames: ["General", "Ops"])
         XCTAssertEqual(edit, [TeamPublishWarnings.edit, TeamPublishWarnings.gitDriver, TeamPublishWarnings.editShellGap,
-                              TeamAccessProfile.shellWarning, TeamPublishWarnings.session, "Members of General, Ops can call it; every call still waits for your Allow."])
+                              TeamAccessProfile.shellWarning, TeamPublishWarnings.session, "Members of General, Ops can call it. Personal requests wait for your Allow. In channels, your own calls from the executor Mac run and publish automatically; trust enables automatic answers to other calls with profiles without shell access. Answers are visible to current and future team members."])
         let readGit = TeamPublishWarnings.lines(access: .readGit, fromSession: false, teamNames: ["General"])
         XCTAssertEqual(Array(readGit.prefix(2)), [TeamPublishWarnings.readGit, TeamPublishWarnings.gitDriver])
         // No promise of isolation the Y1 report did not prove (review D3b-p1-3).

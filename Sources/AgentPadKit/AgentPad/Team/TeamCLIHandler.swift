@@ -8,6 +8,7 @@ enum TeamCLIHandler {
     static func handle(
         _ request: AgentPadCLIRequest, service: TeamService = .shared,
         origin: AgentPadCallerOrigin = .outside,
+        chatSessions: @escaping @MainActor () -> [Session] = { [] },
         isCallerWaiting: @escaping @MainActor () -> Bool = { true }
     ) async -> AgentPadCLIResponse {
         if let refusal = origin.refusal(for: request) { return .failure(refusal) }
@@ -37,6 +38,8 @@ enum TeamCLIHandler {
         do {
             var extra: (inout AgentPadCLITeamInfo) -> Void = { _ in }
             switch action {
+            case .chat:
+                return await ChatSessionTools.handle(request, origin: origin, sessions: chatSessions, isCallerWaiting: isCallerWaiting)
             case .status:
                 extra = ChatCLI.status()
             case .login:

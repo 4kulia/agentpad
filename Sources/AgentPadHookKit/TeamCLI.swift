@@ -132,6 +132,8 @@ public enum AgentPadCLITeamAction: String, Sendable, CaseIterable {
     case agents, ask, check, cancel, publish, unpublish, watch
     /// Internal, for the run tools of a colleague's call (not on the command line).
     case access, accessCheck = "access-check"
+    /// Internal transport for ordinary Claude tabs' channel tools.
+    case chat
 }
 
 /// `team <action>` with its values.
@@ -255,7 +257,7 @@ extension AgentPadHookKit {
             guard let minutes = Int(wait), minutes >= 0, minutes <= 24 * 60 else { return failure("--wait takes minutes, 0 to 1440.") }
             command.waitMinutes = minutes
         }
-        if action == .access || action == .accessCheck {
+        if action == .access || action == .accessCheck || action == .chat {
             return failure("\(action.rawValue) is used by AgentPad itself.")
         }
         let expected: Int

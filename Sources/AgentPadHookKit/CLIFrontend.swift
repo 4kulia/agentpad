@@ -397,7 +397,33 @@ extension AgentPadHookKit {
 /// under a single deadline so a stuck or older app (which never answers)
 /// surfaces as a typed failure instead of a hung CLI process.
 public enum AgentPadCLITransport {
+    // AgentPad: one cancellation owns at most one live IPC descriptor.
+    public final class Cancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        private var descriptor: Int32?
+        public init() {}
+        public var isCancelled: Bool { lock.withLock { cancelled } }
+        public func cancel() {
+            lock.withLock {
+                cancelled = true
+                if let descriptor { _ = shutdown(descriptor, SHUT_RDWR) }
+            }
+        }
+        fileprivate func register(_ fd: Int32) -> Bool {
+            lock.withLock {
+                guard !cancelled else { return false }
+                descriptor = fd
+                return true
+            }
+        }
+        fileprivate func closeSocket(_ fd: Int32) {
+            lock.withLock { descriptor = nil; close(fd) }
+        }
+    }
+
     public enum Failure: Error, Equatable, Sendable {
+        case cancelled
         /// No listener on the socket path (app not running / socket gone).
         case connectFailed
         case writeFailed
@@ -412,12 +438,16 @@ public enum AgentPadCLITransport {
     public static func roundTrip(
         line: Data,
         socketPath: String,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        cancellation: Cancellation? = nil
     ) -> Result<Data, Failure> {
         let deadline = DispatchTime.now() + timeout
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return .failure(.connectFailed) }
-        defer { close(fd) }
+        defer {
+            if let cancellation { cancellation.closeSocket(fd) } else { close(fd) }
+        }
+        guard cancellation?.register(fd) != false else { return .failure(.cancelled) }
         let flags = fcntl(fd, F_GETFL)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
         // A AgentPad too old to speak this protocol reads once and closes, so a
@@ -445,6 +475,7 @@ public enum AgentPadCLITransport {
         var offset = 0
         let bytes = [UInt8](line)
         while offset < bytes.count {
+            guard cancellation?.isCancelled != true else { return .failure(.cancelled) }
             let n = bytes.withUnsafeBufferPointer { buf in
                 write(fd, buf.baseAddress! + offset, bytes.count - offset)
             }
@@ -470,6 +501,7 @@ public enum AgentPadCLITransport {
         var sawNewline = false
         var buffer = [UInt8](repeating: 0, count: 65536)
         while !sawNewline {
+            guard cancellation?.isCancelled != true else { return .failure(.cancelled) }
             guard reply.count < AgentPadCLIProtocol.maxResponseLineBytes else { return .failure(.replyTooLarge) }
             guard poll(fd, events: Int16(POLLIN), deadline: deadline) else { return .failure(.timedOut) }
             let n = read(fd, &buffer, buffer.count)

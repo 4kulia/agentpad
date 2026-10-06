@@ -563,7 +563,7 @@ extension ChatService: TeamPublishing {
                         AND requested IS NULL AND last_error IS NULL AND published_session IS NOT ?
                     """, arguments: [key.server.description, key.accountId, key.orgId, connection.sessionId])
                 for var row in rows {
-                    guard let agent = localAgent(row.agentId), agent.enabled, row.accepted.matches(agent), Self.canRun(agent) else { continue }
+                    guard let agent = localAgent(row.agentId), agent.enabled, row.accepted.matches(agent), Self.canRun(agent, sessionRoot: claudeProjectsRoot) else { continue }
                     var again = row.accepted
                     again.auto = true
                     again.generation = try Self.generation(db, key)
@@ -587,10 +587,10 @@ extension ChatService: TeamPublishing {
 
     /// This Mac can run the agent: its folder is there, and its conversation
     /// for a session agent.
-    static func canRun(_ agent: TeamPublishedAgent) -> Bool {
+    static func canRun(_ agent: TeamPublishedAgent, sessionRoot: URL = TeamSessionFiles.root) -> Bool {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: agent.folder, isDirectory: &isDir), isDir.boolValue else { return false }
-        return agent.sessionId.map { TeamSessionFiles.exists($0) } ?? true
+        return agent.sessionId.map { TeamSessionFiles.exists($0, root: sessionRoot) } ?? true
     }
 
     /// The owner gives up a publication waiting for the owner — unconfirmed,
@@ -713,7 +713,7 @@ enum TeamPublishWarnings {
         case .edit: out = [edit, gitDriver, editShellGap, TeamAccessProfile.shellWarning]
         }
         if fromSession { out.append(session) }
-        let who = teamNames.isEmpty ? "No team chosen yet." : "Members of \(teamNames.joined(separator: ", ")) can call it; every call still waits for your Allow."
+        let who = teamNames.isEmpty ? "No team chosen yet." : "Members of \(teamNames.joined(separator: ", ")) can call it. Personal requests wait for your Allow. In channels, your own calls from the executor Mac run and publish automatically; trust enables automatic answers to other calls with profiles without shell access. Answers are visible to current and future team members."
         out.append(who)
         return out
     }
@@ -740,11 +740,20 @@ extension ChatService {
     /// `agent.publish` settles publications (D3); other types go to their
     /// owner's handler in `commandOwners` (D5: `request.create`).
     func commandAnswered(_ key: ChatOrgKey, _ record: ChatCommandRecord, _ outcome: ChatCommandOutcome) {
+        if ["request.cancel", "request.stop"].contains(record.type), case .taken = outcome,
+           let request = Self.args(record)["request_id"]?.string {
+            try? journal?.blockAutomaticRequest(key, request: request)
+        }
         if record.type == Self.publishType || record.type == Self.unpublishType {
             if record.type == Self.publishType, case .taken(let answer?) = outcome { keepTeamSeqs(key, record, answer) }
             settlePublications(key)
             return
         }
         commandOwners[record.type]?(key, record, outcome)
+        // A finished event may precede its HTTP ACK. The journal is marked
+        // sent before this callback; either delivery order must pay the debt.
+        if record.type == "run.finished", case .taken = outcome {
+            reconcileAutomaticChannels()
+        }
     }
 }

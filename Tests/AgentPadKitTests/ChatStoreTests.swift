@@ -40,14 +40,17 @@ final class ChatStoreTests: XCTestCase {
         try ChatStoreMigrations.journal.migrate(journal)
         try cache.read { db in
             XCTAssertEqual(try String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"),
-                           (1...11).map { "release-\($0)" })
-            for table in ["requests", "agent_channels", "request_contents", "publication_intents", "my_threads"] {
+                           (1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review"])
+            for table in ["requests", "agent_channels", "request_contents", "publication_intents", "my_threads", "channel_sends", "channel_call_intents", "session_posts"] {
                 XCTAssertTrue(try db.tableExists(table), table)
             }
         }
         try journal.read { db in
             XCTAssertEqual(try String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"),
-                           (1...9).map { "release-\($0)" })
+                           (1...9).map { "release-\($0)" } + ["release-10-ux1"])
+            for table in ["channel_authorities", "publication_surfaces", "automatic_request_blocks"] {
+                XCTAssertTrue(try db.tableExists(table), table)
+            }
             let columns = Set(try db.columns(in: "runs").map(\.name))
             for column in ["stop_confirmed_at", "preflight_pid", "preflight_pgid", "preflight_started_at",
                            "kind", "org", "channel_id", "thread_root_id", "result_erased", "channel_revoked"] {

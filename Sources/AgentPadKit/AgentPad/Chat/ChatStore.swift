@@ -237,6 +237,10 @@ final class ChatCommandTable: Sendable {
         try queue.write { db in
             guard try String.fetchOne(db, sql: "SELECT state FROM \(table) WHERE command_id = ? AND \(scopeSQL)",
                                       arguments: [record.commandId] + scopeArgs) == "pending" else { return nil }
+            if record.type == "request.create_in_channel_v2" {
+                guard try Bool.fetchOne(db, sql: "SELECT cancelled FROM channel_call_intents WHERE command_id = ?", arguments: [record.commandId]) == false else { return nil }
+                try db.execute(sql: "UPDATE channel_call_intents SET send_started_at = coalesce(send_started_at, CURRENT_TIMESTAMP) WHERE command_id = ?", arguments: [record.commandId])
+            }
             guard ChatPublication.isDecision(record.type) else { return SendStart(repeatsUnanswered: false) }
             let current = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM publication_intents WHERE command_id = ?)",
                                             arguments: [record.commandId]) == true

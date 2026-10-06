@@ -270,14 +270,14 @@ enum TeamWindows {
 
     static func showCalls() { showCallsTab() }
 
-    static func showPublishSession(sessionId: String, title: String) {
+    static func showPublishSession(sessionId: String, title: String, surfaceId: UUID? = nil) {
         publishSession?.close()
         // Closing is bound to this window: a save that ends after it was
         // replaced must not close the next one.
         final class Handle { weak var window: NSWindow? }
         let handle = Handle()
         let made = window(title: "Publish to Team", content: TeamPublishSessionView(
-            sessionId: sessionId, title: title, service: .shared
+            sessionId: sessionId, title: title, service: .shared, surfaceId: surfaceId
         ) { handle.window?.close() })
         handle.window = made
         publishSession = made

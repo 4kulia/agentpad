@@ -24,7 +24,9 @@ final class ChatOutbox {
     static let requestEnded = "request_ended"
     /// Never sent again by hand after the server's generation changed.
     static func neverResent(_ type: String) -> Bool {
-        type.hasPrefix("run.") || type == "request.decide" || ChatPublication.isDecision(type)
+        type.hasPrefix("run.") || type == "request.decide" || type == "request.decide_automatic"
+            || type == "agent.channel_trust.set"
+            || type == "message.post_from_session" || type == "request.create_in_channel_v2" || ChatPublication.isDecision(type)
     }
     static let maxAge: TimeInterval = 30 * 24 * 60 * 60
 
@@ -340,6 +342,19 @@ final class ChatOutbox {
             hold()
             onUnauthorized()
         case 429:
+            if record.type == "message.post_from_session" {
+                // Expected quota refusal is terminal; a new explicit attempt
+                // may try after the deadline. It must never create an auto loop.
+                let seconds = max(1, Int(ceil(answer.retryAfter ?? 60)))
+                let until = Int(now().timeIntervalSince1970) + seconds, commandId = record.commandId
+                try? await queue.queue.write { db in
+                    try db.execute(sql: "UPDATE session_posts SET retry_after = ? WHERE command_id = ?",
+                                   arguments: [until, commandId])
+                }
+                onRefused(record, "rate_limited")
+                fail(&record, in: queue, code: "rate_limited")
+                return
+            }
             // A throttle of this attempt says nothing about an earlier lost
             // answer. Only a fresh send's 429 unlocks the owner's decision.
             retry(&record, in: queue, after: answer.retryAfter, notAccepted: !started.repeatsUnanswered)

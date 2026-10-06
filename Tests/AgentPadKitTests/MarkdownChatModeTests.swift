@@ -98,6 +98,15 @@ final class MarkdownChatModeTests: XCTestCase {
         XCTAssertEqual(chat("x\u{0}0\u{0}y"), "<p>x\u{FFFD}0\u{FFFD}y</p>")
     }
 
+    func testCodeDelimiterRunsAndLazyQuoteContinuationShareTheChatTree() {
+        XCTAssertEqual(chat("``a ` b``"), "<p><code>a ` b</code></p>")
+        XCTAssertEqual(chat("````swift\n```\na\n````"), "<pre><code class=\"language-swift\">```\na</code></pre>")
+        XCTAssertEqual(chat("    code"), "<pre><code>code</code></pre>")
+        XCTAssertEqual(chat("> quoted\ncontinuation\n\noutside"), "<blockquote><p>quoted<br>continuation</p></blockquote>\n<p>outside</p>")
+        XCTAssertEqual(MarkdownRenderer.chatDocument("- ```\n  code\n  ```"), [
+            .listOpen(ordered: false), .item(checked: nil, []), .code(lang: nil, Array("code".unicodeScalars)), .listClose(ordered: false)])
+    }
+
     func testChatBlocks() {
         XCTAssertEqual(chat("one\ntwo"), "<p>one<br>two</p>", "line breaks matter in chat")
         XCTAssertEqual(chat("*a* _b_ ~~c~~ **d**"), "<p><em>a</em> <em>b</em> <del>c</del> <strong>d</strong></p>")

@@ -122,6 +122,8 @@ public struct AgentPadCLIRequest: Codable, Equatable, Sendable {
     public var teamTeams: [String]?
     /// The caller's working directory, for the project it is in.
     public var teamCwd: String?
+    // AgentPad: validated channel MCP arguments; identity comes from the socket.
+    public var chatArguments: String?
 
     public init(
         verb: AgentPadCLIVerb,
@@ -164,6 +166,8 @@ public struct AgentPadCLIResponse: Codable, Equatable, Sendable {
     public var windows: [AgentPadCLIWindowInfo]?
     /// AgentPad: `team` payload.
     public var team: AgentPadCLITeamInfo?
+    // AgentPad: structured channel result, without credentials or local paths.
+    public var chatResult: String?
 
     public init(
         ok: Bool,

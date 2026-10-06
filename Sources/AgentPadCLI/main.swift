@@ -112,9 +112,9 @@ if arguments == ["mcp"] || runToolsCallId != nil {
         cwd: FileManager.default.currentDirectoryPath,
         version: AgentPadCLIProtocol.version.description,
         runCallId: runToolsCallId,
-        send: { request, timeout in
+        send: { request, timeout, cancellation in
             guard let line = request.encodedLine() else { return .failure(.init("internal error: request encoding failed")) }
-            switch AgentPadCLITransport.roundTrip(line: line, socketPath: socket, timeout: timeout) {
+            switch AgentPadCLITransport.roundTrip(line: line, socketPath: socket, timeout: timeout, cancellation: cancellation) {
             case .success(let data):
                 guard let response = AgentPadCLIResponse.decode(from: data) else { return .failure(.init("AgentPad sent a reply this tool cannot read; update AgentPad.")) }
                 return .success(response)
@@ -302,6 +302,8 @@ case .failure(.timedOut), .failure(.closedWithoutReply):
     fail("\(AppIdentity.appName) is running but didn't answer — it may be older than this agentpad-cli (no CLI support). Update \(AppIdentity.appName), or use the agentpad-cli bundled with the running version.")
 case .failure(.writeFailed):
     fail("couldn't send the request to \(AppIdentity.appName)")
+case .failure(.cancelled):
+    fail("request cancelled")
 case .failure(.replyTooLarge):
     fail("\(AppIdentity.appName) sent an oversized reply")
 case .success(let data):

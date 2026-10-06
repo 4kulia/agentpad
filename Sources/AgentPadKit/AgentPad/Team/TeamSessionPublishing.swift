@@ -10,12 +10,13 @@ struct TeamPublishMenu: View {
     /// The Claude Code conversation; nil for other agents, which shows nothing.
     let sessionId: String?
     let title: String
+    var surfaceId: UUID? = nil
     var service = TeamService.shared
 
     var body: some View {
         if let sessionId, TeamSessionFiles.isValidId(sessionId), ChannelConversationFilter.current().allows(conversationId: sessionId) {
             Menu("Publish to Team") {
-                Button("Publish…") { TeamWindows.showPublishSession(sessionId: sessionId, title: title) }
+                Button("Publish…") { TeamWindows.showPublishSession(sessionId: sessionId, title: title, surfaceId: surfaceId) }
                 let published = service.calls.agents(forSession: sessionId)
                 if !published.isEmpty {
                     Divider()
@@ -46,6 +47,7 @@ struct TeamPublishSessionView: View {
     let title: String
     let service: TeamService
     let onClose: () -> Void
+    let surfaceId: UUID?
 
     @State private var mode: TeamPublishMode = .session
     @State private var sessionName: String
@@ -67,11 +69,12 @@ struct TeamPublishSessionView: View {
     /// again only when the agent edited changes (review D3c-p2-3).
     @State private var restoredFor: [UUID]?
 
-    init(sessionId: String, title: String, service: TeamService, onClose: @escaping () -> Void) {
+    init(sessionId: String, title: String, service: TeamService, surfaceId: UUID? = nil, onClose: @escaping () -> Void) {
         self.sessionId = sessionId.lowercased()
         self.title = title
         self.service = service
         self.onClose = onClose
+        self.surfaceId = surfaceId
         let existing = service.calls.agents(forSession: sessionId).first
         let suggested = TeamPublishedAgent.suggestedName(title)
         _sessionName = State(initialValue: existing?.name ?? (suggested.isEmpty ? "session-\(sessionId.prefix(6).lowercased())" : suggested))
@@ -155,7 +158,7 @@ struct TeamPublishSessionView: View {
                 Text(error).font(Theme.display(11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
             HStack {
-                Text("Every call still waits for your Allow.")
+                Text("Channel calls can run and publish automatically.")
                     .font(Theme.display(10.5))
                     .foregroundStyle(Theme.chromeMuted)
                 Spacer()
@@ -169,7 +172,8 @@ struct TeamPublishSessionView: View {
         .frame(width: 500)
         .task {
             let id = sessionId
-            folder = await Task.detached { TeamSessionFiles.workingDirectory(of: id) }.value
+            let sessionRoot = service.calls.sessionFilesRoot
+            folder = await Task.detached { TeamSessionFiles.workingDirectory(of: id, root: sessionRoot) }.value
             if let folder {
                 if folderName.isEmpty { folderName = TeamPublishedAgent.suggestedName(URL(fileURLWithPath: folder).lastPathComponent) }
                 restoreTeams()
@@ -275,6 +279,9 @@ struct TeamPublishSessionView: View {
             // on its own, and the Published Agents window says how each went.
             if let teams, let key {
                 try await service.calls.saveAndPublish(batch, teams: teams.filter { chosen.contains($0.teamId) }.map(\.teamId), key: key)
+                for agent in batch where agent.isSession {
+                    try ChatService.shared.bindPublication(key, agent: agent.id.uuidString.lowercased(), surface: surfaceId)
+                }
             } else {
                 try await service.calls.save(batch)
             }

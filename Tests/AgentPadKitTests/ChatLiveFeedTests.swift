@@ -521,6 +521,7 @@ final class ChatLiveFeedTests: XCTestCase {
     /// that fails to start.
     private final class LiveRunner: TeamAgentRunner, @unchecked Sendable {
         let real: Bool
+        var isolation: IsolatedClaudeFixture?
         var answer = "E2E answer from the stand-in executor"
         var broken = false
         /// Runs until stopped (D4b).
@@ -569,12 +570,13 @@ final class ChatLiveFeedTests: XCTestCase {
                     .run(request, onActivity: onActivity, onProcessStarted: onProcessStarted)
             }
             if real {
-                let path = try XCTUnwrap(ClaudeCodeRunner.locateClaude())
+                let isolated = try XCTUnwrap(isolation, "A real executor needs its isolated test profile")
+                let path = try XCTUnwrap(isolated.executablePath)
                 var req = request
                 req.onVersionReady = { ready in
                     XCTAssertEqual(ready.version, "2.1.289", "the live Y2 run must use the probed version")
                 }
-                return try await ClaudeCodeRunner(claudePath: path, preflight: versionGate ?? ClaudeVersionPreflight())
+                return try await isolated.runner(claudePath: path, preflight: versionGate)
                     .run(req, onActivity: onActivity, onProcessStarted: onProcessStarted)
             }
             return TeamRunResult(text: answer, isError: false, turns: 1, durationMs: 1)
@@ -595,10 +597,13 @@ final class ChatLiveFeedTests: XCTestCase {
             throw XCTSkip("set AGENTPAD_LIVE_D4=1 (stand-in executor) or AGENTPAD_LIVE_REAL_CLAUDE=1 (real claude)")
         }
         let real = env["AGENTPAD_LIVE_REAL_CLAUDE"] == "1"
+        let isolated = real ? try IsolatedClaudeFixture() : nil
+        defer { isolated?.remove() }
         let mark = Self.runMark()
         let ownerAddress = try live.email(id: "run-\(mark)-a"), memberAddress = try live.email(id: "run-\(mark)-b")
         let org = try createOrg(name: "E2E D4 \(mark)", owner: ownerAddress)
         let runner = LiveRunner(real: real)
+        runner.isolation = isolated
         let a = try await signIn(ownerAddress, org: org, name: "owner", executor: runner)
         let owner = try XCTUnwrap(ChatOrgModel.current(a.service))
         try await waitUntil("owner: manages, its rights confirmed") { owner.myRole == "owner" && owner.manages }
@@ -607,6 +612,7 @@ final class ChatLiveFeedTests: XCTestCase {
 
         // The owner's Mac: its agent published, its side installed.
         let ownerTeam = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("owner-team")), offCalls: TeamOffCallStore())
+        isolated?.configure(service: a.service, calls: ownerTeam.calls)
         ownerTeam.calls.serverMode = true
         ownerTeam.calls.publishing = a.service
         ownerTeam.calls.useServer(a.store.calls, key: a.key)
@@ -676,7 +682,7 @@ final class ChatLiveFeedTests: XCTestCase {
         // the binary itself is the same probed 2.1.289, with identical rights.
         if real, env["AGENTPAD_LIVE_Y2"] == "1" {
             let versions = ClaudeVersionApprovals()
-            runner.versionGate = ClaudeVersionPreflight(configuration: "live-y2-unprobed", approvals: { versions })
+            runner.versionGate = try XCTUnwrap(runner.isolation).preflight(configuration: "live-y2-unprobed", approvals: { versions })
             let versionCall = try ask("Read NOTES.md and give one brief sentence.")
             try await waiting(versionCall)
             XCTAssertNil(ownerTeam.calls.decide(versionCall, allow: true))
@@ -1007,8 +1013,11 @@ final class ChatLiveFeedTests: XCTestCase {
         reading.service = b.service
         reading.follow(b.store)
         let address = try XCTUnwrap(member.agents(in: channel).first { $0.agentId == agentId }?.address)
-        XCTAssertTrue(reading.send("@\(address) please answer in this thread", root: nil, members: [], agents: member.agents(in: channel)))
-        let offer = try XCTUnwrap(reading.offers.first)
+        // This scenario tests an explicit manual request. UX1 Send now
+        // creates a request immediately; prepare its thread without invoking it.
+        let question = "@\(address) please answer in this thread"
+        let source = try b.service.post(b.key, channel: channel, root: nil, text: question, mentions: [])
+        let offer = ChatChannelAsk.Offer(messageId: source, agentId: agentId, address: address, text: question, root: source)
         try await waitUntil("member: confirmed root") { reading.contextCandidates(root: offer.root).contains { $0.messageId == offer.root && ChatChannelAsk.eligible($0) } }
         let first = try b.service.askInChannel(b.key, channel: channel, agentId: agentId, root: offer.root,
                                                text: "Remember the first participant's request", context: reading.contextCandidates(root: offer.root))
@@ -1123,8 +1132,11 @@ final class ChatLiveFeedTests: XCTestCase {
         reading.service = b.service
         reading.follow(b.store)
         let address = try XCTUnwrap(member.agents(in: channel).first { $0.agentId == agentId }?.address)
-        XCTAssertTrue(reading.send("@\(address) please answer in this thread", root: nil, members: [], agents: member.agents(in: channel)))
-        let offer = try XCTUnwrap(reading.offers.first)
+        // This scenario tests an explicit manual request. UX1 Send now
+        // creates a request immediately; prepare its thread without invoking it.
+        let question = "@\(address) please answer in this thread"
+        let source = try b.service.post(b.key, channel: channel, root: nil, text: question, mentions: [])
+        let offer = ChatChannelAsk.Offer(messageId: source, agentId: agentId, address: address, text: question, root: source)
         try await waitUntil("member: confirmed root") { reading.contextCandidates(root: offer.root).contains { $0.messageId == offer.root && ChatChannelAsk.eligible($0) } }
         let deletedText = "F5 context removed before Allow"
         let extra = try b.service.post(b.key, channel: channel, root: offer.root, text: deletedText, mentions: [])

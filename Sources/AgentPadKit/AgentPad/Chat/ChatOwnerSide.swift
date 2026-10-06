@@ -509,13 +509,17 @@ final class ChatOwnerSide {
             service.actionHandlers[kind] = Handler(kind: kind, owner: owner)
         }
         service.owner = owner
+        calls.agentsWillChange = { [weak service] ids in
+            guard let service else { throw ChatError.notConnected }
+            try service.revokeAgentAuthorities(ids)
+        }
         calls.decideOnServer = { [weak owner, weak calls] call, allow, reason in
             guard let owner, let key = calls?.serverKey else { return TeamServerCore.decideNotYet }
             return owner.decide(key, requestId: call.id, allow: allow, reason: reason)
         }
         // Every answer of a request's command wakes the runner: what waits
         // for it goes on.
-        for type in ["run.start", "request.received", "request.decide", "request.stop"] {
+        for type in ["run.start", "request.received", "request.decide", "request.decide_automatic", "request.stop"] {
             service.commandOwners[type] = { [weak service, weak owner] key, record, outcome in
                 if type == "request.received" { owner?.receiptAnswered(key, record, outcome) }
                 service?.runner(for: key).run()
@@ -548,7 +552,7 @@ final class ChatOwnerSide {
             guard let key = service?.connection?.orgKey else { return }
             service?.sendEphemeral(key, type: "run.activity", body: ["request_id": .string(row.requestId), "text": .string(text)])
         }
-        service.onRunActivity = { row, text in throttle.note(row, row.kind == "channel" ? "Working" : text) }
+        service.onRunActivity = { row, text in throttle.note(row, row.kind == "channel" ? ChatService.channelAction(text) : text) }
         service.onSessionChanged = { [weak calls] in calls?.forgetServerFolderGrants() }
         calls.accessScope = { [weak service, weak calls] id in
             guard let key = calls?.serverKey, let approval = try service?.journal?.approval(key, requestId: id) else { return nil }
@@ -632,6 +636,12 @@ final class ChatOwnerSide {
                 if request.kind == "channel" {
                     guard try await service?.loadChannelContent(key, request: request) == true else {
                         return request.channelId.map { service?.channelAgentAllowed(key, channel: $0) == true } == true ? .retry : .later
+                    }
+                    if let service, let store = service.orgSessions[key]?.store,
+                       let current = try store.calls.request(request.requestId),
+                       let content = try await store.queue.read({ try ChatChannelContent.read($0, request: request.requestId) }),
+                       let authority = service.automaticAuthority(key, request: current, content: content) {
+                        return saveDecision(key, requestId: request.requestId, allow: true, reason: nil, consent: authority) == nil ? .done : .retry
                     }
                 }
                 // The notice, without content, once per server generation (F4).
@@ -794,7 +804,7 @@ final class ChatOwnerSide {
         } catch { return "The current context could not be loaded; try again." }
     }
 
-    private func saveDecision(_ key: ChatOrgKey, requestId: String, allow: Bool, reason: String?) -> String? {
+    private func saveDecision(_ key: ChatOrgKey, requestId: String, allow: Bool, reason: String?, consent: ChatChannelAuthority? = nil) -> String? {
         guard let service, let journal = service.journal, let connection = service.connection, connection.orgKey == key,
               let request = try? service.orgSessions[key]?.store?.calls.request(requestId)
         else { return "The server connection is not ready; try again." }
@@ -805,6 +815,7 @@ final class ChatOwnerSide {
             return "The channel or its verified context is not available; try again."
         }
         let order = ChatService.requestKey(requestId)
+        let decisionType = consent == nil ? "request.decide" : "request.decide_automatic"
         do {
             // An earlier call's approval under this id is never reused (review D5b3-1).
             try service.disownForeignApproval(key, request)
@@ -814,14 +825,15 @@ final class ChatOwnerSide {
                       let launch = service.launchRequest(requestId), let generation = try journal.generation(key).generation
                 else { return "The agent or the request is not there any more." }
                 approval = try TeamApprovals.make(request: launch, agent: agent, key: key, generation: generation, session: connection.sessionId,
-                                                  initiator: request.initiatorAccountId)
+                                                  initiator: request.initiatorAccountId, consent: consent)
             }
             try store(key) { db in
                 // A decision the server has now stands; one an earlier
                 // generation took, or one never sent, does not: the button
                 // decides again (review D4-p1-2).
-                guard try Self.told(db, key, order: order, type: "request.decide") == nil else { return [] }
-                try Self.supersede(db, key, order: order, type: "request.decide")
+                guard try Self.told(db, key, order: order, type: "request.decide") == nil,
+                      try Self.told(db, key, order: order, type: "request.decide_automatic") == nil else { return [] }
+                try Self.supersede(db, key, order: order, type: decisionType)
                 if let approval {
                     let held = try ChatApproval.fetchOne(db, sql: """
                         SELECT * FROM approvals WHERE server = ? AND account_id = ? AND org_id = ? AND request_id = ? AND kind = 'initial'
@@ -841,12 +853,16 @@ final class ChatOwnerSide {
                     }
                 }
                 var args: [String: ChatJSON] = ["request_id": .string(requestId), "allow": .bool(allow)]
+                if let consent {
+                    args = ["request_id": .string(requestId), "basis": .string(consent.basis)]
+                    if consent.basis == "channel_trust" { args["policy_id"] = .string(consent.id) }
+                }
                 if !allow {
                     let text = (reason ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                     args["reason"] = .string(text.isEmpty ? "declined by the owner" : String(text.prefix(300)))
                 }
                 let received = try Self.told(db, key, order: order, type: "request.received")
-                return [("request.decide", .object(args), order, received?.state == .pending ? received?.commandId : nil)]
+                return [(decisionType, .object(args), order, received?.state == .pending ? received?.commandId : nil)]
             }
             return nil
         } catch {

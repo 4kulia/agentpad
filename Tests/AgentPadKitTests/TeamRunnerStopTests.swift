@@ -315,14 +315,17 @@ final class TeamRunnerStopTests: XCTestCase {
     }
 
     private func liveRun(spawn: String, pidFile: String) async throws -> (Error?, pid_t, Duration) {
-        guard ProcessInfo.processInfo.environment["AGENTPAD_Y5_LIVE"] == "1", let claude = ClaudeCodeRunner.locateClaude() else {
+        guard ProcessInfo.processInfo.environment["AGENTPAD_Y5_LIVE"] == "1" else {
             throw XCTSkip("set AGENTPAD_Y5_LIVE=1 to run with the real claude")
         }
         let server = try mcpServer(spawn)
+        let isolated = try IsolatedClaudeFixture()
+        defer { isolated.remove() }
+        let claude = try XCTUnwrap(isolated.executablePath)
         let config = "{\"mcpServers\":{\"y5\":{\"type\":\"stdio\",\"command\":\"/usr/bin/python3\",\"args\":[\"\(server)\"]}}}"
-        var runner = ClaudeCodeRunner(claudePath: claude)
+        var runner = isolated.runner(claudePath: claude)
         runner.extraArguments = ["--mcp-config", config]
-        var agent = TeamPublishedAgent(name: "y5", description: "d", folder: root.path, access: .read)
+        var agent = TeamPublishedAgent(name: "y5", description: "d", folder: isolated.project.path, access: .read)
         agent.model = "haiku"
         let request = TeamRunRequest(agent: agent, prompt: "Count slowly from 1 to 200, one number per line.",
                                      sessionId: UUID().uuidString.lowercased(), resume: false, callerName: "M", callerProject: nil)

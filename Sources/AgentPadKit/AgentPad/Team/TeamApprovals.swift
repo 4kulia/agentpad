@@ -20,6 +20,8 @@ struct TeamLaunchRequest: Equatable, Sendable {
     var thread: String? = nil
     var channelId: String? = nil
     var threadRootId: String? = nil
+    var sourceMessageId: String? = nil
+    var replyMode: String? = nil
 }
 
 /// Everything a run is started with that comes from this Mac and the
@@ -52,8 +54,10 @@ struct TeamLaunchInputs: Codable, Equatable, Sendable {
     var expiresAt: Int64
     /// Bumped when what an approval means changes, so old ones never match.
     var termsVersion: Int
+    var sourceMessageId: String?
+    var replyMode: String?
 
-    static let currentTerms = 1
+    static let currentTerms = 2
 
     init(agent: TeamPublishedAgent, request: TeamLaunchRequest) {
         agentId = agent.id.uuidString.lowercased()
@@ -73,6 +77,8 @@ struct TeamLaunchInputs: Codable, Equatable, Sendable {
         callerName = request.callerName
         callerProject = request.callerProject
         thread = request.thread
+        sourceMessageId = request.sourceMessageId
+        replyMode = request.replyMode
         expiresAt = Int64(request.expiresAt.timeIntervalSince1970.rounded(.down))
         termsVersion = Self.currentTerms
     }
@@ -110,6 +116,8 @@ struct TeamLaunchParams: Codable, Equatable, Sendable {
     /// Selected at the start too; carried through a folder continuation so
     /// the final result tells the owner why this thread lost its memory.
     var conversationRestarted: Bool? = nil
+    var consentBasis: String? = nil
+    var consentReference: String? = nil
 
     /// Canonical JSON: sorted keys, no spaces.
     func canonical() throws -> Data {
@@ -186,7 +194,7 @@ enum TeamApprovals {
     /// The approval of the Allow button, not stored: its caller stores it
     /// with `request.decide` in one transaction (D4).
     static func make(request: TeamLaunchRequest, agent: TeamPublishedAgent, key: ChatOrgKey, generation: String,
-                     session: String? = nil, initiator: String? = nil, now: Date = Date()) throws -> ChatApproval {
+                     session: String? = nil, initiator: String? = nil, consent: ChatChannelAuthority? = nil, now: Date = Date()) throws -> ChatApproval {
         var params = TeamLaunchParams(
             inputs: TeamLaunchInputs(agent: agent, request: request), agentName: agent.name,
             conversationId: request.conversationId ?? UUID().uuidString.lowercased(),
@@ -197,6 +205,8 @@ enum TeamApprovals {
         params.initiator = initiator
         params.channelId = request.channelId
         params.threadRootId = request.threadRootId
+        params.consentBasis = consent?.basis ?? "manual"
+        params.consentReference = consent?.id
         let bytes = try params.canonical()
         let approval = ChatApproval(
             id: UUID().uuidString.lowercased(), server: key.server.description, accountId: key.accountId, orgId: key.orgId,

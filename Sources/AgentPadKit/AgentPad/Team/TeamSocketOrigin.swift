@@ -12,17 +12,25 @@ import Foundation
 enum AgentPadCallerOrigin: Equatable, Sendable {
     /// Not confirmed to be part of a team run.
     case outside
+    /// Captured by the kernel at accept, never from the request payload.
+    case localProcess(pid: Int32, startedAtUs: UInt64)
     /// A process of a team run: the run itself, its group or a descendant.
     /// `callId` is the call the run serves, when it has run tools.
     case teamRun(callId: String?)
+
+    var isTeamRun: Bool {
+        if case .teamRun = self { return true }
+        return false
+    }
 
     static let teamRunRefusal = "not available to a team run"
 
     /// The origin of the process `pid`.
     static func of(peerPID pid: pid_t?, processes: TeamProcesses = .shared) -> AgentPadCallerOrigin {
         guard let pid, pid > 0 else { return .teamRun(callId: nil) }
-        guard case .run(let callId) = processes.run(containing: pid) else { return .outside }
-        return .teamRun(callId: callId)
+        if case .run(let callId) = processes.run(containing: pid) { return .teamRun(callId: callId) }
+        guard let start = SessionProcessScanner.startTimeUs(of: pid), start != 0 else { return .outside }
+        return .localProcess(pid: pid, startedAtUs: start)
     }
 
     /// The PID of the process at the other end of a Unix socket.
@@ -40,7 +48,7 @@ enum AgentPadCallerOrigin: Equatable, Sendable {
         let verb = AgentPadCLIVerb(rawValue: request.verb)
         let action = request.teamAction.flatMap(AgentPadCLITeamAction.init(rawValue:))
         switch self {
-        case .outside:
+        case .outside, .localProcess:
             return nil
         case .teamRun:
             guard verb == .team, action == .access || action == .accessCheck else { return Self.teamRunRefusal }

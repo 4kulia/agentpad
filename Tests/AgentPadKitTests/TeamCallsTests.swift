@@ -550,7 +550,10 @@ final class TeamCallsTests: XCTestCase {
         owner.calls.decide(sent.id, allow: true)
         try await waitUntil { runner.waiting == 1 }
         let request = try await owner.calls.requestAccess(callId: sent.id, path: other.path, reason: "kb")
+        var revoked: [UUID] = []
+        owner.calls.agentsWillChange = { revoked += $0 }
         await owner.calls.decideAccess(request.id, .always)
+        XCTAssertEqual(revoked, [try XCTUnwrap(owner.calls.agents.first { $0.name == "backend" }?.id)])
         XCTAssertEqual(owner.calls.agents.first { $0.name == "backend" }?.extraFolders, [other.resolvingSymlinksInPath().path])
         // A denied or unknown request cannot be decided again.
         let again = await owner.calls.decideAccess(request.id, .denied)
@@ -630,10 +633,13 @@ final class TeamCallsTests: XCTestCase {
         XCTAssertEqual(request.agent.sessionId, session)
         XCTAssertFalse(request.resume)
 
+        var revoked: [UUID] = []
+        owner.calls.agentsWillChange = { revoked += $0 }
         try FileManager.default.removeItem(at: file)
         let after = await caller.calls.catalog()
         XCTAssertNil(after.first { $0.entry.name == "fix-login" }, "a deleted conversation takes its agent along")
         XCTAssertTrue(owner.calls.agents(forSession: session).isEmpty)
+        XCTAssertEqual(revoked, [agent.id])
     }
 
     func testPublishingBothIsAllOrNothing() async throws {
@@ -812,9 +818,9 @@ final class TeamCallsTests: XCTestCase {
 final class TeamLiveClaudeTests: XCTestCase {
     func testRunnerGetsAnAnswerFromClaudeCode() async throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["AGENTPAD_LIVE_CLAUDE"] == "1", "set AGENTPAD_LIVE_CLAUDE=1")
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("team-claude-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: folder) }
+        let isolated = try IsolatedClaudeFixture()
+        let folder = isolated.project
+        defer { isolated.remove() }
         try "the password is hunter2".write(to: folder.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
         try "codename: blue heron".write(to: folder.appendingPathComponent("NOTES.md"), atomically: true, encoding: .utf8)
         var agent = TeamPublishedAgent(name: "notes", description: "d", folder: folder.path, access: .read)
@@ -826,7 +832,7 @@ final class TeamLiveClaudeTests: XCTestCase {
             sessionId: UUID().uuidString.lowercased(), resume: false, callerName: "Test", callerProject: nil
         )
         let tools = Counter()
-        let result = try await ClaudeCodeRunner().run(request) { _ in tools.increment() }
+        let result = try await isolated.runner().run(request) { _ in tools.increment() }
         XCTAssertFalse(result.isError, result.text)
         XCTAssertTrue(result.text.lowercased().contains("blue heron"), result.text)
         XCTAssertFalse(result.text.contains("hunter2"), "denied paths stay unread")

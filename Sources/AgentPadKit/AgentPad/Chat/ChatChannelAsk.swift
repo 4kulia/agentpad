@@ -22,6 +22,7 @@ enum ChatChannelAsk {
         /// The thread the agent answers in: the message's own, or the
         /// message itself when it is a root.
         var root: String
+        var ux1 = false
         var id: String { "\(messageId)|\(agentId)" }
     }
 
@@ -34,6 +35,7 @@ enum ChatChannelAsk {
         var text: String
         var failed: Bool
         var error: String?
+        var source: String? = nil
         var id: String { commandId }
     }
 
@@ -41,11 +43,7 @@ enum ChatChannelAsk {
     /// Only the user's own message is looked at — an agent's message never
     /// asks (AG-10).
     static func asked(in text: String, agents: [ChatChannelAgent]) -> [ChatChannelAgent] {
-        agents.filter { agent in
-            guard agent.enabled, let address = agent.address else { return false }
-            let pattern = "(?<![\\w@])@" + NSRegularExpression.escapedPattern(for: address) + "(?![\\w-])"
-            return text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
-        }
+        ChatMentions.agents(in: text, agents: agents)
     }
 
     /// A message that may be given as context: as the server has it now.
@@ -94,15 +92,15 @@ enum ChatChannelAsk {
         guard try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM channels WHERE channel_id = ?)", arguments: [channel]) == true
         else { return [] }
         return try ChatCommandRecord.fetchAll(db, sql: """
-            SELECT * FROM outbox WHERE type = ? AND dismissed = 0 AND IFNULL(error, '') != 'dismissed'
+            SELECT * FROM outbox WHERE type IN (?, 'request.create_in_channel_v2') AND dismissed = 0 AND IFNULL(error, '') != 'dismissed'
                 AND state IN ('pending', 'sent', 'unconfirmed', 'failed') ORDER BY seq
             """, arguments: [commandType]).compactMap { record in
             guard let envelope = try? JSONDecoder().decode(ChatCommandEnvelope.self, from: record.bodyBytes),
                   case .object(let args) = envelope.args, args["channel_id"]?.string == channel,
                   let agent = args["agent_id"]?.string else { return nil }
             if let id = args["request_id"]?.string, try Bool.fetchOne(db, sql: "SELECT has_fixed FROM requests WHERE request_id = ?", arguments: [id]) == true { return nil }
-            return Asked(commandId: record.commandId, agentId: agent, root: args["thread_root_id"]?.string,
-                         text: args["text"]?.string ?? "", failed: record.state == .failed, error: record.error)
+            return Asked(commandId: record.commandId, agentId: agent, root: args["thread_root_id"]?.string ?? args["source_message_id"]?.string,
+                         text: args["text"]?.string ?? "", failed: record.state == .failed, error: record.error, source: args["source_message_id"]?.string)
         }
     }
 

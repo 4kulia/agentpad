@@ -1676,7 +1676,7 @@ final class ChatChannelExecutionTests: XCTestCase {
             let kept = try await legacy.read { try ChatApproval.fetchOne($0, key: approval.id) }
             XCTAssertEqual(kept?.params, approval.params)
             let versions = try await legacy.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier") }
-            XCTAssertEqual(versions, (1...9).map { "release-\($0)" }.sorted())
+            XCTAssertEqual(versions, ((1...9).map { "release-\($0)" } + ["release-10-ux1"]).sorted())
         }
     }
 
@@ -1730,7 +1730,7 @@ final class ChatChannelExecutionTests: XCTestCase {
         let kept = try await cache.read { try String.fetchOne($0, sql: "SELECT name FROM agent_channels WHERE channel_id = ?", arguments: [Self.channel]) }
         XCTAssertEqual(kept, "billing")
         let versions = try await cache.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier") }
-        XCTAssertEqual(versions, (1...11).map { "release-\($0)" }.sorted())
+        XCTAssertEqual(versions, ((1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review"]).sorted())
     }
 
 }

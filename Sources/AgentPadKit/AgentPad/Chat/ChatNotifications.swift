@@ -126,6 +126,15 @@ enum ChatNotifications {
     private static var reconciling = false
     private static var reconcileAgain = false
 
+    static func follow(_ service: ChatService, session: ChatOrgSession) {
+        guard let store = session.store else { return }
+        session.noticeWatch = try? DatabaseRegionObservation(tracking: Table("channels"), Table("teams"), Table("messages"),
+                                                             Table("notified"), Table("read_marks"), Table("meta"), Table("requests"))
+            .start(in: store.queue, onError: { _ in }) { [weak service] _ in
+                Task { @MainActor in if let service { reconcile(service) } }
+            }
+    }
+
     /// Takes back every chat notice that no longer applies: of another
     /// organization or account, signed out, rights in doubt, a snapshot
     /// owed, a channel not kept — or a message read, deleted or gone. Called

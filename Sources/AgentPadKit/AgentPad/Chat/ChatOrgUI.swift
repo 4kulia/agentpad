@@ -219,7 +219,7 @@ struct ChatOrgSidebarSection: View {
     /// What the owner agrees to (AG-1, DESIGN-F5 §1): who sees the answers,
     /// the agent's rights with their warnings (EX-7), its session's memory.
     static func addAgentText(_ agent: ChatAgentCard, team: String, fromSession: Bool) -> String {
-        var lines = ["Its answers, once you publish them, are seen by the members of team \(team), future ones included. "
+        var lines = ["Its answers are seen by the members of team \(team), future ones included. Calls made on the executor Mac publish automatically; channel trust also enables automatic answers. "
             + "With each request it reads the messages of the channel it is given."]
         if let access = TeamAccessProfile(rawValue: agent.access) {
             lines.append("\(access.title): \(access.summary)")

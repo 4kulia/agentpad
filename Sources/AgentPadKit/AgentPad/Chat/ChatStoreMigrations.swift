@@ -405,6 +405,58 @@ enum ChatStoreMigrations {
                 WHERE command_id IN (SELECT command_id FROM outbox WHERE state = 'pending')
                 """)
         }
+        migrator.registerMigration("release-12-ux1") { db in
+            try db.alter(table: "messages") { t in
+                t.add(column: "author_agent_name", .text)
+                t.add(column: "author_session_name", .text)
+                t.add(column: "in_reply_to_message_id", .text)
+            }
+            try db.alter(table: "requests") { t in
+                for name in ["source_message_id", "reply_mode", "requested_policy_id", "decision_basis", "decision_policy_id"] {
+                    t.add(column: name, .text)
+                }
+                t.add(column: "source_revision", .integer)
+            }
+            try db.alter(table: "agent_channels") { t in
+                t.add(column: "executor_session_id", .text)
+                t.add(column: "trust", .text)
+            }
+            // A draft version is shared by every composer of this scope.
+            try db.alter(table: "drafts") { t in t.add(column: "version", .text) }
+            try db.execute(sql: "UPDATE drafts SET version = lower(hex(randomblob(16)))")
+            try db.create(table: "channel_sends") { t in
+                t.primaryKey("draft_version", .text)
+                t.column("channel_id", .text).notNull()
+                t.column("thread_root_id", .text)
+                t.column("message_id", .text).notNull().unique()
+                t.column("command_id", .text).notNull()
+            }
+            try db.create(table: "channel_call_intents") { t in
+                t.primaryKey("request_id", .text)
+                t.column("message_id", .text).notNull()
+                t.column("agent_id", .text).notNull()
+                t.column("command_id", .text).notNull()
+                t.column("cancelled", .boolean).notNull().defaults(to: false)
+                t.column("send_started_at", .datetime)
+                t.uniqueKey(["message_id", "agent_id"])
+            }
+            try db.create(table: "session_posts") { t in
+                t.primaryKey("message_id", .text)
+                t.column("command_id", .text).notNull()
+                t.column("provenance", .text).notNull()
+                t.column("generation", .text).notNull()
+                t.column("session_id", .text).notNull()
+                t.column("result", .text)
+                t.column("retry_after", .integer)
+            }
+        }
+        migrator.registerMigration("release-13-ux1-review") { db in
+            // Older intents have no witness of a fresh manual decision. Keep
+            // them revocable when their run's automatic consent is revoked.
+            try db.alter(table: "publication_intents") { t in
+                t.add(column: "automatic", .boolean).notNull().defaults(to: true)
+            }
+        }
         return migrator
     }
 
@@ -561,6 +613,37 @@ enum ChatStoreMigrations {
                 }
             }
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS runs_conversation ON runs (conversation_id)")
+        }
+        migrator.registerMigration("release-10-ux1") { db in
+            try db.create(table: "automatic_request_blocks") { t in
+                t.column("server", .text).notNull()
+                t.column("account_id", .text).notNull()
+                t.column("org_id", .text).notNull()
+                t.column("request_id", .text).notNull()
+                t.primaryKey(["server", "account_id", "org_id", "request_id"])
+            }
+            // Authority exists only here. A server snapshot cannot rebuild it.
+            try db.create(table: "channel_authorities") { t in
+                t.primaryKey("id", .text)
+                t.column("server", .text).notNull()
+                t.column("account_id", .text).notNull()
+                t.column("org_id", .text).notNull()
+                t.column("channel_id", .text).notNull()
+                t.column("agent_id", .text).notNull()
+                t.column("kind", .text).notNull()
+                t.column("body", .text).notNull()
+                t.column("revoked", .boolean).notNull().defaults(to: false)
+            }
+            try db.create(table: "publication_surfaces") { t in
+                t.column("server", .text).notNull()
+                t.column("account_id", .text).notNull()
+                t.column("org_id", .text).notNull()
+                t.column("agent_id", .text).notNull()
+                t.column("surface_id", .text).notNull()
+                t.column("session_id", .text).notNull()
+                t.column("generation", .text).notNull()
+                t.primaryKey(["server", "account_id", "org_id", "agent_id"])
+            }
         }
         return migrator
     }

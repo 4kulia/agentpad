@@ -31,7 +31,7 @@ final class TeamMCPServerTests: XCTestCase {
     }
 
     private func makeServer(_ app: FakeApp, _ out: Output) -> AgentPadTeamMCPServer {
-        AgentPadTeamMCPServer(cwd: "/work/shop", version: "1", send: { request, _ in .success(app.send(request)) }, write: { out.append($0) })
+        AgentPadTeamMCPServer(cwd: "/work/shop", version: "1", send: { request, _, _ in .success(app.send(request)) }, write: { out.append($0) })
     }
 
     private func call(_ server: AgentPadTeamMCPServer, id: Int, method: String, params: [String: Any] = [:]) {
@@ -73,7 +73,7 @@ final class TeamMCPServerTests: XCTestCase {
         XCTAssertTrue((result["instructions"] as? String)?.contains("team_agents first") ?? false)
         call(server, id: 3, method: "tools/list")
         let tools = try XCTUnwrap((try wait(out, for: 3)["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.compactMap { $0["name"] as? String }, ["team_agents", "team_ask", "team_check", "team_cancel"])
+        XCTAssertEqual(tools.compactMap { $0["name"] as? String }, ["team_agents", "team_ask", "team_check", "team_cancel", "chat_channels", "chat_read", "chat_post"])
     }
 
     func testRunToolsOfferOnlyFolderAccess() throws {
@@ -85,7 +85,7 @@ final class TeamMCPServerTests: XCTestCase {
             response.team = team
             return response
         }
-        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", runCallId: "c1", send: { request, _ in .success(app.send(request)) }, write: { out.append($0) })
+        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", runCallId: "c1", send: { request, _, _ in .success(app.send(request)) }, write: { out.append($0) })
         call(server, id: 1, method: "initialize")
         call(server, id: 2, method: "tools/list")
         let tools = ((try wait(out, for: 2)["result"] as? [String: Any])?["tools"] as? [[String: Any]])?.compactMap { $0["name"] as? String }
@@ -96,6 +96,125 @@ final class TeamMCPServerTests: XCTestCase {
         XCTAssertTrue(text(try wait(out, for: 4)).contains("granted"))
         XCTAssertEqual(app.requests.first?.teamCall, "c1")
         XCTAssertEqual(app.requests.first?.teamFolder, "/kb")
+    }
+
+    func testChannelToolsAreDeniedToEveryTeamRunEvenWhenManuallyNamed() {
+        let app = FakeApp(), out = Output()
+        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", runCallId: "self-call", send: { request, _, _ in .success(app.send(request)) }, write: { out.append($0) })
+        for name in ["chat_channels", "chat_read", "chat_post"] {
+            XCTAssertTrue(server.callTool(name, arguments: [:], requestKey: name, progressToken: nil).1)
+        }
+        XCTAssertTrue(app.requests.isEmpty)
+    }
+
+    func testChatPostImmediatelyForwardsCanonicalArgumentsAndPendingResult() throws {
+        let app = FakeApp(), out = Output()
+        app.answer = { request in
+            var response = AgentPadCLIResponse(ok: true)
+            let args = try! JSONSerialization.jsonObject(with: Data(request.chatArguments!.utf8)) as! [String: Any]
+            response.chatResult = String(decoding: try! JSONSerialization.data(withJSONObject: ["status": "pending", "message_id": (args["message_id"] as! String).lowercased()]), as: UTF8.self)
+            return response
+        }
+        let server = makeServer(app, out)
+        call(server, id: 1, method: "initialize")
+        let message = "ABCDEF00-0000-4000-8000-000000000001"
+        call(server, id: 2, method: "tools/call", params: ["name": "chat_post", "arguments": ["org_id": "o1", "channel_id": "c1", "text": "@agent@owner hello", "message_id": message]])
+        let result = try XCTUnwrap(try wait(out, for: 2)["result"] as? [String: Any])
+        XCTAssertEqual((result["structuredContent"] as? [String: Any])?["status"] as? String, "pending")
+        XCTAssertEqual(result["isError"] as? Bool, false)
+        XCTAssertEqual((result["structuredContent"] as? [String: Any])?["message_id"] as? String, message.lowercased())
+        XCTAssertEqual(app.requests.count, 1)
+        XCTAssertEqual(app.requests[0].teamAction, "chat")
+        XCTAssertTrue(app.requests[0].chatArguments?.contains("chat_post") == true)
+        XCTAssertNil(app.requests[0].teamPrompt, "never use team_ask")
+        for field in ["author_agent_id", "author_account_id", "author_session_name", "surface_id", "pid", "session_id"] {
+            XCTAssertTrue(server.callTool("chat_post", arguments: ["org_id": "o1", "channel_id": "c1", "text": "hi", field: "forged"], requestKey: field, progressToken: nil).1)
+        }
+        XCTAssertEqual(app.requests.count, 1, "model-provided author/provenance never reaches the app")
+    }
+
+    func testChatPostTimeoutKeepsItsIDAndRepeatingTheCallKeyCannotDuplicate() throws {
+        let app = FakeApp(), out = Output()
+        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { request, timeout, _ in
+            XCTAssertGreaterThanOrEqual(timeout, 32, "HTTP preflight plus outbox wait")
+            _ = app.send(request)
+            return .failure(.init("timeout"))
+        }, write: { out.append($0) })
+        let args: [String: Any] = ["org_id": "o1", "channel_id": "c1", "text": "hello"]
+        func invoke(_ key: String, _ arguments: [String: Any]) throws -> [String: Any] {
+            let (raw, failed) = server.callTool("chat_post", arguments: arguments, requestKey: key, progressToken: nil)
+            XCTAssertTrue(failed)
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+        }
+        let first = try invoke("n:7", args), second = try invoke("n:7", args), distinct = try invoke("s:7", args)
+        XCTAssertEqual(first["status"] as? String, "unknown")
+        XCTAssertEqual(first["error"] as? String, "timeout")
+        let id = try XCTUnwrap(first["message_id"] as? String)
+        XCTAssertNotNil(UUID(uuidString: id))
+        XCTAssertEqual(second["message_id"] as? String, id)
+        XCTAssertNotEqual(distinct["message_id"] as? String, id)
+        let sent = try app.requests.map { try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.chatArguments!.utf8)) as? [String: Any]) }
+        XCTAssertEqual(sent[0]["message_id"] as? String, id)
+        XCTAssertEqual(sent[1]["message_id"] as? String, id)
+        var changed = args; changed["text"] = "different"
+        XCTAssertTrue(server.callTool("chat_post", arguments: changed, requestKey: "n:7", progressToken: nil).1)
+        XCTAssertEqual(app.requests.count, 3, "conflicting call key must not enqueue")
+    }
+
+    func testCancelledPostLogsAlreadyKnownSentOutcome() throws {
+        let out = Output(), entered = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { request, _, cancellation in
+            entered.signal()
+            _ = proceed.wait(timeout: .now() + 5)
+            XCTAssertTrue(cancellation?.isCancelled == true)
+            let args = try! JSONSerialization.jsonObject(with: Data(request.chatArguments!.utf8)) as! [String: Any]
+            var response = AgentPadCLIResponse(ok: true)
+            response.chatResult = String(decoding: try! JSONSerialization.data(withJSONObject: ["status": "sent", "message_id": args["message_id"]!]), as: UTF8.self)
+            return .success(response)
+        }, write: { out.append($0) })
+        call(server, id: 1, method: "initialize")
+        let id = UUID().uuidString.lowercased()
+        call(server, id: 2, method: "tools/call", params: ["name": "chat_post", "arguments": ["org_id": "o", "channel_id": "c", "text": "private text", "message_id": id]])
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        server.handle(line: try JSONSerialization.data(withJSONObject: ["method": "notifications/cancelled", "params": ["requestId": 2]]))
+        proceed.signal()
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, !out.all.contains(where: { $0["method"] as? String == "notifications/message" }) { Thread.sleep(forTimeInterval: 0.01) }
+        let notice = out.all.compactMap { ($0["params"] as? [String: Any])?["data"] as? String }.first
+        XCTAssertTrue(notice?.contains(id) == true)
+        XCTAssertTrue(notice?.contains("delivery status: sent") == true)
+        XCTAssertFalse(notice?.contains("private text") == true)
+        XCTAssertNil(out.response(2))
+    }
+
+    func testCancellationBeforeIPCRegistrationCannotConnect() {
+        let cancellation = AgentPadCLITransport.Cancellation()
+        cancellation.cancel()
+        let result = AgentPadCLITransport.roundTrip(line: Data("request\n".utf8), socketPath: "/nonexistent/ux1.sock", timeout: 1, cancellation: cancellation)
+        XCTAssertEqual(result, .failure(.cancelled))
+    }
+
+    func testChatPostCannotReportSuccessWithoutItsMessageIDAndDeliveryStatus() throws {
+        for invalid in ["missing_id", "wrong_id", "missing_status"] {
+            let app = FakeApp(), out = Output()
+            app.answer = { request in
+                let args = try! JSONSerialization.jsonObject(with: Data(request.chatArguments!.utf8)) as! [String: Any]
+                var result: [String: Any] = ["status": "sent", "message_id": args["message_id"]!]
+                if invalid == "missing_id" { result["message_id"] = nil }
+                if invalid == "wrong_id" { result["message_id"] = UUID().uuidString }
+                if invalid == "missing_status" { result["status"] = nil }
+                var response = AgentPadCLIResponse(ok: true)
+                response.chatResult = String(decoding: try! JSONSerialization.data(withJSONObject: result), as: UTF8.self)
+                return response
+            }
+            let server = makeServer(app, out)
+            let (raw, failed) = server.callTool("chat_post", arguments: ["org_id": "o1", "channel_id": "c1", "text": "hi"], requestKey: invalid, progressToken: nil)
+            XCTAssertTrue(failed, invalid)
+            let result = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+            XCTAssertEqual(result["status"] as? String, "unknown")
+            XCTAssertEqual(result["error"] as? String, "invalid_post_response")
+            XCTAssertNotNil((result["message_id"] as? String).flatMap(UUID.init(uuidString:)))
+        }
     }
 
     /// `team_ask` takes the thread as `thread_id` (as its answer names it),
@@ -402,7 +521,7 @@ final class TeamMCPServerTests: XCTestCase {
     func testAFolderRequestRefusedKeepsTheReason() throws {
         let app = FakeApp(), out = Output()
         app.answer = { _ in .failure("Extending folder access through a server is not available yet.") }
-        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", runCallId: "c1", send: { request, _ in .success(app.send(request)) },
+        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", runCallId: "c1", send: { request, _, _ in .success(app.send(request)) },
                                            write: { out.append($0) })
         call(server, id: 1, method: "initialize")
         call(server, id: 2, method: "tools/call", params: ["name": "request_folder_access", "arguments": ["path": "/tmp", "reason": "x"]])

@@ -240,12 +240,11 @@ enum MarkdownRenderer {
         return true
     }
 
-    private static func chatBlocks(_ text: Line, depth: Int) -> [ChatBlock] {
+    private static func chatBlocks(_ text: Line, depth: Int, listDepth: Int = 0) -> [ChatBlock] {
         var out: [ChatBlock] = []
         let lines = chatLines(text)
         var i = 0
         var paragraph: [Line] = []
-        var listStack: [(ordered: Bool, indent: Int)] = []
 
         func joined(_ parts: [Line]) -> [Unicode.Scalar] {
             var all: [Unicode.Scalar] = []
@@ -260,10 +259,21 @@ enum MarkdownRenderer {
             out.append(.paragraph(chatInlineNodes(joined(paragraph))))
             paragraph = []
         }
-        func closeLists(to depth: Int = 0) {
-            while listStack.count > depth {
-                out.append(.listClose(ordered: listStack.removeLast().ordered))
+        func fencedCode(_ opening: Line, indent: Int = 0) -> ChatBlock {
+            let marker = opening.first!
+            let length = opening.prefix { $0 == marker }.count
+            let lang = trim(opening.dropFirst(length))
+            var code: [Line] = []
+            i += 1
+            while i < lines.count {
+                let closing = trim(lines[i])
+                let count = closing.prefix { $0 == marker }.count
+                if count >= length, trim(closing.dropFirst(count)).isEmpty { break }
+                let padding = min(indent, lines[i].prefix { $0 == " " }.count)
+                code.append(lines[i].dropFirst(padding)); i += 1
             }
+            i += 1
+            return .code(lang: isChatLanguage(lang) ? String(String.UnicodeScalarView(lang)) : nil, joined(code))
         }
 
         while i < lines.count {
@@ -271,25 +281,29 @@ enum MarkdownRenderer {
             let trimmed = trim(line)
 
             if starts(trimmed, "```") || starts(trimmed, "~~~") {
-                flushParagraph(); closeLists()
-                let fence = String(String.UnicodeScalarView(trimmed.prefix(3)))
-                let lang = trim(trimmed.dropFirst(3))
-                var code: [Line] = []
-                i += 1
-                while i < lines.count, !starts(trim(lines[i]), fence) {
-                    code.append(lines[i]); i += 1
-                }
-                i += 1
-                out.append(.code(lang: isChatLanguage(lang) ? String(String.UnicodeScalarView(lang)) : nil, joined(code)))
+                flushParagraph()
+                out.append(fencedCode(trimmed))
                 continue
             }
             if trimmed.isEmpty {
-                flushParagraph(); closeLists()
+                flushParagraph()
                 i += 1
                 continue
             }
+            if paragraph.isEmpty, starts(line, "    ") || starts(line, "\t") {
+                var code: [Line] = []
+                while i < lines.count {
+                    let next = lines[i]
+                    if starts(next, "    ") { code.append(next.dropFirst(4)) }
+                    else if starts(next, "\t") { code.append(next.dropFirst()) }
+                    else { break }
+                    i += 1
+                }
+                out.append(.code(lang: nil, joined(code)))
+                continue
+            }
             if let level = chatHeadingLevel(trimmed) {
-                flushParagraph(); closeLists()
+                flushParagraph()
                 var text = trimmed.dropFirst(level)
                 while let c = text.first, c == " " || c == "#" { text = text.dropFirst() }
                 while let c = text.last, c == " " || c == "#" { text = text.dropLast() }
@@ -298,24 +312,40 @@ enum MarkdownRenderer {
                 continue
             }
             if isChatRule(trimmed) {
-                flushParagraph(); closeLists()
+                flushParagraph()
                 out.append(.rule)
                 i += 1
                 continue
             }
             if starts(trimmed, ">"), depth < maxQuoteDepth {
-                flushParagraph(); closeLists()
+                flushParagraph()
                 var quoted: [Line] = []
-                while i < lines.count, starts(trim(lines[i]), ">") {
-                    var q = trim(lines[i]).dropFirst()
-                    if q.first == " " { q = q.dropFirst() }
-                    quoted.append(q); i += 1
+                var lazyParagraph = false
+                while i < lines.count {
+                    let next = trim(lines[i])
+                    if starts(next, ">") {
+                        var q = next.dropFirst()
+                        if q.first == " " { q = q.dropFirst() }
+                        quoted.append(q)
+                        // A list item or nested quote can end in a paragraph
+                        // whose next line omits the outer quote marker too.
+                        var content = trim(q)
+                        while !content.isEmpty {
+                            if starts(content, ">") { content = trim(content.dropFirst()) }
+                            else if let item = chatListItem(content) { content = trim(item.text) }
+                            else { break }
+                        }
+                        lazyParagraph = !content.isEmpty && !chatInterruptsParagraph(content)
+                    } else if lazyParagraph, !next.isEmpty, !chatInterruptsParagraph(next) {
+                        quoted.append(lines[i])
+                    } else { break }
+                    i += 1
                 }
-                out.append(.quote(chatBlocks(joined(quoted)[...], depth: depth + 1)))
+                out.append(.quote(chatBlocks(joined(quoted)[...], depth: depth + 1, listDepth: listDepth)))
                 continue
             }
             if trimmed.contains("|"), i + 1 < lines.count, isChatTableSeparator(lines[i + 1]) {
-                flushParagraph(); closeLists()
+                flushParagraph()
                 let header = chatCells(trimmed)
                 var rows: [[Line]] = []
                 i += 2
@@ -325,44 +355,58 @@ enum MarkdownRenderer {
                 out.append(.table(header: header.map { chatInlineNodes(Array($0)) }, rows: rows.map { $0.map { chatInlineNodes(Array($0)) } }))
                 continue
             }
-            if let item = chatListItem(line) {
+            if let first = chatListItem(line) {
                 flushParagraph()
-                if listStack.count >= maxListDepth, let top = listStack.last, item.indent > top.indent {
-                    out.append(.continuation(chatInlineNodes(Array(item.text))))
+                // At the bound, keep unsupported containers as data; they
+                // must not turn hidden code or quotes into executable mentions.
+                guard listDepth < maxListDepth else {
+                    out.append(.code(lang: nil, joined(Array(lines[i...]))))
+                    break
+                }
+                out.append(.listOpen(ordered: first.ordered))
+                var firstItem = true
+                while i < lines.count, let item = chatListItem(lines[i]),
+                      item.indent == first.indent, item.ordered == first.ordered {
+                    if !firstItem { out.append(.itemNext) }
+                    firstItem = false
+                    let contentIndent = item.text.startIndex - lines[i].startIndex
+                    var body = item.text
+                    var checkbox: Bool?
+                    if starts(body, "[ ] ") { checkbox = false; body = body.dropFirst(4) }
+                    else if starts(body, "[x] ") || starts(body, "[X] ") { checkbox = true; body = body.dropFirst(4) }
+                    var contents = [body]
+                    var afterBlank = false
                     i += 1
-                    continue
-                }
-                if let top = listStack.last, item.indent > top.indent {
-                    out.append(.listOpen(ordered: item.ordered))
-                    listStack.append((item.ordered, item.indent))
-                } else {
-                    while let top = listStack.last, item.indent < top.indent { closeLists(to: listStack.count - 1) }
-                    if let top = listStack.last, top.ordered == item.ordered {
-                        out.append(.itemNext)
-                    } else {
-                        if !listStack.isEmpty { closeLists(to: listStack.count - 1) }
-                        out.append(.listOpen(ordered: item.ordered))
-                        listStack.append((item.ordered, item.indent))
+                    while i < lines.count {
+                        let next = lines[i], t = trim(next)
+                        if let sibling = chatListItem(next), sibling.indent <= first.indent { break }
+                        let padding = next.prefix { $0 == " " }.count
+                        if t.isEmpty {
+                            contents.append(t); afterBlank = true; i += 1; continue
+                        }
+                        if padding >= contentIndent {
+                            contents.append(next.dropFirst(contentIndent))
+                        } else if !afterBlank, !chatInterruptsParagraph(t) {
+                            // Lazy paragraph continuation, including a code
+                            // span spanning several physical lines.
+                            contents.append(t)
+                        } else { break }
+                        afterBlank = false
+                        i += 1
                     }
+                    var children = chatBlocks(joined(contents)[...], depth: depth, listDepth: listDepth + 1)
+                    if case .paragraph(let inline)? = children.first {
+                        out.append(.item(checked: checkbox, inline)); children.removeFirst()
+                    } else { out.append(.item(checked: checkbox, [])) }
+                    out.append(contentsOf: children)
                 }
-                var body = item.text
-                var checkbox: Bool?
-                if starts(body, "[ ] ") { checkbox = false; body = body.dropFirst(4) }
-                else if starts(body, "[x] ") || starts(body, "[X] ") { checkbox = true; body = body.dropFirst(4) }
-                out.append(.item(checked: checkbox, chatInlineNodes(Array(body))))
-                i += 1
+                out.append(.listClose(ordered: first.ordered))
                 continue
             }
-            if !listStack.isEmpty, starts(line, "  ") {
-                out.append(.continuation(chatInlineNodes(Array(trimmed))))
-                i += 1
-                continue
-            }
-            closeLists()
             paragraph.append(trimmed)
             i += 1
         }
-        flushParagraph(); closeLists()
+        flushParagraph()
         return out
     }
 
@@ -371,6 +415,11 @@ enum MarkdownRenderer {
         guard (1...6).contains(hashes) else { return nil }
         let rest = line.dropFirst(hashes)
         return rest.isEmpty || rest.first == " " ? hashes : nil
+    }
+
+    private static func chatInterruptsParagraph(_ line: Line) -> Bool {
+        starts(line, ">") || starts(line, "```") || starts(line, "~~~")
+            || chatHeadingLevel(line) != nil || isChatRule(line) || chatListItem(line) != nil
     }
 
     private static func isChatRule(_ line: Line) -> Bool {
@@ -548,7 +597,19 @@ enum MarkdownRenderer {
             while i >= 0 { table[i] = hit(i) ? i : table[i + 1]; i -= 1 }
             return table
         }
-        let nextTick = nextTable { s[$0] == "`" }
+        // Pair whole delimiter runs of equal length in linear time. A shorter
+        // run inside code is content, never the end of that code span.
+        var tickLengths: [Int: Int] = [:], tickCloses: [Int: Int] = [:], lastTick: [Int: Int] = [:]
+        var tick = n - 1
+        while tick >= 0 {
+            if s[tick] != "`" { tick -= 1; continue }
+            let end = tick + 1
+            while tick >= 0, s[tick] == "`" { tick -= 1 }
+            let start = tick + 1, length = end - start
+            tickLengths[start] = length
+            tickCloses[start] = lastTick[length]
+            lastTick[length] = start
+        }
         let nextClose = nextTable { s[$0] == "]" }
         let nextParen = nextTable { s[$0] == ")" }
         func slice(_ range: Range<Int>) -> String {
@@ -566,13 +627,15 @@ enum MarkdownRenderer {
         while i < n {
             let c = s[i]
             if c == "`" {
-                let close = nextTick[i + 1]
-                if close < n {
+                let length = tickLengths[i] ?? 1
+                if let close = tickCloses[i] {
                     flush(i)
-                    nodes.append(.code(Array(s[i + 1..<close])))
-                    i = close + 1; plain = i
+                    nodes.append(.code(Array(s[i + length..<close])))
+                    i = close + length; plain = i
                     continue
                 }
+                i += length
+                continue
             } else if c == "[" || c == "!" && i + 1 < n && s[i + 1] == "[" {
                 let open = c == "!" ? i + 1 : i
                 let close = nextClose[open + 1]

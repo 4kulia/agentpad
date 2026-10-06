@@ -365,7 +365,8 @@ final class HookServer {
             // take its tab's pending command (Y4).
             var request = AgentPadCLIProtocol.decodeLine(AgentPadShellCommandRequest.self, from: data)
             if let claimed = request?.shellPID {
-                let ownShell = origin == .outside && peerPID.map { hooks.isSelfOrAncestor(claimed, $0) } == true
+                // AgentPad: the new kernel PID case retains ordinary shell control.
+                let ownShell = !origin.isTeamRun && peerPID.map { hooks.isSelfOrAncestor(claimed, $0) } == true
                 if !ownShell { request = nil }
             }
             deliver(.shellCommand(request, fd: clientFd))

@@ -163,6 +163,12 @@ enum SessionProcessScanner {
 
     // MARK: - Kernel
 
+    // AgentPad: cheap kernel-only identity scan for channel MCP provenance.
+    static func identityProcesses(foregroundPID: pid_t) -> [Raw] {
+        guard let tty = controllingTerminal(of: foregroundPID) else { return [] }
+        return processes(onTerminal: tty)
+    }
+
     private static func controllingTerminal(of pid: pid_t) -> dev_t? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
         var proc = kinfo_proc()

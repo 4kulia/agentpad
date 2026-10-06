@@ -118,6 +118,21 @@ struct ClaudeCodeRunner: TeamAgentRunner {
     var extraArguments: [String] = []
     var preflight: any ClaudeVersionChecking = ClaudeVersionPreflight.shared
     var sessionFilesRoot: URL = TeamSessionFiles.root
+    /// Explicit test-fixture injection after filtering. Production never
+    /// inherits CLAUDE_CONFIG_DIR from the app or a caller's environment.
+    var isolatedConfigDirectory: URL? = nil
+
+    func executionEnvironment(claudePath: String, isolateGit: Bool, ownersPath: Bool,
+                              base: [String: String] = ProcessInfo.processInfo.environment) throws -> [String: String] {
+        var environment = Self.environment(claudePath: claudePath, isolateGit: isolateGit, ownersPath: ownersPath, base: base)
+        if let config = isolatedConfigDirectory {
+            guard sessionFilesRoot.standardizedFileURL == config.appendingPathComponent("projects").standardizedFileURL else {
+                throw TeamRunnerError.didNotStart("isolated Claude history root does not match its config directory")
+            }
+            environment["CLAUDE_CONFIG_DIR"] = config.path
+        }
+        return environment
+    }
 
     /// The real `claude`, never AgentPad's wrapper: a call is not a tab and
     /// must not report to the sidebar as one (R-5).
@@ -340,8 +355,8 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         let ready = try await preflight.prepare(selectedPath: selectedPath, request: request, onActivity: onActivity)
         await request.onVersionReady?(ready)
         let claude = ready.executable.file.resolvedPath
-        let environment = Self.environment(claudePath: claude, isolateGit: !request.agent.access.takesCommands,
-                                           ownersPath: request.agent.access.runsShell)
+        let environment = try executionEnvironment(claudePath: claude, isolateGit: !request.agent.access.takesCommands,
+                                                    ownersPath: request.agent.access.runsShell)
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
 
         // One reader per pipe: the handler runs serially, and its EOF says

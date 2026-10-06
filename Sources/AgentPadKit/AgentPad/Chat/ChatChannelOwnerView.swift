@@ -25,7 +25,8 @@ final class ChatChannelOwnerModel {
                 }
         }
         if let journal = service.journal {
-            journalWatch = try? DatabaseRegionObservation(tracking: Table("runs"), Table("run_commands"))
+            journalWatch = try? DatabaseRegionObservation(tracking: Table("runs"), Table("run_commands"), Table("approvals"),
+                                                          Table("channel_authorities"), Table("automatic_request_blocks"), Table("org_generations"), Table("assignments"))
                 .start(in: journal.queue, onError: { _ in }) { [weak self] _ in
                     Task { @MainActor in self?.revision += 1 }
                 }
@@ -53,6 +54,25 @@ final class ChatChannelOwnerModel {
     func content(_ request: ChatRequest) -> ChatChannelContent? {
         guard visible, let store = service.orgSessions[key]?.store else { return nil }
         return try? store.queue.read { try ChatChannelContent.read($0, request: request.requestId) }
+    }
+
+    func isAutomatic(_ request: ChatRequest) -> Bool {
+        if let approval = try? service.journal?.approval(key, requestId: request.requestId),
+           let params = try? TeamLaunchParams.decode(approval.params) {
+            guard approval.voidAt == nil, params.consentBasis != nil, params.consentBasis != "manual",
+                  service.automaticApprovalValid(key, request: request, params: params) else { return false }
+            if let store = service.orgSessions[key]?.store,
+               let command = try? store.queue.read({ try ChatPublication.current($0, run: approval.runId) }),
+               command.sessionId != service.connection?.sessionId || [.failed, .dropped, .unconfirmed].contains(command.state)
+                || (try? store.queue.read { try ChatPublication.isAutomatic($0, command: command.commandId) }) == false {
+                return false
+            }
+            return true
+        }
+        if let content = content(request) { return service.automaticAuthority(key, request: request, content: content) != nil }
+        // While the verified snapshot is loading, a local Send stays progress,
+        // not an extra Allow card. The launch still requires full verification.
+        return (try? service.journal?.channelAuthority(request.requestId))?.basis == "self_call"
     }
 
     func canCancel(_ request: ChatRequest) -> Bool {
@@ -120,7 +140,7 @@ struct ChatChannelOwnerPanel: View {
 
     var body: some View {
         if model.visible {
-            let requests = model.requests
+            let requests = model.requests.filter { !model.isAutomatic($0) || !calls.channelPendingAccess($0.requestId).isEmpty }
             if !requests.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(requests, id: \.requestId) { request in
@@ -128,8 +148,8 @@ struct ChatChannelOwnerPanel: View {
                             Text("\(request.agentName ?? "Agent") · \(request.state.rawValue.replacingOccurrences(of: "_", with: " "))").font(.callout)
                             Spacer()
                             if request.ownerAccountId == model.key.accountId {
-                                if request.state == .awaitingDecision { Button("Review request…") { selected = request.requestId } }
-                                if request.publication != nil { Button("Preview result…") { selected = request.requestId } }
+                                if !model.isAutomatic(request), request.state == .awaitingDecision { Button("Review request…") { selected = request.requestId } }
+                                if !model.isAutomatic(request), request.publication != nil { Button("Preview result…") { selected = request.requestId } }
                                 if !calls.channelPendingAccess(request.requestId).isEmpty { Button("Review folders…") { selected = request.requestId } }
                                 if [.starting, .running].contains(request.state) {
                                     Button("Stop") { problem = model.service.askToEnd(model.key, request.requestId, type: "request.stop", states: [.starting, .running]) }
@@ -169,7 +189,7 @@ struct ChatChannelDecisionSheet: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
                         if let terms = model.decisionText(request) { Text(terms).font(.callout).textSelection(.enabled) }
-                        if request.state == .awaitingDecision {
+                        if request.state == .awaitingDecision, !model.isAutomatic(request) {
                             Text("Review channel request").font(.headline)
                             Text(ChatMarkdownText.attributed(request.text ?? "")).textSelection(.enabled)
                             if let content = model.content(request) {
@@ -187,7 +207,7 @@ struct ChatChannelDecisionSheet: View {
                                 .disabled(deciding)
                             } else { Text("The decision is made on \(request.executorDeviceName ?? "the executor Mac").") }
                         }
-                        if let run = model.service.channelPreview(model.key, requestId: requestId) {
+                        if !model.isAutomatic(request), let run = model.service.channelPreview(model.key, requestId: requestId) {
                             Text("Preview · only on this Mac").font(.headline)
                             if model.canOpenSession(requestId) {
                                 Button("Continue…") { problem = model.openSession(requestId) }

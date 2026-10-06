@@ -32,8 +32,8 @@ struct ChatAskStrip: View {
                             Spacer()
                             if let root = asked.root, agents.contains(where: { $0.agentId == asked.agentId }) {
                                 Button("Ask Again…") {
-                                    asking = .init(messageId: root, agentId: asked.agentId, address: name(asked.agentId), text: asked.text, root: root)
-                                    model.dismissAsk(asked)
+                                    asking = .init(messageId: asked.source ?? root, agentId: asked.agentId, address: name(asked.agentId),
+                                                   text: asked.source.flatMap(model.message)?.text ?? asked.text, root: root, ux1: asked.source != nil)
                                 }
                             }
                             Button("Dismiss") { model.dismissAsk(asked) }.buttonStyle(.link)
@@ -73,11 +73,13 @@ struct ChatAskSheet: View {
         let cut = Set(fit.cut.map(\.messageId))
         VStack(alignment: .leading, spacing: 10) {
             Text("Ask \(offer.address)").font(.headline)
-            Text("The agent's owner decides on their Mac whether it runs, and whether its answer is published here.")
+            Text(offer.ux1 ? "Review the current question and context. Your own agent on this Mac or a trusted agent runs and publishes automatically. Other calls wait for the owner."
+                 : "The agent's owner decides on their Mac whether it runs, and whether its answer is published here.")
                 .foregroundStyle(.secondary).font(.callout)
             TextEditor(text: $text)
                 .font(.body)
                 .frame(minHeight: 60, maxHeight: 120)
+                .disabled(offer.ux1)
             Text("Context: \(fit.taken.count) of at most \(ChatChannelAsk.maxContext) messages, "
                  + "\(fit.taken.reduce(0) { $0 + $1.text.utf8.count } / 1024) of \(ChatChannelAsk.maxContextBytes / 1024) KiB")
                 .font(.caption).foregroundStyle(.secondary)
@@ -89,6 +91,7 @@ struct ChatAskSheet: View {
                         if cut.contains(m.messageId) { Text("does not fit: left out").font(.caption).foregroundStyle(.orange) }
                     }
                 }
+                .disabled(offer.ux1 && (m.messageId == offer.root || m.messageId == offer.messageId))
             }
             .frame(minHeight: 160)
             if let problem { Text(problem).foregroundStyle(.red).font(.caption) }
@@ -97,7 +100,7 @@ struct ChatAskSheet: View {
                 Button("Cancel") { close() }.keyboardShortcut(.cancelAction)
                 Button("Ask") {
                     // Read again: the root may be the server's only now, and each revision is the current one.
-                    candidates = model.contextCandidates(root: offer.root)
+                    if !offer.ux1 { candidates = model.contextCandidates(root: offer.root) }
                     problem = model.ask(offer, text: text, context: candidates.filter { chosen.contains($0.messageId) }, agents: agents)
                     if problem == nil { close() }
                 }
@@ -110,7 +113,7 @@ struct ChatAskSheet: View {
         .onAppear {
             text = offer.text
             candidates = model.contextCandidates(root: offer.root)
-            chosen = [offer.root]
+            chosen = offer.ux1 ? [offer.root, offer.messageId] : [offer.root]
         }
         // The agent gone from the channel: the sheet closes, keeping nothing.
         .onChange(of: agents.contains { $0.agentId == offer.agentId }) { _, there in if !there { close() } }

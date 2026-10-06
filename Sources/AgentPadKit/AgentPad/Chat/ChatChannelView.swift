@@ -11,6 +11,7 @@ struct ChatChannelView: View {
     let key: ChatOrgKey
     @State private var model: ChatChannelModel?
     @State private var ownerModel: ChatChannelOwnerModel?
+    @State private var showingAgents = false
     private var org = ChatOrgCurrent.shared
     private var service = ChatService.shared
 
@@ -61,6 +62,10 @@ struct ChatChannelView: View {
             Text("#\(card.name)").font(.headline)
             if let team { Text(team).foregroundStyle(.secondary) }
             Spacer()
+            if service.supports("chat.channel_ux1", key: key) {
+                Button("Agents") { showingAgents.toggle() }
+                    .popover(isPresented: $showingAgents) { ChatChannelTrustView(key: key, channel: card.channelId, agents: agents) }
+            }
             if card.archived { Text("Archived: read only").foregroundStyle(.orange) }
             if offline { Text("Offline").foregroundStyle(.secondary) }
             if service.orgSessions[key]?.pausedChannels.contains(card.channelId) == true {
@@ -91,7 +96,11 @@ struct ChatChannelView: View {
                 .frame(maxWidth: .infinity)
                 .padding(10)
         } else {
-            ChatComposer(model: model, root: root, mentionable: mentionable, agents: agents)
+            if service.supports("chat.channel_ux1", key: key) {
+                ChatUX1Composer(model: model, root: root, members: members, mentionable: mentionable, agents: agents)
+            } else {
+                ChatComposer(model: model, root: root, mentionable: mentionable, agents: agents)
+            }
         }
     }
 }
@@ -261,26 +270,30 @@ struct ChatMessageRow: View {
     @State private var deleting: Int?
 
     private var mine: Bool { message.authorAccountId == me }
-    private var author: String {
-        if !message.hasFixed && message.localState == nil { return "" }
-        if let agent = message.authorAgentId {
-            // The agent's name while it is in the channel; its owner's name says whose it was.
-            let name = ChatOrgCurrent.shared.model?.agents(in: message.channelId).first { $0.agentId == agent }?.name ?? "Agent"
-            let owner = members.first { $0.accountId == message.authorAccountId }?.name
-            return owner.map { "\(name) (\($0)'s agent)" } ?? name
-        }
-        return members.first { $0.accountId == message.authorAccountId }?.name ?? (mine ? "You" : "Former member")
+    private var author: ChatMessageAttribution {
+        let owner = members.first { $0.accountId == message.authorAccountId }
+        return ChatMessageAttribution(message, ownerName: owner?.name ?? (mine ? "You" : "Former member"), ownerHandle: owner?.handle,
+            catalogAgentName: ChatOrgCurrent.shared.model?.agents(in: message.channelId).first { $0.agentId == message.authorAgentId }?.name)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
-                Text(author).fontWeight(.semibold)
+                Text(verbatim: author.title).fontWeight(.semibold).help(author.ownerTooltip)
+                if let id = author.publishedAgentId {
+                    Text("Agent").font(.caption2).foregroundStyle(.secondary).help("Published agent · \(id)")
+                }
                 Text(Self.time(message.createdAt)).foregroundStyle(.secondary).font(.caption)
                 if message.editedAt != nil, !message.deleted { Text("edited").foregroundStyle(.secondary).font(.caption) }
                 marks
             }
             body(of: message)
+            if let source = message.inReplyToMessageId {
+                Button("Reply to: \(model.message(source).map { $0.deleted ? "Message deleted" : String($0.text.prefix(90)) } ?? "original message")") {
+                    model.openThread(message.threadRootId ?? source)
+                }.buttonStyle(.link).font(.caption)
+            }
+            ChatSourceProgress(model: model, source: message.messageId)
             if editing != nil, !message.deleted {
                 editor
             }
@@ -337,7 +350,8 @@ struct ChatMessageRow: View {
             Text("Loading…").foregroundStyle(.secondary)
         } else {
             VStack(alignment: .leading, spacing: 2) {
-                Text(ChatMarkdownText.attributed(message.text)).textSelection(.enabled)
+                ChatMentionText(markdown: message.text, addresses: mentionable.map(\.handle)
+                    + (ChatOrgCurrent.shared.model?.agents(in: message.channelId).compactMap(\.address) ?? []))
                 if message.stale != nil { Text("updating…").foregroundStyle(.secondary).font(.caption) }
             }
         }

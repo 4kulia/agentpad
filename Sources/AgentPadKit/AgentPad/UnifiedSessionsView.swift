@@ -99,7 +99,7 @@ struct UnifiedSessionsView: View {
                     TeamPublishMenu(
                         sessionId: (entry.agent.id == AgentTemplate.claudeCodeID || entry.agent.baseAgentId == AgentTemplate.claudeCodeID)
                             ? entry.conversationId : nil,
-                        title: entry.tabTitle
+                        title: entry.tabTitle, surfaceId: entry.id
                     )
                 }
         case .external(let session):

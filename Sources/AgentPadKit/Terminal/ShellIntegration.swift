@@ -1329,6 +1329,8 @@ enum AgentPadShellIntegration {
         // prompt; team_ask sends text to another person, so it asks (7.5).
         object["permissions"] = ["allow": [
             "mcp__agentpad-team__team_agents", "mcp__agentpad-team__team_check",
+            // AgentPad: UX1 immediate publication is explicitly authorized by the owner.
+            "mcp__agentpad-team__chat_channels", "mcp__agentpad-team__chat_read", "mcp__agentpad-team__chat_post",
         ]]
         return object
     }

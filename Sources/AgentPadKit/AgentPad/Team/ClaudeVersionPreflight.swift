@@ -267,7 +267,8 @@ enum ClaudeVersionCommand {
     }
 
     static func read(_ executable: ClaudeExecutable, request: TeamRunRequest, timeout: Duration,
-                     timing: TeamRunStop.Timing = .init(grace: .milliseconds(200), killWait: .seconds(1), output: .seconds(1))) async throws -> String {
+                     timing: TeamRunStop.Timing = .init(grace: .milliseconds(200), killWait: .seconds(1), output: .seconds(1)),
+                     isolatedConfigDirectory: URL? = nil) async throws -> String {
         try ClaudeVersionPreflight.checkCancellation()
         let input = Pipe(), output = Pipe(), errors = Pipe()
         let woke = TeamExit(), exited = TeamExit(), outDone = TeamExit(), errDone = TeamExit()
@@ -287,8 +288,7 @@ enum ClaudeVersionCommand {
         do {
             spawned = try TeamSpawn.suspended(
                 path: executable.file.resolvedPath, arguments: ["--version"],
-                environment: ClaudeCodeRunner.environment(claudePath: executable.file.resolvedPath,
-                    isolateGit: !request.agent.access.takesCommands, ownersPath: request.agent.access.runsShell),
+                environment: try environment(executable: executable.file.resolvedPath, request: request, isolatedConfigDirectory: isolatedConfigDirectory),
                 directory: request.agent.folder, stdin: input, stdout: output, stderr: errors)
         } catch { throw unreadable }
         try? input.fileHandleForWriting.close()
@@ -327,6 +327,13 @@ enum ClaudeVersionCommand {
         try ClaudeVersionPreflight.checkCancellation()
         guard registered, recordingError == nil, ended == 1, let code = exited.exitCode else { throw unreadable }
         return try bytes.version(exitCode: code)
+    }
+
+    static func environment(executable: String, request: TeamRunRequest, isolatedConfigDirectory: URL?) throws -> [String: String] {
+        let runner = ClaudeCodeRunner(claudePath: executable, sessionFilesRoot: isolatedConfigDirectory?.appendingPathComponent("projects") ?? TeamSessionFiles.root,
+                                      isolatedConfigDirectory: isolatedConfigDirectory)
+        return try runner.executionEnvironment(claudePath: executable, isolateGit: !request.agent.access.takesCommands,
+                                                ownersPath: request.agent.access.runsShell)
     }
 
     private final class VersionBytes: @unchecked Sendable {

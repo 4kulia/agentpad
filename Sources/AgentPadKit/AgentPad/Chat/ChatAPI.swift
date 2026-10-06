@@ -301,9 +301,9 @@ final class ChatAPI: Sendable {
     }
 
     /// `GET /v1/orgs/{org}/channels?after=`: channels the snapshot left out (F2).
-    func channelsPage(_ org: String, after: String, token: String) async throws -> ChatChannelsPage {
+    func channelsPage(_ org: String, after: String?, token: String) async throws -> ChatChannelsPage {
         var parts = URLComponents()
-        parts.queryItems = [.init(name: "after", value: after)]
+        parts.queryItems = after.map { [.init(name: "after", value: $0)] }
         return try await call(ChatChannelsPage.self, "GET", "/v1/orgs/\(org)/channels", token: token, query: parts.percentEncodedQuery)
     }
 

@@ -33,6 +33,8 @@ final class ChatChannelModel {
     /// the channel; and the asks the queue holds (living or refused).
     private(set) var offers: [ChatChannelAsk.Offer] = []
     private(set) var asks: [ChatChannelAsk.Asked] = []
+    private(set) var sourceStatuses: [ChatSourceStatus] = []
+    @ObservationIgnored private var statusObservation: AnyDatabaseCancellable?
 
     /// How many root messages show; grows by `page` as the user scrolls up.
     private(set) var shown = 50
@@ -64,6 +66,8 @@ final class ChatChannelModel {
         let channel = channel
         asksObservation = ValueObservation.tracking { db in try ChatChannelAsk.asks(db, channel: channel) }
             .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] asks in self?.asks = asks }
+        statusObservation = ValueObservation.tracking { db in try ChatSourceStatus.read(db, channel: channel) }
+            .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] statuses in self?.sourceStatuses = statuses }
     }
 
     private func observeFeed() {
@@ -206,13 +210,23 @@ final class ChatChannelModel {
     }
 
     /// `agents`: the channel's agents seen now — those `text` names are offered to ask (F5).
-    func send(_ text: String, root: String?, members: [(account: String, handle: String)], agents: [ChatChannelAgent] = []) -> Bool {
+    func send(_ text: String, root: String?, members: [(account: String, handle: String)], agents: [ChatChannelAgent] = [],
+              draftVersion: String? = nil, mentionOnly: Bool = false, context: [ChatMessage] = []) -> Bool {
         if let problem = Self.textProblem(text) { self.problem = problem; return false }
         do {
+            if service.supports("chat.channel_ux1", key: key) {
+                if draftVersion == nil { saveDraft(text, root: root) }
+                guard let version = draftVersion ?? self.draftVersion(root: root) else { return false }
+                _ = try service.sendChannel(key, channel: channel, root: root, text: text,
+                    mentions: Self.mentions(in: text, members: members), agents: agents, draftVersion: version,
+                    mentionOnly: mentionOnly, additionalContext: context)
+                problem = nil
+                return true
+            }
             let id = try service.post(key, channel: channel, root: root, text: text, mentions: Self.mentions(in: text, members: members))
             problem = nil
             saveDraft("", root: root)
-            for agent in ChatChannelAsk.asked(in: text, agents: agents) {
+            for agent in mentionOnly ? [] : ChatChannelAsk.asked(in: text, agents: agents) {
                 offers.append(.init(messageId: id, agentId: agent.agentId, address: agent.address ?? agent.name, text: text, root: root ?? id))
             }
             return true
@@ -289,7 +303,13 @@ final class ChatChannelModel {
         guard let root = message(offer.root), ChatChannelAsk.eligible(root) else { return "The message is not sent yet." }
         let taken = ChatChannelAsk.fit(context, root: offer.root).taken
         do {
-            try service.askInChannel(key, channel: channel, agentId: offer.agentId, root: offer.root, text: text, context: taken)
+            if offer.ux1 {
+                guard let source = message(offer.messageId), source.text == text,
+                      let agent = agents.first(where: { $0.agentId == offer.agentId }) else { return "The question changed. Review it and choose the context again." }
+                try service.retryChannelCall(key, source: source, agent: agent, context: taken)
+            } else {
+                try service.askInChannel(key, channel: channel, agentId: offer.agentId, root: offer.root, text: text, context: taken)
+            }
             dismissOffer(offer)
             return nil
         } catch {
@@ -330,6 +350,10 @@ final class ChatChannelModel {
         }) ?? nil ?? ""
     }
 
+    func draftVersion(root: String?) -> String? {
+        try? store?.queue.read { try String.fetchOne($0, sql: "SELECT version FROM drafts WHERE channel_id = ? AND thread_root_id = ?", arguments: [channel, root ?? ""]) }
+    }
+
     /// Kept only while the channel's card is and the rights are not in doubt:
     /// a save made late — after the user left the team — writes nothing
     /// (review F3-p1-3).
@@ -342,9 +366,10 @@ final class ChatChannelModel {
                 try db.execute(sql: "DELETE FROM drafts WHERE channel_id = ? AND thread_root_id = ?", arguments: [channel, root ?? ""])
             } else {
                 try db.execute(sql: """
-                    INSERT INTO drafts (channel_id, thread_root_id, text, updated_at) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(channel_id, thread_root_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at
-                    """, arguments: [channel, root ?? "", text, Date().timeIntervalSince1970])
+                    INSERT INTO drafts (channel_id, thread_root_id, text, updated_at, version) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(channel_id, thread_root_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at,
+                        version = CASE WHEN text = excluded.text THEN version ELSE excluded.version END
+                    """, arguments: [channel, root ?? "", text, Date().timeIntervalSince1970, UUID().uuidString.lowercased()])
             }
         }
     }

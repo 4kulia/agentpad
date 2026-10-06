@@ -95,7 +95,8 @@ final class ShellIntegrationTests: XCTestCase {
         XCTAssertTrue(script.contains(#""--strict-mcp-config""#), "the user's own choice of MCP servers wins")
         let object = AgentPadShellIntegration.claudeHooksObject(hookCmd: Self.stubHook)
         let allow = (object["permissions"] as? [String: Any])?["allow"] as? [String]
-        XCTAssertEqual(allow, ["mcp__agentpad-team__team_agents", "mcp__agentpad-team__team_check"],
+        XCTAssertEqual(allow, ["mcp__agentpad-team__team_agents", "mcp__agentpad-team__team_check",
+                               "mcp__agentpad-team__chat_channels", "mcp__agentpad-team__chat_read", "mcp__agentpad-team__chat_post"],
                        "team_ask still asks: it sends text to another person")
     }
 

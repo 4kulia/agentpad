@@ -108,6 +108,13 @@ final class ChatService {
     /// Opens the event feed when signed in (C3, C8); off in tests that do not
     /// stand up a server.
     var followsFeed = false
+    /// Negotiated on each connection; never inferred from cached data.
+    var serverCapabilities: [ChatServerAddress: Set<String>] = [:]
+    var channelActivity: [String: ChatChannelActivity] = [:]
+
+    func supports(_ capability: String, key: ChatOrgKey) -> Bool {
+        serverCapabilities[key.server]?.contains(capability) == true
+    }
     /// Delay before retry `n` of `/v1/me` and of snapshots; nil keeps theirs
     /// (tests shorten it).
     var retryDelay: ((Int) -> TimeInterval)?
@@ -257,6 +264,7 @@ final class ChatService {
                     let approval = try? self.journal?.approval(session.key, requestId: id)
                     let params = approval.flatMap { try? TeamLaunchParams.decode($0.params) }
                     let request = try? store.calls.request(id)
+                    if let params, let request, !self.automaticApprovalValid(session.key, request: request, params: params) { return nil }
                     let same = params?.session == self.connection?.sessionId && params?.channelId == request?.channelId
                         && params?.threadRootId == request?.threadRootId && params?.initiator == request?.initiatorAccountId
                         && params?.inputs.prompt == request?.text && params?.inputs.agentId == request?.agentId
@@ -1099,6 +1107,8 @@ final class ChatService {
             made.context = context
             made.channelId = channel
             made.threadRootId = request.threadRootId
+            made.sourceMessageId = request.sourceMessageId
+            made.replyMode = request.replyMode
             made.thread = request.threadRootId.map { "channel:\(channel):\($0)" }
         } else {
             made.thread = request.threadId.map { "personal:\($0)" }

@@ -29,7 +29,11 @@ final class ChatFeed: ChatSocketLifecycle {
         let api = service.makeAPI(connection.server)
         self.api = api
         socket = ChatSocket(server: connection.server, token: token, makeTransport: service.makeSocketTransport)
-        socket.checkServer = { _ = try await api.serverInfo() }
+        socket.checkServer = { [weak service] in
+            let info = try await api.serverInfo()
+            guard service?.connection?.sessionId == connection.sessionId else { return }
+            service?.serverCapabilities[connection.server] = Set(info.capabilities)
+        }
         account = ChatAccountFeed(accountId: connection.accountId, sessionId: connection.sessionId, socket: socket)
         socket.lifecycle = self
         // The one place that says the data is in step: runs waiting for their
@@ -40,6 +44,7 @@ final class ChatFeed: ChatSocketLifecycle {
         }
         socket.onEphemeral = { [weak self] org, type, body in
             guard let self, self.isCurrent else { return }
+            self.service?.receiveChannelActivity(org: org, type: type, body: body)
             self.service?.onEphemeral(org, type, body)
         }
         socket.onUnauthorized = { [weak self] reason in
@@ -88,6 +93,7 @@ final class ChatFeed: ChatSocketLifecycle {
     /// Everything stops: the socket, the streams, the organization's sync and
     /// its queue's sending; nothing of this feed reaches the network again.
     func stop() {
+        service?.channelActivity.removeAll()
         stopped = true
         starting?.cancel()
         account.stop()
@@ -125,6 +131,7 @@ final class ChatFeed: ChatSocketLifecycle {
     }
 
     func socketDisconnected() {
+        service?.channelActivity.removeAll()
         session?.outbox?.hold()
     }
 
@@ -197,11 +204,7 @@ final class ChatFeed: ChatSocketLifecycle {
         // What may be seen changed, or a message went: notices are reconciled (review F4-A).
         sync.onMessageGone = { [weak service] _, _ in if let service { ChatNotifications.reconcile(service) } }
         // One point after every transaction that may change what notices stand for (review F4b-5).
-        fresh.noticeWatch = try? DatabaseRegionObservation(tracking: Table("channels"), Table("teams"), Table("messages"),
-                                                          Table("notified"), Table("read_marks"), Table("meta"), Table("requests"))
-            .start(in: store.queue, onError: { _ in }) { [weak service] _ in
-                Task { @MainActor in if let service { ChatNotifications.reconcile(service) } }
-            }
+        ChatNotifications.follow(service, session: fresh)
         sync.onFollowed = { [weak fresh] channels in if fresh?.followedChannels != channels { fresh?.followedChannels = channels } }
         sync.onSnapshotOwed = { [weak fresh, weak service] owed in
             if fresh?.snapshotOwed != owed { fresh?.snapshotOwed = owed }

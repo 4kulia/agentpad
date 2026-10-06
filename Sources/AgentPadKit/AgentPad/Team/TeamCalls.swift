@@ -169,6 +169,8 @@ final class TeamCalls {
     static let minPollInterval: Duration = .milliseconds(500)
 
     private(set) var agents: [TeamPublishedAgent] = []
+    /// Durable consent revocation must succeed before changed settings are saved.
+    var agentsWillChange: @MainActor ([UUID]) throws -> Void = { _ in }
     private(set) var incoming: [Incoming] = []
     private(set) var outgoing: [Outgoing] = []
 
@@ -695,6 +697,13 @@ final class TeamCalls {
         for (agent, _) in prepared {
             if let i = next.firstIndex(where: { $0.id == agent.id }) { next[i] = agent } else { next.append(agent) }
         }
+        try persistAgents(next)
+    }
+
+    /// The only write of agent settings, including folder grants and removals.
+    private func persistAgents(_ next: [TeamPublishedAgent]) throws {
+        let changed = agents.filter { old in next.first { $0.id == old.id } != old }.map(\.id)
+        if !changed.isEmpty { try agentsWillChange(changed) }
         try storage.save(next, to: storage.agentsURL)
         agents = next
     }
@@ -755,8 +764,7 @@ final class TeamCalls {
         if !(next[i].extraFolders ?? []).contains(path), next[i].folder != path {
             next[i].extraFolders = (next[i].extraFolders ?? []) + [path]
         }
-        try storage.save(next, to: storage.agentsURL)
-        agents = next
+        try persistAgents(next)
     }
 
     /// Session agents whose conversation was deleted stop existing (the
@@ -769,8 +777,7 @@ final class TeamCalls {
         }
         guard !gone.isEmpty else { return }
         let next = agents.filter { agent in !gone.contains { $0.id == agent.id } }
-        guard (try? storage.save(next, to: storage.agentsURL)) != nil else { return }
-        agents = next
+        try? persistAgents(next)
     }
 
     /// The agents published from one conversation.
@@ -799,8 +806,7 @@ final class TeamCalls {
     func removeUnpublished(_ id: UUID) throws {
         let next = agents.filter { $0.id != id }
         guard next.count != agents.count else { return }
-        try storage.save(next, to: storage.agentsURL)
-        agents = next
+        try persistAgents(next)
     }
 
     // MARK: Owner: requests from colleagues

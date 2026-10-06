@@ -49,6 +49,10 @@ extension ChatService {
     /// "Retry": the same message id again with a new command — the server
     /// takes a repeat of the same post as the post it has.
     func retry(_ key: ChatOrgKey, messageId: String) throws {
+        // MCP provenance/attribution cannot be rebuilt by the manual retry button.
+        if (try? orgSessions[key]?.store?.queue.read { try Bool.fetchOne($0, sql: "SELECT EXISTS(SELECT 1 FROM session_posts WHERE message_id = ?)", arguments: [messageId]) }) == true {
+            throw ChatError.storage("Retry this post from the same Claude tab with its message_id.")
+        }
         guard let store = orgSessions[key]?.store,
               let row = try store.queue.read({ db in
                   try Row.fetchOne(db, sql: "SELECT * FROM messages WHERE message_id = ? AND local_state = 'failed'", arguments: [messageId])
@@ -114,6 +118,17 @@ extension ChatService {
     /// Owners of `message.*` answers, by the one dispatcher (D5's way).
     func installConversations() {
         commandOwners["message.post"] = { [weak self] key, record, outcome in self?.postAnswered(key, record, outcome) }
+        commandOwners["message.post_from_session"] = { [weak self] key, record, outcome in
+            if case .taken(let answer) = outcome, let answer, let store = self?.orgSessions[key]?.store,
+               answer.result["message_id"]?.string == Self.args(record)["message_id"]?.string,
+               answer.result["channel_id"]?.string == Self.args(record)["channel_id"]?.string,
+               answer.result["author_account_id"]?.string == key.accountId,
+               let json = try? JSONEncoder().encode(answer.result) {
+                try? store.queue.write { try $0.execute(sql: "UPDATE session_posts SET result = ? WHERE command_id = ?",
+                    arguments: [String(decoding: json, as: UTF8.self), record.commandId]) }
+            }
+            self?.postAnswered(key, record, outcome)
+        }
         for type in ["message.edit", "message.delete"] {
             commandOwners[type] = { [weak self] key, record, outcome in self?.changeAnswered(key, record, outcome) }
         }
@@ -178,6 +193,7 @@ extension ChatService {
     /// (review F3b-3).
     func resendPosts(_ key: ChatOrgKey) {
         guard let store = orgSessions[key]?.store else { return }
+        reconcileSessionPosts(key)
         let rows = (try? store.queue.read { db in
             try Row.fetchAll(db, sql: "SELECT * FROM messages WHERE local_state = 'sending' AND has_fixed = 0").map(ChatMessage.init(row:))
         }) ?? []
@@ -190,6 +206,7 @@ extension ChatService {
             if let id = Self.args(command)["message_id"]?.string { states[id, default: []].insert(command.state) }
         }
         for row in rows {
+            if (try? store.queue.read { try Bool.fetchOne($0, sql: "SELECT EXISTS(SELECT 1 FROM session_posts WHERE message_id = ?)", arguments: [row.messageId]) }) == true { continue }
             let kept = states[row.messageId] ?? []
             if kept.contains(.pending) || kept.contains(.unconfirmed) { continue }
             if kept.contains(.dropped) {

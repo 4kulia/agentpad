@@ -9,9 +9,10 @@ struct ChatChannelAgentWire: Codable, Equatable, Sendable {
     var addedBy: String?
     var addedAt: String?
     var agent: ChatAgentCard?
+    var trust: ChatChannelTrust? = nil
 
     enum CodingKeys: String, CodingKey {
-        case agent
+        case agent, trust
         case agentId = "agent_id", channelId = "channel_id", addedBy = "added_by", addedAt = "added_at"
     }
 }
@@ -29,6 +30,8 @@ struct ChatChannelAgent: Equatable, Sendable, Identifiable {
     var enabled: Bool
     var available: Bool
     var executorDeviceName: String?
+    var executorSessionId: String? = nil
+    var trust: ChatChannelTrust? = nil
     var id: String { agentId }
     var address: String? { ownerHandle.map { "\(name)@\($0)" } }
 }
@@ -45,6 +48,8 @@ extension ChatChannelAgent {
         enabled = row["enabled"]
         available = row["available"]
         executorDeviceName = row["executor_device_name"]
+        executorSessionId = row["executor_session_id"]
+        trust = (row["trust"] as String?).flatMap { try? JSONDecoder().decode(ChatChannelTrust.self, from: Data($0.utf8)) }
     }
 }
 
@@ -53,7 +58,7 @@ extension ChatChannelAgent {
 /// snapshot's whole list and the channel's stream; read only through a
 /// channel card kept (the F2 gate), and gone with it (`dropOrphans`).
 enum ChatChannelAgents {
-    static let eventTypes: Set<String> = ["agent.add_to_channel", "agent.remove_from_channel"]
+    static let eventTypes: Set<String> = ["agent.add_to_channel", "agent.remove_from_channel", "agent.channel_trust.set"]
 
     /// Events of a channel's stream this reads: its own, and the card an
     /// agent of the channel publishes anew (`agent.publish` there).
@@ -65,10 +70,16 @@ enum ChatChannelAgents {
     static func apply(_ db: Database, _ event: ChatEvent) throws -> Bool {
         let channel = String(event.stream.dropFirst("channel:".count))
         switch event.type {
+        case "agent.channel_trust.set":
+            guard let agent = event.body["agent_id"]?.string,
+                  let trust = event.body["trust"].flatMap({ ChatCallStore.decode(ChatChannelTrust.self, $0) }) else { return false }
+            try writeTrust(db, channel: channel, agent: agent, trust: trust)
+            return true
         case "agent.add_to_channel":
             guard let wire = ChatCallStore.decode(ChatChannelAgentWire.self, event.body), wire.channelId == channel,
                   let card = wire.agent, card.agentId == wire.agentId else { return false }
             try write(db, channel: channel, card: card, addedBy: wire.addedBy, addedAt: wire.addedAt ?? event.at)
+            try writeTrust(db, channel: channel, agent: wire.agentId, trust: wire.trust)
             return true
         case "agent.remove_from_channel":
             guard let agent = event.body["agent_id"]?.string else { return false }
@@ -89,20 +100,27 @@ enum ChatChannelAgents {
         for wire in list {
             guard let card = wire.agent, card.agentId == wire.agentId else { continue }
             try write(db, channel: wire.channelId, card: card, addedBy: wire.addedBy, addedAt: wire.addedAt)
+            try writeTrust(db, channel: wire.channelId, agent: wire.agentId, trust: wire.trust)
         }
     }
 
     private static func write(_ db: Database, channel: String, card: ChatAgentCard, addedBy: String?, addedAt: String?) throws {
         try db.execute(sql: """
             INSERT INTO agent_channels (channel_id, agent_id, added_by, added_at, name, owner_account_id, description, access,
-                enabled, available, executor_device_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                enabled, available, executor_device_name, executor_session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id, agent_id) DO UPDATE SET added_by = coalesce(excluded.added_by, added_by),
                 added_at = coalesce(excluded.added_at, added_at), name = excluded.name, owner_account_id = excluded.owner_account_id,
                 description = excluded.description, access = excluded.access, enabled = excluded.enabled,
-                available = excluded.available, executor_device_name = excluded.executor_device_name
+                available = excluded.available, executor_device_name = excluded.executor_device_name,
+                executor_session_id = excluded.executor_session_id
             """, arguments: [channel, card.agentId, addedBy, addedAt, card.name, card.ownerAccountId, card.description,
-                             card.access, card.enabled, card.available, card.executorDeviceName])
+                             card.access, card.enabled, card.available, card.executorDeviceName, card.executorSessionId])
+    }
+
+    static func writeTrust(_ db: Database, channel: String, agent: String, trust: ChatChannelTrust?) throws {
+        let json = try trust.map { String(decoding: try JSONEncoder().encode($0), as: UTF8.self) }
+        try db.execute(sql: "UPDATE agent_channels SET trust = ? WHERE channel_id = ? AND agent_id = ?", arguments: [json, channel, agent])
     }
 
     /// The agents of `channel`, only while its card is kept.
