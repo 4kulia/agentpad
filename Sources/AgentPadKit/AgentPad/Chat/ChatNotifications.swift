@@ -128,11 +128,12 @@ enum ChatNotifications {
 
     static func follow(_ service: ChatService, session: ChatOrgSession) {
         guard let store = session.store else { return }
+        let changes = CoalescedMainActorAction { [weak service] in
+            if let service { reconcile(service) }
+        }
         session.noticeWatch = try? DatabaseRegionObservation(tracking: Table("channels"), Table("teams"), Table("messages"),
                                                              Table("notified"), Table("read_marks"), Table("meta"), Table("requests"))
-            .start(in: store.queue, onError: { _ in }) { [weak service] _ in
-                Task { @MainActor in if let service { reconcile(service) } }
-            }
+            .start(in: store.queue, onError: { _ in }) { _ in changes.schedule() }
     }
 
     /// Takes back every chat notice that no longer applies: of another
@@ -141,6 +142,7 @@ enum ChatNotifications {
     /// on every change of what may be seen, and at start; calls meanwhile
     /// make one more pass.
     static func reconcile(_ service: ChatService = .shared) {
+        MainThreadWatchdog.shared.checkpoint()
         service.reconcileChannelResults()
         guard !reconciling else { reconcileAgain = true; return }
         reconciling = true

@@ -93,6 +93,12 @@ final class TeamSocketOriginTests: XCTestCase {
         ]
     }
 
+    private var channelRequests: [(String, AgentPadCLIRequest)] {
+        ["chat_channels", "chat_read", "chat_post"].map { name in
+            (name, team(.chat) { $0.chatArguments = "{\"tool\":\"\(name)\"}" })
+        }
+    }
+
     // (1) The run and its grandchild may not change anything.
     func testRunAndGrandchildAreRefused() async throws {
         let (pid, grandchild) = try await startRun()
@@ -101,7 +107,7 @@ final class TeamSocketOriginTests: XCTestCase {
             XCTAssertEqual(origin, .teamRun(callId: callId), "pid \(caller)")
             // C7: the server actions too, all five — refused before any window, read or queue.
             let server = [AgentPadCLITeamAction.status, .login, .logout, .members, .invite].map { ("team \($0.rawValue)", team($0)) }
-            for (name, request) in changingRequests + server + [("focus", AgentPadCLIRequest(verb: .focus, tab: UUID().uuidString)),
+            for (name, request) in changingRequests + channelRequests + server + [("focus", AgentPadCLIRequest(verb: .focus, tab: UUID().uuidString)),
                                                                 ("team unpublish", team(.unpublish))] {
                 let response = await respond(request, origin: origin)
                 XCTAssertFalse(response.ok, name)
@@ -151,7 +157,7 @@ final class TeamSocketOriginTests: XCTestCase {
         for pid in [nil, 0, -1] as [pid_t?] {
             let origin = AgentPadCallerOrigin.of(peerPID: pid)
             XCTAssertEqual(origin, .teamRun(callId: nil))
-            for (name, request) in changingRequests + [("team access", team(.access) { $0.teamCall = self.callId; $0.teamFolder = "/tmp" })] {
+            for (name, request) in changingRequests + channelRequests + [("team access", team(.access) { $0.teamCall = self.callId; $0.teamFolder = "/tmp" })] {
                 let response = await respond(request, origin: origin)
                 XCTAssertEqual(response.error, AgentPadCallerOrigin.teamRunRefusal, name)
             }

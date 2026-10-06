@@ -73,7 +73,7 @@ final class ShellIntegrationTests: XCTestCase {
         let script = AgentPadShellIntegration.claudeWrapperScript
         let scan = #"if [[ "$_agentpad_arg" == "--no-session-persistence" ]]; then"#
         let marker = "export AGENTPAD_CLAUDE_NO_SESSION_PERSISTENCE=1"
-        let launch = #""$real" ${_agentpad_team[@]+"${_agentpad_team[@]}"} --settings "$AGENTPAD_HOOKS_PATH" "$@""#
+        let launch = #""$real" ${_agentpad_team[@]+"${_agentpad_team[@]}"} --settings "$AGENTPAD_HOOKS_PATH" ${_agentpad_prompt[@]+"${_agentpad_prompt[@]}"} "$@""#
 
         XCTAssertTrue(script.contains(scan))
         XCTAssertTrue(script.contains("unset AGENTPAD_CLAUDE_NO_SESSION_PERSISTENCE"))

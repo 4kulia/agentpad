@@ -23,17 +23,7 @@ final class LibghosttyApp {
             return
         }
 
-        var runtime = ghostty_runtime_config_s(
-            userdata: nil,
-            supports_selection_clipboard: false,
-            wakeup_cb: agentPadWakeupCb,
-            action_cb: agentPadActionCb,
-            read_clipboard_cb: agentPadReadClipboardCb,
-            confirm_read_clipboard_cb: agentPadConfirmReadClipboardCb,
-            write_clipboard_cb: agentPadWriteClipboardCb,
-            close_surface_cb: agentPadCloseSurfaceCb,
-            tmux_control_cb: nil
-        )
+        var runtime = Self.runtimeConfig()
 
         guard let config = AgentPadSettings.makeGhosttyConfig() else {
             NSLog("agentpad: ghostty_config_new failed")
@@ -86,6 +76,21 @@ final class LibghosttyApp {
                 ghostty_app_keyboard_changed(app)
             }
         }
+    }
+
+    /// Also used by manual-IO contract tests with an isolated core config.
+    static func runtimeConfig() -> ghostty_runtime_config_s {
+        ghostty_runtime_config_s(
+            userdata: nil,
+            supports_selection_clipboard: false,
+            wakeup_cb: agentPadWakeupCb,
+            action_cb: agentPadActionCb,
+            read_clipboard_cb: agentPadReadClipboardCb,
+            confirm_read_clipboard_cb: agentPadConfirmReadClipboardCb,
+            write_clipboard_cb: agentPadWriteClipboardCb,
+            close_surface_cb: agentPadCloseSurfaceCb,
+            tmux_control_cb: nil
+        )
     }
 
     /// The config currently applied to the app. libghostty's embedded API
@@ -258,11 +263,15 @@ private let agentPadWakeupCb: ghostty_runtime_wakeup_cb = { _ in
 
 /// Replaces the general pasteboard's contents. Must run on main so the change
 /// notification reaches clipboard managers (Paste, Maccy, …) — otherwise the
-/// value lands but listeners miss it. The single write site app-wide — OSC 52
-/// allow, consent-sheet allow, ⌘C, and every UI "Copy" row/button.
+/// value lands but listeners miss it. OSC 52, terminal copy and UI copy buttons
+/// share the write primitive below.
 @MainActor
 func writeToGeneralPasteboard(_ text: String) {
-    let pb = NSPasteboard.general
+    writeToPasteboard(text, to: .general)
+}
+
+@MainActor
+private func writeToPasteboard(_ text: String, to pb: NSPasteboard) {
     pb.clearContents()
     pb.setString(text, forType: .string)
 }
@@ -327,6 +336,24 @@ private func dispatchToView(_ userdata: UnsafeMutableRawPointer, _ work: @MainAc
             let view = Unmanaged<GhosttySurfaceView>.fromOpaque(pointer).takeUnretainedValue()
             work(view)
         }
+    }
+}
+
+/// UI-initiated clipboard actions already run on main. Complete them there so
+/// a subsequent keypress or clipboard change cannot overtake the paste. OSC 52
+/// callbacks from the IO thread still need the normal main-actor hop.
+private func dispatchClipboardToView(
+    _ userdata: UnsafeMutableRawPointer,
+    _ work: @MainActor @escaping (GhosttySurfaceView) -> Void
+) {
+    if Thread.isMainThread {
+        let bits = Int(bitPattern: userdata)
+        MainActor.assumeIsolated {
+            guard let pointer = UnsafeMutableRawPointer(bitPattern: bits) else { return }
+            work(Unmanaged<GhosttySurfaceView>.fromOpaque(pointer).takeUnretainedValue())
+        }
+    } else {
+        dispatchToView(userdata, work)
     }
 }
 
@@ -477,17 +504,17 @@ private let agentPadActionCb: ghostty_runtime_action_cb = { _, target, action in
 /// gets a look at the content). Reads the system pasteboard and answers via
 /// `ghostty_surface_complete_clipboard_request`; if the core judges the
 /// content risky it calls back through `confirm_read_clipboard` before
-/// completing. Fires off-main; both the pasteboard read and the completion
-/// hop to main (same rule as the write callback). The `state` pointer is a
+/// completing. UI pastes complete synchronously; OSC reads hop to main when
+/// needed (same rule as the write callback). The `state` pointer is a
 /// core-owned request that stays valid until completed — transit as Int bits
 /// like `dispatchToView`.
 private let agentPadReadClipboardCb: ghostty_runtime_read_clipboard_cb = { userdata, kind, state in
     guard kind == GHOSTTY_CLIPBOARD_STANDARD, let userdata, let state else { return false }
     let stateBits = Int(bitPattern: state)
-    dispatchToView(userdata) { view in
+    dispatchClipboardToView(userdata) { view in
         view.completeClipboardRequest(
             stateBits: stateBits,
-            text: NSPasteboard.general.string(forType: .string) ?? "",
+            text: view.clipboard.string(forType: .string) ?? "",
             confirmed: false
         )
     }
@@ -504,7 +531,7 @@ private let agentPadConfirmReadClipboardCb: ghostty_runtime_confirm_read_clipboa
     guard let userdata, let str, let state else { return }
     let contents = String(cString: str)
     let stateBits = Int(bitPattern: state)
-    dispatchToView(userdata) { view in
+    dispatchClipboardToView(userdata) { view in
         view.presentClipboardConfirmation(contents: contents, stateBits: stateBits, request: request)
     }
 }
@@ -531,13 +558,16 @@ private let agentPadWriteClipboardCb: ghostty_runtime_write_clipboard_cb = { use
     // `ask` behaved as `allow`). The core doesn't wait on write requests —
     // the host owns the dialog AND the write (upstream osc_52_write branch).
     if confirm, let userdata {
-        dispatchToView(userdata) { view in
+        dispatchClipboardToView(userdata) { view in
             view.presentClipboardWriteConfirmation(contents: text)
         }
         return
     }
-    // libghostty fires this on its own thread; the write helper is main-only.
-    dispatchToMain { writeToGeneralPasteboard(text) }
+    if let userdata {
+        dispatchClipboardToView(userdata) { $0.writeClipboard(text) }
+    } else {
+        dispatchToMain { writeToGeneralPasteboard(text) }
+    }
 }
 private let agentPadCloseSurfaceCb: ghostty_runtime_close_surface_cb = { _, _ in }
 
@@ -681,7 +711,7 @@ final class LibghosttyEngine: TerminalEngine {
 /// lives in `ghostty_surface_config_s.platform.macos.nsview`; libghostty owns
 /// the Metal layer and draws into it.
 @MainActor
-final class GhosttySurfaceView: NSView {
+final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     /// Vsync-aligned render driver. Replaces the old free-running 60Hz `Timer`,
     /// which presented off-vsync into the IOSurfaceLayer → beat-frequency judder
     /// + torn frames on a ProMotion (120Hz) display, most visible while scrolling
@@ -1125,18 +1155,13 @@ final class GhosttySurfaceView: NSView {
             // /usr/bin/login so we don't get a "Last login:…" line each session.
             config.command.withCString { cmdPtr in
                 var surfaceConfig = ghostty_surface_config_new()
-                surfaceConfig.platform_tag = GHOSTTY_PLATFORM_MACOS
-                surfaceConfig.platform.macos.nsview = Unmanaged.passUnretained(self).toOpaque()
-                // Userdata lets the @convention(c) action callback recover the
-                // originating Swift view from a surface-scoped event.
-                surfaceConfig.userdata = Unmanaged.passUnretained(self).toOpaque()
                 surfaceConfig.scale_factor = scale
                 surfaceConfig.working_directory = wdPtr
                 surfaceConfig.command = cmdPtr
                 return envVars.withUnsafeMutableBufferPointer { buf in
                     surfaceConfig.env_vars = buf.baseAddress
                     surfaceConfig.env_var_count = buf.count
-                    return ghostty_surface_new(app, &surfaceConfig)
+                    return attachSurface(app: app, config: &surfaceConfig)
                 }
             }
         }
@@ -1145,7 +1170,6 @@ final class GhosttySurfaceView: NSView {
             NSLog("agentpad: ghostty_surface_new failed")
             return
         }
-        surface = new
         pendingConfig = nil
         // A fresh surface's conditional state defaults to LIGHT — seed it with
         // AgentPad's active theme so the 996 query / mode 2031 / conditional
@@ -1154,6 +1178,17 @@ final class GhosttySurfaceView: NSView {
         GhosttySurfaceRegistry.add(self)
         ghostty_surface_set_color_scheme(new, LibghosttyApp.currentColorScheme)
         ghostty_surface_refresh(new)
+    }
+
+    /// Installs both the native view and callback identity for any IO backend.
+    @discardableResult
+    func attachSurface(app: ghostty_app_t, config: inout ghostty_surface_config_s) -> ghostty_surface_t? {
+        guard surface == nil else { return nil }
+        config.platform_tag = GHOSTTY_PLATFORM_MACOS
+        config.platform.macos.nsview = Unmanaged.passUnretained(self).toOpaque()
+        config.userdata = Unmanaged.passUnretained(self).toOpaque()
+        surface = ghostty_surface_new(app, &config)
+        return surface
     }
 
     private func startRenderLink() {
@@ -1306,6 +1341,42 @@ final class GhosttySurfaceView: NSView {
         return resigned
     }
 
+    enum ClipboardAction: Equatable { case copy, paste }
+
+    static func clipboardAction(for event: NSEvent) -> ClipboardAction? {
+        guard event.type == .keyDown,
+              event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command
+        else { return nil }
+        // `characters` can carry the Command-layout Latin equivalent even
+        // when charactersIgnoringModifiers comes from a non-Latin layout.
+        for key in [event.charactersIgnoringModifiers, event.characters,
+                    event.characters(byApplyingModifiers: .command)] {
+            switch key?.lowercased() {
+            case "c": return .copy
+            case "v": return .paste
+            default: break
+            }
+        }
+        return nil
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // AppKit visits views other than the first responder here. Never let
+        // a hidden tab or an unfocused split consume another editor's ⌘V.
+        guard window?.firstResponder === self, !isHiddenOrHasHiddenAncestor,
+              surface != nil, let action = Self.clipboardAction(for: event)
+        else { return false }
+        performClipboardAction(action)
+        return true
+    }
+
+    private func performClipboardAction(_ action: ClipboardAction) {
+        switch action {
+        case .copy: copy(self)
+        case .paste: paste(self)
+        }
+    }
+
     override func keyDown(with event: NSEvent) {
         guard let surface else {
             super.keyDown(with: event)
@@ -1315,34 +1386,8 @@ final class GhosttySurfaceView: NSView {
         let cmd = mods.contains(.command)
         let cmdOnly = cmd && mods.intersection([.shift, .control, .option]).isEmpty
 
-        // Cmd+V: read the system pasteboard directly and inject as text via
-        // the paste path so bracketed-paste mode wraps it correctly. The
-        // right-click Paste menu shares the same path via `paste(_:)`.
-        // `readTerminalPasteText` covers fileURLs (Finder Copy → full
-        // path, not bare filename) and raw image data (screenshots →
-        // spilled to a cache PNG so agents can open it as a path).
-        if cmdOnly, event.charactersIgnoringModifiers?.lowercased() == "v" {
-            // One entry owns the whole tier ladder: remote upload for SSH
-            // workspaces, off-main transcode for clipboard images, escaped
-            // paths for files — and plain text handed to the core's protected
-            // paste path (clipboard-paste-protection).
-            if AgentPadShellIntegration.paste(
-                from: .general,
-                host: pasteUploadHostProvider?(),
-                plainText: .viaCore({ [weak self] in self?.pasteFromClipboardViaCore() ?? false }),
-                deliver: { [weak self] in self?.paste($0) }
-            ) {
-                return
-            }
-        }
-
-        // Cmd+C with a live selection — without this branch libghostty's
-        // bypassed keybinding system would leave Cmd+C dead.
-        if cmdOnly,
-           event.charactersIgnoringModifiers?.lowercased() == "c",
-           ghostty_surface_has_selection(surface)
-        {
-            performCopy()
+        if let action = Self.clipboardAction(for: event) {
+            performClipboardAction(action)
             return
         }
 
@@ -1729,6 +1774,9 @@ final class GhosttySurfaceView: NSView {
 
     private var scrollAccum: NSPoint = .zero
     private static let scrollLinePoints: Double = 20.0
+    /// Latched at press: releasing Option before the mouse must not leak an
+    /// unmatched drag/release to the TUI or abandon the terminal selection.
+    private var optionSelectionDrag = false
 
     override func scrollWheel(with event: NSEvent) {
         guard let surface else {
@@ -1762,6 +1810,10 @@ final class GhosttySurfaceView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if optionSelectionDrag {
+            updateOptionSelection(with: event, starting: false)
+            return
+        }
         forwardMouseEvent(event)
     }
 
@@ -1776,11 +1828,46 @@ final class GhosttySurfaceView: NSView {
         if window?.firstResponder !== self {
             window?.makeFirstResponder(self)
         }
+        optionSelectionDrag = surface.map { ghostty_surface_mouse_captured($0) } == true
+            && event.modifierFlags.contains(.option)
+            && event.modifierFlags.intersection([.control, .command]).isEmpty
+        if optionSelectionDrag {
+            updateOptionSelection(with: event, starting: true)
+            return
+        }
         forwardMouseEvent(event, button: (.PRESS, .LEFT))
     }
 
     override func mouseUp(with event: NSEvent) {
+        if optionSelectionDrag {
+            updateOptionSelection(with: event, starting: false)
+            optionSelectionDrag = false
+            return
+        }
         forwardMouseEvent(event, button: (.RELEASE, .LEFT))
+    }
+
+    /// The pinned core exposes tracked selection endpoints. Use those instead
+    /// of faking Shift: a TUI can capture Shift too (`mouse-shift-capture`), and
+    /// Alt forwarded to the core means a rectangular selection. Grid metrics
+    /// account for padding and display scale; the core handles wide glyphs.
+    private func updateOptionSelection(with event: NSEvent, starting: Bool) {
+        guard let surface else { return }
+        var grid = ghostty_surface_grid_metrics_s()
+        guard ghostty_surface_grid_metrics(surface, &grid),
+              grid.columns > 0, grid.rows > 0, grid.cell_width > 0, grid.cell_height > 0
+        else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        let x = floor((p.x - grid.padding_left) / grid.cell_width)
+        let y = floor((bounds.height - p.y - grid.padding_top) / grid.cell_height)
+        let column = UInt16(max(0, min(Double(grid.columns - 1), x)))
+        let row = UInt16(max(0, min(Double(grid.rows - 1), y)))
+        if starting {
+            _ = ghostty_surface_select_viewport_cell(surface, column, row)
+        } else {
+            _ = ghostty_surface_set_selection_endpoint_viewport(surface, column, row, false)
+        }
+        setNeedsRender()
     }
 
     // Middle button (buttonNumber 2): the core owns the behavior —
@@ -1804,14 +1891,46 @@ final class GhosttySurfaceView: NSView {
         forwardMouseEvent(event, button: (.RELEASE, .MIDDLE))
     }
 
-    /// Direct selection extraction — bypasses the libghostty binding +
-    /// write_clipboard_cb path so `keyDown`'s Cmd+C fallback works
-    /// regardless of which keys are bound for copy in the active config.
-    /// The right-click "Copy" entry in the SwiftUI popover takes the same
-    /// path via the `TerminalEngine.readSelection()` interface.
-    private func performCopy() {
-        guard let str = readSelection() else { return }
-        writeToGeneralPasteboard(str)
+    /// A named pasteboard lets embedded/manual surfaces use their own clipboard.
+    /// Normal terminal surfaces always use the system clipboard.
+    var clipboard: NSPasteboard = .general
+
+    func writeClipboard(_ text: String) {
+        writeToPasteboard(text, to: clipboard)
+    }
+
+    /// AppKit's Edit menu targets these selectors through the responder chain.
+    /// Calling the action by name also honors Ghostty's copy formatting options.
+    @objc func copy(_ sender: Any?) {
+        guard let surface, ghostty_surface_has_selection(surface) else { return }
+        performAction("copy_to_clipboard")
+    }
+
+    @objc func paste(_ sender: Any?) {
+        guard surface != nil else { return }
+        _ = AgentPadShellIntegration.paste(
+            from: clipboard,
+            host: pasteUploadHostProvider?(),
+            plainText: .viaCore({ [weak self] in self?.pasteFromClipboardViaCore() ?? false }),
+            deliver: { [weak self] in self?.paste($0) }
+        )
+    }
+
+    override func selectAll(_ sender: Any?) {
+        performAction("select_all")
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(NSText.copy(_:)):
+            return surface.map { ghostty_surface_has_selection($0) } ?? false
+        case #selector(NSText.paste(_:)):
+            return surface != nil && AgentPadShellIntegration.pasteboardHasTerminalPasteContent(clipboard)
+        case #selector(NSText.selectAll(_:)):
+            return surface != nil
+        default:
+            return false
+        }
     }
 
     func readSelection() -> String? {
@@ -1834,7 +1953,10 @@ final class GhosttySurfaceView: NSView {
         // as a keystroke, covering paste-with-trailing-newline that runs on
         // arrival, which a Return-key trigger would miss.
         onUserInput?()
-        text.withCString { ghostty_surface_text(surface, $0, UInt(strlen($0))) }
+        // This is a paste API, not raw input. The core owns mode 2004, control
+        // filtering and newline conversion. Count UTF-8 bytes, including NULs
+        // (which the core replaces with spaces), rather than truncating at NUL.
+        text.withCString { ghostty_surface_text(surface, $0, UInt(text.utf8.count)) }
     }
 
     // MARK: - Clipboard requests (OSC 52 read + protected paste)
@@ -1868,7 +1990,9 @@ final class GhosttySurfaceView: NSView {
     /// here exactly once — deny answers with an empty string, never silence.
     func completeClipboardRequest(stateBits: Int, text: String, confirmed: Bool) {
         guard let surface, let state = UnsafeMutableRawPointer(bitPattern: stateBits) else { return }
-        text.withCString { ptr in
+        // complete_clipboard_request takes a NUL-terminated string, unlike
+        // surface_text. Apply the core's NUL → space rule before crossing it.
+        text.replacingOccurrences(of: "\0", with: " ").withCString { ptr in
             ghostty_surface_complete_clipboard_request(surface, ptr, state, confirmed)
         }
     }
@@ -1911,9 +2035,9 @@ final class GhosttySurfaceView: NSView {
             on: window,
             kind: .oscWrite,
             contents: contents
-        ) { allowed in
+        ) { [weak self] allowed in
             guard allowed else { return }
-            writeToGeneralPasteboard(contents)
+            self?.writeClipboard(contents)
         }
     }
 

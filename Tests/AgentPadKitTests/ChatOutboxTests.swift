@@ -57,6 +57,22 @@ final class ChatOutboxTests: XCTestCase {
 
     nonisolated private static let ok = ChatStubProtocol.Answer(status: 200, body: Data(#"{"events":[],"result":{}}"#.utf8))
 
+    func testZeroRetryAfterCannotSpinEvenWhenPumpIsWoken() async throws {
+        ChatStubProtocol.reset { _, _ in .success(.init(status: 429, headers: ["Retry-After": "0"], body: Data())) }
+        let store = try store(), box = outbox(store)
+        defer { box.hold() }
+        let record = try setName(box)
+        try await waitUntil { try store.commands().first?.attempts ?? 0 >= 1 }
+        let pending = try XCTUnwrap(store.commands().first)
+        XCTAssertGreaterThan(try XCTUnwrap(pending.nextAttemptAt).timeIntervalSinceNow, 0.5)
+        for _ in 0..<30 {
+            box.pump()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(ChatStubProtocol.seen.count, 1)
+        XCTAssertEqual(try store.commands().first?.bodyBytes, record.bodyBytes)
+    }
+
     // (1), (10)
     func testRepeatAfterABreakSendsTheSameIdAndBytes() async throws {
         let calls = Counter()

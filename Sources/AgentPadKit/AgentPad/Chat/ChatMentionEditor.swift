@@ -28,12 +28,28 @@ struct ChatMentionEditor: NSViewRepresentable {
     @Binding var text: String
     @Binding var selection: NSRange
     var candidates: [ChatMentionCandidate]
+    var autofocus = false
     var key: (UInt16, NSEvent.ModifierFlags) -> Bool
 
     final class Editor: NSTextView {
         var consume: ((UInt16, NSEvent.ModifierFlags) -> Bool)?
+        var focusOnAttach = false
+        private var didAutofocus = false
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            focusIfNeeded()
+        }
+        func focusIfNeeded() {
+            guard focusOnAttach, !didAutofocus else { return }
+            // SwiftUI attaches lazy rows after updateNSView. Focus only once,
+            // after attachment, so later model updates never steal it back.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.focusOnAttach, !self.didAutofocus, let window = self.window else { return }
+                self.didAutofocus = window.makeFirstResponder(self)
+            }
+        }
         override func keyDown(with event: NSEvent) {
-            if consume?(event.keyCode, event.modifierFlags) != true { super.keyDown(with: event) }
+            if hasMarkedText() || consume?(event.keyCode, event.modifierFlags) != true { super.keyDown(with: event) }
         }
     }
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -74,6 +90,8 @@ struct ChatMentionEditor: NSViewRepresentable {
         guard let view = scroll.documentView as? Editor else { return }
         context.coordinator.parent = self
         view.consume = key
+        view.focusOnAttach = autofocus
+        view.focusIfNeeded()
         if view.string != text { view.string = text }
         let length = (text as NSString).length
         let range = NSRange(location: 0, length: length)

@@ -52,4 +52,26 @@ final class ChatNotificationsTests: XCTestCase {
         XCTAssertEqual(posted.map(\.title), ["A request waits for your decision", "A request waits for your decision"])
         XCTAssertEqual(posted.map(\.id), [ChatNotifications.requestId(key, "r1"), ChatNotifications.requestId(key, "r2")])
     }
+
+    func testRepeatedReadMarksDoNotWakeDatabaseObservers() throws {
+        let store = try XCTUnwrap(service().orgSessions[key]?.store)
+        let changes = Counter()
+        let watch = try DatabaseRegionObservation(tracking: Table("read_marks"), Table("notified"))
+            .start(in: store.queue, onError: { XCTFail("\($0)") }) { _ in changes.increment() }
+        defer { watch.cancel() }
+        try store.queue.write { db in
+            try db.execute(sql: "INSERT INTO notified (object_id, kind, channel_id, seq) VALUES ('m', 'mention', 'c', 10)")
+        }
+        XCTAssertEqual(try store.queue.write { try ChatUnread.markRead($0, channel: "c", upTo: 10) }, ["m"])
+        let settled = changes.value
+        for _ in 0..<100 {
+            try store.queue.write { db in
+                XCTAssertEqual(try ChatUnread.markRead(db, channel: "c", upTo: 10), [])
+                XCTAssertEqual(try ChatUnread.markRead(db, channel: "c", upTo: 9), [])
+            }
+        }
+        XCTAssertEqual(changes.value, settled, "unchanged read marks must not wake F4")
+        try store.queue.write { try ChatUnread.markRead($0, channel: "c", upTo: 11) }
+        XCTAssertEqual(changes.value, settled + 1, "a new message still advances the mark")
+    }
 }

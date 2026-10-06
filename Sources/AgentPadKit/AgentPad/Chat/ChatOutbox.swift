@@ -377,7 +377,10 @@ final class ChatOutbox {
     private func retry(_ record: inout ChatCommandRecord, in queue: ChatCommandTable, after seconds: TimeInterval?, notAccepted: Bool = false) {
         var next = record
         next.attempts += 1
-        next.nextAttemptAt = now().addingTimeInterval(seconds ?? retryDelay(next.attempts))
+        // Retry-After: 0 (including an HTTP date in the past) must not bypass
+        // the pause. pump() is called by send's defer and by unrelated events.
+        let delay = seconds.map { $0.isFinite ? max(1, $0) : retryDelay(next.attempts) } ?? retryDelay(next.attempts)
+        next.nextAttemptAt = now().addingTimeInterval(delay)
         do {
             if try queue.update(next, ifState: .pending, notAccepted: notAccepted) { record = next }
         } catch {

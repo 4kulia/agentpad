@@ -2,6 +2,7 @@ import AgentPadHookKit
 import AppKit
 import Foundation
 import GRDB
+import Observation
 import XCTest
 @testable import AgentPadKit
 
@@ -622,12 +623,12 @@ final class ChatUX1Tests: XCTestCase {
             .init(pid: 11, ppid: 10, name: "claude", isForeground: true, startedAtUs: 110),
             .init(pid: 12, ppid: 11, name: "agentpad-cli", isForeground: true, startedAtUs: 120)]
         let tab = ChatSessionIdentity.Tab(id: surface, customTitle: "Mine", folderName: "project", processes: rows)
-        XCTAssertEqual(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [tab], identity: { _, _ in true })?.surface, surface.uuidString.lowercased())
-        XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 121, tabs: [tab], identity: { _, _ in true }), "reused PID")
-        XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [tab], identity: { _, _ in false }), "ended process")
-        XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [tab, tab], identity: { _, _ in true }), "ambiguous tab")
+        XCTAssertEqual(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [tab], identity: { _, _ in true }, signatureVerifier: { $0 == 11 })?.surface, surface.uuidString.lowercased())
+        XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 121, tabs: [tab], identity: { _, _ in true }, signatureVerifier: { $0 == 11 }), "reused PID")
+        XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [tab], identity: { _, _ in false }, signatureVerifier: { $0 == 11 }), "ended process")
+        XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [tab, tab], identity: { _, _ in true }, signatureVerifier: { $0 == 11 }), "ambiguous tab")
         var noClaude = tab; noClaude.processes.removeAll { $0.pid == 11 }
-        XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [noClaude], identity: { _, _ in true }), "a stale hook UUID cannot prove Claude")
+        XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [noClaude], identity: { _, _ in true }, signatureVerifier: { $0 == 11 }), "a stale hook UUID cannot prove Claude")
     }
 
     func testSignatureUsesOnlyManualTitleFolderAndSafeShortFallback() {
@@ -707,7 +708,7 @@ final class ChatUX1Tests: XCTestCase {
         let f = try await fixture()
         var request = AgentPadCLIRequest(verb: .team); request.teamAction = "chat"; request.chatArguments = "{}"
         let refused = await ChatSessionTools.handle(request, origin: .outside, sessions: { [] }, service: f.service)
-        XCTAssertFalse(refused.ok); XCTAssertEqual(refused.error, "unverified_session")
+        XCTAssertFalse(refused.ok); XCTAssertEqual(refused.error, "session_process_unavailable")
         XCTAssertNotNil(AgentPadCallerOrigin.teamRun(callId: "own-self-call").refusal(for: request))
         f.service.serverCapabilities[f.key.server] = []
         do { _ = try await ChatSessionTools.call(.object(["tool": .string("chat_channels")]), caller: caller(), service: f.service, revalidate: { true }); XCTFail() }
@@ -818,6 +819,78 @@ final class ChatUX1Tests: XCTestCase {
         f.service.pruneChannelActivity(); XCTAssertTrue(f.service.channelActivity.isEmpty)
         XCTAssertEqual(ChatService.channelAction("Read /private/personal/file"), "Reading files")
         XCTAssertEqual(ChatService.channelAction("Bash: cat private"), "Running a command")
+    }
+
+    func testRepeatedActivityAndPruningDoNotInvalidateUnchangedProgress() async throws {
+        let f = try await fixture(), sent = try send(f)
+        let request = try receive(f, request: XCTUnwrap(sent.request), state: "running")
+        let body: ChatJSON = .object(["request_id": .string(request.requestId), "text": .string("Reading files")])
+        let now = Date()
+        f.service.receiveChannelActivity(org: f.key.orgId, type: "run.activity", body: body, now: now)
+        let changes = Counter()
+        for n in 1...100 {
+            withObservationTracking { _ = f.service.activity(f.key, request: request.requestId, now: now) }
+                onChange: { changes.increment() }
+            f.service.receiveChannelActivity(org: f.key.orgId, type: "run.activity", body: body, now: now.addingTimeInterval(Double(n) / 100))
+            f.service.pruneChannelActivity(now: now)
+        }
+        XCTAssertEqual(changes.value, 0, "TTL refresh and a no-op prune are not display changes")
+        XCTAssertEqual(f.service.activity(f.key, request: request.requestId, now: now.addingTimeInterval(15.5)), "Reading files", "TTL was extended")
+        f.service.pruneChannelActivity(now: now.addingTimeInterval(17))
+        XCTAssertNil(f.service.activity(f.key, request: request.requestId))
+    }
+
+    func testNoticeAndAutomaticPublicationObserversBecomeQuiet() async throws {
+        let f = try await fixture(), approval = try await automaticRun(f)
+        let original = ChatNotifications.listIds
+        let passes = Counter()
+        ChatNotifications.listIds = { passes.increment(); return [] }
+        let session = try XCTUnwrap(f.service.orgSessions[f.key])
+        ChatNotifications.follow(f.service, session: session)
+        defer { session.noticeWatch = nil; ChatNotifications.listIds = original }
+        try await f.journal.queue.write { try $0.execute(sql: "UPDATE run_commands SET state = 'sent', sent_generation = 'g1' WHERE type = 'run.finished'") }
+        // One external transaction starts F4 and the automatic publisher.
+        try f.write("UPDATE requests SET version = version + 1 WHERE request_id = ?", [approval.requestId])
+        try await wait { try f.store.outbox.commands().contains { $0.type == "result.publish" } }
+        try await Task.sleep(for: .milliseconds(200))
+        let settled = passes.value
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertGreaterThan(settled, 0)
+        XCTAssertEqual(passes.value, settled, "F4/UX1 must settle without external changes")
+        XCTAssertEqual(try f.store.outbox.commands().filter { $0.type == "result.publish" }.count, 1)
+    }
+
+    func testProgressPublicationChangesAreObservedWithoutATimer() async throws {
+        let f = try await fixture(), approval = try await automaticRun(f), m = model(f)
+        let status = try XCTUnwrap(m.sourceStatuses.first { $0.id == approval.requestId })
+        try await Task.sleep(for: .milliseconds(100))
+        let changed = expectation(description: "progress observes cancellation")
+        withObservationTracking { _ = m.sourceStatusWord(status) } onChange: { changed.fulfill() }
+        try f.journal.blockAutomaticRequest(f.key, request: approval.requestId)
+        await fulfillment(of: [changed], timeout: 2)
+        XCTAssertTrue(m.sourceStatusWord(status).contains("automatic publication cancelled"))
+    }
+
+    func testActivityBurstHasOneDisplayUpdateAndExpiresWithoutPollingViews() async throws {
+        let f = try await fixture(), sent = try send(f)
+        let request = try receive(f, request: XCTUnwrap(sent.request), state: "running")
+        let before = f.service.channelActivityRevision
+        for n in 0..<100 {
+            f.service.receiveChannelActivity(org: f.key.orgId, type: "run.activity",
+                body: .object(["request_id": .string(request.requestId), "text": .string("Working \(n)")]))
+        }
+        try await wait { f.service.channelActivityRevision > before }
+        XCTAssertEqual(f.service.channelActivityRevision, before + 1)
+        XCTAssertEqual(f.service.activity(f.key, request: request.requestId), "Working 99")
+        // Bring this entry close to expiry to exercise the real expiry task.
+        f.service.clearChannelActivity()
+        f.service.receiveChannelActivity(org: f.key.orgId, type: "run.activity",
+            body: .object(["request_id": .string(request.requestId), "text": .string("Last")]), now: Date().addingTimeInterval(-14.8))
+        try await wait { f.service.channelActivity.isEmpty }
+        XCTAssertNil(f.service.channelActivityExpiry)
+        let settled = f.service.channelActivityRevision
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertEqual(f.service.channelActivityRevision, settled, "no per-row polling or leftover expiry jobs")
     }
 
     func testMCPFreshHistoryIsPagedAttributedAndNeverMarksUserRead() async throws {
@@ -936,9 +1009,10 @@ final class ChatUX1Tests: XCTestCase {
         workspace.applyConversationId(conversationId: forged, sessionId: surface)
         XCTAssertEqual(tab.conversationId, f.agent.sessionId, "the real B model has the forged A UUID")
         let processes: [SessionProcessScanner.Raw] = [
-            .init(pid: 41, ppid: 1, name: "claude", isForeground: true, startedAtUs: 400),
+            .init(pid: 41, ppid: 1, name: "2.1.291", isForeground: true, startedAtUs: 400),
             .init(pid: 42, ppid: 41, name: "agentpad-cli", isForeground: true, startedAtUs: 420)]
-        let identity = try XCTUnwrap(ChatSessionIdentity.resolve(pid: 42, startedAt: 420, tabs: [ChatSessionIdentity.tab(tab, processes: processes)], identity: { _, _ in true }))
+        let identity = try XCTUnwrap(ChatSessionIdentity.resolve(pid: 42, startedAt: 420, tabs: [ChatSessionIdentity.tab(tab, processes: processes)],
+            identity: { _, _ in true }, signatureVerifier: { $0 == 41 }))
         XCTAssertEqual(identity.surface, tab.id.uuidString.lowercased())
         let author = try f.service.sessionAuthor(f.key, caller: identity, generation: "g1")
         XCTAssertEqual(author.field, "author_session_name"); XCTAssertEqual(author.value, "Tab B")

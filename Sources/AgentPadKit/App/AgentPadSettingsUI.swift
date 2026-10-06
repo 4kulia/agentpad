@@ -232,6 +232,7 @@ final class AgentPadSettingsModel {
     /// false, every agent tab starts fresh — but the persisted conversation
     /// id stays on disk so turning the toggle back on can resume it later.
     var resumeConversations: Bool = true
+    var agentPadPrompt = true
     /// Last agent picked from an "Ask AI" control — drives the split button's
     /// brand mark + plain-click target, the `lastOpenInAppId` model.
     /// Persisted under `agents.lastAsk`.
@@ -402,6 +403,7 @@ final class AgentPadSettingsModel {
         agentOptions = (agents["options"] as? [String: String]) ?? [:]
         defaultAgentId = agents["default"] as? String
         resumeConversations = (agents["resumeConversations"] as? Bool) ?? true
+        agentPadPrompt = AgentPadAgentPrompt.isEnabled(in: parsed)
         lastAskAgentId = agents["lastAsk"] as? String
 
         let ssh = parsed["ssh"] as? [String: Any] ?? [:]
@@ -604,6 +606,7 @@ final class AgentPadSettingsModel {
             && defaultAgentId == nil
             && serialisedCustom.isEmpty
             && resumeConversations  // default-true is the no-op case
+            && agentPadPrompt
             && lastAskAgentId == nil
         if allDefaults {
             parsed.removeValue(forKey: "agents")
@@ -616,6 +619,7 @@ final class AgentPadSettingsModel {
             agents["custom"] = serialisedCustom.isEmpty ? nil : serialisedCustom
             // Only serialise when non-default to keep settings.json lean.
             agents["resumeConversations"] = resumeConversations ? nil : false
+            agents["agentPadPrompt"] = agentPadPrompt ? nil : false
             agents["lastAsk"] = lastAskAgentId
             parsed["agents"] = agents
         }
@@ -1486,6 +1490,21 @@ struct AgentPadSettingsView: View {
                     Toggle("", isOn: $model.resumeConversations)
                         .labelsHidden()
                         .toggleStyle(.switch)
+                }
+                SettingsRow(label: "AgentPad context for Claude Code") {
+                    Toggle("", isOn: $model.agentPadPrompt)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .onChange(of: model.agentPadPrompt) { _, _ in model.scheduleSave() }
+                }
+                SettingsCaption("For new tabs. Replace the built-in context with your own file at ~/Library/Application Support/agentpad/agent-prompt.md. To extend it, copy the built-in text first.")
+                SettingsRow(label: "Built-in context") {
+                    Button("Copy prompt") {
+                        if let url = AgentPadAgentPrompt.builtInURL, let text = try? String(contentsOf: url, encoding: .utf8) {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(text, forType: .string)
+                        }
+                    }
                 }
             }
         }

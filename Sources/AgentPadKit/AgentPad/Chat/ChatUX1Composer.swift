@@ -66,6 +66,9 @@ struct ChatUX1Composer: View {
     }
     private func key(_ code: UInt16, _ modifiers: NSEvent.ModifierFlags) -> Bool {
         if code == 36 && modifiers.contains(.command) { send(); return true }
+        if code == 126, modifiers.intersection([.command, .control, .option, .shift]).isEmpty, text.isEmpty {
+            return model.editLastMessage(root: root, composerText: text)
+        }
         guard !matches.isEmpty else { return false }
         switch code {
         case 125: selected = (selected + 1) % matches.count

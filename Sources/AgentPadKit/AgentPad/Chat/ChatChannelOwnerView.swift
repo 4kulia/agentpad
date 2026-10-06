@@ -17,19 +17,16 @@ final class ChatChannelOwnerModel {
         self.service = service
         self.key = key
         self.channel = channel
+        let changes = CoalescedMainActorAction { [weak self] in self?.revision += 1 }
         if let store = service.orgSessions[key]?.store {
             watch = try? DatabaseRegionObservation(tracking: Table("requests"), Table("request_contents"), Table("channels"),
                                                    Table("teams"), Table("team_members"), Table("members"), Table("agent_channels"), Table("meta"), Table("outbox"), Table("publication_intents"))
-                .start(in: store.queue, onError: { _ in }) { [weak self] _ in
-                    Task { @MainActor in self?.revision += 1 }
-                }
+                .start(in: store.queue, onError: { _ in }) { _ in changes.schedule() }
         }
         if let journal = service.journal {
             journalWatch = try? DatabaseRegionObservation(tracking: Table("runs"), Table("run_commands"), Table("approvals"),
                                                           Table("channel_authorities"), Table("automatic_request_blocks"), Table("org_generations"), Table("assignments"))
-                .start(in: journal.queue, onError: { _ in }) { [weak self] _ in
-                    Task { @MainActor in self?.revision += 1 }
-                }
+                .start(in: journal.queue, onError: { _ in }) { _ in changes.schedule() }
         }
     }
 

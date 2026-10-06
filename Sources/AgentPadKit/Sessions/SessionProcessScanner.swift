@@ -43,7 +43,7 @@ struct SessionProcess: Identifiable, Equatable {
 enum SessionProcessScanner {
     /// Flattened kernel row, split out so the tree logic is testable without
     /// a live pty.
-    struct Raw: Equatable {
+    struct Raw: Equatable, Sendable {
         let pid: pid_t
         let ppid: pid_t
         let name: String

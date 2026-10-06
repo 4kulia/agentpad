@@ -136,6 +136,9 @@ struct ChatFeedView: View {
                 if let last { proxy.scrollTo(last, anchor: .bottom) }
                 readIfLooking()
             }
+            .onChange(of: model.editing?.messageId) { _, id in
+                if let id, model.editing?.root == nil { proxy.scrollTo(id, anchor: .center) }
+            }
             .onAppear {
                 if let last = model.feed.messages.last?.messageId { proxy.scrollTo(last, anchor: .bottom) }
                 // F4: this feed shows while its window is key (review F4-B).
@@ -178,18 +181,24 @@ struct ChatThreadView<Composer: View>: View {
             }
             .padding(10)
             Divider()
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if model.threadHasEarlier {
-                        Button("Earlier replies") { model.earlierReplies() }.buttonStyle(.link)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        if model.threadHasEarlier {
+                            Button("Earlier replies") { model.earlierReplies() }.buttonStyle(.link)
+                        }
+                        ForEach(model.thread) { message in
+                            ChatMessageRow(model: model, message: message, members: members, mentionable: mentionable, me: me,
+                                           archived: archived, replies: 0, inThread: true)
+                            .id(message.messageId)
+                        }
+                        ForEach(model.threadRequests) { card in ChatRequestCardRow(card: card, members: members, ownerModel: ownerModel) }
                     }
-                    ForEach(model.thread) { message in
-                        ChatMessageRow(model: model, message: message, members: members, mentionable: mentionable, me: me,
-                                       archived: archived, replies: 0, inThread: true)
-                    }
-                    ForEach(model.threadRequests) { card in ChatRequestCardRow(card: card, members: members, ownerModel: ownerModel) }
+                    .padding(10)
                 }
-                .padding(10)
+                .onChange(of: model.editing?.messageId) { _, id in
+                    if let id, model.editing?.root == root { proxy.scrollTo(id, anchor: .center) }
+                }
             }
             Divider()
             composer()
@@ -251,7 +260,7 @@ struct WindowReader: NSViewRepresentable {
     }
 }
 
-/// One message: author, time, text and its marks; actions in its menu.
+/// One message, with discoverable hover actions and the same context menu.
 struct ChatMessageRow: View {
     let model: ChatChannelModel
     let message: ChatMessage
@@ -263,9 +272,13 @@ struct ChatMessageRow: View {
     /// F5: requests to agents in its thread.
     var requests = 0
     var inThread = false
-    /// The editor: its text and the revision it was opened on (review F3-p1-1).
-    struct Editing: Equatable { var text: String; let revision: Int; var problem: String? }
-    @State private var editing: Editing?
+    @State private var hovering = false
+    @State private var editSelection = NSRange(location: 0, length: 0)
+    private var editRoot: String? { inThread ? model.threadRoot : nil }
+    private var editing: ChatChannelModel.Editing? {
+        guard model.editing?.messageId == message.messageId, model.editing?.root == editRoot else { return nil }
+        return model.editing
+    }
     /// The revision the deletion's confirmation was opened on.
     @State private var deleting: Int?
 
@@ -308,6 +321,14 @@ struct ChatMessageRow: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(6)
+        .background(hovering ? Color.secondary.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .overlay(alignment: .topTrailing) {
+            if hovering, editing == nil { hoverActions }
+        }
         .contextMenu { menu }
         .confirmationDialog("Delete this message?", isPresented: Binding(get: { deleting != nil && !message.deleted },
                                                                           set: { if !$0 { deleting = nil } })) {
@@ -321,7 +342,7 @@ struct ChatMessageRow: View {
         // Deleted: the editor and its text go too (review F3-p1-2).
         .onChange(of: message.deleted) { _, deleted in
             if deleted {
-                editing = nil
+                if editing != nil { model.cancelEditing() }
                 deleting = nil
             }
         }
@@ -365,7 +386,8 @@ struct ChatMessageRow: View {
                 if local.kind == "edit" {
                     // Again from the version shown now: its revision is the one expected. In an
                     // archived channel it opens to read and copy; Save stays off (review F3d-3).
-                    Button("Edit again") { editing = Editing(text: local.text ?? message.text, revision: message.revision) }
+                    Button("Edit again") { model.beginEditing(message, root: editRoot, recovering: true) }
+                        .disabled(model.editing != nil)
                         .buttonStyle(.link).font(.caption)
                     Button("Copy") {
                         NSPasteboard.general.clearContents()
@@ -380,21 +402,20 @@ struct ChatMessageRow: View {
 
     private var editor: some View {
         VStack(alignment: .trailing) {
-            TextEditor(text: Binding(get: { editing?.text ?? "" }, set: { editing?.text = $0 }))
-                .font(.body)
+            ChatMentionEditor(text: Binding(get: { editing?.text ?? "" }, set: { model.editing?.text = $0 }),
+                              selection: $editSelection, candidates: [], autofocus: true) { code, modifiers in
+                if code == 53 { model.cancelEditing(); return true }
+                if code == 36, modifiers.contains(.command), canSave { save(); return true }
+                return false
+            }
+                .onAppear { editSelection = NSRange(location: ((editing?.text ?? "") as NSString).length, length: 0) }
                 .frame(minHeight: 60, maxHeight: 160)
                 .border(Color.secondary.opacity(0.3))
-                // ⌘↩ of this field only (review F3b-p2-4).
-                .onKeyPress(.return, phases: .down) { press in
-                    guard press.modifiers.contains(.command), canSave else { return .ignored }
-                    save()
-                    return .handled
-                }
             HStack {
                 if let problem = editing?.problem { Text(problem).foregroundStyle(.red).font(.caption) }
                 Spacer()
                 if archived { Text("Archived: it can't be changed").foregroundStyle(.secondary).font(.caption) }
-                Button("Cancel") { editing = nil }
+                Button("Cancel") { model.cancelEditing() }
                 Button("Save") { save() }
                     .disabled(!canSave)
             }
@@ -402,22 +423,54 @@ struct ChatMessageRow: View {
     }
 
     /// Archived, or a change of it still on its way: the text stays, Save waits (review F3b-2, F3b-p2-5).
-    private var canSave: Bool { !archived && !message.changing && !message.deleted }
+    private var canSave: Bool { !archived && model.canEdit(message) }
 
     private func save() {
         guard let now = editing, canSave else { return }
         // Closed only once it went: refused here, the text stays with why (review F3-p2-2).
         if let problem = model.edit(message, to: now.text, revision: now.revision, members: mentionable) {
-            editing?.problem = problem
+            model.editing?.problem = problem
         } else {
-            editing = nil
+            model.cancelEditing()
+        }
+    }
+
+    private var canReply: Bool { message.hasFixed && !message.deleted && message.localState == nil }
+    private var canDelete: Bool { mine && message.hasFixed && !message.deleted && !message.changing && message.localState == nil }
+
+    @ViewBuilder
+    private var hoverActions: some View {
+        if canReply || canDelete {
+            HStack(spacing: 8) {
+                if canReply {
+                    Button { model.openThread(message.threadRootId ?? message.messageId) } label: {
+                        Label("Reply", systemImage: "arrowshape.turn.up.left")
+                    }.help("Reply in thread")
+                }
+                if mine, message.authorAgentId == nil, message.authorSessionName == nil, !archived {
+                    Button { model.beginEditing(message, root: editRoot) } label: {
+                        Label("Edit", systemImage: "pencil")
+                    }.disabled(!model.canEdit(message) || model.editing != nil).help("Edit message")
+                }
+                if canDelete {
+                    Button(role: .destructive) { deleting = message.revision } label: {
+                        Label("Delete", systemImage: "trash")
+                    }.help("Delete message…")
+                }
+            }
+            .font(.caption)
+            .buttonStyle(.borderless)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.25)))
         }
     }
 
     @ViewBuilder
     private var menu: some View {
         if message.hasFixed, !message.deleted {
-            if !inThread, message.threadRootId == nil { Button("Reply in Thread") { model.openThread(message.messageId) } }
+            if canReply { Button("Reply in Thread") { model.openThread(message.threadRootId ?? message.messageId) } }
             Button("Copy") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(message.text, forType: .string)
@@ -425,10 +478,10 @@ struct ChatMessageRow: View {
             if mine {
                 // One change at a time (review F3b-2).
                 // An agent's message is edited by nobody (F8); its owner may delete it.
-                if !archived, !message.changing, message.authorAgentId == nil {
-                    Button("Edit") { editing = Editing(text: message.text, revision: message.revision) }
+                if !archived, model.canEdit(message) {
+                    Button("Edit") { model.beginEditing(message, root: editRoot) }.disabled(model.editing != nil)
                 }
-                if !message.changing { Button("Delete…", role: .destructive) { deleting = message.revision } }
+                if canDelete { Button("Delete…", role: .destructive) { deleting = message.revision } }
             }
         }
     }
@@ -449,6 +502,7 @@ struct ChatComposer: View {
     let mentionable: [(account: String, handle: String)]
     var agents: [ChatChannelAgent] = []
     @State private var text = ""
+    @State private var selection = NSRange(location: 0, length: 0)
     /// The thread (or the channel, nil) whose draft `text` is.
     @State private var loaded: String??
 
@@ -458,16 +512,14 @@ struct ChatComposer: View {
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 4) {
-            TextEditor(text: $text)
-                .font(.body)
-                .frame(minHeight: 44, maxHeight: 140)
-                .scrollContentBackground(.hidden)
-                // ⌘↩ of this field only: the feed's and a thread's composers are apart (review F3b-p2-4).
-                .onKeyPress(.return, phases: .down) { press in
-                    guard press.modifiers.contains(.command) else { return .ignored }
-                    send()
-                    return .handled
+            ChatMentionEditor(text: $text, selection: $selection, candidates: []) { code, modifiers in
+                if code == 36, modifiers.contains(.command) { send(); return true }
+                if code == 126, modifiers.intersection([.command, .control, .option, .shift]).isEmpty {
+                    return model.editLastMessage(root: root, composerText: text)
                 }
+                return false
+            }
+            .frame(minHeight: 44, maxHeight: 140)
             HStack {
                 if let problem = model.problem { Text(problem).foregroundStyle(.red).font(.caption) }
                 Spacer()

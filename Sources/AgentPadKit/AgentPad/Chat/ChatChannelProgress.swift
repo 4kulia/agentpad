@@ -65,18 +65,21 @@ extension ChatService {
     }
 
     func receiveChannelActivity(org: String, type: String, body: ChatJSON, now: Date = Date()) {
+        MainThreadWatchdog.shared.checkpoint()
         guard let key = connection?.orgKey, key.orgId == org, type == "run.activity",
               let id = body["request_id"]?.string, let text = body["text"]?.string,
               let request = try? orgSessions[key]?.store?.calls.request(id), request.kind == "channel", !request.state.isFinal,
               let channel = request.channelId, channelAgentAllowed(key, channel: channel) else { return }
-        channelActivity[id] = ChatChannelActivity(key: key, request: id, text: String(text.prefix(240)), expires: now.addingTimeInterval(15))
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(15))
-            self?.pruneChannelActivity()
-        }
+        let displayText = String(text.prefix(240))
+        let changed = channelActivity[id]?.key != key || channelActivity[id]?.text != displayText
+            || (channelActivity[id]?.expires ?? .distantPast) <= now
+        channelActivity[id] = ChatChannelActivity(key: key, request: id, text: displayText, expires: now.addingTimeInterval(15))
+        if changed { channelActivityChanges.schedule() }
+        scheduleChannelActivityExpiry()
     }
 
     func activity(_ key: ChatOrgKey, request id: String, now: Date = Date()) -> String? {
+        _ = channelActivityRevision
         guard let entry = channelActivity[id], entry.key == key, entry.expires > now, isServerKnown(self, key),
               let request = try? orgSessions[key]?.store?.calls.request(id), !request.state.isFinal,
               let channel = request.channelId, channelAgentAllowed(key, channel: channel) else { return nil }
@@ -84,7 +87,37 @@ extension ChatService {
     }
 
     func pruneChannelActivity(now: Date = Date()) {
-        channelActivity = channelActivity.filter { activity($0.value.key, request: $0.key, now: now) != nil }
+        let kept = channelActivity.filter { activity($0.value.key, request: $0.key, now: now) != nil }
+        if kept.count != channelActivity.count {
+            channelActivity = kept
+            channelActivityRevision += 1
+        }
+        if kept.isEmpty {
+            channelActivityExpiry?.cancel()
+            channelActivityExpiry = nil
+            channelActivityChanges.cancel()
+        }
+        else { scheduleChannelActivityExpiry() }
+    }
+
+    private func scheduleChannelActivityExpiry() {
+        guard channelActivityExpiry == nil, let next = channelActivity.values.map(\.expires).min() else { return }
+        let delay = max(0.01, next.timeIntervalSinceNow)
+        channelActivityExpiry = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self else { return }
+            self.channelActivityExpiry = nil
+            self.pruneChannelActivity()
+        }
+    }
+
+    func clearChannelActivity() {
+        channelActivityExpiry?.cancel()
+        channelActivityExpiry = nil
+        channelActivityChanges.cancel()
+        guard !channelActivity.isEmpty else { return }
+        channelActivity.removeAll()
+        channelActivityRevision += 1
     }
 
     static func channelAction(_ text: String) -> String {
@@ -107,23 +140,21 @@ struct ChatSourceProgress: View {
     var body: some View {
         let statuses = model.sourceStatuses.filter { $0.source == source }
         if !statuses.isEmpty {
-            TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(statuses) { status in
-                        HStack {
-                            Text("\(status.agent) · \(model.service.sourceStatusWord(status, key: model.key))")
-                            if let activity = model.service.activity(model.key, request: status.id, now: timeline.date) { Text(activity).foregroundStyle(.secondary) }
-                            Spacer()
-                            if status.owner == model.key.accountId && ["starting", "running"].contains(status.state) {
-                                Button("Stop") { problem = model.service.askToEnd(model.key, status.id, type: "request.stop", states: [.starting, .running]) }
-                            } else if status.local && status.state == "pending" || status.initiator == model.key.accountId && ["submitted", "awaiting_decision", "approved"].contains(status.state) {
-                                Button("Cancel") { problem = model.service.cancelChannelIntent(model.key, request: status.id) }
-                            }
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(statuses) { status in
+                    HStack {
+                        Text("\(status.agent) · \(model.sourceStatusWord(status))")
+                        if let activity = model.service.activity(model.key, request: status.id) { Text(activity).foregroundStyle(.secondary) }
+                        Spacer()
+                        if status.owner == model.key.accountId && ["starting", "running"].contains(status.state) {
+                            Button("Stop") { problem = model.service.askToEnd(model.key, status.id, type: "request.stop", states: [.starting, .running]) }
+                        } else if status.local && status.state == "pending" || status.initiator == model.key.accountId && ["submitted", "awaiting_decision", "approved"].contains(status.state) {
+                            Button("Cancel") { problem = model.service.cancelChannelIntent(model.key, request: status.id) }
                         }
                     }
-                    if let problem { Text(problem).foregroundStyle(.red) }
-                }.font(.caption).padding(.vertical, 3)
-            }
+                }
+                if let problem { Text(problem).foregroundStyle(.red) }
+            }.font(.caption).padding(.vertical, 3)
         }
     }
 }

@@ -77,6 +77,29 @@ final class HookServerCLITests: XCTestCase {
         XCTAssertEqual(response.appVersion, "test-1.0")
     }
 
+    func testStalledMCPReaderDoesNotBlockMainThread() throws {
+        let received = expectation(description: "received")
+        let pending = PendingBox()
+        startServer(onCLIRequest: { _, _, _, completion in
+            pending.completion = completion
+            received.fulfill()
+        })
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        var size: Int32 = 1024
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
+        XCTAssertEqual(AgentPadHookKit.withUnixSocketAddress(path: socketPath) { connect(fd, $0, $1) }, 0)
+        let line = try XCTUnwrap(AgentPadCLIRequest(verb: .status).encodedLine())
+        XCTAssertEqual(line.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }, line.count)
+        wait(for: [received], timeout: 5)
+        var response = AgentPadCLIResponse(ok: true)
+        response.chatResult = String(repeating: "x", count: 1024 * 1024)
+        let start = ContinuousClock.now
+        pending.completion?(response)
+        XCTAssertLessThan(ContinuousClock.now - start, .milliseconds(250), "a client not reading must never stall the UI")
+    }
+
     func testShellCommandTravelsOverTheSocketInsteadOfThePTY() throws {
         let engine = TestEngine()
         // AgentPad: the shell is this process — the app checks the caller is the

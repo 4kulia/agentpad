@@ -8,26 +8,33 @@ enum ChatSessionTools {
 
     static func handle(_ request: AgentPadCLIRequest, origin: AgentPadCallerOrigin,
                        sessions: @escaping @MainActor () -> [Session], service: ChatService = .shared,
-                       isCallerWaiting: @escaping @MainActor () -> Bool = { true }) async -> AgentPadCLIResponse {
-        guard origin.refusal(for: request) == nil,
-              let caller = ChatSessionIdentity.resolve(origin, sessions: sessions()) else { return failure("unverified_session") }
+                       isCallerWaiting: @escaping @MainActor () -> Bool = { true },
+                       signatureVerifier: @escaping @Sendable (Int32) -> Bool = ChatClaudeProcess.hasTrustedSignature,
+                       scan: @escaping @Sendable (Int32) -> [SessionProcessScanner.Raw] = SessionProcessScanner.identityProcesses,
+                       kernel: ChatSessionIdentity.Kernel = .init()) async -> AgentPadCLIResponse {
         do {
+            let verified = try await ChatSessionIdentity.verify(origin, sessions: sessions(), scan: scan,
+                                                                signatureVerifier: signatureVerifier, kernel: kernel)
             guard let raw = request.chatArguments, raw.utf8.count <= 24 * 1024,
                   let json = try? JSONDecoder().decode(ChatJSON.self, from: Data(raw.utf8)) else { throw Failure(code: "invalid_args") }
-            let result = try await call(json, caller: caller, service: service, isCallerWaiting: isCallerWaiting) {
-                ChatSessionIdentity.resolve(origin, sessions: sessions())?.provenance == caller.provenance
+            let result = try await call(json, caller: verified.caller, service: service, isCallerWaiting: isCallerWaiting) {
+                try ChatSessionIdentity.revalidate(verified, sessions: sessions(), kernel: kernel)
+                return true
             }
+            try ChatSessionIdentity.revalidate(verified, sessions: sessions(), kernel: kernel)
             var response = AgentPadCLIResponse(ok: true)
             response.chatResult = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
             return response
-        } catch let problem as Failure { return failure(problem.code, retryAfter: problem.retryAfter) }
+        } catch let problem as ChatSessionIdentity.VerificationError { return failure(problem.rawValue, message: problem.message) }
+        catch let problem as Failure { return failure(problem.code, retryAfter: problem.retryAfter) }
         catch let ChatAPIError.server(_, code, retryAfter) { return failure(code, retryAfter: retryAfter.map { Int(ceil($0)) }) }
         catch { return failure("not_connected") }
     }
 
-    static func failure(_ code: String, retryAfter: Int? = nil) -> AgentPadCLIResponse {
+    static func failure(_ code: String, retryAfter: Int? = nil, message: String? = nil) -> AgentPadCLIResponse {
         var result: [String: ChatJSON] = ["error": .string(code)]
         if let retryAfter { result["retry_after_seconds"] = .number(Double(retryAfter)) }
+        if let message { result["message"] = .string(message) }
         var response = AgentPadCLIResponse.failure(code)
         response.chatResult = String(decoding: (try? JSONEncoder().encode(ChatJSON.object(result))) ?? Data(), as: UTF8.self)
         return response
@@ -35,7 +42,7 @@ enum ChatSessionTools {
 
     static func call(_ json: ChatJSON, caller: ChatLocalCaller, service: ChatService,
                      isCallerWaiting: @escaping @MainActor () -> Bool = { true },
-                     revalidate: @escaping @MainActor () -> Bool) async throws -> ChatJSON {
+                     revalidate: @escaping @MainActor () throws -> Bool) async throws -> ChatJSON {
         guard case .object(let args) = json, let tool = args["tool"]?.string else { throw Failure(code: "invalid_args") }
         let allowed: Set<String>
         switch tool {
@@ -44,7 +51,7 @@ enum ChatSessionTools {
         case "chat_post": allowed = ["tool", "org_id", "channel_id", "thread_root_id", "text", "message_id"]
         default: throw Failure(code: "unsupported")
         }
-        guard Set(args.keys).isSubset(of: allowed), isCallerWaiting(), !Task.isCancelled, revalidate(), let connection = service.connection,
+        guard Set(args.keys).isSubset(of: allowed), try revalidate(), isCallerWaiting(), !Task.isCancelled, let connection = service.connection,
               service.state == .signedIn, let token = service.token else { throw Failure(code: "not_connected") }
         func uuid(_ key: String, optional: Bool = false) throws -> String? {
             guard let value = args[key] else {
@@ -66,8 +73,8 @@ enum ChatSessionTools {
             (try String.fetchOne(db, sql: "SELECT generation FROM meta WHERE id = 1"),
              try Int.fetchOne(db, sql: "SELECT channel_access_epoch FROM meta WHERE id = 1") ?? -1)
         }
-        func current() -> Bool {
-            guard isCallerWaiting(), !Task.isCancelled, revalidate(), service.state == .signedIn, let now = service.connection,
+        func cacheIsCurrent() -> Bool {
+            guard isCallerWaiting(), !Task.isCancelled, service.state == .signedIn, let now = service.connection,
                   now.server == connection.server, now.accountId == connection.accountId, now.sessionId == connection.sessionId,
                   service.isServerKnown(service, key), ChatNotifications.allowed(service, key, channel: channel) else { return false }
             return (try? store.queue.read { db in
@@ -75,14 +82,20 @@ enum ChatSessionTools {
                     && Int.fetchOne(db, sql: "SELECT channel_access_epoch FROM meta WHERE id = 1") == stamp.1
             }) == true
         }
-        guard current() else { throw Failure(code: "not_found") }
+        func current() throws -> Bool {
+            guard cacheIsCurrent() else { return false }
+            // Kernel identity follows the synchronous rights/DB read:
+            // no suspension between this guard and queuing/returning data.
+            return try revalidate()
+        }
+        guard try current() else { throw Failure(code: "not_found") }
         let api = service.makeAPI(connection.server)
         var result: ChatJSON
         switch tool {
         case "chat_channels":
             if let after = args["after"], after.string == nil || (after.string?.utf8.count ?? 0) > 512 { throw Failure(code: "invalid_args") }
             let page = try await api.channelsPage(org, after: args["after"]?.string, token: token)
-            guard current() else { throw Failure(code: "not_found") }
+            guard try current() else { throw Failure(code: "not_found") }
             let names = try await store.queue.read { db -> [String: String] in
                 Dictionary(uniqueKeysWithValues: try Row.fetchAll(db, sql: "SELECT team_id, name FROM teams WHERE mine = 1").map { ($0["team_id"], $0["name"]) })
             }
@@ -99,7 +112,7 @@ enum ChatSessionTools {
                 before = Int(number)
             }
             let page = try await api.messagesPage(org, channel: channel, root: root, before: before, token: token)
-            guard current(), page.messages.count <= 100 else { throw Failure(code: "not_found") }
+            guard try current(), page.messages.count <= 100 else { throw Failure(code: "not_found") }
             // No cache writes and no user read-mark changes.
             result = .object(["org_id": .string(org), "channel_id": .string(channel),
                 "thread_root_id": root.map(ChatJSON.string) ?? .null,
@@ -112,19 +125,19 @@ enum ChatSessionTools {
             // A fresh authenticated read makes access current even on an exact
             // repeat; the post command itself validates the root/author atomically.
             _ = try await api.messagesPage(org, channel: channel, root: root, before: nil, token: token)
-            guard current() else { throw Failure(code: "not_found") }
+            guard try current() else { throw Failure(code: "not_found") }
             let command = try service.queueSessionPost(key, caller: caller, generation: generation, message: id,
                                                        channel: channel, root: root, text: text)
             let until = Date().addingTimeInterval(2)
             repeat {
-                guard current() else { throw Failure(code: "not_found") }
+                guard try current() else { throw Failure(code: "not_found") }
                 if let outcome = try service.sessionPostOutcome(key, message: id, command: command) { return outcome }
                 try await Task.sleep(for: .milliseconds(50))
             } while Date() < until
             result = .object(["status": .string("pending"), "message_id": .string(id), "org_id": .string(org),
                 "channel_id": .string(channel), "thread_root_id": root.map(ChatJSON.string) ?? .null])
         }
-        guard current() else { throw Failure(code: "not_found") }
+        guard try current() else { throw Failure(code: "not_found") }
         guard try JSONEncoder().encode(result).count <= 1024 * 1024 else { throw Failure(code: "too_large") }
         return result
     }

@@ -17,6 +17,7 @@ final class ChatChannelModel {
         /// More is kept in the cache below what shows, or the server has more.
         var hasOlder = false
         var historyNext: Int?
+        var archived = true
     }
 
     let key: ChatOrgKey
@@ -25,6 +26,16 @@ final class ChatChannelModel {
     private(set) var thread: [ChatMessage] = []
     private(set) var threadRoot: String?
     private(set) var threadHasEarlier = false
+    /// Shared by the feed and thread, including a root visible in both.
+    struct Editing: Equatable {
+        let messageId: String
+        let root: String?
+        var text: String
+        let revision: Int
+        var problem: String?
+    }
+    var editing: Editing?
+    @ObservationIgnored private var editingObservation: AnyDatabaseCancellable?
     /// F5: the requests to agents in the thread open.
     private(set) var threadRequests: [ChatChannelRequests.Card] = []
     /// The last problem of an action, in words.
@@ -34,7 +45,10 @@ final class ChatChannelModel {
     private(set) var offers: [ChatChannelAsk.Offer] = []
     private(set) var asks: [ChatChannelAsk.Asked] = []
     private(set) var sourceStatuses: [ChatSourceStatus] = []
+    private var sourceStatusRevision = 0
     @ObservationIgnored private var statusObservation: AnyDatabaseCancellable?
+    @ObservationIgnored private var statusDetailsWatch: AnyDatabaseCancellable?
+    @ObservationIgnored private var statusJournalWatch: AnyDatabaseCancellable?
 
     /// How many root messages show; grows by `page` as the user scrolls up.
     private(set) var shown = 50
@@ -65,15 +79,33 @@ final class ChatChannelModel {
         observeFeed()
         let channel = channel
         asksObservation = ValueObservation.tracking { db in try ChatChannelAsk.asks(db, channel: channel) }
+            .removeDuplicates()
             .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] asks in self?.asks = asks }
         statusObservation = ValueObservation.tracking { db in try ChatSourceStatus.read(db, channel: channel) }
+            .removeDuplicates()
             .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] statuses in self?.sourceStatuses = statuses }
+        // The progress row used to poll these details every second, including
+        // finished runs. Follow publication/cancellation changes instead.
+        let details = CoalescedMainActorAction { [weak self] in self?.sourceStatusRevision += 1 }
+        statusDetailsWatch = DatabaseRegionObservation(tracking: Table("outbox"), Table("publication_intents"))
+            .start(in: store.queue, onError: { _ in }) { _ in details.schedule() }
+        statusJournalWatch = nil
+        if let journal = service.journal {
+            statusJournalWatch = DatabaseRegionObservation(tracking: Table("runs"), Table("approvals"), Table("automatic_request_blocks"))
+                .start(in: journal.queue, onError: { _ in }) { _ in details.schedule() }
+        }
+    }
+
+    func sourceStatusWord(_ status: ChatSourceStatus) -> String {
+        _ = sourceStatusRevision
+        return service.sourceStatusWord(status, key: key)
     }
 
     private func observeFeed() {
         guard let store else { return }
         let channel = channel, shown = shown
         feedObservation = ValueObservation.tracking { db in try Self.readFeed(db, channel: channel, shown: shown) }
+            .removeDuplicates()
             .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] feed in
                 self?.feed = feed
                 self?.completeShown(feed.messages)
@@ -105,7 +137,8 @@ final class ChatChannelModel {
         }
         let next: Int? = window?["history_next"]
         return Feed(messages: rows + local, replies: replies, requests: try ChatChannelRequests.counts(db, channel: channel, roots: ids),
-                    hasOlder: older || next != nil, historyNext: next)
+                    hasOlder: older || next != nil, historyNext: next,
+                    archived: try Bool.fetchOne(db, sql: "SELECT archived FROM channels WHERE channel_id = ?", arguments: [channel]) ?? true)
     }
 
     /// A message that shows as a placeholder or with a newer revision known
@@ -138,6 +171,7 @@ final class ChatChannelModel {
     }
 
     func openThread(_ root: String?) {
+        if let editing, editing.root != nil, editing.root != root { cancelEditing() }
         threadRoot = root
         threadObservation = nil
         threadRequestsObservation = nil
@@ -146,11 +180,12 @@ final class ChatChannelModel {
         guard let root, let store else { return }
         let channel = channel
         threadRequestsObservation = ValueObservation.tracking { db in try ChatChannelRequests.read(db, channel: channel, root: root) }
+            .removeDuplicates()
             .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] cards in
                 guard let self, self.threadRoot == root else { return }
                 self.threadRequests = cards
             }
-        threadObservation = ValueObservation.tracking { db -> ([ChatMessage], Bool, Bool) in
+        let observation = ValueObservation.tracking { db -> ([ChatMessage], Bool, Bool) in
             let cursor = try Row.fetchOne(db, sql: "SELECT next, shown_from FROM thread_cursors WHERE channel_id = ? AND root_id = ?",
                                           arguments: [channel, root])
             let from: Int = cursor?["shown_from"] ?? Int.max
@@ -161,6 +196,9 @@ final class ChatChannelModel {
                 """, arguments: [root, root, min(from, bottom)]).map(ChatMessage.init(row:))
             return (rows, cursor != nil, (cursor?["next"] as Int?) != nil)
         }
+        threadObservation = observation.removeDuplicates(by: { lhs, rhs in
+            lhs.0 == rhs.0 && lhs.1 == rhs.1 && lhs.2 == rhs.2
+        })
         .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] value in
             guard let self, self.threadRoot == root else { return }
             self.thread = value.0
@@ -234,6 +272,55 @@ final class ChatChannelModel {
             problem = "Not sent: \(error.localizedDescription)"
             return false
         }
+    }
+
+    func canEdit(_ message: ChatMessage) -> Bool {
+        !feed.archived && message.channelId == channel && message.authorAccountId == key.accountId
+            && message.authorAgentId == nil && message.authorSessionName == nil && message.seq != nil && message.hasFixed && message.hasMutable
+            && !message.deleted && !message.loading && !message.changing && message.localState == nil
+    }
+
+    /// Only messages in the visible conversation, ordered by server sequence.
+    /// Whitespace is a draft too: the shortcut requires a literally empty field.
+    func lastEditableMessage(root: String?) -> ChatMessage? {
+        guard editing == nil, root == nil || root == threadRoot else { return nil }
+        return (root == nil ? feed.messages : thread).filter { message in
+            canEdit(message) && (root.map { message.threadRootId == $0 || message.messageId == $0 }
+                ?? (message.threadRootId == nil))
+        }.max { ($0.seq ?? 0) < ($1.seq ?? 0) }
+    }
+
+    @discardableResult
+    func editLastMessage(root: String?, composerText: String) -> Bool {
+        guard composerText.isEmpty, let message = lastEditableMessage(root: root) else { return false }
+        return beginEditing(message, root: root)
+    }
+
+    @discardableResult
+    func beginEditing(_ shown: ChatMessage, root: String?, recovering: Bool = false) -> Bool {
+        guard editing == nil, let current = message(shown.messageId) else { return false }
+        // Failed edits remain available to read/copy after archival (F3d-3).
+        let recoverable = recovering && current.localEdit?.kind == "edit" && current.localEdit?.state == "failed"
+            && current.authorAccountId == key.accountId && current.authorAgentId == nil && current.authorSessionName == nil && !current.deleted
+        guard canEdit(current) || recoverable else { return false }
+        editing = Editing(messageId: current.messageId, root: root,
+                          text: recoverable ? current.localEdit?.text ?? current.text : current.text,
+                          revision: current.revision)
+        if let store {
+            let id = current.messageId
+            editingObservation = ValueObservation.tracking { db in
+                try Row.fetchOne(db, sql: "\(ChatMessages.select) WHERE m.message_id = ?", arguments: [id]).map(ChatMessage.init(row:))
+            }.start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] message in
+                // A new revision does not replace the editor's original revision or draft.
+                if message == nil || message?.deleted == true { self?.cancelEditing() }
+            }
+        }
+        return true
+    }
+
+    func cancelEditing() {
+        editing = nil
+        editingObservation = nil
     }
 
     /// Nil when the edit went to the queue; else why not — the editor then
@@ -324,6 +411,7 @@ final class ChatChannelModel {
     /// The feed shows at its end in front of the user: read up to its last
     /// root; notices of what is read go.
     func markRead() {
+        MainThreadWatchdog.shared.checkpoint()
         // Up to the last message wholly known, never past a placeholder (review F4c-1).
         let known = feed.messages.filter { $0.seq != nil }
         let firstUnknown = known.filter { !$0.hasFixed }.compactMap(\.seq).min()

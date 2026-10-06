@@ -93,7 +93,7 @@ final class ChatFeed: ChatSocketLifecycle {
     /// Everything stops: the socket, the streams, the organization's sync and
     /// its queue's sending; nothing of this feed reaches the network again.
     func stop() {
-        service?.channelActivity.removeAll()
+        service?.clearChannelActivity()
         stopped = true
         starting?.cancel()
         account.stop()
@@ -131,7 +131,7 @@ final class ChatFeed: ChatSocketLifecycle {
     }
 
     func socketDisconnected() {
-        service?.channelActivity.removeAll()
+        service?.clearChannelActivity()
         session?.outbox?.hold()
     }
 

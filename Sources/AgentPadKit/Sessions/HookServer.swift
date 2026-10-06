@@ -471,10 +471,17 @@ final class HookServer {
     }
 
     private nonisolated static func writeCLIResponseAndClose(_ response: AgentPadCLIResponse, fd: Int32) {
-        writeResponseAndClose(response.encodedLine(), fd: fd)
+        DispatchQueue.global(qos: .userInitiated).async {
+            writeResponseAndClose(response.encodedLine(), fd: fd)
+        }
     }
 
     private nonisolated static func writeResponseAndClose(_ line: Data?, fd: Int32) {
+        // Shell replies also enter here from dispatch() on the main actor.
+        if Thread.isMainThread {
+            DispatchQueue.global(qos: .userInitiated).async { writeResponseAndClose(line, fd: fd) }
+            return
+        }
         defer { close(fd) }
         guard let line else { return }
         let deadline = ContinuousClock.now + .seconds(3)

@@ -696,6 +696,22 @@ final class ChatMessagesTests: XCTestCase {
         try await waitUntil("read again") { (try? self.row(store, "m7"))?.text == "two" }
     }
 
+    func testSingleReadRetryCannotBeWokenIntoABusyLoop() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m7", seq: 7, text: "one")], head: 7))
+        let (service, _) = try await started(answers)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        try await waitUntil("snapshot") { !sync.needsSnapshot }
+        sync.oneRetryDelay = { _ in 1 }
+        answers.set("/v1/orgs/\(org)/channels/\(channel)/messages?before=8", #"{"error":"internal"}"#, status: 500)
+        sync.readOne(channel, id: "m7", seq: 7, atLeast: 2)
+        try await waitUntil("first read") { ChatStubProtocol.seen.contains { $0.request.url?.query == "before=8" } }
+        for _ in 0..<100 { sync.readOne(channel, id: "m7", seq: 7, atLeast: 2) }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(ChatStubProtocol.seen.filter { $0.request.url?.query == "before=8" }.count, 1)
+        sync.stop()
+    }
+
     /// A channel that came on a later channels page is followed once the pages are in (review F3b-p1-5).
     func testAChannelOfALaterPageIsFollowed() async throws {
         let answers = Answers()
@@ -1246,5 +1262,91 @@ final class ChatMessagesTests: XCTestCase {
         let other = ChatOrgKey(server: server, accountId: self.other, orgId: org)
         XCTAssertTrue(ChatNotifications.stillDue(ChatNotifications.requestId(key, "r1"), service))
         XCTAssertFalse(ChatNotifications.stillDue(ChatNotifications.requestId(other, "r1"), service))
+    }
+}
+
+// Release 1.1.2: hover and keyboard editing share one model-owned editor.
+extension ChatMessagesTests {
+    func testEditLastSelectsOwnMessageInTheCurrentConversation() throws {
+        let agent = message("agent", seq: 40, author: me).replacingOccurrences(of: "\"mentions\":[]", with: "\"author_agent_id\":\"bot\",\"mentions\":[]")
+        let signature = message("signature", seq: 45, author: me).replacingOccurrences(of: "\"mentions\":[]", with: "\"author_session_name\":\"Claude tab\",\"mentions\":[]")
+        let store = try store([
+            message("root", seq: 1, author: me), message("mine", seq: 10, author: me),
+            message("other", seq: 20), message("reply", seq: 30, root: "root", author: me),
+            agent, signature, message("deleted", seq: 50, deleted: true, author: me),
+            message("other-thread", seq: 60, root: "mine", author: me)
+        ], head: 60)
+        let model = ChatChannelModel(key: key, channel: channel)
+        model.follow(store)
+        XCTAssertEqual(model.lastEditableMessage(root: nil)?.messageId, "mine")
+        XCTAssertNil(model.lastEditableMessage(root: "root"), "a closed thread is not the current conversation")
+        model.openThread("root")
+        XCTAssertEqual(model.lastEditableMessage(root: "root")?.messageId, "reply")
+        XCTAssertFalse(model.editLastMessage(root: nil, composerText: " "))
+        XCTAssertFalse(model.editLastMessage(root: nil, composerText: "draft"))
+        XCTAssertTrue(model.editLastMessage(root: "root", composerText: ""))
+        XCTAssertEqual(model.editing?.messageId, "reply")
+        XCTAssertFalse(model.editLastMessage(root: nil, composerText: ""), "one editor across feed and thread")
+        XCTAssertFalse(model.beginEditing(try XCTUnwrap(model.message("root")), root: nil))
+        model.openThread(nil)
+        XCTAssertNil(model.editing, "closing the thread releases its editor")
+        XCTAssertTrue(model.editLastMessage(root: nil, composerText: ""))
+        XCTAssertEqual(model.editing?.messageId, "mine")
+    }
+
+    func testEditLastSkipsIncompleteLocalAndChangingMessages() throws {
+        let store = try store((1...8).map { message("m\($0)", seq: $0, author: me) }, head: 8)
+        let bytes = try ChatCommandEnvelope(commandId: "cmd", org: org, type: "message.edit", args: .object([:])).encoded()
+        _ = try store.outbox.enqueue(ChatCommandRecord(commandId: "cmd", sessionId: "s", type: "message.edit", bodyBytes: bytes,
+                                                       orderKey: org, dependsOn: nil, createdAt: Date(), state: .pending))
+        try store.queue.write { db in
+            try db.execute(sql: "UPDATE messages SET has_fixed = 0 WHERE message_id = 'm3'")
+            try db.execute(sql: "UPDATE messages SET has_mutable = 0 WHERE message_id = 'm4'")
+            try db.execute(sql: "UPDATE messages SET stale = 2 WHERE message_id = 'm5'")
+            try db.execute(sql: "UPDATE messages SET local_state = 'sending' WHERE message_id = 'm6'")
+            try db.execute(sql: "UPDATE messages SET local_state = 'failed' WHERE message_id = 'm7'")
+            try db.execute(sql: "INSERT INTO local_edits (message_id, channel_id, kind, text, command_id, state) VALUES ('m8', ?, 'edit', 'pending', 'cmd', 'saving')", arguments: [self.channel])
+        }
+        let model = ChatChannelModel(key: key, channel: channel)
+        model.follow(store)
+        XCTAssertEqual(model.lastEditableMessage(root: nil)?.messageId, "m2")
+        var candidate = try XCTUnwrap(model.message("m2"))
+        candidate.channelId = "elsewhere"
+        XCTAssertFalse(model.canEdit(candidate))
+    }
+
+    func testEditLastDoesNothingWithoutOwnMessagesOrInArchive() async throws {
+        let store = try store([message("other", seq: 1)])
+        let model = ChatChannelModel(key: key, channel: channel)
+        model.follow(store)
+        XCTAssertFalse(model.editLastMessage(root: nil, composerText: ""))
+        let incoming = wire(message("mine", seq: 2, author: me)), channel = channel
+        try await store.queue.write { db in
+            try ChatMessages.write(db, incoming)
+            try db.execute(sql: "UPDATE channels SET archived = 1 WHERE channel_id = ?", arguments: [channel])
+        }
+        try await waitUntil { model.feed.archived }
+        XCTAssertFalse(model.editLastMessage(root: nil, composerText: ""))
+        XCTAssertFalse(model.beginEditing(try XCTUnwrap(model.message("mine")), root: nil))
+    }
+
+    func testEditorKeepsOpeningRevisionAndClearsOnDeletion() async throws {
+        let store = try store([message("mine", seq: 1, author: me)])
+        let model = ChatChannelModel(key: key, channel: channel)
+        model.follow(store)
+        let old = try XCTUnwrap(model.message("mine"))
+        let second = wire(message("mine", seq: 1, text: "second", revision: 2, author: me))
+        try await store.queue.write { db in try ChatMessages.write(db, second) }
+        XCTAssertTrue(model.beginEditing(old, root: nil))
+        XCTAssertEqual(model.editing?.revision, 2, "snapshot at opening, not when the row was rendered")
+        model.editing?.text = "my draft"
+        let third = wire(message("mine", seq: 1, text: "third", revision: 3, author: me))
+        try await store.queue.write { db in try ChatMessages.write(db, third) }
+        try await waitUntil { model.feed.messages.first?.revision == 3 }
+        XCTAssertEqual(model.editing?.revision, 2)
+        XCTAssertEqual(model.editing?.text, "my draft")
+        let deleted = wire(message("mine", seq: 1, revision: 4, deleted: true, author: me))
+        try await store.queue.write { db in try ChatMessages.write(db, deleted) }
+        try await waitUntil { model.editing == nil }
     }
 }

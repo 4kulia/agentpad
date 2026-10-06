@@ -745,6 +745,7 @@ enum AgentPadShellIntegration {
             // well-known capability profile.
             "TERM": "xterm-256color",
         ]
+        env.merge(AgentPadAgentPrompt.environment(settings: AgentPadSettings.loadParsed() ?? [:])) { _, new in new }
         // Preserve the user's original ZDOTDIR (if they had one — rare, mostly
         // dotfile organizers). The wrapper rc consumes this to restore ZDOTDIR
         // after sourcing ~/.zshrc; child installer scripts then see the real
@@ -1652,10 +1653,35 @@ enum AgentPadShellIntegration {
             done
             unset _agentpad_arg
         fi
+        # Personal tabs only. Executors bypass this shim and have their own
+        # context. Probe the actual binary's flag, not a guessed minimum version.
+        # The alarm bounds even a broken --help; failure leaves launch unchanged.
+        _agentpad_prompt=()
+        _agentpad_prompt_path="$AGENTPAD_AGENT_PROMPT_PATH"
+        if [[ -f "$AGENTPAD_AGENT_PROMPT_OVERRIDE" && -r "$AGENTPAD_AGENT_PROMPT_OVERRIDE" ]]; then
+            _agentpad_prompt_path="$AGENTPAD_AGENT_PROMPT_OVERRIDE"
+        fi
+        for _agentpad_arg in "$@"; do
+            [[ "$_agentpad_arg" == "--" ]] && break
+            case "$_agentpad_arg" in
+                --bare|--help|-h|--version|-v|--system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*|--append-system-prompt|--append-system-prompt=*|--append-system-prompt-file|--append-system-prompt-file=*)
+                    _agentpad_prompt_path=""; break ;;
+            esac
+        done
+        if [[ -n "$AGENTPAD_SURFACE_ID" && -f "$_agentpad_prompt_path" && -r "$_agentpad_prompt_path" ]]; then
+            if _agentpad_help="$(/usr/bin/perl -e 'alarm 2; exec @ARGV or exit 127' "$real" --help </dev/null 2>/dev/null)" \
+                && printf '%s' "$_agentpad_help" | /usr/bin/grep -Eq -- '(^|[[:space:],])--append-system-prompt([[:space:]=]|$)'; then
+                _agentpad_prompt_text="$(/bin/cat "$_agentpad_prompt_path" 2>/dev/null)"
+                if [[ -n "$_agentpad_prompt_text" ]]; then
+                    _agentpad_prompt=(--append-system-prompt "$_agentpad_prompt_text")
+                fi
+            fi
+        fi
+        unset _agentpad_help _agentpad_prompt_text _agentpad_prompt_path _agentpad_arg
         if [[ -n "$AGENTPAD_SURFACE_ID" && -n "$AGENTPAD_HOOKS_PATH" ]]; then
-            "$real" ${_agentpad_team[@]+"${_agentpad_team[@]}"} --settings "$AGENTPAD_HOOKS_PATH" "$@"
+            "$real" ${_agentpad_team[@]+"${_agentpad_team[@]}"} --settings "$AGENTPAD_HOOKS_PATH" ${_agentpad_prompt[@]+"${_agentpad_prompt[@]}"} "$@"
         else
-            "$real" "$@"
+            "$real" ${_agentpad_prompt[@]+"${_agentpad_prompt[@]}"} "$@"
         fi
         status=$?
         \(agentMarkerCommand(slug: "claude", event: .ended))

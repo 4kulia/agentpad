@@ -107,6 +107,26 @@ final class TeamMCPServerTests: XCTestCase {
         XCTAssertTrue(app.requests.isEmpty)
     }
 
+    func testChannelVerificationFailureKeepsActionableMessageInMCP() throws {
+        let app = FakeApp(), out = Output(), server = makeServer(app, out)
+        let message = "The calling process has ended or cannot be verified. Restart Claude in this tab and retry."
+        app.answer = { _ in
+            var response = AgentPadCLIResponse.failure("session_process_unavailable")
+            response.chatResult = String(decoding: try! JSONSerialization.data(withJSONObject: [
+                "error": "session_process_unavailable", "message": message]), as: UTF8.self)
+            return response
+        }
+        call(server, id: 1, method: "initialize")
+        call(server, id: 2, method: "tools/call", params: ["name": "chat_channels", "arguments": [String: String]()])
+        let reply = try wait(out, for: 2)
+        let result = try XCTUnwrap(reply["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, true)
+        XCTAssertEqual((result["structuredContent"] as? [String: Any])?["message"] as? String, message)
+        let content = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text(reply).utf8)) as? [String: Any])
+        XCTAssertEqual(content["message"] as? String, message)
+        XCTAssertEqual(content["error"] as? String, "session_process_unavailable")
+    }
+
     func testChatPostImmediatelyForwardsCanonicalArgumentsAndPendingResult() throws {
         let app = FakeApp(), out = Output()
         app.answer = { request in

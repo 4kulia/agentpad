@@ -39,6 +39,7 @@ enum ChatUnread {
             try db.execute(sql: """
                 INSERT INTO read_marks (channel_id, last_read_seq) VALUES (?, ?)
                 ON CONFLICT(channel_id) DO UPDATE SET last_read_seq = MAX(last_read_seq, excluded.last_read_seq)
+                WHERE excluded.last_read_seq > read_marks.last_read_seq
                 """, arguments: [channel, seq])
         }
         let filter = root == nil ? "seq <= ?" : "object_id IN (SELECT message_id FROM messages WHERE thread_root_id = ? OR message_id = ?)"
@@ -52,6 +53,7 @@ enum ChatUnread {
         try db.execute(sql: """
             INSERT INTO read_marks (channel_id, last_read_seq, muted) VALUES (?, 0, ?)
             ON CONFLICT(channel_id) DO UPDATE SET muted = excluded.muted
+            WHERE read_marks.muted != excluded.muted
             """, arguments: [channel, muted])
     }
 

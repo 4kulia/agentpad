@@ -110,7 +110,14 @@ final class ChatService {
     var followsFeed = false
     /// Negotiated on each connection; never inferred from cached data.
     var serverCapabilities: [ChatServerAddress: Set<String>] = [:]
-    var channelActivity: [String: ChatChannelActivity] = [:]
+    // TTL refreshes are bookkeeping, not SwiftUI changes. The display revision
+    // is coalesced and expires via one task for the whole service.
+    @ObservationIgnored var channelActivity: [String: ChatChannelActivity] = [:]
+    var channelActivityRevision = 0
+    @ObservationIgnored var channelActivityExpiry: Task<Void, Never>?
+    @ObservationIgnored lazy var channelActivityChanges = CoalescedMainActorAction(delay: 0.25) { [weak self] in
+        self?.channelActivityRevision += 1
+    }
 
     func supports(_ capability: String, key: ChatOrgKey) -> Bool {
         serverCapabilities[key.server]?.contains(capability) == true

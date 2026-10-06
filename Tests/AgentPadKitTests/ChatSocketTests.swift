@@ -444,6 +444,22 @@ final class ChatSocketTests: XCTestCase {
         socket.stop()
     }
 
+    func testFailedConnectionsRespectTheirRetryPause() async throws {
+        let sink = FakeSink([org: 0])
+        let socket = socket(sink, streams: [org])
+        socket.retryDelay = { _ in 1 }
+        socket.start()
+        defer { socket.stop() }
+        try await waitUntil { self.transports.count == 1 }
+        transport.push(.closed(code: 1006))
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(transports.count, 1, "no immediate reconnect after failure")
+        try await waitUntil { self.transports.count == 2 }
+        transport.push(.closed(code: 1006))
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(transports.count, 2, "the next failure also waits")
+    }
+
     /// C3-17: an event that could not be written is not passed: the stream is
     /// followed again from its cursor, and `subscribed` behind the cursor is not ready.
     func testUnwrittenEventIsFollowedAgain() async throws {

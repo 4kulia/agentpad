@@ -98,6 +98,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     public override init() { super.init() }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        MainThreadWatchdog.shared.start()
+        MainThreadWatchdog.shared.checkpoint()
         AgentPadFonts.registerOnce()
         // MUST STAY ABOVE ANY UI CONSTRUCTION — `restoreWindows()` below is the
         // near neighbour that would break it. NSToolTipManager reads this delay
@@ -1152,6 +1154,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
+        MainThreadWatchdog.shared.stop()
         // AgentPad: a colleague's call running here must not outlive the app
         // that enforces its time limit and Stop button.
         // AgentPad: server-mode runs end with their outcome and fact in the journal (D11).
@@ -1234,8 +1237,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             selfRow("Rename Workspace…", #selector(handleRenameWorkspace), "r", modifiers: [.command, .shift]),
         ])))
 
-        // Edit menu — first-responder selectors so libghostty's NSResponder
-        // implementation handles copy/paste inside the surface.
+        // Edit menu — first-responder selectors implemented by our surface
+        // view (libghostty itself has no NSResponder). Text editors keep their
+        // native handlers when they own focus.
         mainMenu.addItem(submenu(buildMenu(title: "Edit", entries: [
             responderRow("Cut", #selector(NSText.cut(_:)), "x"),
             responderRow("Copy", #selector(NSText.copy(_:)), "c"),
