@@ -571,6 +571,39 @@ final class ChatMessagesTests: XCTestCase {
         XCTAssertTrue(body.contains("\"expected_revision\":1"), body)
     }
 
+    func testResumedEditSavesOriginalRevisionAndFinishesOnlyAfterQueueing() async throws {
+        let answers = Answers(), mine = "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b66"
+        answers.set("/v1/orgs/\(org)/state", state([message("root", seq: 1),
+            message(mine, seq: 7, text: "original", revision: 2, root: "root", author: me)], head: 7))
+        let (service, _) = try await started(answers)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        try await waitUntil("snapshot") { !sync.needsSnapshot }
+        sync.stop()
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let model = ChatChannelModel(key: key, channel: channel); model.service = service; model.follow(store)
+        model.openThread("root")
+        XCTAssertTrue(model.beginEditing(try XCTUnwrap(model.message(mine)), root: "root"))
+        model.editing?.text = " "
+        XCTAssertFalse(model.saveEditing(members: []))
+        XCTAssertNotNil(model.editing?.problem)
+        model.openThread(nil)
+        let newer = wire(message(mine, seq: 7, text: "changed elsewhere", revision: 3, root: "root", author: me))
+        try await store.queue.write { _ = try ChatMessages.write($0, newer) }
+        model.openThread("root")
+        try await waitUntil { model.editing?.message.revision == 3 }
+        XCTAssertEqual(model.editing?.text, " "); XCTAssertEqual(model.editing?.revision, 2)
+        XCTAssertNotNil(model.editing?.problem)
+        model.editing?.text = "resumed edit"
+        XCTAssertTrue(model.saveEditing(members: []))
+        XCTAssertNil(model.editing)
+        model.openThread(nil); model.openThread("root"); XCTAssertNil(model.editing)
+        let commands = try store.outbox.commands()
+        let command = try XCTUnwrap(commands.first { $0.type == "message.edit" })
+        let body = try JSONDecoder().decode(ChatCommandEnvelope.self, from: command.bodyBytes)
+        XCTAssertEqual(body.args["expected_revision"]?.int, 2)
+        XCTAssertEqual(body.args["text"]?.string, "resumed edit")
+    }
+
     /// A message read alone again once a newer revision is known — not once
     /// per life (review F3-p1-4).
     func testAMessageIsReadAgainForANewerRevision() async throws {
@@ -1348,5 +1381,241 @@ extension ChatMessagesTests {
         let deleted = wire(message("mine", seq: 1, revision: 4, deleted: true, author: me))
         try await store.queue.write { db in try ChatMessages.write(db, deleted) }
         try await waitUntil { model.editing == nil }
+    }
+}
+
+// UX2 A4 / B1 compatibility: real synchronizer, cache window and tab draft.
+extension ChatMessagesTests {
+    func testUnknownChannelEventsReadOnlyTheirChannel() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("old", seq: 1, author: me)], before: 1))
+        let (service, transport) = try await started(answers)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let snapshots = sync.snapshots, originalWindow = try window(store)
+        let mark = try int(store, "SELECT last_read_seq FROM read_marks")
+        for (index, type) in ["reaction.add", "pin.remove", "thread.participation", "future.channel.feature"].enumerated() {
+            let revision = index + 2
+            answers.set("/v1/orgs/\(org)/channels/\(channel)/messages", page([message("old", seq: 1, text: "refreshed", revision: revision, author: me)], next: nil))
+            let input = frame(11 + index, type, "old", message: nil)
+                .replacingOccurrences(of: "\"body\":{", with: "\"body\":{\"channel_id\":\"\(channel)\",")
+            transport.frame(input)
+            try await waitUntil("channel pointer read") { try self.row(store, "old")?.revision == revision }
+            XCTAssertEqual(sync.snapshots, snapshots, type)
+            XCTAssertFalse(sync.needsSnapshot)
+            XCTAssertEqual(try store.cursor(channelStream), 11 + index)
+        }
+        XCTAssertEqual(try window(store).epoch, originalWindow.epoch)
+        XCTAssertEqual(try window(store).bottom, originalWindow.bottom)
+        XCTAssertEqual(try window(store).next, originalWindow.next)
+        XCTAssertEqual(try int(store, "SELECT last_read_seq FROM read_marks"), mark)
+        XCTAssertEqual(try int(store, "SELECT COUNT(*) FROM skipped_events"), 4)
+    }
+
+    func testChannelPointersCoalesceAndKeepAnInvalidationDuringRead() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state())
+        let (service, _) = try await started(answers)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        let path = "/v1/orgs/\(org)/channels/\(channel)/messages"
+        answers.set(path, page([], next: nil))
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        answers.gate = gate; answers.gated = path
+        let reads = { ChatStubProtocol.seen.filter { $0.request.url?.path == path }.count }
+        let body = #"{"channel_id":"\#(channel)"}"#
+        XCTAssertTrue(sync.apply(try event(11, "reaction.add", body: body, message: nil)))
+        XCTAssertTrue(sync.apply(try event(12, "pin.add", body: body, message: nil)))
+        try await waitUntil("first read") { reads() == 1 }
+        XCTAssertTrue(sync.apply(try event(13, "thread.participation", body: body, message: nil)))
+        XCTAssertTrue(sync.apply(try event(14, "future.type", body: body, message: nil)))
+        gate.open()
+        try await waitUntil("read owed during first request") { reads() == 2 }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(reads(), 2)
+        XCTAssertFalse(sync.needsSnapshot)
+    }
+
+    func testChannelPointerRetryAndRevokedChannelRead() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state())
+        let (service, _) = try await started(answers)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        sync.oneRetryDelay = { _ in 0.02 }
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let path = "/v1/orgs/\(org)/channels/\(channel)/messages"
+        answers.set(path, #"{"error":"unavailable"}"#, status: 503)
+        XCTAssertTrue(sync.apply(try event(11, "pin.add", body: #"{"channel_id":"\#(channel)"}"#, message: nil)))
+        try await waitUntil { ChatStubProtocol.seen.contains { $0.request.url?.path == path } }
+        answers.set(path, page([message("read", seq: 10)], next: nil))
+        try await waitUntil { try self.row(store, "read") != nil }
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        answers.gate = gate; answers.gated = path
+        answers.set(path, page([message("revoked", seq: 12)], next: nil))
+        let count = ChatStubProtocol.seen.count
+        let task = Task { await sync.readChannel(channel, .latest) }
+        try await waitUntil { ChatStubProtocol.seen.count > count }
+        try await store.queue.write { db in try db.execute(sql: "DELETE FROM channels") }
+        gate.open()
+        let outcome = await task.value
+        XCTAssertEqual(outcome, .void)
+        XCTAssertNil(try row(store, "revoked"))
+    }
+
+    func testOnlyUnknownAddressedEventsUseChannelPointers() throws {
+        XCTAssertEqual(ChatEvents.channelPointer(try event(11, "future.type", body: #"{"channel_id":"c"}"#, message: nil)), "c")
+        for type in ["message.edit", "channel.rename", "run.finished", "member.set_role"] {
+            XCTAssertNil(ChatEvents.channelPointer(try event(11, type, body: #"{"channel_id":"c"}"#, message: nil)))
+        }
+        for body in ["{}", #"{"channel_id":null}"#, #"{"channel_id":42}"#, #"{"channel_id":" "}"#] {
+            XCTAssertNil(ChatEvents.channelPointer(try event(11, "future.type", body: body, message: nil)))
+        }
+    }
+
+    func testSnapshotEvictionKeepsAndReloadsFeedEditDraft() async throws { try await checkEvictedEdit(root: nil) }
+    func testSnapshotEvictionKeepsAndReloadsThreadEditDraft() async throws { try await checkEvictedEdit(root: "root") }
+
+    func testOpenThreadReloadsAfterSnapshotOnlyWhenReadyAndPreservesEdit() async throws {
+        let answers = Answers()
+        let rootMessage = message("root", seq: 1)
+        let mine = message("mine", seq: 3, root: "root", author: me)
+        let path = "/v1/orgs/\(org)/channels/\(channel)/threads/root"
+        answers.set("/v1/orgs/\(org)/state", state([rootMessage, mine]))
+        answers.set(path, page([rootMessage, mine], next: 3))
+        answers.set("/v1/orgs/\(org)/channels/\(channel)/messages?before=4", page([mine], next: nil))
+        let (service, _) = try await started(answers)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store), sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        let session = ChatChannelSession()
+        let card = try JSONDecoder().decode(ChatChannelCard.self, from: Data(self.card(10, [], before: nil).utf8))
+        let ready = ChannelTabState.ready(card, team: "Billing", offline: false)
+        session.update(ready, key: key, store: store, service: service)
+        let model = try XCTUnwrap(session.model)
+        model.openThread("root")
+        try await waitUntil("first thread page") { model.threadHasEarlier }
+        XCTAssertTrue(model.beginEditing(try XCTUnwrap(model.message("mine")), root: "root"))
+        model.editing?.text = "unsaved thread edit"
+        let reads = { ChatStubProtocol.seen.filter { $0.request.url?.path == path }.count }
+        XCTAssertEqual(reads(), 1)
+        let snapshots = sync.snapshots
+        session.update(.checking, key: key, store: store, service: service)
+        answers.set("/v1/orgs/\(org)/state", state([message("new", seq: 100)], head: 100, before: 100))
+        sync.requestSnapshot()
+        try await waitUntil("snapshot evicts the open thread") { sync.snapshots > snapshots && !sync.needsSnapshot && !model.threadHasEarlier }
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(reads(), 1, "checking cannot start a thread read")
+        XCTAssertEqual(model.threadRoot, "root")
+        XCTAssertEqual(model.editing?.text, "unsaved thread edit")
+        session.update(ready, key: key, store: store, service: service)
+        session.update(ready, key: key, store: store, service: service)
+        try await waitUntil("open thread restored") { model.threadHasEarlier && model.thread.contains { $0.id == "root" } }
+        XCTAssertEqual(reads(), 2, "repeated ready notifications share one read")
+        XCTAssertTrue(session.model === model)
+        XCTAssertEqual(model.editing?.text, "unsaved thread edit")
+        XCTAssertEqual(model.editing?.revision, 1)
+        XCTAssertEqual(try window(store).bottom, 100)
+        // Loss of a cursor also needs a read without any F2 state transition.
+        try await store.queue.write { try $0.execute(sql: "DELETE FROM thread_cursors") }
+        try await waitUntil("missing cursor restored") { reads() == 3 && model.threadHasEarlier }
+        // An obsolete cursor cannot be mistaken for one from the new epoch.
+        try await store.queue.write { try $0.execute(sql: "UPDATE channel_windows SET epoch = epoch + 1") }
+        try await waitUntil("obsolete cursor replaced") {
+            try self.int(store, "SELECT epoch FROM thread_cursors WHERE root_id = 'root'") == self.window(store).epoch
+        }
+        XCTAssertEqual(reads(), 4)
+        XCTAssertEqual(model.editing?.text, "unsaved thread edit")
+        session.update(.noAccess, key: key, store: store, service: service)
+    }
+
+    func testOpenThreadReplacesInFlightPageOnEpochChangeAndCancelsOnNoAccess() async throws {
+        let answers = Answers(), gate = Gate()
+        answers.set("/v1/orgs/\(org)/state", state([message("root", seq: 1)]))
+        let path = "/v1/orgs/\(org)/channels/\(channel)/threads/root"
+        answers.set(path, page([message("root", seq: 1), message("reply", seq: 2, root: "root")], next: 2))
+        let (service, _) = try await started(answers)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let session = ChatChannelSession()
+        let card = try JSONDecoder().decode(ChatChannelCard.self, from: Data(self.card(10, [], before: nil).utf8))
+        session.update(.ready(card, team: "Billing", offline: false), key: key, store: store, service: service)
+        let model = try XCTUnwrap(session.model)
+        gate.close(); defer { gate.open() }
+        answers.gate = gate; answers.gated = path
+        let reads = { ChatStubProtocol.seen.filter { $0.request.url?.path == path }.count }
+        model.openThread("root")
+        try await waitUntil("first page in flight") { reads() == 1 }
+        try newWindow(store, head: 100, [wire(message("new", seq: 100))], before: 100)
+        try await waitUntil("new epoch asks its own first page") { reads() == 2 }
+        gate.open()
+        try await waitUntil("current epoch page applied") { model.threadHasEarlier }
+        XCTAssertEqual(try int(store, "SELECT epoch FROM thread_cursors WHERE root_id = 'root'"), try window(store).epoch)
+        gate.close()
+        try newWindow(store, head: 200, [wire(message("newer", seq: 200))], before: 200)
+        try await waitUntil("another page in flight") { reads() == 3 }
+        session.update(.noAccess, key: key, store: store, service: service)
+        gate.open()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(session.model)
+        XCTAssertEqual(try int(store, "SELECT COUNT(*) FROM thread_cursors"), 0, "a cancelled read cannot repopulate the cache")
+        XCTAssertNil(try row(store, "reply"))
+    }
+
+    private func checkEvictedEdit(root: String?) async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("root", seq: 1), message("mine", seq: 2, root: root, author: me)]))
+        answers.set("/v1/orgs/\(org)/channels/\(channel)/threads/root", page([message("mine", seq: 2, root: root, author: me)], next: nil))
+        let (service, _) = try await started(answers)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        let session = ChatChannelSession()
+        let card = try JSONDecoder().decode(ChatChannelCard.self, from: Data(self.card(10, [], before: nil).utf8))
+        let ready = ChannelTabState.ready(card, team: "Billing", offline: false)
+        session.update(ready, key: key, store: store, service: service)
+        let model = try XCTUnwrap(session.model)
+        if let root { model.openThread(root) }
+        model.saveDraft("composer draft", root: root)
+        XCTAssertTrue(model.beginEditing(try XCTUnwrap(model.message("mine")), root: root))
+        model.editing?.text = "unsaved edit 🐇"
+        model.positions[root ?? ""] = ChatScrollPosition()
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        let path = "/v1/orgs/\(org)/channels/\(channel)/messages?before=3"
+        answers.gate = gate; answers.gated = path
+        answers.set(path, page([message("mine", seq: 2, text: "changed elsewhere", revision: 2, root: root, author: me)], next: nil))
+        answers.set("/v1/orgs/\(org)/state", state([message("new", seq: 100)], head: 100, before: 100))
+        session.update(.checking, key: key, store: store, service: service)
+        sync.requestSnapshot()
+        try await waitUntil("evicted editor requests its message") { ChatStubProtocol.seen.contains { $0.request.url?.query == "before=3" } }
+        XCTAssertTrue(session.model === model)
+        XCTAssertEqual(model.editing?.text, "unsaved edit 🐇")
+        XCTAssertEqual(model.editing?.revision, 1)
+        let reloading = try XCTUnwrap(model.conversationMessages(root: root).first { $0.id == "mine" })
+        XCTAssertTrue(reloading.loading)
+        XCTAssertFalse(model.canEdit(reloading), "Save waits for the current server row")
+        XCTAssertEqual(model.draft(root: root), "composer draft")
+        gate.open()
+        try await waitUntil("edit source loaded") { model.editing?.message.revision == 2 }
+        session.update(ready, key: key, store: store, service: service)
+        XCTAssertTrue(session.model === model)
+        XCTAssertEqual(model.editing?.text, "unsaved edit 🐇")
+        XCTAssertEqual(model.editing?.revision, 1, "the conflict check keeps the opening revision")
+        XCTAssertTrue(model.canEdit(try XCTUnwrap(model.conversationMessages(root: root).first { $0.id == "mine" })))
+        XCTAssertEqual(try window(store).bottom, 100, "reloading an edit does not pretend to load continuous history")
+        session.update(.noAccess, key: key, store: store, service: service)
+        XCTAssertNil(session.model)
+        XCTAssertNil(model.editing)
+    }
+
+    func testEscapeDismissesEditSearchThenThreadAndPreservesComposerDrafts() throws {
+        let store = try store([message("root", seq: 1, author: me), message("reply", seq: 2, root: "root", author: me)])
+        let model = ChatChannelModel(key: key, channel: channel); model.follow(store)
+        model.openThread("root"); model.saveDraft("reply draft", root: "root")
+        model.setSearching(true)
+        XCTAssertTrue(model.beginEditing(try XCTUnwrap(model.message("reply")), root: "root"))
+        XCTAssertTrue(model.dismissTransient()); XCTAssertNil(model.editing)
+        XCTAssertEqual(model.focusRequest?.area, .thread)
+        XCTAssertTrue(model.searching); XCTAssertEqual(model.threadRoot, "root")
+        XCTAssertTrue(model.dismissTransient()); XCTAssertFalse(model.searching)
+        XCTAssertEqual(model.threadRoot, "root")
+        XCTAssertTrue(model.dismissTransient()); XCTAssertNil(model.threadRoot)
+        XCTAssertEqual(model.focusedMessageID, "root")
+        XCTAssertEqual(model.draft(root: "root"), "reply draft")
+        XCTAssertFalse(model.dismissTransient())
     }
 }

@@ -52,170 +52,8 @@ final class ChatOrgCurrent {
     }
 }
 
-/// The top of the Team tab in the left panel: the organization, then the
-/// user's own teams with their channels (F2), and why the connection ended
-/// when it did.
-struct ChatOrgSidebarSection: View {
-    private var current = ChatOrgCurrent.shared
-    /// Opens a channel's tab in this window (or brings it forward); `true`: a new tab always.
-    var openChannel: (ChannelRef, Bool) -> Void = { _, _ in }
-    /// Channels created here, opened once their card is seen.
-    @State private var toOpen: Set<String> = []
-
-    init(openChannel: @escaping (ChannelRef, Bool) -> Void = { _, _ in }) {
-        self.openChannel = openChannel
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if let model = current.model {
-                HStack {
-                    Text(model.orgName ?? "Organization")
-                        .font(Theme.display(12, weight: .semibold))
-                        .foregroundStyle(Theme.chromeForeground)
-                    Spacer()
-                    Button { ChatOrgWindow.show() } label: { Image(systemName: "person.2") }
-                        .buttonStyle(.borderless)
-                        .help("Organization…")
-                }
-                // Archived teams too, while channels may be shown: their channels stay readable.
-                ForEach(model.channelsVisible ? model.channelTeams : model.myTeams) { team in
-                    Text(team.archived ? "# \(team.name) · archived" : "# \(team.name)")
-                        .font(Theme.display(12))
-                        .foregroundStyle(Theme.chromeMuted)
-                        .padding(.leading, 8)
-                        .contextMenu {
-                            if model.canCreateChannel(in: team) {
-                                Button("New Channel…") { newChannel(in: team, model) }
-                            }
-                        }
-                    channels(of: team, model)
-                }
-                ForEach(model.channelRefusals, id: \.id) { item in
-                    Text("\(item.title): \(item.reason).").font(Theme.display(11)).foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if !model.channelRefusals.isEmpty {
-                    Button("Dismiss") { model.dismissRefusals(Set(model.channelRefusals.map(\.id))) }
-                        .buttonStyle(.borderless).font(Theme.display(11))
-                }
-                if let notice = model.notice {
-                    Text(notice).font(Theme.display(11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            if let reason = Self.reason(ChatService.shared.state) {
-                Text(reason)
-                    .font(Theme.display(11))
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(.horizontal, Theme.sidebarContentLeadingX)
-        .padding(.vertical, 6)
-        .task(id: ChatOrgCurrent.identity()) { current.refresh() }
-        .onChange(of: current.model?.view.channels) { openCreated() }
-        // A card may come while a snapshot is owed: shown — and opened — once it ends (review F2b-p2-2).
-        .onChange(of: current.model?.channelsVisible) { openCreated() }
-    }
-
-    @ViewBuilder
-    private func channels(of team: ChatOrgView.Team, _ model: ChatOrgModel) -> some View {
-        ForEach(model.channels(of: team), id: \.channelId) { card in
-            Button {
-                if let key = model.key { openChannel(ChannelRef(key, channel: card.channelId), false) }
-            } label: {
-                HStack {
-                    Text("#\(card.name)")
-                        .font(Theme.display(12))
-                        .foregroundStyle(card.archived ? Theme.chromeMuted : Theme.chromeForeground)
-                    Spacer()
-                    // F4: unread — a number, "N+" when the cache holds less, "•" when not counted.
-                    if let unread = model.unread(card.channelId) {
-                        if unread.count > 0 {
-                            Text(unread.more ? "\(unread.count)+" : "\(unread.count)")
-                                .font(Theme.display(10, weight: .semibold))
-                                .foregroundStyle(unread.muted ? Theme.chromeMuted : Theme.chromeForeground)
-                        } else if unread.something || unread.more {
-                            Text("•").foregroundStyle(Theme.chromeMuted)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, 20)
-            .help(card.archived ? "Archived: read only" : "Open #\(card.name)")
-            .contextMenu {
-                if let key = model.key {
-                    Button("Open in New Tab") { openChannel(ChannelRef(key, channel: card.channelId), true) }
-                }
-                if let unread = model.unread(card.channelId) {
-                    Button(unread.muted ? "Unmute Thread Replies" : "Mute Thread Replies") { model.setMuted(card.channelId, !unread.muted) }
-                }
-                if model.canRenameChannel(card) { Button("Rename…") { renameChannel(card, model) } }
-                if model.canArchiveChannel(card) { Button("Archive…") { archiveChannel(card, model) } }
-                let addable = model.addableAgents(card)
-                if !addable.isEmpty {
-                    Menu("Add Agent") {
-                        ForEach(addable, id: \.agentId) { agent in Button("\(agent.name)…") { addAgent(agent, to: card, model) } }
-                    }
-                }
-                let removable = model.agents(in: card.channelId).filter(model.canRemoveAgent)
-                if !removable.isEmpty {
-                    Menu("Remove Agent") {
-                        ForEach(removable) { agent in Button("\(agent.address ?? agent.name)…") { removeAgent(agent, from: card, model) } }
-                    }
-                }
-            }
-        }
-        ForEach(model.creatingChannels(in: team), id: \.self) { name in
-            Text("#\(name) — creating…")
-                .font(Theme.display(12))
-                .foregroundStyle(Theme.chromeMuted)
-                .padding(.leading, 20)
-        }
-    }
-
-    // Each dialog stays open only while what it names may be seen: once
-    // the team, the channel or the rights are gone it closes as cancelled
-    // and keeps nothing it showed (review F2-p1-2; `ChatOrgWindow.ask`).
-
-    private func newChannel(in team: ChatOrgView.Team, _ model: ChatOrgModel) {
-        let id = team.teamId
-        let valid: @MainActor () -> Bool = { model.isCurrent() && model.channelTeams.contains { $0.teamId == id && model.canCreateChannel(in: $0) } }
-        Task { @MainActor in
-            guard let name = await ChatOrgWindow.ask("New channel in \(team.name)", "A channel of the team: its members read and write in it.",
-                                                     "Create", field: "", while: valid) else { return }
-            if let problem = ChatOrgModel.channelNameProblem(name) { return ChannelPrompt.fail(problem) }
-            guard let now = model.channelTeams.first(where: { $0.teamId == id }) else { return }
-            do { toOpen.insert(try model.createChannel(name, in: now)) } catch { ChannelPrompt.fail(error) }
-        }
-    }
-
-    private func renameChannel(_ card: ChatChannelCard, _ model: ChatOrgModel) {
-        let id = card.channelId
-        let valid: @MainActor () -> Bool = { model.isCurrent() && model.visibleChannel(id).map(model.canRenameChannel) == true }
-        Task { @MainActor in
-            guard let name = await ChatOrgWindow.ask("Rename #\(card.name)", "Every member of the team sees the new name.", "Rename",
-                                                     field: card.name, while: valid) else { return }
-            if let problem = ChatOrgModel.channelNameProblem(name) { return ChannelPrompt.fail(problem) }
-            guard let now = model.visibleChannel(id) else { return }
-            do { try model.renameChannel(now, to: name) } catch { ChannelPrompt.fail(error) }
-        }
-    }
-
-    private func archiveChannel(_ card: ChatChannelCard, _ model: ChatOrgModel) {
-        let id = card.channelId
-        let valid: @MainActor () -> Bool = { model.isCurrent() && model.visibleChannel(id).map(model.canArchiveChannel) == true }
-        Task { @MainActor in
-            guard await ChatOrgWindow.confirm("Archive #\(card.name)?", "It stays readable; nobody can post in it.", "Archive",
-                                              while: valid),
-                  let now = model.visibleChannel(id) else { return }
-            do { try model.archiveChannel(now) } catch { ChannelPrompt.fail(error) }
-        }
-    }
-
+/// Shared F5 wording kept for the composer and channel tools.
+enum ChatOrgSidebarSection {
     /// What the owner agrees to (AG-1, DESIGN-F5 §1): who sees the answers,
     /// the agent's rights with their warnings (EX-7), its session's memory.
     static func addAgentText(_ agent: ChatAgentCard, team: String, fromSession: Bool) -> String {
@@ -230,39 +68,6 @@ struct ChatOrgSidebarSection: View {
         return lines.joined(separator: "\n\n")
     }
 
-    private func addAgent(_ agent: ChatAgentCard, to card: ChatChannelCard, _ model: ChatOrgModel) {
-        let id = card.channelId, agentId = agent.agentId
-        let valid: @MainActor () -> Bool = {
-            model.isCurrent() && model.visibleChannel(id).map { model.addableAgents($0).contains { $0.agentId == agentId } } == true
-        }
-        let fromSession = TeamService.shared.calls.agents.first { $0.id.uuidString.lowercased() == agentId }?.isSession == true
-        let text = Self.addAgentText(agent, team: model.channelTeam(card)?.name ?? "of the channel", fromSession: fromSession)
-        Task { @MainActor in
-            guard await ChatOrgWindow.confirm("Add \(agent.name) to #\(card.name)?", text, "Add", while: valid),
-                  let now = model.visibleChannel(id) else { return }
-            do { try model.addAgent(agentId, to: now) } catch { ChannelPrompt.fail(error) }
-        }
-    }
-
-    private func removeAgent(_ agent: ChatChannelAgent, from card: ChatChannelCard, _ model: ChatOrgModel) {
-        let valid: @MainActor () -> Bool = { model.isCurrent() && model.canRemoveAgent(agent) }
-        Task { @MainActor in
-            guard await ChatOrgWindow.confirm("Remove \(agent.name) from #\(card.name)?",
-                                              "Its requests in the channel end; it can be added again.", "Remove", while: valid)
-            else { return }
-            do { try model.removeAgent(agent) } catch { ChannelPrompt.fail(error) }
-        }
-    }
-
-    /// A channel created here opens in a tab once its card may be seen.
-    private func openCreated() {
-        guard let model = current.model, let key = model.key else { return }
-        for id in toOpen where model.visibleChannel(id) != nil {
-            toOpen.remove(id)
-            openChannel(ChannelRef(key, channel: id), false)
-        }
-    }
-
     /// Why this Mac is no longer in the organization: the session closed, or
     /// the account removed.
     static func reason(_ state: ChatService.State) -> String? {
@@ -270,8 +75,7 @@ struct ChatOrgSidebarSection: View {
         case .needsSignIn(let text), .notMember(_, let text): text
         default: nil
         }
-    }
-}
+    }}
 
 @MainActor
 enum ChatOrgWindow {

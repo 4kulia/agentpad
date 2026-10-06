@@ -593,6 +593,8 @@ final class AgentPadCLIController {
             conversationId: request.conversationId,
             cwd: request.cwd
         ) {
+        case .chatMessage:
+            completion(refuse("Expected a session resume request."))
         case .invalid(let reason):
             completion(refuse(reason))
         case .resumeSession(let agentId, let conversationId, let cwd):

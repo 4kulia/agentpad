@@ -6,19 +6,30 @@ import SwiftUI
 struct ChatMentionText: NSViewRepresentable {
     var markdown: String
     var addresses: [String]
+    var fontSize: CGFloat = 14
 
-    static func attributed(_ markdown: String, addresses: [String]) -> NSAttributedString {
+    final class MessageTextView: NSTextView {
+        // Clicking still selects/copies native text. Tab enters the timeline's
+        // roving selection instead of stopping on every read-only text view.
+        override var canBecomeKeyView: Bool { false }
+    }
+
+    static func attributed(_ markdown: String, addresses: [String], fontSize: CGFloat = 14) -> NSAttributedString {
         let rendered = ChatMarkdownText.attributed(markdown)
         let text = NSMutableAttributedString(attributedString: NSAttributedString(rendered))
         let all = NSRange(location: 0, length: text.length)
-        text.addAttributes([.font: NSFont.systemFont(ofSize: NSFont.systemFontSize), .foregroundColor: NSColor.labelColor], range: all)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.minimumLineHeight = fontSize * 1.5
+        paragraph.maximumLineHeight = fontSize * 1.5
+        text.addAttributes([.font: NSFont(name: "Onest", size: fontSize) ?? NSFont.systemFont(ofSize: fontSize),
+                            .foregroundColor: Theme.resolved.foregroundColor, .paragraphStyle: paragraph], range: all)
         var offset = 0
         for run in rendered.runs {
             let length = String(rendered[run.range].characters).utf16.count
             let range = NSRange(location: offset, length: length)
             let intent = run.inlinePresentationIntent ?? []
-            var font = intent.contains(.code) ? NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-                : NSFont.systemFont(ofSize: NSFont.systemFontSize)
+            var font = intent.contains(.code) ? (NSFont(name: "JetBrainsMono-Regular", size: 12) ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular))
+                : (NSFont(name: "Onest", size: fontSize) ?? NSFont.systemFont(ofSize: fontSize))
             if intent.contains(.stronglyEmphasized) { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
             if intent.contains(.emphasized) { font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
             text.addAttribute(.font, value: font, range: range)
@@ -43,7 +54,7 @@ struct ChatMentionText: NSViewRepresentable {
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> NSTextView {
-        let view = NSTextView()
+        let view = MessageTextView()
         view.isEditable = false
         view.isSelectable = true
         view.drawsBackground = false
@@ -56,7 +67,7 @@ struct ChatMentionText: NSViewRepresentable {
         return view
     }
     func updateNSView(_ view: NSTextView, context: Context) {
-        let content = Self.attributed(markdown, addresses: addresses)
+        let content = Self.attributed(markdown, addresses: addresses, fontSize: fontSize)
         if view.textStorage?.isEqual(to: content) != true { view.textStorage?.setAttributedString(content) }
     }
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSTextView, context: Context) -> CGSize? {

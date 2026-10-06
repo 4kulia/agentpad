@@ -103,6 +103,7 @@ enum SidebarContent: String, Codable, Equatable, Sendable {
     case files
     /// AgentPad: team calls received and sent (Team/TeamCallsSidebar.swift).
     case team
+    case chat
 }
 
 /// What the right sidebar shows in full mode — live agents, on-disk history,
@@ -133,6 +134,21 @@ final class WorkspaceStore {
     /// Left sidebar's middle content — workspace list or file tree. Persisted
     /// like `sidebarMode`; the footer toggle in `SidebarView` flips it.
     var sidebarContent: SidebarContent = .files
+    var chatSidebarPreferences = ChatSidebarPreferences()
+    let chatNavigation = ChatSidebarNavigation()
+    var sidebarDisplayWidth: CGFloat {
+        sidebarContent == .chat ? CGFloat(ChatSidebarPreferences.clampWidth(chatSidebarPreferences.width)) : sidebarWidth
+    }
+
+    func setSidebarDisplayWidth(_ width: CGFloat) {
+        if sidebarContent == .chat { chatSidebarPreferences.width = ChatSidebarPreferences.clampWidth(Double(width)) }
+        else { sidebarWidth = SidebarView.clampWidth(width) }
+    }
+
+    func setChatSectionCollapsed(_ section: ChatSidebarPreferences.Section, _ collapsed: Bool) {
+        chatSidebarPreferences.setCollapsed(section, collapsed)
+        scheduleSave()
+    }
     /// Right sidebar's full-mode content — live agents, history, or active
     /// session information.
     /// Persisted like `sidebarContent`; the panel's own footer toggle flips it.
@@ -313,9 +329,10 @@ final class WorkspaceStore {
         scheduleSave()
     }
 
-    /// Content-only swap — the sidebar keeps its width, so no size-propagation
-    /// suspension is needed (that dance is for width-animating mode changes).
+    /// Navigation changes immediately. Chat keeps its own width; expanding
+    /// the compact rail uses the existing layout-suspension path.
     func setSidebarContent(_ content: SidebarContent) {
+        if content == .chat, sidebarMode != .full { setSidebarMode(.full) }
         // Gate on non-nil: `@Observable` notifies on every write, so an
         // unconditional nil-over-nil here would invalidate `fileTreeRoot`
         // observers on each no-op content set.
@@ -343,7 +360,7 @@ final class WorkspaceStore {
         // The rename popover anchors to a workspace row — flip the sidebar
         // back to the list, or the parked request sits unconsumed in files
         // mode and fires stale on the next toggle.
-        if sidebarContent == .files || sidebarContent == .team { setSidebarContent(.workspaces) }
+        if sidebarContent != .workspaces { setSidebarContent(.workspaces) }
         pendingRenameWorkspace = active
     }
 
@@ -2140,7 +2157,9 @@ final class WorkspaceStore {
             : workspaces.first?.id
         sidebarMode = state.sidebarMode ?? .full
         rightSidebarMode = state.rightSidebarMode ?? .full
-        sidebarContent = state.sidebarContent ?? .files
+        sidebarContent = state.sidebarSelectedContent.flatMap(SidebarContent.init(rawValue:)) ?? state.sidebarContent ?? .files
+        chatSidebarPreferences = state.chatSidebarPreferences ?? ChatSidebarPreferences()
+        chatSidebarPreferences.width = ChatSidebarPreferences.clampWidth(chatSidebarPreferences.width)
         rightSidebarContent = state.rightSidebarContent ?? .agents
         sidebarWidth = state.sidebarWidth
             .map { SidebarView.clampWidth(CGFloat($0)) }
@@ -2915,9 +2934,10 @@ final class WorkspaceStore {
             activeWorkspaceId: activeWorkspaceId,
             sidebarMode: sidebarMode,
             rightSidebarMode: rightSidebarMode,
-            // AgentPad: saved as the list, so an older build can still read
-            // the state file (it does not know `.team`).
-            sidebarContent: sidebarContent == .team ? .workspaces : sidebarContent,
+            // Legacy readers do not know Chat (or, before F2, Team).
+            sidebarContent: sidebarContent == .team || sidebarContent == .chat ? .workspaces : sidebarContent,
+            sidebarSelectedContent: sidebarContent.rawValue,
+            chatSidebarPreferences: chatSidebarPreferences,
             rightSidebarContent: rightSidebarContent,
             sidebarWidth: Double(sidebarWidth),
             rightSidebarWidth: Double(rightSidebarWidth),

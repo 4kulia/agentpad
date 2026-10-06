@@ -13,6 +13,10 @@ struct PersistedState: Codable, Equatable {
     /// Optional so state.json files written before the file-tree toggle
     /// existed still decode (nil → `.workspaces`).
     var sidebarContent: SidebarContent?
+    /// New modes are stored separately so a rollback still decodes the
+    /// legacy sidebarContent enum and restores every workspace and tab.
+    var sidebarSelectedContent: String?
+    var chatSidebarPreferences: ChatSidebarPreferences?
     /// Optional so state.json files written before the History pane existed
     /// still decode (nil → `.agents`).
     var rightSidebarContent: RightSidebarContent?

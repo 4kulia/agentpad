@@ -73,7 +73,8 @@ final class ChannelTabEngine: TerminalEngine {
     private(set) var terminations = 0
     /// Closes the tab; set by the store that holds it.
     var onClose: () -> Void = {}
-    private lazy var host: NSView = NSHostingView(rootView: ChannelTabView(ref: ref, close: { [weak self] in self?.onClose() }))
+    let conversation = ChatChannelSession()
+    private lazy var host: NSView = NSHostingView(rootView: ChannelTabView(ref: ref, conversation: conversation, close: { [weak self] in self?.onClose() }))
 
     init(ref: ChannelRef) {
         self.ref = ref
@@ -122,11 +123,13 @@ final class ChannelTabEngine: TerminalEngine {
 /// The channel tab's content. F3 puts the feed where "ready" stands.
 struct ChannelTabView: View {
     let ref: ChannelRef
+    let conversation: ChatChannelSession
     let close: () -> Void
     private var current = ChatOrgCurrent.shared
 
-    init(ref: ChannelRef, close: @escaping () -> Void) {
+    init(ref: ChannelRef, conversation: ChatChannelSession, close: @escaping () -> Void) {
         self.ref = ref
+        self.conversation = conversation
         self.close = close
     }
 
@@ -136,7 +139,7 @@ struct ChannelTabView: View {
             switch state {
             case .ready(let card, let team, let offline):
                 if let key = current.model?.key {
-                    ChatChannelView(card: card, team: team, offline: offline, key: key)
+                    ChatChannelView(card: card, team: team, offline: offline, key: key, conversation: conversation)
                 }
             case .checking:
                 ProgressView().controlSize(.small)
@@ -157,5 +160,9 @@ struct ChannelTabView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: ChatOrgCurrent.identity()) { current.refresh() }
+        .onChange(of: state, initial: true) { _, state in
+            let key = current.model?.key
+            conversation.update(state, key: key, store: key.flatMap { ChatService.shared.orgSessions[$0]?.store }, service: .shared)
+        }
     }
 }

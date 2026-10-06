@@ -3,6 +3,7 @@ import AppKit
 import Foundation
 import GRDB
 import Observation
+import SwiftUI
 import XCTest
 @testable import AgentPadKit
 
@@ -119,6 +120,55 @@ final class ChatUX1Tests: XCTestCase {
             XCTAssertTrue(ChatMentions.agents(in: text, agents: [agent]).isEmpty, text)
         }
         XCTAssertEqual(ChatMentions.agents(in: "@BILLING@ANNA @billing@anna", agents: [agent, agent]).map(\.agentId), [agent.agentId])
+    }
+
+    func testRecreatedComposerPreservesMentionOnlyAndSelectedContextThroughSend() async throws {
+        let f = try await fixture(), model = model(f), agent = try card(f)
+        _ = try message(f, id: thread, text: "Context")
+        let text = "@billing@anna hello"
+        model.saveDraft(text, root: nil, mentionOnly: true, contextIds: [thread])
+        let content: (String?) -> AnyView = { root in
+            AnyView(ChatUX1Composer(model: model, root: root, members: [], mentionable: [], agents: [agent])
+                .frame(width: 700, height: 400))
+        }
+        let host = NSHostingView(rootView: content(nil))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 400), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        func editors(_ view: NSView) -> [ChatMentionEditor.Editor] {
+            (view as? ChatMentionEditor.Editor).map { [$0] } ?? view.subviews.flatMap(editors)
+        }
+        host.layoutSubtreeIfNeeded()
+        try await wait { editors(host).first?.string == text }
+        let saved = model.composerDraft(root: nil)
+        XCTAssertEqual(saved.contextIds, [thread])
+        host.rootView = AnyView(EmptyView()); host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(30))
+        model.openThread(thread); host.rootView = content(thread)
+        try await wait { editors(host).count == 1 && editors(host).first?.string == "" }
+        XCTAssertEqual(model.composerDraft(root: thread), ChatChannelModel.Draft())
+        host.rootView = AnyView(EmptyView()); host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(30))
+        model.openThread(nil); host.rootView = content(nil)
+        try await wait { editors(host).first?.string == text }
+        XCTAssertEqual(model.composerDraft(root: nil), saved)
+        XCTAssertEqual(editors(host).first?.consume?(36, .command), true)
+        XCTAssertEqual(try f.store.outbox.commands().filter { $0.type == "message.post" }.count, 1)
+        XCTAssertEqual(try f.store.outbox.commands().filter { $0.type == "request.create_in_channel_v2" }.count, 0)
+        XCTAssertEqual(try scalar(f.journal.queue, "SELECT COUNT(*) FROM channel_authorities"), 0)
+        XCTAssertEqual(model.composerDraft(root: nil), ChatChannelModel.Draft())
+        // The restored context is also used when the user chooses to call.
+        model.saveDraft(text, root: nil, contextIds: [thread])
+        host.rootView = AnyView(EmptyView()); host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(30))
+        host.rootView = content(nil)
+        try await wait { editors(host).first?.string == text }
+        XCTAssertEqual(editors(host).first?.consume?(36, .command), true)
+        let call = try XCTUnwrap(f.store.outbox.commands().first { $0.type == "request.create_in_channel_v2" })
+        guard case .array(let context)? = ChatService.args(call)["context"] else { return XCTFail("missing context") }
+        XCTAssertTrue(context.contains { $0["message_id"]?.string == thread })
+        host.rootView = AnyView(EmptyView()); host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(30))
     }
 
     func testMarkdownCodeAndLazyQuotesNeverCreateCallsOrConsentThroughSend() async throws {

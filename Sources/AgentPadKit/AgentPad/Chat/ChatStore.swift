@@ -680,7 +680,8 @@ final class ChatStore: Sendable {
         if !whole {
             try db.execute(sql: "INSERT OR IGNORE INTO skipped_events (stream, seq, type, at) VALUES (?, ?, ?, ?)",
                            arguments: [event.stream, event.seq, event.type, event.at])
-            NSLog("agentpad: chat event \(event.type) (\(event.stream) #\(event.seq)) is not wholly known to this AgentPad; a snapshot brings its effect")
+            let recovery = ChatEvents.channelPointer(event) == nil ? "an organization snapshot" : "a channel read"
+            NSLog("agentpad: chat event \(event.type) (\(event.stream) #\(event.seq)) is not wholly known to this AgentPad; \(recovery) brings its effect")
         }
         return whole
     }

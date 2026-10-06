@@ -123,6 +123,8 @@ final class ChatSync: ChatStreamSink {
     /// Single reads under way, and those asked again meanwhile, by message id.
     private var readingOne: Set<String> = []
     private var readOneAgain: Set<String> = []
+    private var channelRefreshes: [String: Task<Void, Never>] = [:]
+    private var channelsToRefresh: Set<String> = []
 
     /// The first snapshot; retried until it works.
     func start() async {
@@ -134,6 +136,9 @@ final class ChatSync: ChatStreamSink {
         snapshotting?.cancel()
         retrying?.cancel()
         readyRetry?.cancel()
+        for task in channelRefreshes.values { task.cancel() }
+        channelRefreshes = [:]
+        channelsToRefresh = []
         socket?.detach(self)
     }
 
@@ -483,9 +488,12 @@ final class ChatSync: ChatStreamSink {
             // Names and the catalog the calls are shown with (review D8d-p2-11).
             callsChanged()
         }
-        // An event this build did not wholly apply: its effect comes with a
-        // snapshot, not lost in silence (review D8f-p3-1, D8g-p3-3).
-        if applied == .passedOver { requestSnapshot() }
+        // Unknown channel features invalidate only their channel. Other
+        // unhandled events retain full recovery (review D8f-p3-1, D8g-p3-3).
+        if applied == .passedOver {
+            if let channel = ChatEvents.channelPointer(event) { refreshChannel(channel) }
+            else { requestSnapshot() }
+        }
         // Added to a team, or joined one: its stream joins the set, with the
         // team's state from a new snapshot, without reconnecting; owed until
         // it works.
@@ -800,12 +808,46 @@ extension ChatSync {
     private func channelsPausedChanged() { onChannelsPaused(pausedChannels) }
 
     enum ChannelRead: Equatable {
+        /// A forward-compatible channel pointer: merge its latest messages,
+        /// retaining the reading window, pagination and stream cursor.
+        case latest
         /// The continuous history, down from `history_next`.
         case history
         /// A thread: its first page, or (`more`) on from its own cursor.
         case thread(root: String, more: Bool)
         /// One message only; the window stays (review F3-3).
         case one(id: String, seq: Int)
+    }
+
+    private func refreshChannel(_ channel: String) {
+        channelsToRefresh.insert(channel)
+        guard channelRefreshes[channel] == nil else { return }
+        channelRefreshes[channel] = Task { [weak self] in
+            guard let self else { return }
+            defer { self.channelRefreshes[channel] = nil; self.channelsToRefresh.remove(channel) }
+            var failures = 0
+            while !self.stopped && !Task.isCancelled && self.channelsToRefresh.remove(channel) != nil {
+                // An event is an invalidation, never a grant of channel access.
+                guard self.canRefreshChannel(channel) else { return }
+                let outcome = await self.readChannel(channel, .latest)
+                if outcome == .refused { return }
+                if outcome == .failed || outcome == .void {
+                    self.channelsToRefresh.insert(channel)
+                    failures += 1
+                    try? await Task.sleep(for: .seconds(min(60, self.oneRetryDelay(failures))))
+                } else { failures = 0 }
+                // A pointer received during the await leaves another pass owed.
+            }
+        }
+    }
+
+    private func canRefreshChannel(_ channel: String) -> Bool {
+        (try? store.queue.read { db in
+            try Bool.fetchOne(db, sql: """
+                SELECT EXISTS(SELECT 1 FROM channels WHERE channel_id = ?)
+                    AND NOT (SELECT rights_in_doubt FROM meta WHERE id = 1)
+                """, arguments: [channel])
+        }) == true
     }
 
     /// Reads a page of `channel` and applies it only in the window, the
@@ -890,10 +932,14 @@ extension ChatSync {
         let before: Int?
         var root: String?
         switch kind {
+        case .latest:
+            guard canRefreshChannel(channel) else { return .void }
+            before = nil
         case .history:
             guard let next = window.next else { return .void }
             before = next
         case .thread(let r, let more):
+            guard !Task.isCancelled, !needsSnapshot, canRefreshChannel(channel) else { return .void }
             root = r
             if more {
                 guard case .some(.some(let next)) = window.thread else { return .void }
@@ -906,10 +952,12 @@ extension ChatSync {
         }
         do {
             let page = try await api.messagesPage(key.orgId, channel: channel, root: root, before: before, token: token)
-            guard !stopped, socket?.epoch == epoch, revocations == revoked else { return .void }
+            guard !Task.isCancelled, !stopped, socket?.epoch == epoch, revocations == revoked else { return .void }
             return try await store.queue.write { db -> ChannelReadOutcome in
                 guard try ChatMessages.current(db, channel, epoch: window.epoch) else { return .void }
                 switch kind {
+                case .latest:
+                    for message in page.messages where message.channelId == channel { try ChatMessages.write(db, message) }
                 case .history: try ChatMessages.applyHistory(db, channel: channel, page: page)
                 case .thread(let r, _): try ChatMessages.applyThread(db, channel: channel, root: r, epoch: window.epoch, page: page)
                 case .one(let id, _): try ChatMessages.applyOne(db, id: id, page: page)

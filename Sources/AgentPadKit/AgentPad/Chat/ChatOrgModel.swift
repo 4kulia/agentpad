@@ -68,6 +68,7 @@ struct ChatOrgView: Equatable, Sendable {
     /// F4: unread of each channel kept, and mentions not read.
     var unread: [String: ChatUnread.Count] = [:]
     var mentionsUnread = 0
+    var mentionsByChannel: [String: Int] = [:]
     /// F5: the agents of the channels kept; the user's own agents of the
     /// catalog (those it may add); the last snapshot carried them.
     var channelAgents: [ChatChannelAgent] = []
@@ -79,7 +80,7 @@ struct ChatOrgView: Equatable, Sendable {
             && a.followsAdmin == b.followsAdmin && a.rightsInDoubt == b.rightsInDoubt && a.rightsSession == b.rightsSession
             && a.refusals == b.refusals && a.channels == b.channels && a.channelsServed == b.channelsServed
             && a.channelsReadOpen == b.channelsReadOpen && a.creating.elementsEqual(b.creating) { $0 == $1 }
-            && a.unread == b.unread && a.mentionsUnread == b.mentionsUnread
+            && a.unread == b.unread && a.mentionsUnread == b.mentionsUnread && a.mentionsByChannel == b.mentionsByChannel
             && a.channelAgents == b.channelAgents && a.myAgents == b.myAgents && a.agentsServed == b.agentsServed
     }
 
@@ -113,6 +114,7 @@ struct ChatOrgView: Equatable, Sendable {
                 return (team, name)
             }
         let meta = try Row.fetchOne(db, sql: "SELECT channels_served, channels_read_open, agents_served, me FROM meta WHERE id = 1")
+        let mentions = try ChatUnread.unreadMentionsByChannel(db)
         return ChatOrgView(
             orgName: try String.fetchOne(db, sql: "SELECT org_name FROM meta WHERE id = 1"),
             members: try Row.fetchAll(db, sql: "SELECT account_id, handle, name, role FROM members ORDER BY name COLLATE NOCASE, handle").map {
@@ -139,7 +141,8 @@ struct ChatOrgView: Equatable, Sendable {
             channelsReadOpen: meta?["channels_read_open"] ?? false,
             creating: creating,
             unread: try unread(db),
-            mentionsUnread: try ChatUnread.unreadMentions(db),
+            mentionsUnread: mentions.values.reduce(0, +),
+            mentionsByChannel: mentions,
             channelAgents: try String.fetchAll(db, sql: "SELECT channel_id FROM channels ORDER BY channel_id")
                 .flatMap { try ChatChannelAgents.read(db, channel: $0) },
             myAgents: try ChatCallStore.catalog(db).filter { $0.ownerAccountId == (meta?["me"] as String?) },
@@ -416,6 +419,10 @@ final class ChatOrgModel {
 
     /// Mentions not read, for the Dock: none while channels may not be shown.
     var mentionsForBadge: Int { channelsVisible ? view.mentionsUnread : 0 }
+
+    func unreadMentions(_ channel: String) -> Int {
+        visibleChannel(channel) != nil ? view.mentionsByChannel[channel, default: 0] : 0
+    }
 
     /// Channels of the user's teams; none while the rights are in doubt (C6).
     func channels(of team: ChatOrgView.Team) -> [ChatChannelCard] {

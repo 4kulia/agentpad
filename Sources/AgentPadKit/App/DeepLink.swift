@@ -28,6 +28,7 @@ import SwiftUI
 /// (an "Open In" button, a script) expects visible feedback, not a silent no-op.
 enum AgentPadDeepLink: Equatable {
     case resumeSession(agentId: String, conversationId: String, cwd: String?)
+    case chatMessage(ChatMessageLink)
     case invalid(reason: String)
 
     static let scheme = AppIdentity.urlScheme
@@ -66,6 +67,8 @@ enum AgentPadDeepLink: Equatable {
             action = components.path.split(separator: "/").first.map { $0.lowercased() }
         }
         switch action {
+        case "chat":
+            return ChatMessageLink(components: components).map(Self.chatMessage) ?? .invalid(reason: "Invalid message link.")
         case "resume":
             func value(_ name: String) -> String? {
                 components.queryItems?.first { $0.name == name }?.value

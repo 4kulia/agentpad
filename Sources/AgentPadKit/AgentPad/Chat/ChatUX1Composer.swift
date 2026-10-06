@@ -7,6 +7,9 @@ struct ChatUX1Composer: View {
     let mentionable: [(account: String, handle: String)]
     let agents: [ChatChannelAgent]
     @State private var text = ""
+    @State private var control = ChatEditorControl()
+    @State private var editorHeight: CGFloat = 58
+    @AppStorage("chat.ux2.formatting") private var formatting = true
     @State private var selection = NSRange(location: 0, length: 0)
     @State private var version: String?
     @State private var mentionOnly = false
@@ -14,6 +17,7 @@ struct ChatUX1Composer: View {
     @State private var dismissedQuery: String?
     @State private var contextIds = Set<String>()
     @State private var choosingContext = false
+    @State private var draftLoaded = false
 
     private var org: ChatOrgModel? { ChatOrgCurrent.shared.model }
     private var card: ChatChannelCard? { org?.visibleChannel(model.channel) }
@@ -34,11 +38,14 @@ struct ChatUX1Composer: View {
         return people + present + mine
     }
     private var token: (range: NSRange, query: String)? { ChatMentionCandidate.token(text, caret: selection.location) }
-    private var matches: [ChatMentionCandidate] {
+    private var sections: [ChatMentionSection] {
         guard selection.length == 0, let token, dismissedQuery != token.query else { return [] }
-        return Array(ChatMentionCandidate.filtered(candidates, query: token.query).prefix(8))
+        return ChatMentionSection.grouped(ChatMentionCandidate.filtered(candidates, query: token.query))
     }
-    private var called: [ChatChannelAgent] { ChatMentions.agents(in: text, agents: agents) }
+    private var matches: [ChatMentionCandidate] { sections.flatMap(\.rows).map(\.candidate) }
+    private var called: [ChatChannelAgent] {
+        model.service.supports("chat.channel_ux1", key: model.key) ? ChatMentions.agents(in: text, agents: agents) : []
+    }
     private var context: [ChatMessage] { model.contextCandidates(root: root ?? "").filter { contextIds.contains($0.messageId) && $0.messageId != root } }
     private var contextBytes: Int { text.utf8.count + context.reduce(0) { $0 + $1.text.utf8.count } + (root.flatMap(model.message)?.text.utf8.count ?? 0) }
     private var contextCount: Int { context.count + (root == nil ? 1 : 2) }
@@ -46,10 +53,13 @@ struct ChatUX1Composer: View {
 
     private func changed(_ value: String) {
         text = value
-        model.saveDraft(value, root: root)
-        version = model.draftVersion(root: root)
+        saveDraft()
         selected = 0
         dismissedQuery = nil
+    }
+    private func saveDraft() {
+        model.saveDraft(text, root: root, mentionOnly: mentionOnly, contextIds: contextIds)
+        version = model.draftVersion(root: root)
     }
     private func send() {
         guard let version, mentionOnly || called.isEmpty || !tooMuchContext else { return }
@@ -60,47 +70,116 @@ struct ChatUX1Composer: View {
     private func choose(_ candidate: ChatMentionCandidate) {
         guard let token else { return }
         let inserted = "@\(candidate.address) "
-        changed((text as NSString).replacingCharacters(in: token.range, with: inserted))
-        selection = NSRange(location: token.range.location + (inserted as NSString).length, length: 0)
+        control.replace(token.range, with: inserted)
         if candidate.addToChannel, let id = candidate.agentId { add(id) }
     }
     private func key(_ code: UInt16, _ modifiers: NSEvent.ModifierFlags) -> Bool {
-        if code == 36 && modifiers.contains(.command) { send(); return true }
-        if code == 126, modifiers.intersection([.command, .control, .option, .shift]).isEmpty, text.isEmpty {
-            return model.editLastMessage(root: root, composerText: text)
+        if code == 53, modifiers.intersection([.command, .control, .option, .shift]).isEmpty, matches.isEmpty {
+            return model.dismissTransient()
         }
-        guard !matches.isEmpty else { return false }
-        switch code {
-        case 125: selected = (selected + 1) % matches.count
-        case 126: selected = (selected + matches.count - 1) % matches.count
-        case 36, 48: choose(matches[min(selected, matches.count - 1)])
-        case 53: dismissedQuery = token?.query
-        default: return false
+        switch ChatComposerKey.action(code: code, modifiers: modifiers, hasCandidates: !matches.isEmpty, text: text, inThread: model.threadRoot != nil) {
+        case .send: send()
+        case .editLast: return model.editLastMessage(root: root, composerText: text)
+        case .nextCandidate: selected = (selected + 1) % matches.count
+        case .previousCandidate: selected = (selected + matches.count - 1) % matches.count
+        case .chooseCandidate: choose(matches[min(selected, matches.count - 1)])
+        case .dismissCandidates: dismissedQuery = token?.query
+        case .closeThread:
+            model.dismissTransient()
+        case .native: return false
         }
         return true
     }
 
+    private var recipient: String { root == nil ? "Message in #\(card?.name ?? "channel")" : "Reply in thread" }
+    private var canSend: Bool { version != nil && ChatChannelModel.textProblem(text) == nil && (mentionOnly || called.isEmpty || !tooMuchContext) }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            if !matches.isEmpty {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(matches.enumerated()), id: \.element.id) { index, candidate in
-                        Button { choose(candidate) } label: {
-                            HStack {
-                                Text(candidate.label).fontWeight(.medium)
-                                Text("@\(candidate.address)").foregroundStyle(.secondary)
-                                Spacer()
-                                if candidate.addToChannel { Text("Add to channel").font(.caption) }
-                            }.padding(6).background(index == selected ? Color.accentColor.opacity(0.15) : .clear)
-                        }.buttonStyle(.plain).help("@\(candidate.address)")
-                    }
-                }.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(recipient)
+                Spacer()
+                if !text.isEmpty { Label("Draft", systemImage: "pencil").font(Theme.display(9)) }
+            }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+            VStack(spacing: 0) {
+                if formatting { ChatFormattingBar(control: control) }
+                ChatMentionEditor(text: Binding(get: { text }, set: { changed($0) }), selection: $selection, candidates: candidates,
+                                  autofocus: root != nil, navigationTarget: root == nil && draftLoaded ? ChannelRef(model.key, channel: model.channel) : nil,
+                                  control: control,
+                                  heightChanged: { if editorHeight != $0 { editorHeight = $0 } }, placeholder: recipient,
+                                  accessibilityName: recipient,
+                                  suggestions: .init(sections: sections, selected: min(selected, max(0, matches.count - 1)),
+                                                     title: "Mention in \(root == nil ? "channel" : "thread")", choose: choose),
+                                  key: { key($0, $1) })
+                    .frame(height: editorHeight)
+                    .accessibilityLabel(recipient)
+                HStack(spacing: 2) {
+                    ChatIconButton(title: "Insert emoji", symbol: "face.smiling", action: control.emoji)
+                    ChatIconButton(title: "Mention a person or agent", symbol: "at") { control.insert("@") }
+                    Button("Aa") { formatting.toggle() }.buttonStyle(.plain).frame(width: 28, height: 28)
+                        .help("Show formatting").accessibilityLabel("Show formatting").accessibilityValue(formatting ? "Shown" : "Hidden").chatFocusRing()
+                    Spacer()
+                    Button(action: send) { Image(systemName: "paperplane.fill").frame(width: 32, height: 28) }
+                        .buttonStyle(.plain).foregroundStyle(canSend ? ChatAppearance.surface : ChatAppearance.secondary)
+                        .background(canSend ? ChatAppearance.accent : Theme.chromeSelection, in: RoundedRectangle(cornerRadius: 5))
+                        .disabled(!canSend).help("Send (⌘↩)").accessibilityLabel("Send").chatFocusRing()
+                }.padding(.horizontal, 8).padding(.bottom, 8)
             }
-            ChatMentionEditor(text: Binding(get: { text }, set: { changed($0) }), selection: $selection, candidates: candidates,
-                              key: { key($0, $1) })
-                .frame(minHeight: 50, maxHeight: 130)
+            .background(ChatAppearance.composerSurface, in: RoundedRectangle(cornerRadius: 9))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(control.focused ? ChatAppearance.accent : ChatAppearance.border, lineWidth: control.focused ? 2 : 1))
+            agentContext
+            if let problem = model.problem { Text(problem).foregroundStyle(ChatAppearance.failure).font(Theme.display(11)).textSelection(.enabled) }
+            HStack {
+                if text.utf8.count > ChatChannelModel.maxBytes * 3 / 4 {
+                    Text("\(text.utf8.count) / \(ChatChannelModel.maxBytes) bytes").foregroundStyle(ChatAppearance.failure)
+                }
+                Spacer()
+                Text("⌘↩ Send · Return for a new line")
+            }.font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
+        }
+        .padding(.horizontal, root == nil ? 24 : 16).padding(.top, 10).padding(.bottom, 12)
+        .background(ChatAppearance.surface)
+        .onChange(of: model.problem) { _, problem in
+            if let problem, control.focused { ChatAccessibility.announce(problem, in: control.view) }
+        }
+        .onChange(of: selected) { _, value in
+            if control.focused, matches.indices.contains(value) {
+                ChatAccessibility.announce(matches[value].accessibilityName, in: control.view)
+            }
+        }
+        .onChange(of: model.focusRequest) { _, request in
+            if request?.area == .composer, root == model.threadRoot { control.focus() }
+        }
+        .task(id: root ?? "") {
+            let draft = model.composerDraft(root: root)
+            text = draft.text; version = draft.version
+            contextIds = draft.contextIds; mentionOnly = draft.mentionOnly
+            selection = NSRange(location: (text as NSString).length, length: 0)
+            selected = 0; dismissedQuery = nil
+            draftLoaded = true
+        }
+        .sheet(isPresented: $choosingContext) {
+            VStack(alignment: .leading) {
+                Text("Context for the agent").font(.headline)
+                Text("Your question and the undeleted thread root are included. Choose additional messages.").font(.caption)
+                List(model.contextCandidates(root: root ?? "").filter { $0.messageId != root }) { message in
+                    Toggle(String(message.text.prefix(160)), isOn: Binding(get: { contextIds.contains(message.messageId) }, set: { on in
+                        if on { contextIds.insert(message.messageId) } else { contextIds.remove(message.messageId) }
+                        saveDraft()
+                    }))
+                }
+                Text("\(contextCount) / 20 messages · \(contextBytes) / 49152 bytes\(tooMuchContext ? " — reduce the selection before sending" : "")")
+                    .font(.caption).foregroundStyle(tooMuchContext ? .red : .secondary)
+                Button("Done") { choosingContext = false }
+            }.padding(16).frame(width: 480, height: 340)
+        }
+    }
+
+    @ViewBuilder private var agentContext: some View {
             if !called.isEmpty {
-                Toggle("Only mention — don't request an answer", isOn: $mentionOnly).font(.caption)
+                Toggle("Only mention — don't request an answer", isOn: Binding(get: { mentionOnly }, set: {
+                    mentionOnly = $0; saveDraft()
+                })).font(.caption)
                 if !mentionOnly {
                     ForEach(called) { agent in
                         Text("\(agent.name): \(mode(agent))").font(.caption).foregroundStyle(.secondary)
@@ -119,31 +198,6 @@ struct ChatUX1Composer: View {
                     else { Text("Its owner must add it.") }
                 }.font(.caption)
             }
-            HStack {
-                if let problem = model.problem { Text(problem).foregroundStyle(.red).font(.caption) }
-                Spacer()
-                Text("\(text.utf8.count) / \(ChatChannelModel.maxBytes) bytes").foregroundStyle(.secondary).font(.caption)
-                Button("Send") { send() }.disabled(version == nil || ChatChannelModel.textProblem(text) != nil || !mentionOnly && !called.isEmpty && tooMuchContext)
-            }
-        }.padding(8)
-        .task(id: root ?? "") {
-            text = model.draft(root: root); version = model.draftVersion(root: root)
-            selection = NSRange(location: (text as NSString).length, length: 0)
-        }
-        .sheet(isPresented: $choosingContext) {
-            VStack(alignment: .leading) {
-                Text("Context for the agent").font(.headline)
-                Text("Your question and the undeleted thread root are included. Choose additional messages.").font(.caption)
-                List(model.contextCandidates(root: root ?? "").filter { $0.messageId != root }) { message in
-                    Toggle(String(message.text.prefix(160)), isOn: Binding(get: { contextIds.contains(message.messageId) }, set: { on in
-                        if on { contextIds.insert(message.messageId) } else { contextIds.remove(message.messageId) }
-                    }))
-                }
-                Text("\(contextCount) / 20 messages · \(contextBytes) / 49152 bytes\(tooMuchContext ? " — reduce the selection before sending" : "")")
-                    .font(.caption).foregroundStyle(tooMuchContext ? .red : .secondary)
-                Button("Done") { choosingContext = false }
-            }.padding(16).frame(width: 480, height: 340)
-        }
     }
 
     private func mode(_ agent: ChatChannelAgent) -> String {

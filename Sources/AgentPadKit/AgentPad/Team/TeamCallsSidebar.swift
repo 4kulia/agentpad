@@ -7,8 +7,6 @@ import SwiftUI
 /// Allow / Decline / Stop / Cancel in place (docs/agentpad/TEAM.md R-2, R-3, J-1).
 struct TeamCallsSidebar: View {
     var service = TeamService.shared
-    /// AgentPad F2: opens a channel's tab in this window.
-    var openChannel: (ChannelRef, Bool) -> Void = { _, _ in }
     @State private var filter = Filter.all
     @State private var expanded: String?
 
@@ -48,8 +46,6 @@ struct TeamCallsSidebar: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Rectangle().fill(Theme.chromeHairline).frame(height: 1)
-            // The organization and the user's teams (C6).
-            ChatOrgSidebarSection(openChannel: openChannel)
             if service.mode != .server && all.isEmpty {
                 empty("Team work goes through a server.", action: ("Connect…", { ChatConnectWindow.show() }))
             } else if let problem = calls.storeProblem {

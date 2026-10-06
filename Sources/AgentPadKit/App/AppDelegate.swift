@@ -551,6 +551,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private func handleDeepLink(_ link: AgentPadDeepLink) {
         NSApp.activate(ignoringOtherApps: true)
         switch link {
+        case .chatMessage(let target):
+            guard let key = ChatService.shared.connection?.orgKey, target.matches(key: key, channel: target.channel),
+                  case .ready = ChannelTabs.state(ChannelRef(key, channel: target.channel)) else {
+                presentDeepLinkFailure("Connect to the message's organization and confirm channel access first.")
+                return
+            }
+            guard let controller = deepLinkController()?.controller,
+                  let session = controller.store.showChannel(ChannelRef(key, channel: target.channel)) else { return }
+            if let window = controller.window { front(window) }
+            ChatMessageNavigation.request(target, key: key, destination: session.engine.view)
         case .resumeSession(let agentId, let conversationId, let cwd):
             resumeSessionFromDeepLink(agentId: agentId, conversationId: conversationId, cwd: cwd)
         case .invalid(let reason):
@@ -1278,6 +1288,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         let viewEntries: [MenuEntry] = [
             selfRow("Toggle Sidebar", #selector(handleToggleSidebar), "s", modifiers: [.command, .control]),
+            // AgentPad: Chat focus commands have no terminal-wide shortcuts.
+            .sub(ChatFocusMenu.make(target: self, action: #selector(handleChatFocus(_:)))),
             .separator,
             selfRow("Increase Font Size", #selector(handleIncreaseFontSize), "="),
             selfRow("Decrease Font Size", #selector(handleDecreaseFontSize), "-"),
@@ -1747,6 +1759,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// key-equivalent routing, which keeps the responder boundary in one
     /// native validation hook instead of duplicating guards in every action.
     public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        // AgentPad: scope Chat focus to the current main window and tab.
+        if menuItem.action == #selector(handleChatFocus(_:)), let area = ChatFocusArea(rawValue: menuItem.tag) {
+            guard keyAuxiliaryWindow == nil, let store = activeStore else { return false }
+            if area == .navigation { return true }
+            guard let engine = store.active?.activeSession?.engine as? ChannelTabEngine,
+                  case .ready = ChannelTabs.state(engine.ref), let model = engine.conversation.model else { return false }
+            return area != .thread || model.threadRoot != nil
+        }
         if menuItemMatches(menuItem, #selector(handleCloseTab)) {
             if let auxiliary = keyAuxiliaryWindow {
                 return auxiliary.windowController is DismissablePanel
@@ -1875,6 +1895,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         guard let store = activeStore else { return }
         withAnimation(Theme.chromeTransition) {
             store.setSidebarMode(store.sidebarMode.next)
+        }
+    }
+
+    // AgentPad: the engine owns the conversation, so another window cannot take focus.
+    @objc private func handleChatFocus(_ sender: NSMenuItem) {
+        guard validateMenuItem(sender), let store = activeStore, let area = ChatFocusArea(rawValue: sender.tag) else { return }
+        if area == .navigation {
+            store.setSidebarContent(.chat)
+            store.chatNavigation.focusRequested = true
+        } else if let engine = store.active?.activeSession?.engine as? ChannelTabEngine {
+            engine.conversation.model?.focusRequest = ChatFocusRequest(area: area)
         }
     }
 

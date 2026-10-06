@@ -51,6 +51,11 @@ struct ContentView: View {
         .onChange(of: store.sidebarMode) { _, _ in
             onWindowLayoutChange(true, true)
         }
+        .onChange(of: store.sidebarContent) { _, _ in
+            // Chat restores a separate width. A discrete mode change must
+            // keep room for the pane tree, just like expanding the sidebar.
+            onWindowLayoutChange(true, false)
+        }
         .onChange(of: store.rightSidebarMode) { _, _ in
             onWindowLayoutChange(true, true)
         }
@@ -59,7 +64,7 @@ struct ContentView: View {
             // updating `minSize` is enough and avoids a per-frame window jump.
             if active { onWindowLayoutChange(false, false) }
         }
-        .onChange(of: store.sidebarWidth) { _, _ in
+        .onChange(of: store.sidebarDisplayWidth) { _, _ in
             onWindowLayoutChange(false, false)
         }
         .onChange(of: store.rightSidebarWidth) { _, _ in
@@ -156,7 +161,7 @@ struct ContentView: View {
     /// offset can never disagree with the sidebar's rendered edge.
     private var sidebarWidth: CGFloat {
         switch store.sidebarMode {
-        case .full: return store.sidebarWidth
+        case .full: return store.sidebarDisplayWidth
         case .compact: return SidebarView.compactWidth
         case .hidden: return 0
         }

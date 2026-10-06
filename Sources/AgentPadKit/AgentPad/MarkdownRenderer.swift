@@ -786,6 +786,12 @@ enum MarkdownRenderer {
               url.absoluteString.utf8.count <= chatMaxLinkLength,
               let decoded = url.absoluteString.removingPercentEncoding, clean(decoded, spaces: true) else { return nil }
         switch url.scheme?.lowercased() {
+        case "agentpad":
+            // Message locators only; terminal resume and execution URLs remain
+            // forbidden in untrusted chat. The application rechecks F2 on open.
+            guard url.host?.lowercased() == "chat", let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  ChatMessageLink(components: parts) != nil else { return nil }
+            return url
         case "http", "https":
             guard let host = url.host(percentEncoded: false), !host.isEmpty, url.user == nil, url.password == nil else { return nil }
             return url

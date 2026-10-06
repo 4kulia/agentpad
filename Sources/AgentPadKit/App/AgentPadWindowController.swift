@@ -329,7 +329,7 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
     private var desiredMinimumWindowWidth: CGFloat {
         AgentPadWindowLayout.minimumWindowWidth(
             leftMode: store.sidebarMode,
-            expandedLeftWidth: store.sidebarWidth,
+            expandedLeftWidth: store.sidebarDisplayWidth,
             rightMode: store.rightSidebarMode,
             expandedRightWidth: store.rightSidebarWidth,
             terminalWidth: AgentPadWindowLayout.minimumTerminalTreeWidth(for: store.active?.root)

@@ -457,6 +457,37 @@ enum ChatStoreMigrations {
                 t.add(column: "automatic", .boolean).notNull().defaults(to: true)
             }
         }
+        migrator.registerMigration("release-14-ux2-thread-read-floor") { db in
+            // Upgrade retains the old F4 interpretation of already-read data.
+            // Future root reads leave this baseline alone; individual threads
+            // record their viewed replies in notified, including snapshot rows.
+            try db.alter(table: "read_marks") { t in t.add(column: "thread_read_seq", .integer).notNull().defaults(to: 0) }
+            try db.execute(sql: "UPDATE read_marks SET thread_read_seq = MAX(0, last_read_seq)")
+            // Notifications outlive a channel window. Retain the conversation
+            // even when a later snapshot evicts its message from the cache.
+            try db.alter(table: "notified") { t in t.add(column: "thread_root_id", .text) }
+            try db.execute(sql: """
+                UPDATE notified SET thread_root_id = (SELECT thread_root_id FROM messages WHERE message_id = object_id)
+                WHERE kind != 'decision'
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER ux2_thread_read_initial AFTER INSERT ON read_marks BEGIN
+                    UPDATE read_marks SET thread_read_seq = MAX(0, NEW.last_read_seq) WHERE channel_id = NEW.channel_id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER ux2_thread_read_generation AFTER UPDATE OF last_read_seq ON read_marks
+                WHEN OLD.last_read_seq < 0 AND NEW.last_read_seq >= 0 BEGIN
+                    UPDATE read_marks SET thread_read_seq = NEW.last_read_seq WHERE channel_id = NEW.channel_id;
+                END
+                """)
+        }
+        migrator.registerMigration("release-15-ux2-draft-options") { db in
+            try db.alter(table: "drafts") { t in
+                t.add(column: "mention_only", .boolean).notNull().defaults(to: false)
+                t.add(column: "context_ids", .text).notNull().defaults(to: "[]")
+            }
+        }
         return migrator
     }
 

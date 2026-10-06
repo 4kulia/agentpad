@@ -42,10 +42,21 @@ enum ChatUnread {
                 WHERE excluded.last_read_seq > read_marks.last_read_seq
                 """, arguments: [channel, seq])
         }
-        let filter = root == nil ? "seq <= ?" : "object_id IN (SELECT message_id FROM messages WHERE thread_root_id = ? OR message_id = ?)"
-        let args: StatementArguments = root.map { [channel, $0, $0] } ?? [channel, seq]
+        let filter = root == nil
+            ? "seq <= ? AND thread_root_id IS NULL AND object_id NOT IN (SELECT message_id FROM messages WHERE thread_root_id IS NOT NULL)"
+            : "object_id IN (SELECT message_id FROM messages WHERE (thread_root_id = ? OR message_id = ?) AND seq <= ?)"
+        let args: StatementArguments = root.map { [channel, $0, $0, seq] } ?? [channel, seq]
         let ids = try String.fetchAll(db, sql: "SELECT object_id FROM notified WHERE channel_id = ? AND read = 0 AND \(filter)", arguments: args)
         try db.execute(sql: "UPDATE notified SET read = 1 WHERE channel_id = ? AND read = 0 AND \(filter)", arguments: args)
+        if let root {
+            // A snapshot/catch-up may have brought a mention without a banner.
+            // Record that it was actually viewed without inventing a notification.
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO notified (object_id, kind, channel_id, seq, read, thread_root_id)
+                SELECT message_id, 'reply', channel_id, seq, 1, thread_root_id FROM messages
+                WHERE channel_id = ? AND (thread_root_id = ? OR message_id = ?) AND seq <= ? AND has_fixed = 1
+                """, arguments: [channel, root, root, seq])
+        }
         return ids
     }
 
@@ -63,16 +74,25 @@ enum ChatUnread {
     /// others, not deleted, above the channel's mark, in my teams' channels,
     /// not read in their thread. `notified` only keeps banners from repeating.
     static func unreadMentions(_ db: Database) throws -> Int {
+        try unreadMentionsByChannel(db).values.reduce(0, +)
+    }
+
+    /// Shared by the sidebar, saved mention view and Dock, including thread reads.
+    static func unreadMentionsByChannel(_ db: Database) throws -> [String: Int] {
         let me = try String.fetchOne(db, sql: "SELECT me FROM meta WHERE id = 1") ?? ""
-        return try Int.fetchOne(db, sql: """
-            SELECT COUNT(*) FROM messages m
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT m.channel_id, COUNT(*) AS count FROM messages m
                 JOIN channels c ON c.channel_id = m.channel_id
                 JOIN teams t ON t.team_id = c.team_id AND t.mine = 1
                 LEFT JOIN read_marks r ON r.channel_id = m.channel_id
                 LEFT JOIN notified n ON n.object_id = m.message_id
             WHERE m.has_fixed = 1 AND m.deleted_at IS NULL AND m.author_account_id != ?
-                AND m.mentions LIKE '%"' || ? || '"%' AND m.seq > IFNULL(r.last_read_seq, 0) AND IFNULL(n.read, 0) = 0
-            """, arguments: [me, me]) ?? 0
+                AND m.mentions LIKE '%"' || ? || '"%'
+                AND m.seq > CASE WHEN m.thread_root_id IS NULL THEN IFNULL(r.last_read_seq, 0) ELSE IFNULL(r.thread_read_seq, 0) END
+                AND IFNULL(n.read, 0) = 0
+            GROUP BY m.channel_id
+            """, arguments: [me, me])
+        return Dictionary(uniqueKeysWithValues: rows.map { ($0["channel_id"] as String, $0["count"] as Int) })
     }
 
     /// Whether a message owes a notice, and of which kind — one per message
@@ -99,10 +119,11 @@ enum ChatUnread {
         guard let kind else { return nil }
         // Read already (its place under the mark — a placeholder read in an open
         // feed): marked, read, no notice (review F4b-4).
-        let mark = try Int.fetchOne(db, sql: "SELECT last_read_seq FROM read_marks WHERE channel_id = ?", arguments: [channel]) ?? -1
+        let field = (m["thread_root_id"] as String?) == nil ? "last_read_seq" : "thread_read_seq"
+        let mark = try Int.fetchOne(db, sql: "SELECT \(field) FROM read_marks WHERE channel_id = ?", arguments: [channel]) ?? -1
         let read = (m["seq"] as Int?).map { $0 <= mark } ?? false
-        try db.execute(sql: "INSERT OR IGNORE INTO notified (object_id, kind, channel_id, seq, read) VALUES (?, ?, ?, ?, ?)",
-                       arguments: [messageId, kind, channel, m["seq"] as Int?, read])
+        try db.execute(sql: "INSERT OR IGNORE INTO notified (object_id, kind, channel_id, seq, read, thread_root_id) VALUES (?, ?, ?, ?, ?, ?)",
+                       arguments: [messageId, kind, channel, m["seq"] as Int?, read, m["thread_root_id"] as String?])
         return db.changesCount > 0 && !read ? kind : nil
     }
 }

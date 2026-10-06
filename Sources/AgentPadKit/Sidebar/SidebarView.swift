@@ -135,18 +135,19 @@ struct SidebarView: View {
         DragGesture(minimumDistance: 0, coordinateSpace: .global)
             .onChanged { value in
                 if resizeDragStartWidth == nil {
-                    resizeDragStartWidth = store.sidebarWidth
+                    resizeDragStartWidth = store.sidebarDisplayWidth
                     store.beginSidebarResize()
                 }
-                let proposed = (resizeDragStartWidth ?? store.sidebarWidth) + value.translation.width
-                let clamped = Self.clampWidth(proposed)
-                guard abs(clamped - store.sidebarWidth) > .ulpOfOne else { return }
+                let proposed = (resizeDragStartWidth ?? store.sidebarDisplayWidth) + value.translation.width
+                let clamped = store.sidebarContent == .chat
+                    ? CGFloat(ChatSidebarPreferences.clampWidth(Double(proposed))) : Self.clampWidth(proposed)
+                guard abs(clamped - store.sidebarDisplayWidth) > .ulpOfOne else { return }
                 if !sidebarResizeSuspended {
                     sidebarResizeSuspended = true
                     sidebarSuspendedEngines = store.active?.root.allEngines ?? []
                     for engine in sidebarSuspendedEngines { engine.beginSizePropagationSuspension() }
                 }
-                store.sidebarWidth = clamped
+                store.setSidebarDisplayWidth(clamped)
             }
             .onEnded { _ in
                 resizeDragStartWidth = nil
@@ -179,22 +180,11 @@ struct SidebarView: View {
         let isCompact = mode == .compact
         VStack(spacing: 0) {
             brand(isCompact: isCompact)
-            // Compact can't fit a tree in 52pt, so it always shows the icon
-            // list; the file tree (and its footer toggle) are full-mode only.
-            if fileTreeIsMounted {
-                FileTreeView(store: store, model: store.fileTree)
-            } else if store.sidebarContent == .team && !isCompact {
-                // AgentPad: team calls (Team/TeamCallsSidebar.swift).
-                TeamCallsSidebar(openChannel: { store.showChannel($0, newTab: $1) })
-            } else {
-                ScrollViewReader { proxy in
-                    list(isCompact: isCompact, proxy: proxy)
-                }
-            }
+            sidebarContent(isCompact: isCompact)
             Spacer(minLength: 0)
-            if !isCompact { footer() }
+            ChatSidebarModePicker(store: store, compact: isCompact, model: ChatOrgCurrent.shared.model)
         }
-        .frame(width: isCompact ? Self.compactWidth : store.sidebarWidth)
+        .frame(width: isCompact ? Self.compactWidth : store.sidebarDisplayWidth)
         .glassChromeBackground()
         .overlay(alignment: .trailing) {
             if !isCompact { resizeHandle }
@@ -375,6 +365,24 @@ struct SidebarView: View {
         }
     }
 
+    @ViewBuilder
+    private func sidebarContent(isCompact: Bool) -> some View {
+        // Compact can't fit a tree in 52pt, so it always shows the icon
+        // list; the file tree (and its footer toggle) are full-mode only.
+        if fileTreeIsMounted {
+            FileTreeView(store: store, model: store.fileTree)
+        } else if store.sidebarContent == .team && !isCompact {
+            // AgentPad: team calls (Team/TeamCallsSidebar.swift).
+            TeamCallsSidebar()
+        } else if store.sidebarContent == .chat && !isCompact {
+            ChatSidebarView(store: store, navigation: store.chatNavigation, model: ChatOrgCurrent.shared.model)
+        } else {
+            ScrollViewReader { proxy in
+                list(isCompact: isCompact, proxy: proxy)
+            }
+        }
+    }
+
     /// Cancel whichever sheet is up, clearing its parked store request —
     /// the single dismissal path shared by every sheet's cancel button and
     /// the ⌘W `sheetDismissRequest` signal, so the two can't drift.
@@ -467,43 +475,6 @@ struct SidebarView: View {
         .padding(.bottom, Theme.space1)
         .frame(maxWidth: .infinity)
         .frame(height: Theme.contentHeaderHeight, alignment: .bottom)
-    }
-
-    /// Pinned bottom bar, full mode only — compact hides it since a 52pt
-    /// column can't host the tree the files segment switches to. Two segments
-    /// toggling between the workspace list and the active workspace's file tree.
-    @ViewBuilder
-    private func footer() -> some View {
-        Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
-        HStack(spacing: Theme.chromeControlSpacing) {
-            segment(.workspaces, systemName: "rectangle.stack", help: "Workspaces")
-            segment(.files, systemName: "folder", help: "Files")
-            // AgentPad: team calls, with a dot while any waits for you.
-            segment(.team, systemName: "person.2", help: "Team")
-                .overlay(alignment: .topTrailing) {
-                    if !TeamService.shared.calls.awaitingDecision.isEmpty || !TeamService.shared.calls.pendingAccess.isEmpty || !ClaudeVersionApprovals.shared.pending.isEmpty {
-                        Circle().fill(agentStateWordColor(.attention)).frame(width: 6, height: 6).offset(x: -3, y: 3)
-                    }
-                }
-            Spacer(minLength: 0)
-        }
-        // The first segment is 26pt wide; align its centre to the shared
-        // sidebar axis while preserving the button's generous hit target.
-        .padding(.leading, Theme.sidebarLeadingIconCenterX - Theme.chromeFooterSegmentWidth / 2)
-        .padding(.trailing, Theme.chromeBarEdgeInset)
-        .padding(.vertical, Theme.chromeBottomBarVerticalPadding)
-    }
-
-    private func segment(_ content: SidebarContent, systemName: String, help: String) -> some View {
-        FooterSegment(
-            systemName: systemName,
-            isActive: store.sidebarContent == content,
-            help: help
-        ) {
-            withAnimation(Theme.chromeTransition) {
-                store.setSidebarContent(content)
-            }
-        }
     }
 
     private func list(isCompact: Bool, proxy: ScrollViewProxy) -> some View {

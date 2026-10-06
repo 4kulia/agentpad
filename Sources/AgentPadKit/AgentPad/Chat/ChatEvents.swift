@@ -136,9 +136,20 @@ enum ChatEvents {
     /// Types whose events carry nothing for the cache.
     static let pointers: Set<String> = ["account.membership_changed", "account.session_opened"]
 
+    /// Forward compatibility: later channel features invalidate only their
+    /// channel. Malformed *known* events still need the existing full resync.
+    static func channelPointer(_ event: ChatEvent) -> String? {
+        guard handlers[event.type] == nil, !pointers.contains(event.type),
+              !ChatChannels.eventTypes.contains(event.type), !ChatMessages.eventTypes.contains(event.type),
+              !ChatChannelAgents.eventTypes.contains(event.type), !ChatCallStore.eventTypes.contains(event.type),
+              let channel = event.body["channel_id"]?.string, !channel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return channel
+    }
+
     /// Applies a type with a handler; false for any other. What this build
     /// does not know is not lost in silence: the cache records it, and the
-    /// sync takes a snapshot, which brings its effect (review D8f-p3-1).
+    /// sync rereads its channel or takes an organization snapshot.
     @discardableResult
     static func apply(_ db: Database, _ event: ChatEvent) throws -> Bool {
         if ChatChannels.eventTypes.contains(event.type) { return try ChatChannels.apply(db, event) }
