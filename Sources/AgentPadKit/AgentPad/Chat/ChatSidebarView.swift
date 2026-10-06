@@ -190,28 +190,35 @@ struct ChatSidebarView: View {
 
     private func savedViews(_ snapshot: ChatSidebarSnapshot) -> some View {
         VStack(spacing: 0) {
-            filterRow(.unread, title: "Unread", icon: "tray", badge: ChatSidebarSnapshot.unreadLabel(snapshot.unread))
-            filterRow(.mentions, title: "Mentions", icon: "at", badge: snapshot.mentions > 0 ? "@\(snapshot.mentions)" : nil)
-            if navigation.filter != .all, snapshot.incomplete {
+            inboxRow(.unread, badge: ChatSidebarSnapshot.unreadLabel(snapshot.unread))
+            inboxRow(.mentions, badge: snapshot.mentions > 0 ? "@\(snapshot.mentions)" : nil)
+            if snapshot.incomplete {
                 Text("From loaded history").font(Theme.display(10)).foregroundStyle(ChatSidebarStyle.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 9).padding(.top, 4)
             }
         }.padding(.horizontal, 12)
     }
 
-    private func filterRow(_ value: ChatSidebarFilter, title: String, icon: String, badge: String?) -> some View {
-        Button { navigation.filter = navigation.filter == value ? .all : value } label: {
+    private func inboxRow(_ value: ChatInboxKind, badge: String?) -> some View {
+        let ref = model?.key.map { ChatInboxRef($0, kind: value) }
+        let selected = ref != nil && store.active?.activeSession?.inbox == ref
+        return Button {
+            guard let ref, case .ready = ref.state(model) else { return }
+            navigation.filter = .all
+            store.showInbox(ref)
+        } label: {
             HStack(spacing: 9) {
-                Image(systemName: icon).frame(width: 17).accessibilityHidden(true)
-                Text(title).font(Theme.display(12))
+                Image(systemName: value.symbol).frame(width: 17).accessibilityHidden(true)
+                Text(value.title).font(Theme.display(12))
                 Spacer(minLength: 0)
                 if let badge { ChatSidebarBadge(text: badge, mention: value == .mentions) }
             }.padding(.horizontal, 9).frame(minHeight: 34)
-                .background(navigation.filter == value ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .background(selected ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 6))
                 .contentShape(Rectangle())
         }.buttonStyle(.plain).foregroundStyle(ChatSidebarStyle.secondary)
-            .chatFocusRing().accessibilityLabel(title).accessibilityValue(badge ?? "0")
-            .accessibilityHint(navigation.filter == value ? "Selected. Activate to show all channels." : "Filter channels")
+            .chatFocusRing().accessibilityLabel(value.title).accessibilityValue(badge ?? "0")
+            .accessibilityHint(selected ? "Selected. Show message list." : "Open message list in a tab")
+            .accessibilityIdentifier("chat-inbox-\(value.rawValue)")
     }
 
     private func tree(_ snapshot: ChatSidebarSnapshot) -> some View {

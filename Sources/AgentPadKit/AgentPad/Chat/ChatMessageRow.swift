@@ -33,6 +33,7 @@ struct ChatMessageRow: View {
     }
     /// The revision the deletion's confirmation was opened on.
     @State private var deleting: Int?
+    @State private var showingReactions = false
 
     private var mine: Bool { message.authorAccountId == me }
     private var author: ChatMessageAttribution {
@@ -67,6 +68,25 @@ struct ChatMessageRow: View {
                 if editing != nil && !message.deleted { editor } else { body(of: message) }
                 if message.editedAt != nil && !message.deleted { Text("edited").font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary) }
                 marks
+                if !message.deleted, let b1 = model.b1 {
+                    if b1.state.metadata[message.id] == nil, message.seq != nil,
+                       b1.supports("chat.reactions") || b1.supports("chat.pins") || b1.supports("chat.thread_summary") {
+                        if let error = b1.state.loadError {
+                            HStack { Text(error); Button("Retry") { b1.retryReads() }.buttonStyle(.link) }.font(Theme.display(9))
+                        } else { Text("Loading message details…").font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary) }
+                    }
+                    if b1.supports("chat.pins"), b1.state.metadata[message.id]?.pin != nil {
+                        Label("Pinned", systemImage: "pin.fill").font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
+                    }
+                    if b1.supports("chat.pins"), b1.pending(message.id, choice: "pin") { ProgressView().controlSize(.mini) }
+                    if b1.supports("chat.reactions"), !(b1.state.metadata[message.id]?.reactions.isEmpty ?? true) || b1.state.intents[message.id]?.isEmpty == false {
+                        ChatReactionStrip(b1: b1, message: message.id, members: members).padding(.top, 3)
+                    }
+                    if let problem = b1.problem(message.id) { Text(problem).font(.caption).foregroundStyle(ChatAppearance.failure) }
+                    ForEach((b1.state.intents[message.id] ?? []).filter { $0.error != nil }, id: \.choice) { intent in
+                        Text(intent.error ?? "").font(.caption).foregroundStyle(ChatAppearance.failure)
+                    }
+                }
                 if let source = message.inReplyToMessageId {
                     Button("Reply to: \(model.message(source).map { $0.deleted ? "Message deleted" : String($0.text.prefix(90)) } ?? "original message")") {
                         model.openThread(message.threadRootId ?? source)
@@ -74,7 +94,9 @@ struct ChatMessageRow: View {
                 }
                 ChatSourceProgress(model: model, source: message.messageId)
                 if !inThread {
-                    if let summary = model.feed.replySummaries[message.messageId], summary.count > 0 { replyButton(summary) }
+                    if let b1 = model.b1, b1.supports("chat.thread_summary"), let summary = b1.state.metadata[message.id]?.threadSummary {
+                        if summary.replyCount > 0 { ChatServerReplies(summary: summary, members: members) { model.openThread(message.id) } }
+                    } else if let summary = model.feed.replySummaries[message.messageId], summary.count > 0 { replyButton(summary) }
                     if requests > 0 {
                         Button("\(requests) \(requests == 1 ? "request" : "requests") to agents") { model.openThread(message.messageId) }
                             .buttonStyle(.link).font(Theme.display(10))
@@ -98,6 +120,9 @@ struct ChatMessageRow: View {
             if active && editing == nil { hoverActions.padding(.trailing, inThread ? 8 : 20).offset(y: -12).onHover { toolbarHovering = $0 } }
         }
         .contextMenu { menu }
+        .popover(isPresented: $showingReactions) {
+            if let b1 = model.b1, b1.supports("chat.reactions"), b1.state.accessible { ChatReactionPicker(b1: b1, message: message.id) }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(displayName)\(identity.isBot ? ", BOT" : ""), \(fullTime)")
         .background(WindowReader(box: window))
@@ -251,6 +276,9 @@ struct ChatMessageRow: View {
     private var hoverActions: some View {
         if canReply || canDelete {
             HStack(spacing: 2) {
+                if let b1 = model.b1, b1.supports("chat.reactions"), !message.deleted {
+                    ChatIconButton(title: "Add reaction", symbol: "face.smiling") { showingReactions = true }.disabled(!b1.canChange)
+                }
                 if canReply { ChatIconButton(title: "Reply in thread", symbol: "arrowshape.turn.up.left") { model.openThread(message.threadRootId ?? message.messageId) } }
                 if model.canEdit(message) {
                     ChatIconButton(title: "Edit message", symbol: "pencil") { model.beginEditing(message, root: editRoot) }.disabled(model.editing != nil)
@@ -269,6 +297,13 @@ struct ChatMessageRow: View {
     @ViewBuilder
     private var menu: some View {
         if message.hasFixed, !message.deleted {
+            if let b1 = model.b1 {
+                if b1.supports("chat.reactions") { Button("Add reaction…") { showingReactions = true }.disabled(!b1.canChange) }
+                if b1.supports("chat.pins") {
+                    Button(b1.state.metadata[message.id]?.pin == nil ? "Pin message" : "Unpin message") { b1.togglePin(message.id) }
+                        .disabled(!b1.canChange || b1.pending(message.id, choice: "pin") || b1.state.metadata[message.id] == nil)
+                }
+            }
             if canReply { Button("Reply in Thread") { model.openThread(message.threadRootId ?? message.messageId) } }
             if message.seq != nil, let link = ChatMessageLink(key: model.key, message: message).url {
                 Button("Copy message link") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(link.absoluteString, forType: .string) }

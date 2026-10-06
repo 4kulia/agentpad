@@ -95,7 +95,7 @@ private struct PaneView: View {
                     .padding(8)
                     // AgentPad: a channel tab has no terminal menu (DESIGN-F2).
                     .overlay(RightClickCatcher { unit in
-                        guard active.channel == nil else { return }
+                        guard !active.isChat else { return }
                         // Promote this pane to the workspace's active one —
                         // RightClickCatcher swallows rightMouseDown before
                         // libghostty sees it, so `engine.onFocus` never
@@ -122,7 +122,7 @@ private struct PaneView: View {
                     .overlay(alignment: .topTrailing) {
                         // Per-pane: multiple panes can search simultaneously,
                         // each with their own needle and result count.
-                        if active.searchActive, active.channel == nil {
+                        if active.searchActive, !active.isChat {
                             PaneSearchBar(
                                 session: active,
                                 isWorkspaceActive: store.activeWorkspaceId == workspace.id,
@@ -135,7 +135,7 @@ private struct PaneView: View {
                     .overlay(alignment: .bottom) {
                         // ⌘L composer rises from the bottom like a chat box.
                         // Per-pane / per-session, same as search.
-                        if active.composerActive, active.channel == nil {
+                        if active.composerActive, !active.isChat {
                             PaneComposerBar(
                                 session: active,
                                 pane: pane,
@@ -449,7 +449,7 @@ private struct PaneStatusBar: View {
                 }
             }
             // AgentPad: no composer in a channel tab (DESIGN-F2).
-            if session.channel == nil {
+            if !session.isChat {
                 StatusBarIconButton(
                     systemName: "long.text.page.and.pencil",
                     isActive: session.composerActive,

@@ -432,6 +432,7 @@ struct ChatSnapshot: Equatable, Sendable {
     var channelsComplete = true
     /// F8: the agents of the channels of the user's teams, whole; nil from a server without them.
     var agentChannels: [ChatChannelAgentWire]? = nil
+    var threadParticipationReload = false
 }
 
 /// The cache of one (server, account, organization): `chat/<hash>.sqlite`
@@ -468,7 +469,7 @@ final class ChatStore: Sendable {
             if db.changesCount > 0 {
                 try db.execute(sql: """
                     INSERT OR IGNORE INTO my_threads (channel_id, root_id)
-                    SELECT channel_id, IFNULL(thread_root_id, message_id) FROM messages WHERE author_account_id = ?
+                    SELECT channel_id, IFNULL(thread_root_id, message_id) FROM messages WHERE author_account_id = ? AND (SELECT b1_participation FROM meta WHERE id = 1) = 0
                     """, arguments: [accountId])
             }
         }
@@ -584,6 +585,9 @@ final class ChatStore: Sendable {
             // The rights are read anew with the new generation: nothing is
             // told as "gone" before its snapshot (F2).
             try db.execute(sql: "UPDATE meta SET rights_in_doubt = 1 WHERE id = 1")
+            try ChatB1.reset(db)
+            try db.execute(sql: "DELETE FROM my_threads")
+            try ChatB1.cancelIntents(db, condition: "1")
             // Messages of the server go; one this Mac is sending stays with its command (F3).
             try db.execute(sql: "DELETE FROM messages WHERE local_state IS NULL")
             // Unsettled edits of the old generation's messages go too (review F3d-1).
@@ -591,6 +595,7 @@ final class ChatStore: Sendable {
             // F4: the old generation's numbers say nothing now — read up to the
             // first window of the new one; notices of messages go (review F4-5).
             try db.execute(sql: "UPDATE read_marks SET last_read_seq = -1")
+            try db.execute(sql: "DELETE FROM thread_read_marks")
             try db.execute(sql: "DELETE FROM notified WHERE kind != 'decision'")
             for table in ["agents_catalog", "agent_teams", "threads", "skipped_events", "cursors", "channels", "channel_windows",
                           "thread_cursors"] {
@@ -654,6 +659,7 @@ final class ChatStore: Sendable {
             let at = try Self.cursor(db, event.stream)
             if event.seq <= at { return .duplicate }
             if event.seq != at + 1 { return .gap(expected: at + 1) }
+            try ChatB1.invalidate(db, event: event)
             let whole = try Self.applyBody(db, event, facts: facts)
             try also?(db, event)
             try Self.setCursor(db, event.stream, event.seq)
@@ -678,9 +684,10 @@ final class ChatStore: Sendable {
             whole = try ChatEvents.apply(db, event)
         }
         if !whole {
-            try db.execute(sql: "INSERT OR IGNORE INTO skipped_events (stream, seq, type, at) VALUES (?, ?, ?, ?)",
-                           arguments: [event.stream, event.seq, event.type, event.at])
-            let recovery = ChatEvents.channelPointer(event) == nil ? "an organization snapshot" : "a channel read"
+            try db.execute(sql: "INSERT OR IGNORE INTO skipped_events (stream, seq, type, at, event_json) VALUES (?, ?, ?, ?, ?)",
+                           arguments: [event.stream, event.seq, event.type, event.at, String(decoding: try JSONEncoder().encode(event), as: UTF8.self)])
+            let recovery = event.type.hasPrefix("thread.participation") && event.stream.hasPrefix("member:")
+                ? "a participation read" : (ChatEvents.channelPointer(event) == nil ? "an organization snapshot" : "a channel read")
             NSLog("agentpad: chat event \(event.type) (\(event.stream) #\(event.seq)) is not wholly known to this AgentPad; \(recovery) brings its effect")
         }
         return whole
@@ -717,6 +724,7 @@ final class ChatStore: Sendable {
     /// admin's snapshot carries every team; it is just no longer the user's
     /// (review C9-7).
     private static func drop(_ db: Database, stream: String) throws {
+        try db.execute(sql: "DELETE FROM skipped_events WHERE stream = ?", arguments: [stream])
         try db.execute(sql: "DELETE FROM cursors WHERE stream = ?", arguments: [stream])
         if stream.hasPrefix("team:") {
             try leftTeam(db, String(stream.dropFirst("team:".count)))
@@ -780,6 +788,7 @@ final class ChatStore: Sendable {
     /// The user is out of `team`: a manager keeps it, no longer the user's;
     /// anyone else keeps nothing of it.
     static func leftTeam(_ db: Database, _ team: String) throws {
+        try db.execute(sql: "DELETE FROM edit_drafts WHERE team_id = ?", arguments: [team])
         if try followsAdmin(db) {
             try db.execute(sql: "UPDATE teams SET mine = 0 WHERE team_id = ?", arguments: [team])
         } else {
@@ -861,6 +870,8 @@ final class ChatStore: Sendable {
             if let agents = snapshot.agents { try ChatCallStore.replaceCatalog(db, agents) }
             for wire in snapshot.requests ?? [] { try ChatCallStore.apply(db, wire, onThisDevice: wire.onThisDevice) }
             try ChatReconcile.reconcile(db, try String.fetchAll(db, sql: "SELECT request_id FROM requests"), facts: facts)
+            if snapshot.threadParticipationReload { try ChatB1.reset(db) }
+            if snapshot.teams != nil { try ChatEditDrafts.removeRevoked(db) }
             for (stream, seq) in snapshot.cursors { try Self.setCursor(db, stream, seq) }
             // Calls asked here the server never took (D5), with the read that says so.
             try ChatCallStore.settleCreates(db)

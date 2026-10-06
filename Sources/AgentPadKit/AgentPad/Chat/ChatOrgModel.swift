@@ -69,6 +69,7 @@ struct ChatOrgView: Equatable, Sendable {
     var unread: [String: ChatUnread.Count] = [:]
     var mentionsUnread = 0
     var mentionsByChannel: [String: Int] = [:]
+    var unreadRepliesByChannel: [String: Int] = [:]
     /// F5: the agents of the channels kept; the user's own agents of the
     /// catalog (those it may add); the last snapshot carried them.
     var channelAgents: [ChatChannelAgent] = []
@@ -76,7 +77,8 @@ struct ChatOrgView: Equatable, Sendable {
     var agentsServed = false
 
     static func == (a: ChatOrgView, b: ChatOrgView) -> Bool {
-        a.orgName == b.orgName && a.members == b.members && a.teams == b.teams && a.invitations == b.invitations
+        guard a.unreadRepliesByChannel == b.unreadRepliesByChannel else { return false }
+        return a.orgName == b.orgName && a.members == b.members && a.teams == b.teams && a.invitations == b.invitations
             && a.followsAdmin == b.followsAdmin && a.rightsInDoubt == b.rightsInDoubt && a.rightsSession == b.rightsSession
             && a.refusals == b.refusals && a.channels == b.channels && a.channelsServed == b.channelsServed
             && a.channelsReadOpen == b.channelsReadOpen && a.creating.elementsEqual(b.creating) { $0 == $1 }
@@ -143,6 +145,7 @@ struct ChatOrgView: Equatable, Sendable {
             unread: try unread(db),
             mentionsUnread: mentions.values.reduce(0, +),
             mentionsByChannel: mentions,
+            unreadRepliesByChannel: try ChatUnread.unreadRepliesByChannel(db),
             channelAgents: try String.fetchAll(db, sql: "SELECT channel_id FROM channels ORDER BY channel_id")
                 .flatMap { try ChatChannelAgents.read(db, channel: $0) },
             myAgents: try ChatCallStore.catalog(db).filter { $0.ownerAccountId == (meta?["me"] as String?) },
@@ -405,6 +408,7 @@ final class ChatOrgModel {
     /// F4: a channel's unread, while it may be seen.
     func unread(_ channel: String) -> ChatUnread.Count? {
         guard visibleChannel(channel) != nil, var count = view.unread[channel] else { return nil }
+        count.count += view.unreadRepliesByChannel[channel, default: 0]
         // "•" says "not counted": only for a channel not followed (review F4-C).
         if isFollowed(channel) { count.something = false }
         return count

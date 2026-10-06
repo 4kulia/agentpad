@@ -63,8 +63,8 @@ struct ChatMessagesPage: Codable, Equatable, Sendable {
 
 /// A message as the cache has it: the server's parts, and what only this
 /// Mac knows of one it sends (`localState`).
-struct ChatMessage: Equatable, Sendable, Identifiable {
-    enum LocalState: String, Sendable { case sending, failed }
+struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
+    enum LocalState: String, Codable, Sendable { case sending, failed }
     var messageId: String
     var channelId: String
     var threadRootId: String?
@@ -89,7 +89,7 @@ struct ChatMessage: Equatable, Sendable, Identifiable {
     var localError: String?
     /// The user's edit or deletion of it not settled (`local_edits`): `saving`
     /// while its command is alive in the queue, else `failed` with why.
-    struct LocalEdit: Equatable, Sendable {
+    struct LocalEdit: Codable, Equatable, Sendable {
         var kind: String
         var text: String?
         var state: String
@@ -159,6 +159,7 @@ enum ChatMessages {
         // A deletion takes the user's unsettled edit first, whatever else
         // follows — a row pushed out by a window, a tombstone again (review F3d-1).
         if m.deletedAt != nil {
+            try ChatB1.deleted(db, id: m.messageId)
             try ChatChannelContent.forgetMessage(db, m.messageId)
             try db.execute(sql: "DELETE FROM local_edits WHERE message_id = ?", arguments: [m.messageId])
             // F4: a deleted message's notice is read — out of the Dock's count (review F4-C).
@@ -176,6 +177,7 @@ enum ChatMessages {
                 """, arguments: [m.messageId, m.channelId, m.threadRootId, m.authorAccountId, m.seq, m.createdAt,
                                  m.text, mentionsJSON(m), m.revision, m.editedAt, m.deletedAt, m.authorAgentId, m.runId])
             try writeAttribution(db, m)
+            try ChatUnread.sent(db, channel: m.channelId, thread: m.threadRootId, author: m.authorAccountId, through: m.seq)
             return true
         }
         if let row, !(row["has_fixed"] as Bool) {
@@ -198,6 +200,7 @@ enum ChatMessages {
             // conflict goes with it (review F3-p1-2).
             changed = true
         }
+        try ChatUnread.sent(db, channel: m.channelId, thread: m.threadRootId, author: m.authorAccountId, through: m.seq)
         return changed
     }
 
@@ -239,6 +242,12 @@ enum ChatMessages {
                 UPDATE messages SET stale = MAX(IFNULL(stale, 0), ?), seq = IFNULL(seq, ?)
                 WHERE message_id = ? AND (has_mutable = 0 OR revision < ?)
                 """, arguments: [revision, place, id, revision])
+            // A local post already knows its account and conversation. Its
+            // sequence ACK can advance reading before the full message arrives.
+            if let row = try Row.fetchOne(db, sql: "SELECT channel_id, thread_root_id, author_account_id, seq FROM messages WHERE message_id = ?", arguments: [id]),
+               let author: String = row["author_account_id"], let seq: Int = row["seq"] {
+                try ChatUnread.sent(db, channel: row["channel_id"], thread: row["thread_root_id"], author: author, through: seq)
+            }
         } else if event.type == "message.post", let place {
             try db.execute(sql: """
                 INSERT INTO messages (message_id, channel_id, seq, has_fixed, has_mutable, revision, stale)
@@ -254,6 +263,7 @@ enum ChatMessages {
     /// channel's window"): a new epoch; its messages written; older ones go
     /// (history pages bring them again); the stream's cursor at its head.
     static func applyWindow(_ db: Database, channel: String, head: Int, messages: [ChatMessageWire], before: Int?) throws {
+        try ChatB1.reset(db, channel: channel)
         for m in messages { try write(db, m) }
         let bottom = messages.map(\.seq).min()
         if let bottom {
@@ -315,6 +325,7 @@ enum ChatMessages {
     /// What a channel no longer kept stood for goes with it: its messages,
     /// window, thread cursors, drafts and stream cursor (DESIGN-F3).
     static func dropOrphans(_ db: Database) throws {
+        try ChatB1.dropOrphans(db)
         let kept = "SELECT channel_id FROM channels"
         // All of them, those being sent too: their text is a channel's the user may no longer see;
         // their commands stay in the queue (C6) (review F3b-p1-3).
@@ -324,6 +335,7 @@ enum ChatMessages {
         try db.execute(sql: "DELETE FROM drafts WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM local_edits WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM read_marks WHERE channel_id NOT IN (\(kept))")
+        try db.execute(sql: "DELETE FROM thread_read_marks WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM my_threads WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM notified WHERE channel_id IS NOT NULL AND channel_id NOT IN (\(kept))")
         // The snapshot's list holds the channels of pages still to come: kept until the read ends (F5).
@@ -351,6 +363,9 @@ enum ChatMessages {
                 text, mentions, revision, local_state)
             VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, 0, 'sending')
             """, arguments: [id, channel, root, author, at, text, json])
+        let last = try Int.fetchOne(db, sql: "SELECT MAX(seq) FROM messages WHERE channel_id = ? AND thread_root_id IS ?",
+                                   arguments: [channel, root]) ?? 0
+        try ChatUnread.sent(db, channel: channel, thread: root, author: author, through: last)
     }
 }
 

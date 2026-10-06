@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import GRDB
 import Observation
 
@@ -15,6 +16,7 @@ final class ChatChannelModel {
         var replySummaries: [String: ChatReplySummary] = [:]
         var unreadID: String?
         var earlierUnread = false
+        var boundaryDismissed = false
         /// F5: requests to agents each root's thread has.
         var requests: [String: Int] = [:]
         /// More is kept in the cache below what shows, or the server has more.
@@ -30,6 +32,9 @@ final class ChatChannelModel {
     private(set) var threadRoot: String?
     private(set) var threadHasEarlier = false
     private(set) var entryReadSequence = 0
+    private var readBoundaries: [String: ChatUnread.Boundary] = [:]
+    private var reading = Set<String>()
+    private(set) var threadUnreadID: String?
     var positions: [String: ChatScrollPosition] = [:]
     var revealMessageID: String?
     var focusedMessageID: String?
@@ -44,7 +49,7 @@ final class ChatChannelModel {
     private var navigationReturnPositions: [String: ChatScrollPosition] = [:]
     private var navigationReturnEdit: (id: String, root: String?)?
     /// Shared by the feed and thread, including a root visible in both.
-    struct Editing: Equatable {
+    struct Editing: Codable, Equatable, Sendable {
         let messageId: String
         var root: String?
         var text: String
@@ -52,13 +57,33 @@ final class ChatChannelModel {
         /// Independent of the cache window: the editor survives its eviction.
         var message: ChatMessage
         var problem: String?
+        var version: String?
     }
+    private var activeEditing: Editing?
     var editing: Editing? {
-        didSet { if let editing { editDrafts[editing.messageId] = editing } }
+        get { activeEditing }
+        set {
+            guard var draft = newValue else { activeEditing = nil; return }
+            // Cache hydration, navigation and errors are presentation changes.
+            // Only user text creates a new shared version.
+            if let store, draft.version == nil || draft.text != editDrafts[draft.messageId]?.text {
+                do {
+                    guard var saved = try store.queue.write({ try ChatEditDrafts.save($0, draft: draft, channel: channel) }) else {
+                        acceptEditDrafts(); return
+                    }
+                    saved.root = draft.root; saved.message = draft.message; saved.problem = draft.problem
+                    draft = saved
+                } catch { /* Keep unsaved work in the editor on a storage failure. */ }
+            }
+            editDrafts[draft.messageId] = draft
+            activeEditing = draft
+        }
     }
     /// Navigation changes the active editor, never these per-message drafts.
     private var editDrafts: [String: Editing] = [:]
     private var editOrder: [String] = []
+    private(set) var b1: ChatB1Channel?
+    @ObservationIgnored private var draftObservation: AnyDatabaseCancellable?
     @ObservationIgnored private var editingObservations: [String: AnyDatabaseCancellable] = [:]
     /// F5: the requests to agents in the thread open.
     private(set) var threadRequests: [ChatChannelRequests.Card] = []
@@ -84,6 +109,7 @@ final class ChatChannelModel {
     @ObservationIgnored private var store: ChatStore?
     @ObservationIgnored private var feedObservation: AnyDatabaseCancellable?
     @ObservationIgnored private var threadObservation: AnyDatabaseCancellable?
+    @ObservationIgnored private var inboxReadObservation: AnyCancellable?
     @ObservationIgnored private var threadRead: Task<Void, Never>?
     @ObservationIgnored private var threadReadID: UUID?
     @ObservationIgnored private var threadReadEpoch: Int?
@@ -104,14 +130,25 @@ final class ChatChannelModel {
 
     func follow(_ store: ChatStore) {
         editingObservations = [:]
-        self.store = store
         let channel = channel
-        entryReadSequence = (try? store.queue.read { db in
-            try Int.fetchOne(db, sql: "SELECT last_read_seq FROM read_marks WHERE channel_id = ?", arguments: [channel])
-        }) ?? 0
+        self.store = store
+        b1?.hide()
+        b1 = ChatB1Channel(key: key, channel: channel, store: store, service: service)
+        acceptEditDrafts()
+        if editing == nil { restoreEditing(root: threadRoot) }
+        let draftChannel = channel
+        draftObservation = ValueObservation.tracking { db in try ChatEditDrafts.read(db, channel: draftChannel) }
+            .removeDuplicates().start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] drafts in self?.acceptEditDrafts(observed: drafts) }
+        inboxReadObservation = NotificationCenter.default.publisher(for: .chatInboxMarkedRead).sink { [weak self, weak store] event in
+            guard let self, let store, event.object as? ChatStore === store,
+                  (event.userInfo?["channels"] as? Set<String>)?.contains(self.channel) == true else { return }
+            for root in Array(self.readBoundaries.keys) { self.clearReadBoundary(root: root.isEmpty ? nil : root) }
+        }
+        reading = []
+        readBoundaries = [:]
+        captureReadBoundary(root: nil)
         observeFeed()
         observeThreadRequests()
-        for id in editOrder { observeEdit(id) }
         asksObservation = ValueObservation.tracking { db in try ChatChannelAsk.asks(db, channel: channel) }
             .removeDuplicates()
             .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] asks in self?.asks = asks }
@@ -139,16 +176,24 @@ final class ChatChannelModel {
 
     private func observeFeed() {
         guard let store else { return }
-        let channel = channel, shown = shown, unreadAfter = entryReadSequence, reveal = feedRevealSequence
-        feedObservation = ValueObservation.tracking { db in try Self.readFeed(db, channel: channel, shown: shown, unreadAfter: unreadAfter, revealSequence: reveal) }
+        let channel = channel, shown = shown, boundary = readBoundaries[""], reveal = feedRevealSequence
+        feedObservation = ValueObservation.tracking { db in try Self.readFeed(db, channel: channel, shown: shown, revealSequence: reveal, boundary: boundary) }
             .removeDuplicates()
             .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] feed in
                 self?.feed = feed
                 self?.completeShown(feed.messages)
+                self?.updateB1Window()
+                if feed.boundaryDismissed {
+                    Task { @MainActor [weak self] in
+                        guard self?.readBoundaries[""] == boundary else { return }
+                        self?.clearReadBoundary(root: nil)
+                    }
+                }
             }
     }
 
-    nonisolated static func readFeed(_ db: Database, channel: String, shown: Int, unreadAfter: Int? = nil, revealSequence: Int? = nil) throws -> Feed {
+    nonisolated static func readFeed(_ db: Database, channel: String, shown: Int, unreadAfter: Int? = nil, revealSequence: Int? = nil,
+                                    boundary: ChatUnread.Boundary? = nil) throws -> Feed {
         let window = try Row.fetchOne(db, sql: "SELECT bottom_seq, history_next FROM channel_windows WHERE channel_id = ?", arguments: [channel])
         let windowBottom: Int = window?["bottom_seq"] ?? 0
         let bottom = min(windowBottom, revealSequence ?? windowBottom)
@@ -181,14 +226,15 @@ final class ChatChannelModel {
                 replies[root.messageId] = summary.count
             }
         }
-        let firstUnread = try unreadAfter.flatMap { mark in
-            try String.fetchOne(db, sql: "SELECT message_id FROM messages WHERE channel_id = ? AND thread_root_id IS NULL AND seq > ? ORDER BY seq LIMIT 1",
-                                arguments: [channel, mark])
-        }
-        let earlierUnread = unreadAfter.map { windowBottom > $0 + 1 || (firstUnread != nil && !ids.contains(firstUnread!)) } ?? false
+        let boundary = boundary ?? unreadAfter.map { ChatUnread.Boundary(after: $0, through: Int.max) }
+        let firstUnread = try boundary.flatMap { try ChatUnread.firstUnread(db, channel: channel, boundary: $0) }
+        let earlierUnread = firstUnread.map { id in
+            !ids.contains(id) || boundary.map { windowBottom > $0.after + 1 } == true
+        } ?? false
+        let dismissed = try boundary.map { try ChatUnread.didSend(db, channel: channel, since: $0) } ?? false
 
         let next: Int? = window?["history_next"]
-        return Feed(messages: rows + local, replies: replies, replySummaries: summaries, unreadID: earlierUnread ? nil : firstUnread, earlierUnread: earlierUnread, requests: try ChatChannelRequests.counts(db, channel: channel, roots: ids),
+        return Feed(messages: rows + local, replies: replies, replySummaries: summaries, unreadID: earlierUnread ? nil : firstUnread, earlierUnread: earlierUnread, boundaryDismissed: dismissed, requests: try ChatChannelRequests.counts(db, channel: channel, roots: ids),
                     hasOlder: older || next != nil, historyNext: next,
                     archived: try Bool.fetchOne(db, sql: "SELECT archived FROM channels WHERE channel_id = ?", arguments: [channel]) ?? true)
     }
@@ -224,10 +270,13 @@ final class ChatChannelModel {
 
     func openThread(_ root: String?) {
         guard root != threadRoot else { observeThread(); return }
+        if let old = threadRoot { endReading(root: old) }
         editing = nil
         restoreEditing(root: root)
         focusedMessageID = root == nil ? threadRoot : nil
         threadRoot = root
+        threadUnreadID = nil
+        if let root { captureReadBoundary(root: root) }
         threadObservation = nil
         threadRequestsObservation = nil
         thread = []
@@ -254,11 +303,14 @@ final class ChatChannelModel {
     /// conversation only after ready confirms access to this same store.
     func setAccessConfirmed(_ confirmed: Bool) {
         accessConfirmed = confirmed
-        if confirmed { observeThread() } else { cancelThreadRead() }
+        if confirmed { observeThread(); updateB1Window() }
+        else { cancelThreadRead(); b1?.hide() }
     }
 
     private struct ThreadSnapshot: Equatable {
         let messages: [ChatMessage]
+        let unreadID: String?
+        let boundaryDismissed: Bool
         let hasCursor: Bool
         let hasEarlier: Bool
         let epoch: Int
@@ -267,7 +319,7 @@ final class ChatChannelModel {
 
     private func observeThread() {
         guard let root = threadRoot, let store else { return }
-        let channel = channel
+        let channel = channel, boundary = readBoundaries[root]
         let target = revealMessageID.flatMap(message)
         let targetSequence = target?.threadRootId == root ? target?.seq : nil
         let observation = ValueObservation.tracking { db -> ThreadSnapshot in
@@ -284,17 +336,27 @@ final class ChatChannelModel {
                 \(ChatMessages.select) WHERE m.channel_id = ? AND (m.message_id = ? OR (m.thread_root_id = ? AND (m.seq IS NULL OR m.seq >= ?)))
                 ORDER BY m.seq IS NULL, m.seq, m.created_at
                 """, arguments: [channel, root, root, min(from, bottom, targetSequence ?? Int.max)]).map(ChatMessage.init(row:))
-            return ThreadSnapshot(messages: rows, hasCursor: cursor != nil,
+            let unread = try boundary.flatMap { try ChatUnread.firstUnread(db, channel: channel, thread: root, boundary: $0) }
+            let dismissed = try boundary.map { try ChatUnread.didSend(db, channel: channel, thread: root, since: $0) } ?? false
+            return ThreadSnapshot(messages: rows, unreadID: unread, boundaryDismissed: dismissed, hasCursor: cursor != nil,
                                   hasEarlier: (cursor?["next"] as Int?) != nil, epoch: epoch, accessible: accessible)
         }
         threadObservation = observation.removeDuplicates()
         .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] value in
             guard let self, self.threadRoot == root else { return }
             self.thread = value.messages
+            self.threadUnreadID = value.unreadID
             self.threadHasEarlier = value.hasEarlier
             self.completeShown(value.messages)
+            self.updateB1Window()
             if !value.accessible { self.cancelThreadRead() }
             else if !value.hasCursor { self.loadThread(root, epoch: value.epoch) }
+            if value.boundaryDismissed {
+                Task { @MainActor [weak self] in
+                    guard self?.readBoundaries[root] == boundary else { return }
+                    self?.clearReadBoundary(root: root)
+                }
+            }
         }
     }
 
@@ -405,6 +467,12 @@ final class ChatChannelModel {
         readingPositionRestored += 1
     }
 
+    private func updateB1Window() {
+        guard accessConfirmed, !reading.isEmpty else { b1?.hide(); return }
+        let visible = (reading.contains("") ? feed.messages : []) + (threadRoot.map { reading.contains($0) } == true ? thread : [])
+        b1?.show(Set(visible.filter { $0.hasFixed && $0.seq != nil }.map(\.messageId)))
+    }
+
     // MARK: Writing
 
     /// Nil when `text` may be sent: 1 byte to 16 KiB of UTF-8 (F-API).
@@ -443,10 +511,12 @@ final class ChatChannelModel {
                     mentions: Self.mentions(in: text, members: members), agents: agents, draftVersion: version,
                     mentionOnly: mentionOnly, additionalContext: context)
                 problem = nil
+                markConversationRead(root: root)
                 return true
             }
             let id = try service.post(key, channel: channel, root: root, text: text, mentions: Self.mentions(in: text, members: members))
             problem = nil
+            markConversationRead(root: root)
             saveDraft("", root: root)
             for agent in mentionOnly ? [] : ChatChannelAsk.asked(in: text, agents: agents) {
                 offers.append(.init(messageId: id, agentId: agent.agentId, address: agent.address ?? agent.name, text: text, root: root ?? id))
@@ -482,6 +552,7 @@ final class ChatChannelModel {
 
     @discardableResult
     func beginEditing(_ shown: ChatMessage, root: String?, recovering: Bool = false) -> Bool {
+        if editing?.messageId == shown.messageId { editing?.root = root; return true }
         guard editing == nil, let current = message(shown.messageId) else { return false }
         // Failed edits remain available to read/copy after archival (F3d-3).
         let recoverable = recovering && current.localEdit?.kind == "edit" && current.localEdit?.state == "failed"
@@ -508,6 +579,28 @@ final class ChatChannelModel {
         editing = draft
     }
 
+    private func acceptEditDrafts(observed: [Editing]? = nil) {
+        // Deliveries can lag typing in either window. Always adopt the current
+        // durable versions, without writing an observation back as a new edit.
+        guard let store else { return }
+        // A definitive organization revoke commits deletion, then unlinks the
+        // cache. Its last observation still clears editors after reads fail.
+        let removedCache = !FileManager.default.fileExists(atPath: store.url.path)
+        guard let drafts = (try? store.queue.read { try ChatEditDrafts.read($0, channel: channel) }) ?? (removedCache ? observed : nil) else { return }
+        let ids = Set(drafts.map(\.messageId))
+        for id in editOrder where !ids.contains(id) { finishEditing(id, removeStored: false) }
+        for var draft in drafts {
+            if let local = editDrafts[draft.messageId] {
+                draft.root = local.root; draft.message = local.message
+                draft.problem = local.version == draft.version ? local.problem : nil
+            }
+            editDrafts[draft.messageId] = draft
+            if !editOrder.contains(draft.messageId) { editOrder.append(draft.messageId) }
+            if activeEditing?.messageId == draft.messageId { activeEditing = draft }
+            if editingObservations[draft.messageId] == nil { observeEdit(draft.messageId) }
+        }
+    }
+
     private func observeEdit(_ id: String) {
         guard let store else { return }
         let channel = channel
@@ -518,7 +611,9 @@ final class ChatChannelModel {
         }.start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] exists, message in
             guard let self, var draft = self.editDrafts[id] else { return }
             // A new revision does not replace the editor's original revision or draft.
-            guard exists else { self.cancelEditing(all: true); return }
+            // A missing channel is a cache condition, not proof of revocation.
+            // Definitive revocations delete edit_drafts transactionally.
+            guard exists else { return }
             guard message?.deleted != true else { self.cancelEditing(messageID: id); return }
             if let message { draft.message = message }
             else { draft.message.hasMutable = false }
@@ -533,15 +628,19 @@ final class ChatChannelModel {
 
     /// Only explicit cancellation, deletion or loss of access discards drafts.
     func cancelEditing(messageID: String? = nil, all: Bool = false) {
-        if let id = messageID ?? editing?.messageId { finishEditing(id) }
         if all {
-            editDrafts = [:]
-            editOrder = []
-            editingObservations = [:]
-        }
+            for draft in Array(editDrafts.values) { finishEditing(draft.messageId, version: draft.version) }
+        } else if let id = messageID ?? editing?.messageId { finishEditing(id, version: editDrafts[id]?.version) }
     }
 
-    private func finishEditing(_ id: String) {
+    private func finishEditing(_ id: String, version: String? = nil, removeStored: Bool = true) {
+        if removeStored, let store, let version {
+            do {
+                guard try store.queue.write({ try ChatEditDrafts.remove($0, message: id, version: version) }) else {
+                    acceptEditDrafts(); return
+                }
+            } catch { return }
+        }
         if let editing, editing.messageId == id {
             focusRequest = ChatFocusRequest(area: editing.root == nil ? .feed : .thread)
             focusedMessageID = id
@@ -559,7 +658,7 @@ final class ChatChannelModel {
             editing?.problem = problem
             return false
         }
-        finishEditing(draft.messageId)
+        finishEditing(draft.messageId, version: draft.version)
         return true
     }
 
@@ -578,8 +677,12 @@ final class ChatChannelModel {
     func dismissTransient() -> Bool {
         if editing != nil { cancelEditing() }
         else if searching { returnFromNavigation(); setSearching(false) }
-        else if threadRoot != nil { openThread(nil) }
-        else { return false }
+        else if let root = threadRoot { markThreadRead(root); openThread(nil) }
+        else {
+            let count = try? store?.queue.read { try ChatUnread.count($0, channel: channel, me: key.accountId) }
+            guard feed.unreadID != nil || feed.earlierUnread || (count?.count ?? 0) > 0 || count?.more == true else { return false }
+            markRead()
+        }
         return true
     }
 
@@ -668,28 +771,72 @@ final class ChatChannelModel {
 
     // MARK: Reading (F4)
 
+    private func captureReadBoundary(root: String?) {
+        guard let store else { return }
+        let channel = channel
+        let boundary = try? store.queue.read { try ChatUnread.boundary($0, channel: channel, thread: root) }
+        readBoundaries[root ?? ""] = boundary
+        if root == nil { entryReadSequence = boundary?.after ?? 0 }
+    }
+
+    /// The model survives hidden tabs. A visit belongs to the visible conversation.
+    func beginReading(root: String?) {
+        guard reading.insert(root ?? "").inserted else { return }
+        captureReadBoundary(root: root)
+        if root == nil { observeFeed() } else { observeThread() }
+    }
+
+    func endReading(root: String?) {
+        reading.remove(root ?? "")
+        updateB1Window()
+        clearReadBoundary(root: root)
+    }
+
+    private func clearReadBoundary(root: String?) {
+        guard readBoundaries.removeValue(forKey: root ?? "") != nil else { return }
+        if root == nil { observeFeed() } else { observeThread() }
+    }
+
+    func markConversationRead(root: String?, clearingBoundary: Bool = true) {
+        if let root { markThreadRead(root, clearingBoundary: clearingBoundary) }
+        else { markRead(clearingBoundary: clearingBoundary) }
+    }
+
+    func readIfLooking(root: String?, appActive: Bool, shown: Bool, atBottom: Bool) {
+        guard ChatScrollPosition.canMarkRead(appActive: appActive, shown: shown, atBottom: atBottom,
+                                             searching: searching || hasNavigationReturn) else { return }
+        markConversationRead(root: root, clearingBoundary: false)
+    }
+
+    private func readHead() -> Int? {
+        try? store?.queue.read { try ChatUnread.boundary($0, channel: channel).through }
+    }
+
     /// The feed shows at its end in front of the user: read up to its last
     /// root; notices of what is read go.
-    func markRead() {
+    func markRead(clearingBoundary: Bool = true) {
         MainThreadWatchdog.shared.checkpoint()
-        // Up to the last message wholly known, never past a placeholder (review F4c-1).
+        if clearingBoundary { clearReadBoundary(root: nil) }
+        // Automatic reading stops before a placeholder (review F4c-1).
+        // Explicit Mark as read also acknowledges history not loaded yet.
         let known = feed.messages.filter { $0.seq != nil }
         let firstUnknown = known.filter { !$0.hasFixed }.compactMap(\.seq).min()
         let wholly = known.filter { m in m.hasFixed && (firstUnknown.map { (m.seq ?? 0) < $0 } ?? true) }
-        guard let last = wholly.compactMap(\.seq).max(), let store else { return }
+        guard let last = clearingBoundary ? readHead() : wholly.compactMap(\.seq).max(), let store else { return }
         let channel = channel
         let ids = (try? store.queue.write { db in try ChatUnread.markRead(db, channel: channel, upTo: last) }) ?? []
         if !ids.isEmpty { ChatNotifications.reconcile(service) }
     }
 
     /// The thread's panel is open: its notices are read.
-    func markThreadRead(_ root: String) {
+    func markThreadRead(_ root: String, clearingBoundary: Bool = true) {
         guard let store else { return }
         guard root == threadRoot else { return }
+        if clearingBoundary { clearReadBoundary(root: root) }
         let channel = channel
         let known = thread.filter { $0.seq != nil }
         let firstUnknown = known.filter { !$0.hasFixed }.compactMap(\.seq).min() ?? Int.max
-        let last = known.filter { $0.hasFixed && ($0.seq ?? 0) < firstUnknown }.compactMap(\.seq).max() ?? 0
+        let last = (clearingBoundary ? readHead() : known.filter { $0.hasFixed && ($0.seq ?? 0) < firstUnknown }.compactMap(\.seq).max()) ?? 0
         let ids = (try? store.queue.write { db in try ChatUnread.markRead(db, channel: channel, upTo: last, thread: root) }) ?? []
         if !ids.isEmpty { ChatNotifications.reconcile(service) }
     }

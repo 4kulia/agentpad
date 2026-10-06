@@ -13,6 +13,10 @@ struct ChatMessageLink: Equatable {
         self.message = message.messageId; sequence = message.seq ?? 0
     }
 
+    init(key: ChatOrgKey, channel: String, message: String, sequence: Int) {
+        server = key.server; org = key.orgId; self.channel = channel; self.message = message; self.sequence = sequence
+    }
+
     init?(components: URLComponents) {
         let items = components.queryItems ?? []
         guard components.user == nil, components.password == nil, components.port == nil, components.fragment == nil,

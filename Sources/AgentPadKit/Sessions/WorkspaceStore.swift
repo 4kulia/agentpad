@@ -472,6 +472,7 @@ final class WorkspaceStore {
         let conversationId: String?
         // AgentPad: a closed channel tab comes back a channel tab; no title kept.
         var channel: ChannelRef? = nil
+        var inbox: ChatInboxRef? = nil
     }
 
     /// LIFO stack of recently-closed tabs for ⌘⇧T (reopen). Capped at
@@ -1143,6 +1144,7 @@ final class WorkspaceStore {
         guard let pane = pane(containing: session, in: workspace) else { return nil }
         // AgentPad: duplicating a channel tab opens the same channel.
         if let channel = session.channel { return openChannelTab(channel, in: workspace, pane: pane) }
+        if let inbox = session.inbox { return openInboxTab(inbox, in: workspace, pane: pane) }
         return addTab(in: workspace, pane: pane, template: session.agent, initialCwd: session.currentDirectory)
     }
 
@@ -1375,8 +1377,8 @@ final class WorkspaceStore {
     /// Set or clear a user-provided tab title. Empty / whitespace input clears
     /// the override so the title resumes tracking the working directory.
     func renameTab(_ session: Session, to newTitle: String) {
-        // AgentPad: a channel tab takes its channel's name (DESIGN-F2).
-        guard session.channel == nil else { return }
+        // AgentPad: a chat tab takes its destination’s name (DESIGN-F2).
+        guard !session.isChat else { return }
         let next = normalizedTitle(newTitle)
         guard session.customTitle != next else { return }
         session.customTitle = next
@@ -1574,11 +1576,12 @@ final class WorkspaceStore {
         recentlyClosed.append(ClosedTabState(
             agent: session.agent,
             cwd: session.currentDirectory,
-            customTitle: session.channel == nil ? session.customTitle : nil,
+            customTitle: !session.isChat ? session.customTitle : nil,
             workspaceId: workspace.id,
             paneId: pane.id,
             conversationId: session.conversationId,
-            channel: session.channel
+            channel: session.channel,
+            inbox: session.inbox
         ))
         if recentlyClosed.count > Self.closedTabHistoryLimit {
             recentlyClosed.removeFirst(recentlyClosed.count - Self.closedTabHistoryLimit)
@@ -1605,6 +1608,13 @@ final class WorkspaceStore {
         let cwd = resolvedSpawnCwd(state.cwd.path)
         if let channel = state.channel, let pane {
             let session = openChannelTab(channel, in: workspace, pane: pane)
+            activateWorkspace(workspace)
+            activateTab(session, in: workspace)
+            return session
+        }
+        // AgentPad: reopening a saved chat list must not start a shell.
+        if let inbox = state.inbox, let pane {
+            let session = openInboxTab(inbox, in: workspace, pane: pane)
             activateWorkspace(workspace)
             activateTab(session, in: workspace)
             return session
@@ -2180,6 +2190,11 @@ final class WorkspaceStore {
                     pane.tabs.append(makeChannelSession(channel, id: tab.id, cwd: resolvedSpawnCwd(tab.currentDirectoryPath)))
                     continue
                 }
+                // AgentPad: restore native saved-list tabs without a process.
+                if let inbox = tab.inbox {
+                    pane.tabs.append(makeInboxSession(inbox, id: tab.id, cwd: resolvedSpawnCwd(tab.currentDirectoryPath)))
+                    continue
+                }
                 let agent = AgentTemplate.all.first { $0.id == tab.agentId } ?? .terminal
                 let session = spawnSession(
                     template: agent,
@@ -2221,12 +2236,56 @@ final class WorkspaceStore {
     /// A channel tab's own Close goes to the store that holds it now: set
     /// when it is made here and again when it moves here (review F2b-p2-3).
     private func holdChannelClose(_ session: Session) {
-        (session.engine as? ChannelTabEngine)?.onClose = { [weak self, weak session] in
+        let close: () -> Void = { [weak self, weak session] in
             guard let self, let session,
                   let workspace = self.workspaces.first(where: { ws in ws.root.allPanes.contains { $0.tabs.contains { $0 === session } } })
             else { return }
             self.closeTab(session, in: workspace)
         }
+        (session.engine as? ChannelTabEngine)?.onClose = close
+        if let engine = session.engine as? ChatInboxTabEngine {
+            engine.onClose = close
+            let ref = engine.ref
+            engine.openMessage = { [weak self] message in
+                guard let self else { return }
+                ChatInboxNavigation.open(message, ref: ref, org: ChatOrgCurrent.shared.model, workspace: self)
+            }
+            engine.openChannel = { [weak self] channel in
+                let org = ChatOrgCurrent.shared.model
+                guard case .ready = ref.state(org), let key = org?.key, org?.visibleChannel(channel) != nil else { return }
+                self?.showChannel(ChannelRef(key, channel: channel))
+            }
+        }
+    }
+
+    // AgentPad: inbox tabs share the normal tab lifecycle and current owner.
+    private func makeInboxSession(_ ref: ChatInboxRef, id: UUID = UUID(), cwd: URL) -> Session {
+        let session = Session(id: id, engine: ChatInboxTabEngine(ref: ref), currentDirectory: cwd, agent: .terminal)
+        session.inbox = ref
+        holdChannelClose(session)
+        return session
+    }
+
+    @discardableResult
+    func showInbox(_ ref: ChatInboxRef) -> Session? {
+        for workspace in workspaces {
+            if let session = workspace.root.allPanes.flatMap(\.tabs).first(where: { $0.inbox == ref }) {
+                activateWorkspace(workspace); activateTab(session, in: workspace)
+                return session
+            }
+        }
+        guard let workspace = active ?? workspaces.first else { return nil }
+        return openInboxTab(ref, in: workspace)
+    }
+
+    @discardableResult
+    func openInboxTab(_ ref: ChatInboxRef, in workspace: Workspace, pane: Pane? = nil) -> Session {
+        guard let target = pane ?? workspace.activePane ?? workspace.root.firstPane else { preconditionFailure("workspace has no panes") }
+        let session = makeInboxSession(ref, cwd: workspace.workingDirectory)
+        wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: nil)
+        target.tabs.append(session); target.activeTabId = session.id; workspace.activePaneId = target.id
+        scheduleSave()
+        return session
     }
 
     /// The tab of `ref` in this window, the whole ref compared (review F2b-3).

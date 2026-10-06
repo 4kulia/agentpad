@@ -17,8 +17,10 @@ struct ChatChannelCard: Codable, Equatable, Sendable {
     var head: Int? = nil
     var messages: [ChatMessageWire]? = nil
     var messagesBefore: Int? = nil
+    var chatMetadataReload: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
+        case chatMetadataReload = "chat_metadata_reload"
         case name, archived, version, head, messages
         case messagesBefore = "messages_before"
         case channelId = "channel_id", teamId = "team_id", createdBy = "created_by", createdAt = "created_at",
@@ -112,6 +114,7 @@ enum ChatChannels {
     /// The windows of the channels a snapshot or page brought, of channels kept (F3).
     static func applyWindows(_ db: Database, _ cards: [ChatChannelCard]) throws {
         for card in cards {
+            if card.chatMetadataReload == true, card.head == nil { try ChatB1.reset(db, channel: card.channelId) }
             guard let head = card.head,
                   try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM channels WHERE channel_id = ?)", arguments: [card.channelId]) == true
             else { continue }

@@ -21,7 +21,9 @@ struct TabBarItem: View {
     var body: some View {
         HStack(spacing: 7) {
             commandStatusDot
-            AgentIconView(asset: tab.displayAgent.iconAsset, fallbackSymbol: tab.displayAgent.symbol, size: 15)
+            // AgentPad: saved chat lists have their own navigation symbols.
+            AgentIconView(asset: tab.inbox == nil ? tab.displayAgent.iconAsset : nil,
+                          fallbackSymbol: tab.inbox?.kind.symbol ?? tab.displayAgent.symbol, size: 15)
             Text(tab.title)
                 .font(Theme.display(12, weight: isActive ? .medium : .regular))
                 .lineLimit(1)
@@ -80,8 +82,8 @@ struct TabBarItem: View {
                     onMoveToNewWindow()
                 }
                 AgentPadMenuDivider()
-                // AgentPad: a channel tab takes its channel's name (DESIGN-F2).
-                if tab.channel == nil {
+                // AgentPad: a chat tab takes its destination’s name (DESIGN-F2).
+                if !tab.isChat {
                     AgentPadMenuRow(title: "Rename Tab…", shortcut: "⌘R") {
                         isContextMenuOpen = false
                         beginRename(deferred: true)
@@ -120,7 +122,7 @@ struct TabBarItem: View {
     /// so a re-trigger mid-edit can't wipe what the user is typing.
     private func beginRename(deferred: Bool) {
         // AgentPad: never for a channel tab — its title is its card's (review F2-p1-3).
-        guard !isRenameOpen, tab.channel == nil else { return }
+        guard !isRenameOpen, !tab.isChat else { return }
         pendingRename = tab.customTitle ?? tab.title
         if deferred {
             DispatchQueue.main.async { isRenameOpen = true }

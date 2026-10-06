@@ -62,10 +62,34 @@ struct ChatEvent: Codable, Equatable, Sendable {
     let at: String
     /// F3: an event of a message carries it as it is now; a frame may come without it.
     var message: ChatJSON? = nil
+    /// Retained with skipped events so future envelope fields survive recovery too.
+    var additionalFields: [String: ChatJSON] = [:]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case stream, seq, id, type, actor, body, at, message
         case commandId = "command_id"
+    }
+}
+
+extension ChatEvent {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        stream = try c.decode(String.self, forKey: .stream); seq = try c.decode(Int.self, forKey: .seq)
+        id = try c.decode(String.self, forKey: .id); type = try c.decode(String.self, forKey: .type)
+        actor = try c.decodeIfPresent(Actor.self, forKey: .actor); body = try c.decode(ChatJSON.self, forKey: .body)
+        commandId = try c.decodeIfPresent(String.self, forKey: .commandId); at = try c.decode(String.self, forKey: .at)
+        message = try c.decodeIfPresent(ChatJSON.self, forKey: .message)
+        let known = Set(CodingKeys.allCases.map(\.rawValue))
+        additionalFields = try [String: ChatJSON](from: decoder).filter { !known.contains($0.key) }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(stream, forKey: .stream); try c.encode(seq, forKey: .seq)
+        try c.encode(id, forKey: .id); try c.encode(type, forKey: .type)
+        try c.encodeIfPresent(actor, forKey: .actor); try c.encode(body, forKey: .body)
+        try c.encodeIfPresent(commandId, forKey: .commandId); try c.encode(at, forKey: .at)
+        try c.encodeIfPresent(message, forKey: .message)
+        try additionalFields.encode(to: encoder)
     }
 }
 
@@ -133,9 +157,11 @@ struct ChatOrgState: Codable, Equatable, Sendable {
     var channelsNext: String? = nil
     /// F8: absent from a server without `chat.agents`.
     var agentChannels: [ChatChannelAgentWire]? = nil
+    var threadParticipationReload: Bool? = nil
     let streams: [String: Int]
 
     enum CodingKeys: String, CodingKey {
+        case threadParticipationReload = "thread_participation_reload"
         case org, members, teams, admin, streams, agents, requests, channels
         case myTeams = "my_teams", requestsNext = "requests_next", channelsNext = "channels_next", agentChannels = "agent_channels"
     }
@@ -157,7 +183,8 @@ struct ChatOrgState: Codable, Equatable, Sendable {
             requests: requests,
             channels: channels,
             channelsComplete: channelsNext == nil,
-            agentChannels: agentChannels
+            agentChannels: agentChannels,
+            threadParticipationReload: threadParticipationReload == true
         )
     }
 }

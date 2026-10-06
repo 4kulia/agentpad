@@ -1795,7 +1795,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         ) {
             // AgentPad: none of these is for a channel tab (DESIGN-F2).
             guard let session = activeStore?.active?.activeSession else { return false }
-            return terminalWindowIsKey && session.channel == nil
+            return terminalWindowIsKey && !session.isChat
         }
 
         if menuItemMatches(

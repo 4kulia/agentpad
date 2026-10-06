@@ -44,11 +44,12 @@ final class ChatChannelSession {
                 model?.setAccessConfirmed(false)
                 model?.follow(store)
             }
+            if ownerModel == nil { ownerModel = ChatChannelOwnerModel(service: service, key: key, channel: card.channelId) }
             model?.setAccessConfirmed(true)
         case .notConnected, .noAccess, .noChannels:
+            // Hidden until the scope is readable again. Persistent drafts are
+            // removed by confirmed membership loss, never by this UI gate.
             model?.setAccessConfirmed(false)
-            model?.cancelEditing(all: true)
-            model = nil
             ownerModel = nil
         }
     }

@@ -6,6 +6,10 @@ struct ChatAuthorIdentity: Hashable, Sendable {
     var agent: String?
     var session: String?
 
+    init(account: String, agent: String?, session: String?) {
+        self.account = account; self.agent = agent; self.session = session
+    }
+
     init(_ message: ChatMessage) {
         account = message.authorAccountId
         agent = message.authorAgentId
@@ -104,14 +108,15 @@ struct ChatScrollPosition: Equatable {
     private var known = Set<String>()
     private var lastSequence = 0
 
-    mutating func update(_ messages: [ChatMessage]) -> Bool {
+    mutating func update(_ messages: [ChatMessage], me: String? = nil) -> Bool {
         let ids = Set(messages.map(\.messageId))
+        let incoming = messages.filter { $0.authorAccountId != me }
         let follow = !initialized || atBottom
         if initialized && !atBottom {
-            unseen.formUnion(messages.filter { !known.contains($0.messageId) && ($0.seq == nil || ($0.seq ?? 0) > lastSequence) }.map(\.messageId))
+            unseen.formUnion(incoming.filter { !known.contains($0.messageId) && ($0.seq == nil || ($0.seq ?? 0) > lastSequence) }.map(\.messageId))
         }
         known = ids
-        unseen.formIntersection(ids)
+        unseen.formIntersection(Set(incoming.map(\.messageId)))
         lastSequence = max(lastSequence, messages.compactMap(\.seq).max() ?? 0)
         if !messages.isEmpty { initialized = true }
         return follow

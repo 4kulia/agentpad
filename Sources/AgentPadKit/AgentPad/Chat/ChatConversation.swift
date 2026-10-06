@@ -117,6 +117,7 @@ extension ChatService {
 
     /// Owners of `message.*` answers, by the one dispatcher (D5's way).
     func installConversations() {
+        installB1()
         commandOwners["message.post"] = { [weak self] key, record, outcome in self?.postAnswered(key, record, outcome) }
         commandOwners["message.post_from_session"] = { [weak self] key, record, outcome in
             if case .taken(let answer) = outcome, let answer, let store = self?.orgSessions[key]?.store,

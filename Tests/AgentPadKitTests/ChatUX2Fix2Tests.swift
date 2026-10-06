@@ -139,7 +139,9 @@ final class ChatUX2Fix2Tests: XCTestCase {
         XCTAssertFalse(panel.canBecomeMain)
         XCTAssertTrue(window.firstResponder === editor)
         let before = panel.frame
-        window.setFrameOrigin(CGPoint(x: 280, y: 220))
+        // AppKit may cascade the initial window away from the requested origin.
+        let origin = window.frame.origin
+        window.setFrameOrigin(CGPoint(x: origin.x + 80, y: origin.y + 20))
         editor.mentionPopup.refresh()
         XCTAssertEqual(panel.frame.minX - before.minX, 80, accuracy: 1)
         XCTAssertEqual(panel.frame.minY - before.minY, 20, accuracy: 1)

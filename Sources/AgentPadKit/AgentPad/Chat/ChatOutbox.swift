@@ -24,7 +24,7 @@ final class ChatOutbox {
     static let requestEnded = "request_ended"
     /// Never sent again by hand after the server's generation changed.
     static func neverResent(_ type: String) -> Bool {
-        type.hasPrefix("run.") || type == "request.decide" || type == "request.decide_automatic"
+        ChatB1.commands.contains(type) || type.hasPrefix("run.") || type == "request.decide" || type == "request.decide_automatic"
             || type == "agent.channel_trust.set"
             || type == "message.post_from_session" || type == "request.create_in_channel_v2" || ChatPublication.isDecision(type)
     }
@@ -82,6 +82,7 @@ final class ChatOutbox {
     /// or a late readying) or going on after the user's Try Again: what
     /// waited for a known server is looked at again (review C18-1).
     var onReady: @MainActor () -> Void = {}
+    var maySendCommand: @MainActor (ChatCommandRecord) -> Bool = { _ in true }
     /// The queue's storage failed; the queue stopped.
     var onStorageError: @MainActor (String) -> Void = { _ in }
 
@@ -240,6 +241,7 @@ final class ChatOutbox {
             heads[record.orderKey] = (record, queue)
         }
         for (key, (record, queue)) in heads where !sending.contains(key) {
+            guard maySendCommand(record) else { continue }
             // Waits for its parent's answer (a later `pump` sends it).
             if let parent = record.dependsOn, let parentState = state[parent], parentState != .sent { continue }
             if let due = record.nextAttemptAt, due > at {
@@ -281,7 +283,7 @@ final class ChatOutbox {
             sending.remove(record.orderKey)
             pump()
         }
-        guard may(send: queue), epoch == sentIn else { return }
+        guard may(send: queue), maySendCommand(original), epoch == sentIn else { return }
         // A button or revocation may have replaced/deleted a prepared send
         // before this task ran. Re-read the durable intent at the send boundary.
         let started: ChatCommandTable.SendStart

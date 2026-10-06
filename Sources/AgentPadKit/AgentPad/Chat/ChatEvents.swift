@@ -140,7 +140,7 @@ enum ChatEvents {
     /// channel. Malformed *known* events still need the existing full resync.
     static func channelPointer(_ event: ChatEvent) -> String? {
         guard handlers[event.type] == nil, !pointers.contains(event.type),
-              !ChatChannels.eventTypes.contains(event.type), !ChatMessages.eventTypes.contains(event.type),
+              !ChatB1.events.contains(event.type), !ChatChannels.eventTypes.contains(event.type), !ChatMessages.eventTypes.contains(event.type),
               !ChatChannelAgents.eventTypes.contains(event.type), !ChatCallStore.eventTypes.contains(event.type),
               let channel = event.body["channel_id"]?.string, !channel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return nil }
@@ -152,6 +152,7 @@ enum ChatEvents {
     /// sync rereads its channel or takes an organization snapshot.
     @discardableResult
     static func apply(_ db: Database, _ event: ChatEvent) throws -> Bool {
+        if ChatB1.events.contains(event.type) { return true }
         if ChatChannels.eventTypes.contains(event.type) { return try ChatChannels.apply(db, event) }
         if ChatChannelAgents.reads(event) { return try ChatChannelAgents.apply(db, event) }
         if ChatMessages.eventTypes.contains(event.type) { return try ChatMessages.apply(db, event) }

@@ -296,7 +296,7 @@ final class AgentPadCLIController {
             return refuse("no tab with id \(id.uuidString) — run `agentpad-cli list`")
         }
         // AgentPad: DESIGN-F2.
-        guard hit.session.channel == nil else { return refuse("a channel tab takes its channel's name") }
+        guard !hit.session.isChat else { return refuse("a chat tab takes its destination’s name") }
         hit.context.store.renameTab(hit.session, to: title)
         return ok(note: "renamed")
     }
@@ -706,6 +706,12 @@ final class AgentPadCLIController {
                                     return AgentPadCLITabInfo(id: tab.id.uuidString, title: state.title, cwd: tab.currentDirectory.path,
                                                               isActive: pane.activeTabId == tab.id, agent: "channel", agentState: nil,
                                                               channelId: channelId)
+                                }
+                                // AgentPad: native saved-list tabs have no terminal agent.
+                                if let inbox = tab.inbox {
+                                    return AgentPadCLITabInfo(id: tab.id.uuidString, title: inbox.kind.title,
+                                                             cwd: tab.currentDirectory.path, isActive: pane.activeTabId == tab.id,
+                                                             agent: "chat", agentState: nil)
                                 }
                                 return AgentPadCLITabInfo(
                                     id: tab.id.uuidString,

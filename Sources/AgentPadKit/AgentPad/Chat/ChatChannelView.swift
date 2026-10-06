@@ -50,7 +50,12 @@ struct ChatChannelView: View {
                                 if narrow {
                                     ChatIconButton(title: "Back to #\(card.name)", symbol: "chevron.left") { model.openThread(nil) }
                                 }
-                                Text("Thread").font(Theme.display(14, weight: .semibold))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Thread").font(Theme.display(14, weight: .semibold))
+                                    if let b1 = model.b1, b1.supports("chat.thread_summary"), let summary = b1.state.metadata[root]?.threadSummary {
+                                        Text(summary.label).font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                                    }
+                                }
                                 Text("· #\(card.name)").font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
                                 if narrow { connectionStatus }
                                 Spacer(minLength: 0)
@@ -62,6 +67,8 @@ struct ChatChannelView: View {
                                         .keyboardShortcut("f", modifiers: .command)
                                 }
                                 ChatIconButton(title: "Close thread", symbol: "xmark") { model.openThread(nil) }
+                                if narrow { pinsButton(model) }
+                                ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markThreadRead(root) }
                             }.padding(.horizontal, 18).frame(height: 64)
                                 .overlay(alignment: .bottom) { Rectangle().fill(Theme.chromeHairline).frame(height: 1) }
                             if narrow && model.searching { ChatLocalSearch(model: model) }
@@ -92,6 +99,8 @@ struct ChatChannelView: View {
         model.navigate(to: target)
     }
 
+    @State private var showingPins = false
+
     private func header(_ model: ChatChannelModel) -> some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
@@ -104,6 +113,8 @@ struct ChatChannelView: View {
             }
             if card.archived { Text("Archived · read only").font(Theme.display(10)).foregroundStyle(ChatAppearance.attention) }
             connectionStatus
+            pinsButton(model)
+            ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markRead() }
             ChatIconButton(title: "Search loaded history (⌘F)", symbol: "magnifyingglass") { model.setSearching(!model.searching) }
                 .keyboardShortcut("f", modifiers: .command)
             if service.supports("chat.channel_ux1", key: key) {
@@ -113,6 +124,13 @@ struct ChatChannelView: View {
         }
         .padding(.horizontal, 24).frame(height: 64)
         .overlay(alignment: .bottom) { Rectangle().fill(Theme.chromeHairline).frame(height: 1) }
+    }
+
+    @ViewBuilder private func pinsButton(_ model: ChatChannelModel) -> some View {
+        if let b1 = model.b1, b1.supports("chat.pins") {
+            ChatIconButton(title: "Pinned messages", symbol: "pin") { showingPins.toggle() }
+                .popover(isPresented: $showingPins) { ChatPinnedMessages(b1: b1, model: model, members: members) { showingPins = false } }
+        }
     }
 
     @ViewBuilder private var connectionStatus: some View {
@@ -168,10 +186,21 @@ final class WindowBox {
 struct WindowReader: NSViewRepresentable {
     let box: WindowBox
     var didAttach: (() -> Void)? = nil
+    var visibilityChanged: ((Bool) -> Void)? = nil
 
     final class Reader: NSView {
         var box: WindowBox?
         var didAttach: (() -> Void)?
+        var visibilityChanged: ((Bool) -> Void)?
+        private var lastVisibility: Bool?
+        override func viewDidHide() {
+            super.viewDidHide()
+            attached()
+        }
+        override func viewDidUnhide() {
+            super.viewDidUnhide()
+            attached()
+        }
         override func viewDidMoveToSuperview() {
             super.viewDidMoveToSuperview()
             attached()
@@ -182,10 +211,15 @@ struct WindowReader: NSViewRepresentable {
         }
         func attached() {
             box?.view = self
-            guard didAttach != nil else { return }
+            guard didAttach != nil || visibilityChanged != nil else { return }
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.superview != nil else { return }
-                self.didAttach?()
+                guard let self else { return }
+                let visible = self.window != nil && !self.isHiddenOrHasHiddenAncestor
+                if self.lastVisibility != visible {
+                    self.lastVisibility = visible
+                    self.visibilityChanged?(visible)
+                }
+                if self.superview != nil { self.didAttach?() }
             }
         }
     }
@@ -199,6 +233,7 @@ struct WindowReader: NSViewRepresentable {
     func updateNSView(_ view: Reader, context: Context) {
         view.box = box
         view.didAttach = didAttach
+        view.visibilityChanged = visibilityChanged
         view.attached()
     }
 }

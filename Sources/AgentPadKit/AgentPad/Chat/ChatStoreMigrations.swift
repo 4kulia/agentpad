@@ -488,6 +488,29 @@ enum ChatStoreMigrations {
                 t.add(column: "context_ids", .text).notNull().defaults(to: "[]")
             }
         }
+        migrator.registerMigration("release-16-conversation-read-marks") { db in
+            try db.create(table: "thread_read_marks") { t in
+                t.column("channel_id", .text).notNull()
+                t.column("root_id", .text).notNull()
+                t.column("last_read_seq", .integer).notNull()
+                t.primaryKey(["channel_id", "root_id"])
+            }
+            // Preserve known viewed replies. A removed notification is not a
+            // read receipt: deletions also set notified.read, so exclude them.
+            try db.execute(sql: """
+                INSERT INTO thread_read_marks (channel_id, root_id, last_read_seq)
+                SELECT n.channel_id, n.thread_root_id, MAX(n.seq) FROM notified n
+                    JOIN messages m ON m.message_id = n.object_id
+                WHERE n.read = 1 AND n.thread_root_id IS NOT NULL AND m.has_fixed = 1 AND m.deleted_at IS NULL
+                GROUP BY n.channel_id, n.thread_root_id
+                """)
+        }
+        migrator.registerMigration("release-17-b1") { db in try ChatB1.migrate(db) }
+        migrator.registerMigration("release-18-b1-review") { db in
+            try db.alter(table: "edit_drafts") { t in t.add(column: "version", .text).notNull().defaults(to: "") }
+            try db.execute(sql: "UPDATE edit_drafts SET version = lower(hex(randomblob(16)))")
+            try db.alter(table: "notified") { t in t.add(column: "withdrawn", .boolean).notNull().defaults(to: false) }
+        }
         return migrator
     }
 

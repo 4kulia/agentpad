@@ -29,7 +29,7 @@ struct ChatTimelineView: View {
     private var messages: [ChatMessage] { model.conversationMessages(root: root) }
     private var position: ChatScrollPosition { model.positions[root ?? ""] ?? ChatScrollPosition() }
     private var place: String { root.map { "t:\($0)" } ?? "c:\(model.channel)" }
-    private var rows: [ChatFeedLayout.Row] { ChatFeedLayout.rows(messages, unreadID: root == nil ? model.feed.unreadID : nil) }
+    private var rows: [ChatFeedLayout.Row] { ChatFeedLayout.rows(messages, unreadID: root == nil ? model.feed.unreadID : model.threadUnreadID) }
 
     var body: some View {
         GeometryReader { viewport in
@@ -58,7 +58,8 @@ struct ChatTimelineView: View {
                                 if let root, row.message.threadRootId == root,
                                    row.id == messages.first(where: { $0.threadRootId == root })?.id {
                                     HStack {
-                                        Text(ChatReplySummary(messages: messages.filter { $0.threadRootId == root }, complete: !model.threadHasEarlier).label)
+                                        Text((model.b1?.supports("chat.thread_summary") == true ? model.b1?.state.metadata[root]?.threadSummary?.label : nil)
+                                             ?? ChatReplySummary(messages: messages.filter { $0.threadRootId == root }, complete: !model.threadHasEarlier).label)
                                         Rectangle().fill(Theme.chromeHairline).frame(height: 1)
                                     }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary).padding(18)
                                 }
@@ -120,7 +121,7 @@ struct ChatTimelineView: View {
                 }
                 .onChange(of: messages) { old, new in
                     var state = position
-                    let follow = state.update(new) || nativeViewport.following
+                    let follow = state.update(new, me: me) || nativeViewport.following
                     model.positions[root ?? ""] = state
                     if let target = model.revealMessageID, new.contains(where: { $0.id == target }) {
                         nativeViewport.stopFollowing()
@@ -129,6 +130,7 @@ struct ChatTimelineView: View {
                         proxy.scrollTo(loadingAnchor, anchor: .top)
                         self.loadingAnchor = nil
                     } else if follow { nativeViewport.jumpToBottom() }
+                    readIfLooking()
                 }
                 .onChange(of: model.revealMessageID) { _, target in
                     if let target, messages.contains(where: { $0.id == target }) {
@@ -152,7 +154,7 @@ struct ChatTimelineView: View {
                 .onAppear {
                     ChatNotifications.show(place, view: box.id) { [box, weak model] in box.shown && box.atBottom && model?.searching == false && model?.hasNavigationReturn == false }
                     var state = position
-                    let follow = state.update(messages)
+                    let follow = state.update(messages, me: me)
                     model.positions[root ?? ""] = state
                     if let target = model.revealMessageID, messages.contains(where: { $0.id == target }) { nativeViewport.stopFollowing(); proxy.scrollTo(target, anchor: .center) }
                     else if follow { nativeViewport.jumpToBottom() }
@@ -174,8 +176,11 @@ struct ChatTimelineView: View {
                 }
             }
         }
-        .background(WindowReader(box: box))
-        .onDisappear { started = false; ChatNotifications.hide(place, view: box.id) }
+        .background(WindowReader(box: box, visibilityChanged: { visible in
+            if visible { model.beginReading(root: root); readIfLooking() }
+            else { model.endReading(root: root) }
+        }))
+        .onDisappear { started = false; model.endReading(root: root); ChatNotifications.hide(place, view: box.id) }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in readIfLooking() }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in readIfLooking() }
     }
@@ -188,9 +193,9 @@ struct ChatTimelineView: View {
     }
 
     private func readIfLooking() {
-        guard ChatScrollPosition.canMarkRead(appActive: ChatNotifications.appActive(), shown: box.shown,
-                                             atBottom: box.atBottom, searching: model.searching || model.hasNavigationReturn) else { return }
-        if let root { model.markThreadRead(root) } else { model.markRead() }
+        guard started, let view = box.view, view.window != nil, !view.isHiddenOrHasHiddenAncestor else { return }
+        model.beginReading(root: root)
+        model.readIfLooking(root: root, appActive: ChatNotifications.appActive(), shown: box.shown, atBottom: box.atBottom)
     }
 
     private func dateDivider(_ date: Date) -> some View {
@@ -209,6 +214,8 @@ struct ChatTimelineView: View {
             Rectangle().fill(ChatAppearance.attention.opacity(0.45)).frame(width: 32, height: 1)
             Text("New messages").font(Theme.display(10, weight: .medium))
             Rectangle().fill(ChatAppearance.attention.opacity(0.45)).frame(height: 1)
+            Button("Mark as read") { model.markConversationRead(root: root) }
+                .buttonStyle(.plain).font(Theme.display(10))
         }.foregroundStyle(ChatAppearance.attention).padding(.horizontal, 24).padding(.top, 16).padding(.bottom, 8)
     }
 }

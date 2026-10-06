@@ -206,7 +206,7 @@ final class ChatUX2Tests: XCTestCase {
         try store.queue.write { try $0.execute(sql: "UPDATE read_marks SET last_read_seq = 2") }
         let model = ChatChannelModel(key: key, channel: channel); model.follow(store)
         XCTAssertEqual(model.feed.unreadID, "m3")
-        model.markRead()
+        model.markRead(clearingBoundary: false)
         XCTAssertEqual(model.entryReadSequence, 2)
         XCTAssertEqual(try store.queue.read { try ChatChannelModel.readFeed($0, channel: channel, shown: 50, unreadAfter: model.entryReadSequence).unreadID }, "m3")
         let limited = try store.queue.read { try ChatChannelModel.readFeed($0, channel: channel, shown: 1, unreadAfter: 2) }
@@ -479,7 +479,11 @@ final class ChatUX2Tests: XCTestCase {
         model.openThread("root"); XCTAssertNil(model.editing)
         try await store.queue.write { try $0.execute(sql: "DELETE FROM channels") }
         try await Task.sleep(for: .milliseconds(30))
-        model.openThread("another"); XCTAssertNil(model.editing)
+        model.openThread("another"); XCTAssertEqual(model.editing?.text, "draft second")
+        let team = team
+        try await store.queue.write { try ChatStore.leftTeam($0, team) }
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertNil(model.editing)
     }
 
     func testSessionRebindKeepsHiddenEditDraftAndRevocationClearsIt() throws {
@@ -500,7 +504,14 @@ final class ChatUX2Tests: XCTestCase {
         XCTAssertEqual(model.editing?.revision, 1)
         model.openThread(nil)
         session.update(.noAccess, key: key, store: reopened, service: service)
-        model.openThread("root"); XCTAssertNil(model.editing)
+        model.openThread("root"); XCTAssertEqual(model.editing?.text, "hidden draft")
+        XCTAssertNil(session.ownerModel)
+        session.update(ready, key: key, store: reopened, service: service)
+        XCTAssertTrue(session.model === model)
+        XCTAssertNotNil(session.ownerModel, "channel controls return with access")
+        XCTAssertEqual(model.editing?.text, "hidden draft")
+        model.cancelEditing(all: true)
+        XCTAssertNil(model.editing)
     }
 
     func testSearchIncludesCachedRepliesAndClearsRevokedOrDeletedContent() async throws {
@@ -821,7 +832,7 @@ extension ChatUX2Tests {
         XCTAssertNil(second.model?.editing)
         XCTAssertNil(second.model?.focusRequest)
         first.update(.notConnected, key: nil, store: nil, service: service)
-        XCTAssertNil(first.model); XCTAssertNil(model.editing)
+        XCTAssertTrue(first.model === model); XCTAssertEqual(model.editing?.text, "edit draft")
         XCTAssertNotNil(second.model)
     }
 }

@@ -168,6 +168,8 @@ extension ChatStreamSink {
 @MainActor
 @Observable
 final class ChatSocket {
+    func checkCapabilitiesAgain() { Task { try? await checkServer() } }
+
     enum State: Equatable {
         case disconnected
         case connecting

@@ -15,6 +15,7 @@ final class ChatSync: ChatStreamSink {
         case failed(String)
     }
 
+    let b1: ChatB1Sync
     let key: ChatOrgKey
     private let store: ChatStore
     private let api: ChatAPI
@@ -81,12 +82,17 @@ final class ChatSync: ChatStreamSink {
     private var readyFailures = 0
 
     init(key: ChatOrgKey, store: ChatStore, api: ChatAPI, socket: ChatSocket, outbox: ChatOutbox?, token: String) {
+        self.b1 = ChatB1Sync(key: key, store: store, api: api, token: token, socket: socket)
         self.key = key
         self.store = store
         self.api = api
         self.socket = socket
         self.outbox = outbox
         self.token = token
+        b1.onAccessRefused = { [weak self] status in
+            self?.rightsInDoubt()
+            if status == 404 { self?.onMembershipInDoubt() }
+        }
     }
 
     var myAccountId: String { key.accountId }
@@ -133,6 +139,7 @@ final class ChatSync: ChatStreamSink {
 
     func stop() {
         stopped = true
+        b1.stop()
         snapshotting?.cancel()
         retrying?.cancel()
         readyRetry?.cancel()
@@ -411,6 +418,7 @@ final class ChatSync: ChatStreamSink {
         }
         settled = context.id
         // Actions wait for this (review D8h-p2-1).
+        b1.resume()
         onInStep()
         return true
     }
@@ -476,6 +484,7 @@ final class ChatSync: ChatStreamSink {
             }
         }
         if event.type == "message.delete", event.stream.hasPrefix("channel:"), let id = event.body["message_id"]?.string {
+            b1.cancelCandidate(id)
             onMessageGone(String(event.stream.dropFirst("channel:".count)), id)
         }
         // A channel that came — or went with a team — may be one open in a tab (F3).
@@ -491,7 +500,11 @@ final class ChatSync: ChatStreamSink {
         // Unknown channel features invalidate only their channel. Other
         // unhandled events retain full recovery (review D8f-p3-1, D8g-p3-3).
         if applied == .passedOver {
-            if let channel = ChatEvents.channelPointer(event) { refreshChannel(channel) }
+            if event.type.hasPrefix("thread.participation"), event.stream.hasPrefix("member:") {
+                // Future participation signals retain their raw event while
+                // reloading the derived set, without replacing message windows.
+                b1.schedule()
+            } else if let channel = ChatEvents.channelPointer(event) { refreshChannel(channel) }
             else { requestSnapshot() }
         }
         // Added to a team, or joined one: its stream joins the set, with the

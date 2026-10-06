@@ -267,6 +267,8 @@ struct PersistedTab: Codable, Equatable {
     var conversationId: String?
     // AgentPad: set for a channel tab; older files have none and read as terminals.
     var channel: ChannelRef?
+    // AgentPad: a saved list persists its organization address and kind only.
+    var inbox: ChatInboxRef?
 
     @MainActor
     init(_ session: Session) {
@@ -274,9 +276,10 @@ struct PersistedTab: Codable, Equatable {
         self.agentId = session.agent.id
         self.currentDirectoryPath = session.currentDirectory.path
         // AgentPad: a channel tab keeps no title — its name is its card's (DESIGN-F2).
-        self.customTitle = session.channel == nil ? session.customTitle : nil
+        self.customTitle = !session.isChat ? session.customTitle : nil
         self.conversationId = session.conversationId
         self.channel = session.channel
+        self.inbox = session.inbox
     }
 
     init(id: UUID, agentId: String, currentDirectoryPath: String, customTitle: String? = nil, conversationId: String? = nil) {

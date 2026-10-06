@@ -6,6 +6,8 @@ import Security
 struct ChatServerInfo: Codable, Equatable, Sendable {
     struct Limits: Codable, Equatable, Sendable {
         let message, request, result, frame: Int
+        var chatB1: ChatB1.Limits? = nil
+        enum CodingKeys: String, CodingKey { case message, request, result, frame, chatB1 = "chat_b1" }
     }
 
     let name: String

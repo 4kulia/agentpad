@@ -356,7 +356,7 @@ private struct FileTreeRowView: View {
             AgentPadMenuRow(
                 title: "Insert Path into Terminal",
                 // AgentPad: not into a channel tab (DESIGN-F2).
-                isDisabled: store.active?.activeSession == nil || store.active?.activeSession?.channel != nil
+                isDisabled: store.active?.activeSession == nil || store.active?.activeSession?.isChat == true
             ) {
                 isContextMenuOpen = false
                 store.active?.activeSession?.engine

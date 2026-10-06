@@ -110,6 +110,7 @@ final class ChatService {
     var followsFeed = false
     /// Negotiated on each connection; never inferred from cached data.
     var serverCapabilities: [ChatServerAddress: Set<String>] = [:]
+    var serverB1Limits: [ChatServerAddress: ChatB1.Limits] = [:]
     // TTL refreshes are bookkeeping, not SwiftUI changes. The display revision
     // is coalesced and expires via one task for the whole service.
     @ObservationIgnored var channelActivity: [String: ChatChannelActivity] = [:]
@@ -427,6 +428,7 @@ final class ChatService {
         let name = try? orgSessions[key]?.store?.orgName
         orgSessions[key]?.outbox?.hold()
         reconcileChannelResults(revoked: key)
+        clearB1PrivateState(key)
         dropSession(key)
         let url = files.cacheURL(key)
         for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
@@ -1266,6 +1268,7 @@ final class ChatService {
         if let key = connection.orgKey { keys.insert(key) }
         for key in keys {
             let url = files.cacheURL(key)
+            clearB1PrivateState(key)
             dropSession(key)
             for suffix in ["", "-wal", "-shm"] {
                 try? FileManager.default.removeItem(atPath: url.path + suffix)

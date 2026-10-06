@@ -105,10 +105,18 @@ enum ChatNotifications {
     /// A message the live feed brought (DESIGN-F4): a notice if one is owed
     /// — the channel seen, its marker new — unless the user looks right at
     /// it (the thread's panel for a reply, the feed for a root).
-    static func live(_ service: ChatService, _ key: ChatOrgKey, store: ChatStore, channel: String, messageId message: String) {
+    static func live(_ service: ChatService, _ key: ChatOrgKey, store: ChatStore, channel: String, messageId message: String, eligibleReply: Bool? = nil) {
+        if eligibleReply == nil, service.supports("chat.thread_participation", key: key), visible(service, key, channel),
+           let candidate = try? store.queue.read({ db in
+               try Row.fetchOne(db, sql: "SELECT thread_root_id, (\(ChatUnread.mentionSQL)) AS mentioned FROM messages m WHERE message_id = ? AND deleted_at IS NULL AND author_account_id != ?",
+                                arguments: [message, key.accountId])
+           }), let root: String = candidate["thread_root_id"], !(candidate["mentioned"] as Bool) {
+            service.orgSessions[key]?.sync?.b1.checkReply(channel: channel, id: message, root: root)
+            return
+        }
         guard visible(service, key, channel),
               let owed = (try? store.queue.write({ db -> (kind: String, root: String?)? in
-                  guard let kind = try ChatUnread.owe(db, messageId: message, me: key.accountId) else { return nil }
+                  guard let kind = try ChatUnread.owe(db, messageId: message, me: key.accountId, eligibleReply: eligibleReply) else { return nil }
                   let root = try String.fetchOne(db, sql: "SELECT thread_root_id FROM messages WHERE message_id = ?", arguments: [message])
                   return (kind, root)
               })) ?? nil else { return }
@@ -132,7 +140,7 @@ enum ChatNotifications {
             if let service { reconcile(service) }
         }
         session.noticeWatch = try? DatabaseRegionObservation(tracking: Table("channels"), Table("teams"), Table("messages"),
-                                                             Table("notified"), Table("read_marks"), Table("meta"), Table("requests"))
+                                                             Table("notified"), Table("my_threads"), Table("read_marks"), Table("thread_read_marks"), Table("meta"), Table("requests"))
             .start(in: store.queue, onError: { _ in }) { _ in changes.schedule() }
     }
 
@@ -174,7 +182,7 @@ enum ChatNotifications {
         return (try? store.queue.read { db -> Bool in
             guard let row = try Row.fetchOne(db, sql: "SELECT deleted_at FROM messages WHERE message_id = ?", arguments: [message]),
                   (row["deleted_at"] as String?) == nil else { return false }
-            return try Bool.fetchOne(db, sql: "SELECT read FROM notified WHERE object_id = ?", arguments: [message]) == false
+            return try Bool.fetchOne(db, sql: "SELECT NOT read AND NOT withdrawn FROM notified WHERE object_id = ?", arguments: [message]) == true
         }) ?? false
     }
 }

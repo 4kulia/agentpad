@@ -305,10 +305,14 @@ final class ChatMessagesTests: XCTestCase {
         """#
     }
 
-    private func started(_ answers: Answers, channelOpen: Bool = true, alsoOpen: [String] = [], hold: Set<String> = []) async throws -> (ChatService, FakeSocketTransport) {
+    private func started(_ answers: Answers, channelOpen: Bool = true, alsoOpen: [String] = [], hold: Set<String> = [], b1: Bool = false) async throws -> (ChatService, FakeSocketTransport) {
         let org = self.org, me = self.me
         answers.set("/v1/me", #"{"account_id":"\#(me)","session_id":"s-anna","orgs":[{"org_id":"\#(org)","org_name":"Rabbitshat","role":"member","handle":"anna","name":"Anna"}],"streams":{"account:\#(me)":0}}"#)
         answers.set("/v1/server", #"{"name":"s","version":"0.1.0","generation":"g1","api_versions":["v1"],"capabilities":["auth.email_code","events.ws","chat.channels"]}"#)
+        if b1 {
+            answers.set("/v1/server", #"{"name":"s","version":"0.1.0","generation":"g1","api_versions":["v1"],"capabilities":["auth.email_code","events.ws","chat.channels","chat.reactions","chat.pins","chat.thread_summary","chat.thread_participation"]}"#)
+            if answers.get("/v1/orgs/\(org)/my-threads") == nil { answers.set("/v1/orgs/\(org)/my-threads", #"{"member_head":4,"items":[],"next":null}"#) }
+        }
         ChatStubProtocol.reset { request, _ in
             let path = request.url?.path ?? ""
             let full = path + (request.url?.query.map { "?\($0)" } ?? "")
@@ -1198,7 +1202,9 @@ final class ChatMessagesTests: XCTestCase {
         try newWindow(store, head: 40, [wire(message("own", seq: 40, author: me))], before: 40)
         let gap = try unread(store)
         XCTAssertEqual(gap.count, 0)
-        XCTAssertTrue(gap.more, "unread may lie below the window: at least a dot")
+        XCTAssertFalse(gap.more, "my post reads through the gap before it")
+        try newWindow(store, head: 80, [wire(message("foreign", seq: 80))], before: 80)
+        XCTAssertTrue(try unread(store).more, "a foreign post does not read the gap below the window")
         try store.queue.write { db in
             try db.execute(sql: "UPDATE read_marks SET last_read_seq = 50")
             try ChatMessages.write(db, self.wire(#"{"message_id":"late","channel_id":"\#(self.channel)","thread_root_id":null,"author_account_id":"\#(self.other)","text":"x","mentions":[{"account_id":"\#(self.me)"}],"revision":1,"seq":45,"created_at":"x","edited_at":null,"deleted_at":null}"#))
@@ -1256,7 +1262,7 @@ final class ChatMessagesTests: XCTestCase {
         try store.queue.write { db in try ChatMessages.write(db, self.wire(self.message("m5", seq: 5))) }
         let model = ChatChannelModel(key: key, channel: channel)
         model.follow(store)
-        model.markRead()
+        model.markRead(clearingBoundary: false)
         XCTAssertEqual(try int(store, "SELECT last_read_seq FROM read_marks WHERE channel_id = ?", [channel]), 3)
     }
 
@@ -1552,7 +1558,7 @@ extension ChatMessagesTests {
         session.update(.noAccess, key: key, store: store, service: service)
         gate.open()
         try await Task.sleep(for: .milliseconds(100))
-        XCTAssertNil(session.model)
+        XCTAssertTrue(session.model === model)
         XCTAssertEqual(try int(store, "SELECT COUNT(*) FROM thread_cursors"), 0, "a cancelled read cannot repopulate the cache")
         XCTAssertNil(try row(store, "reply"))
     }
@@ -1598,8 +1604,11 @@ extension ChatMessagesTests {
         XCTAssertTrue(model.canEdit(try XCTUnwrap(model.conversationMessages(root: root).first { $0.id == "mine" })))
         XCTAssertEqual(try window(store).bottom, 100, "reloading an edit does not pretend to load continuous history")
         session.update(.noAccess, key: key, store: store, service: service)
-        XCTAssertNil(session.model)
-        XCTAssertNil(model.editing)
+        XCTAssertTrue(session.model === model)
+        XCTAssertEqual(model.editing?.text, "unsaved edit 🐇")
+        let team = team
+        try await store.queue.write { try ChatStore.leftTeam($0, team) }
+        try await waitUntil("confirmed revoke clears draft") { model.editing == nil }
     }
 
     func testEscapeDismissesEditSearchThenThreadAndPreservesComposerDrafts() throws {
@@ -1617,5 +1626,473 @@ extension ChatMessagesTests {
         XCTAssertEqual(model.focusedMessageID, "root")
         XCTAssertEqual(model.draft(root: "root"), "reply draft")
         XCTAssertFalse(model.dismissTransient())
+    }
+}
+
+// B1: the real API, synchronizer, outbox and notification path with a deterministic server.
+extension ChatMessagesTests {
+    private enum B1Read { case metadata, pins, reactors, threads, participation }
+    private func readDB<T>(_ store: ChatStore, _ body: (Database) throws -> T) throws -> T { try store.queue.read(body) }
+
+    private func assertB1Refusal(_ read: B1Read, status: Int, holdCapabilities: Bool = false, failedCapabilities: Bool = false,
+                                file: StaticString = #filePath, line: UInt = #line) async throws {
+        let answers = Answers(), channel = channel
+        let base = "/v1/orgs/\(org)", statePath = "/v1/orgs/\(org)/state"
+        let metadata = "\(base)/channels/\(channel)/message-metadata", pins = "\(base)/channels/\(channel)/pins"
+        let reactors = "\(base)/channels/\(channel)/messages/m/reactions", threads = "\(base)/my-threads"
+        let participation = "\(base)/channels/\(channel)/threads/m/participation"
+        answers.set(statePath, state([message("m", seq: 1), message("second", seq: 2)]))
+        answers.set(metadata, #"{"as_of_seq":10,"items":[{"message_id":"m","deleted":false,"reactions":[{"emoji":"👍","count":2,"mine":false}],"pin":null},{"message_id":"second","deleted":false,"reactions":[],"pin":null}]}"#)
+        answers.set(pins, #"{"as_of_seq":10,"pins":[{"message_id":"m","seq":1,"author_account_id":"someone","excerpt":"private excerpt","pinned_by":"someone","pinned_at":"now"}]}"#)
+        answers.set(reactors, #"{"as_of_seq":10,"account_ids":["private-account"],"next":"more"}"#)
+        let (service, _) = try await started(answers, b1: true)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync), store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let first = ChatB1Channel(key: key, channel: channel, store: store, service: service)
+        let second = ChatB1Channel(key: key, channel: channel, store: store, service: service)
+        first.show(["m", "second"]); first.showPins(true)
+        try await waitUntil("B1 projections loaded") { first.state.metadata["m"]?.reactions.count == 1 && first.state.pins?.count == 1 }
+        let list = ChatReactionAccounts(b1: first, message: "m", emoji: "👍")
+        await list.load(restart: true)
+        XCTAssertEqual(list.accounts, ["private-account"], file: file, line: line)
+        let revocations = sync.revocations
+        let snapshots = ChatStubProtocol.seen.filter { $0.request.url?.path == statePath }.count
+        let infoReads = ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/server" }.count
+        // The common gate must hide all windows before rights can be confirmed,
+        // with no websocket revocation event and no completed snapshot.
+        let gate = Gate(); gate.close()
+        answers.gate = gate; answers.gated = statePath
+        let infoGate = Gate(); infoGate.close()
+        if holdCapabilities { answers.gate = infoGate; answers.gated = "/v1/server" }
+        if failedCapabilities { answers.set("/v1/server", #"{"error":"unavailable"}"#, status: 503) }
+        defer { service.stopFeed(); sync.stop(); gate.open(); infoGate.open() }
+        let path: String
+        switch read {
+        case .metadata: path = metadata
+        case .pins: path = pins
+        case .reactors: path = reactors
+        case .threads: path = threads
+        case .participation: path = participation
+        }
+        answers.set(path, status == 403 ? #"{"error":"forbidden"}"# : #"{"error":"not_found"}"#, status: status)
+        switch read {
+        case .metadata, .pins:
+            first.retryReads()
+        case .reactors:
+            await list.load(restart: false)
+        case .threads:
+            try await store.queue.write { try $0.execute(sql: "UPDATE b1_participation SET dirty = 1, ticket = ticket + 1") }
+        case .participation:
+            sync.b1.checkReply(channel: channel, id: "reply", root: "m")
+        }
+        if holdCapabilities {
+            try await waitUntil("capability check started") { ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/server" }.count > infoReads }
+            try await waitUntil("B1 hidden while compatibility is unresolved") {
+                first.state.metadata.isEmpty && first.state.pins == nil && list.accounts.isEmpty
+                    && second.state.metadata.isEmpty && second.state.pins == nil
+            }
+            answers.gate = gate; answers.gated = statePath
+            infoGate.open()
+        }
+        try await waitUntil("shared access gate", { sync.revocations > revocations }, file: file, line: line)
+        XCTAssertTrue(sync.needsSnapshot, file: file, line: line)
+        XCTAssertEqual(try int(store, "SELECT rights_in_doubt FROM meta"), 1, file: file, line: line)
+        XCTAssertFalse(ChatNotifications.allowed(service, key, channel: channel), file: file, line: line)
+        for panel in [first, second] {
+            XCTAssertFalse(panel.state.accessible, file: file, line: line)
+            XCTAssertTrue(panel.state.metadata.isEmpty, file: file, line: line)
+            XCTAssertNil(panel.state.pins, file: file, line: line)
+        }
+        XCTAssertTrue(list.accounts.isEmpty, file: file, line: line)
+        try await waitUntil("rights reread", { ChatStubProtocol.seen.filter { $0.request.url?.path == statePath }.count > snapshots }, file: file, line: line)
+        if read == .metadata {
+            XCTAssertEqual(try int(store, "SELECT dirty FROM b1_metadata WHERE message_id = 'm'"), 1, file: file, line: line)
+            XCTAssertFalse(ChatStubProtocol.seen.contains { $0.request.url?.path == metadata && $0.request.url?.query == "ids=m" }, file: file, line: line)
+        }
+    }
+    func testB1Metadata403ClosesSharedAccessGate() async throws { try await assertB1Refusal(.metadata, status: 403) }
+    func testB1Metadata404ClosesSharedAccessGate() async throws { try await assertB1Refusal(.metadata, status: 404) }
+    func testB1Pins403ClosesSharedAccessGate() async throws { try await assertB1Refusal(.pins, status: 403) }
+    func testB1Pins404ClosesSharedAccessGate() async throws { try await assertB1Refusal(.pins, status: 404) }
+    func testB1Reactors403ClosesSharedAccessGate() async throws { try await assertB1Refusal(.reactors, status: 403) }
+    func testB1Reactors404ClosesSharedAccessGate() async throws { try await assertB1Refusal(.reactors, status: 404) }
+    func testB1Threads403ClosesSharedAccessGate() async throws { try await assertB1Refusal(.threads, status: 403) }
+    func testB1Threads404ClosesSharedAccessGate() async throws { try await assertB1Refusal(.threads, status: 404) }
+    func testB1Participation403ClosesSharedAccessGate() async throws { try await assertB1Refusal(.participation, status: 403) }
+    func testB1Participation404ClosesSharedAccessGate() async throws { try await assertB1Refusal(.participation, status: 404) }
+    func testB1Slow404CapabilityCheckHidesContentBeforeItCompletes() async throws { try await assertB1Refusal(.pins, status: 404, holdCapabilities: true) }
+    func testB1Failed404CapabilityCheckClosesSharedAccessGate() async throws { try await assertB1Refusal(.pins, status: 404, failedCapabilities: true) }
+
+    func testB1MissingPinsCapabilityOn404DoesNotRevokeAccessToSupportedReactions() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1)]))
+        let (service, _) = try await started(answers, b1: true)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync), store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let revocations = sync.revocations, snapshots = sync.snapshots
+        answers.set("/v1/server", #"{"name":"s","version":"0.1.0","generation":"g1","api_versions":["v1"],"capabilities":["auth.email_code","events.ws","chat.channels","chat.reactions"]}"#)
+        answers.set("/v1/orgs/\(org)/channels/\(channel)/pins", "", status: 404)
+        sync.b1.showPins(UUID(), channel: channel, shown: true)
+        try await waitUntil { !sync.b1.capabilities.contains("chat.pins") }
+        XCTAssertTrue(sync.b1.capabilities.contains("chat.reactions"))
+        XCTAssertEqual(sync.revocations, revocations)
+        XCTAssertEqual(sync.snapshots, snapshots)
+        XCTAssertEqual(try int(store, "SELECT rights_in_doubt FROM meta"), 0)
+        XCTAssertTrue(ChatNotifications.allowed(service, key, channel: channel))
+    }
+
+    func testB1UnsupportedReactorsRefreshesCapabilitiesWithoutRevokingRights() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1)]))
+        let path = "/v1/orgs/\(org)/channels/\(channel)/messages/m/reactions"
+        answers.set(path, #"{"as_of_seq":10,"account_ids":["one"],"next":"more"}"#)
+        let (service, _) = try await started(answers, b1: true)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync), store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let panel = ChatB1Channel(key: key, channel: channel, store: store, service: service)
+        let list = ChatReactionAccounts(b1: panel, message: "m", emoji: "👍")
+        await list.load(restart: true)
+        XCTAssertEqual(list.accounts, ["one"])
+        let revocations = sync.revocations
+        answers.set(path, #"{"error":"unsupported"}"#, status: 403)
+        answers.set("/v1/server", #"{"name":"s","version":"0.1.0","generation":"g1","api_versions":["v1"],"capabilities":["auth.email_code","events.ws","chat.channels","chat.pins"]}"#)
+        await list.load(restart: false)
+        XCTAssertTrue(list.accounts.isEmpty)
+        XCTAssertFalse(service.supports("chat.reactions", key: key))
+        XCTAssertEqual(sync.revocations, revocations)
+        XCTAssertEqual(try int(store, "SELECT rights_in_doubt FROM meta"), 0)
+        XCTAssertTrue(ChatNotifications.allowed(service, key, channel: channel))
+    }
+
+    func testStaleSaveKeepsNewerSharedEditInBothTabsAndOnReopen() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1, author: me)]))
+        let (service, _) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let first = ChatChannelModel(key: key, channel: channel); first.service = service; first.follow(store)
+        XCTAssertTrue(first.beginEditing(try XCTUnwrap(first.message("m")), root: nil))
+        first.editing?.text = "text captured by save"
+        let second = ChatChannelModel(key: key, channel: channel); second.service = service; second.follow(store)
+        second.editing?.text = "newer unsaved text"
+        let version = try XCTUnwrap(second.editing?.version)
+        // Save before the database observation has updated first's version.
+        XCTAssertEqual(first.editing?.text, "text captured by save")
+        XCTAssertTrue(first.saveEditing(members: []))
+        try await waitUntil { first.editing?.text == "newer unsaved text" && second.editing?.text == "newer unsaved text" }
+        XCTAssertEqual(first.editing?.version, version)
+        XCTAssertEqual(second.editing?.version, version)
+        let reopened = ChatChannelModel(key: key, channel: channel)
+        reopened.follow(try ChatStore.open(files: files, key: key).store)
+        XCTAssertEqual(reopened.editing?.text, "newer unsaved text")
+        XCTAssertEqual(reopened.editing?.version, version)
+        let command = try XCTUnwrap(store.commands().first { $0.type == "message.edit" })
+        XCTAssertEqual(ChatService.args(command)["text"]?.string, "text captured by save")
+    }
+
+    func testB1ParticipationWithdrawalRemovesNoticeWithoutReadingReply() async throws {
+        noticesHere()
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state())
+        let threads = "/v1/orgs/\(org)/my-threads"
+        answers.set(threads, #"{"member_head":4,"items":[{"channel_id":"\#(channel)","root_id":"ancient","first_message_seq":1}],"next":null}"#)
+        answers.set("/v1/orgs/\(org)/channels/\(channel)/threads/ancient/participation", #"{"as_of_seq":100,"participating":true,"eligible_for_reply":true}"#)
+        let (service, transport) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store), channel = channel, me = me
+        transport.frame(post(11, "reply", root: "ancient"))
+        transport.frame(post(12, "mention", root: "ancient", mentions: [me]))
+        try await waitUntil { self.notices.count == 2 }
+        let replyNotice = ChatNotifications.messageId(key, channel: channel, message: "reply")
+        let mentionNotice = ChatNotifications.messageId(key, channel: channel, message: "mention")
+        XCTAssertTrue(shown.contains(replyNotice)); XCTAssertTrue(shown.contains(mentionNotice))
+        let marks = try readDB(store) { db in (try Row.fetchAll(db, sql: "SELECT * FROM read_marks"), try Row.fetchAll(db, sql: "SELECT * FROM thread_read_marks")) }
+        answers.set(threads, #"{"member_head":5,"items":[],"next":null}"#)
+        transport.frame(#"{"frame":"event","stream":"member:\#(org):\#(me)","seq":5,"id":"p5","type":"thread.participation_changed","body":{},"actor":null,"command_id":null,"at":"now"}"#)
+        try await waitUntil { try self.int(store, "SELECT head FROM b1_participation") == 5 && !self.shown.contains(replyNotice) }
+        XCTAssertTrue(shown.contains(mentionNotice))
+        XCTAssertFalse(ChatNotifications.stillDue(replyNotice, service))
+        XCTAssertTrue(ChatNotifications.stillDue(mentionNotice, service))
+        try readDB(store) { db in
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT read FROM notified WHERE object_id = 'reply'"), 0)
+            XCTAssertEqual(try ChatUnread.unreadRepliesByChannel(db)[channel], 2)
+            XCTAssertEqual(try ChatInbox.read(db, kind: .unread, account: me, session: "s-anna").map(\.id), ["reply", "mention"])
+            XCTAssertEqual(try Row.fetchAll(db, sql: "SELECT * FROM read_marks"), marks.0)
+            XCTAssertEqual(try Row.fetchAll(db, sql: "SELECT * FROM thread_read_marks"), marks.1)
+        }
+        // Rejoining and a duplicate live delivery cannot resurrect a withdrawn banner.
+        try await store.queue.write { db in
+            try db.execute(sql: "INSERT INTO my_threads (channel_id, root_id, first_message_seq) VALUES (?, 'ancient', 1)", arguments: [channel])
+            XCTAssertNil(try ChatUnread.owe(db, messageId: "reply", me: me, eligibleReply: true))
+        }
+        XCTAssertFalse(ChatNotifications.stillDue(replyNotice, service))
+        XCTAssertEqual(notices.count, 2)
+        try await store.queue.write { try ChatUnread.markRead($0, channel: channel, upTo: 12, thread: "ancient") }
+        XCTAssertEqual(try int(store, "SELECT read FROM notified WHERE object_id = 'reply'"), 1)
+    }
+
+    func testB1SignalsNeverSnapshotAndReadHeadsNeverMoveCursors() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1)]))
+        let metadataPath = "/v1/orgs/\(org)/channels/\(channel)/message-metadata"
+        answers.set(metadataPath, #"{"as_of_seq":50,"items":[{"message_id":"m","deleted":false,"reactions":[{"emoji":"❤️","count":7,"mine":true}],"pin":null,"thread_summary":{"root_id":"m","reply_count":300,"last_reply_at":null,"last_reply_seq":null,"last_participants":[]}}]}"#)
+        let (service, transport) = try await started(answers, b1: true)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync), store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let snapshots = sync.snapshots
+        sync.b1.show(UUID(), channel: channel, ids: ["m"])
+        try await waitUntil { try self.int(store, "SELECT as_of_seq FROM b1_metadata WHERE message_id = 'm'") == 50 }
+        transport.frame(frame(11, "reaction.changed", "m", message: nil))
+        transport.frame(frame(12, "pin.changed", "m", message: nil))
+        answers.set("/v1/orgs/\(org)/my-threads", #"{"member_head":8,"items":[],"next":null}"#)
+        transport.frame(#"{"frame":"event","stream":"member:\#(org):\#(me)","seq":5,"id":"p5","type":"thread.participation_changed","body":{},"actor":null,"command_id":null,"at":"now"}"#)
+        try await waitUntil { try store.cursor("member:\(self.org):\(self.me)") == 5 && store.cursor(self.channelStream) == 12 }
+        try await waitUntil { try self.int(store, "SELECT head FROM b1_participation") == 8 }
+        XCTAssertEqual(sync.snapshots, snapshots)
+        XCTAssertFalse(sync.needsSnapshot)
+        XCTAssertEqual(try store.cursor(channelStream), 12)
+        XCTAssertEqual(try store.cursor("member:\(org):\(me)"), 5)
+        XCTAssertEqual(try int(store, "SELECT COUNT(*) FROM skipped_events"), 0)
+        XCTAssertFalse(ChatStubProtocol.seen.contains { $0.request.url?.query?.contains("supports=") == true })
+        transport.frame(#"{"frame":"event","stream":"member:\#(org):\#(me)","seq":6,"id":"p6","type":"thread.participation_future","body":{"future":[1,2]},"actor":null,"command_id":null,"at":"now","future_envelope":true}"#)
+        try await waitUntil { try store.cursor("member:\(self.org):\(self.me)") == 6 }
+        XCTAssertEqual(sync.snapshots, snapshots)
+        XCTAssertEqual(try int(store, "SELECT COUNT(*) FROM skipped_events WHERE event_json LIKE '%future_envelope%'"), 1)
+    }
+
+    func testB1PointCheckNotifiesSecondMacWithoutLocalParticipationAndMentionWins() async throws {
+        noticesHere()
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state())
+        let point = "/v1/orgs/\(org)/channels/\(channel)/threads/ancient/participation"
+        answers.set(point, #"{"as_of_seq":100,"participating":true,"eligible_for_reply":true}"#)
+        let (service, transport) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        XCTAssertEqual(try int(store, "SELECT COUNT(*) FROM my_threads"), 0)
+        transport.frame(post(11, "reply", root: "ancient"))
+        try await waitUntil { self.notices.count == 1 }
+        XCTAssertEqual(notices[0].title, "New reply in a thread")
+        transport.frame(post(11, "reply", root: "ancient"))
+        transport.frame(post(12, "mention", root: "ancient", mentions: [me]))
+        try await waitUntil { self.notices.count == 2 }
+        XCTAssertEqual(notices[1].title, "New mention in AgentPad")
+        XCTAssertEqual(ChatStubProtocol.seen.filter { $0.request.url?.path == point }.count, 1)
+        answers.set(point, #"{"as_of_seq":100,"participating":true,"eligible_for_reply":false}"#)
+        transport.frame(post(13, "before-my-contribution", root: "ancient"))
+        try await waitUntil { ChatStubProtocol.seen.filter { $0.request.url?.path == point }.count == 2 }
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(notices.count, 2)
+    }
+
+    func testB1LatePointAnswerRechecksDeletionReadMuteAndLooking() async throws {
+        noticesHere()
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state())
+        let point = "/v1/orgs/\(org)/channels/\(channel)/threads/ancient/participation"
+        answers.set(point, #"{"as_of_seq":100,"participating":true,"eligible_for_reply":true}"#)
+        let (service, transport) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        answers.gate = gate; answers.gated = point + "?reply_id=doomed"
+        transport.frame(post(11, "doomed", root: "ancient"))
+        try await waitUntil { ChatStubProtocol.seen.contains { $0.request.url?.path == point } }
+        transport.frame(frame(12, "message.delete", "doomed", message: message("doomed", seq: 11, revision: 2, root: "ancient", deleted: true)))
+        try await waitUntil { try self.row(store, "doomed")?.deleted == true }
+        gate.open()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(notices.isEmpty)
+        let channel = channel
+        try await store.queue.write { try ChatUnread.setMuted($0, channel: channel, true) }
+        transport.frame(post(13, "muted", root: "ancient"))
+        try await waitUntil { try self.row(store, "muted") != nil }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(notices.isEmpty)
+        try await store.queue.write { try ChatUnread.setMuted($0, channel: channel, false) }
+        ChatNotifications.appActive = { true }
+        let view = UUID(); ChatNotifications.show("t:ancient", view: view) { true }
+        transport.frame(post(14, "viewed", root: "ancient"))
+        try await waitUntil { try self.int(store, "SELECT COUNT(*) FROM notified WHERE object_id = 'viewed'") == 1 }
+        XCTAssertTrue(notices.isEmpty)
+        ChatNotifications.hide("t:ancient", view: view)
+    }
+
+    func testB1ParticipationPaginationRestartsAndReplacesOnlyWhenComplete() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state())
+        let path = "/v1/orgs/\(org)/my-threads"
+        let cursor = "\(channel):old"
+        answers.set(path, #"{"member_head":4,"items":[{"channel_id":"\#(channel)","root_id":"old","first_message_seq":1}],"next":"\#(cursor)"}"#)
+        answers.set(path + "?after=\(cursor)&at=4&limit=200", #"{"error":"snapshot_changed"}"#, status: 409)
+        let (service, _) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        try await waitUntil { ChatStubProtocol.seen.contains { $0.request.url?.query?.contains("at=4") == true } }
+        answers.set(path, #"{"member_head":5,"items":[{"channel_id":"\#(channel)","root_id":"new","first_message_seq":3}],"next":null}"#)
+        try await waitUntil { try self.int(store, "SELECT COUNT(*) FROM my_threads WHERE root_id = 'new'") == 1 }
+        XCTAssertEqual(try int(store, "SELECT COUNT(*) FROM my_threads"), 1)
+        XCTAssertEqual(try store.cursor("member:\(org):\(me)"), 4)
+    }
+
+    func testB1SinglePendingIntentSharedAcrossWindowsAndAckDoesNotRestoreOldState() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1)]))
+        let metadataPath = "/v1/orgs/\(org)/channels/\(channel)/message-metadata"
+        answers.set(metadataPath, #"{"as_of_seq":10,"items":[{"message_id":"m","deleted":false,"reactions":[],"pin":null}]}"#)
+        let (service, _) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store), sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        let first = ChatB1Channel(key: key, channel: channel, store: store, service: service)
+        let second = ChatB1Channel(key: key, channel: channel, store: store, service: service)
+        first.show(["m"]); second.show(["m"])
+        try await waitUntil { first.state.metadata["m"] != nil && second.state.metadata["m"] != nil }
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        answers.gate = gate; answers.gated = "/v1/commands"
+        try service.setB1(key, channel: channel, message: "m", choice: "❤", present: true)
+        XCTAssertThrowsError(try service.setB1(key, channel: channel, message: "m", choice: "❤️", present: false))
+        try await waitUntil { second.pending("m", choice: "❤️") }
+        let command = try XCTUnwrap(store.commands().first { $0.type == "message.reaction.set" })
+        XCTAssertEqual(ChatService.args(command)["emoji"], .string("❤️"))
+        XCTAssertEqual(ChatService.args(command)["present"], .bool(true))
+        answers.set(metadataPath, #"{"as_of_seq":20,"items":[{"message_id":"m","deleted":false,"reactions":[],"pin":null}]}"#)
+        XCTAssertTrue(sync.apply(try event(11, "reaction.changed", body: #"{"channel_id":"\#(channel)","message_id":"m"}"#, message: nil)))
+        try await waitUntil { try self.int(store, "SELECT as_of_seq FROM b1_metadata WHERE message_id = 'm'") == 20 }
+        gate.open()
+        try await waitUntil { !first.pending("m", choice: "❤️") && !second.pending("m", choice: "❤️") }
+        XCTAssertEqual(first.state.metadata["m"]?.reactions, [])
+        XCTAssertEqual(second.state.metadata["m"]?.reactions, [])
+        let channel = channel
+        try await store.queue.write { try $0.execute(sql: "UPDATE channels SET archived = 1 WHERE channel_id = ?", arguments: [channel]) }
+        XCTAssertThrowsError(try service.setB1(key, channel: channel, message: "m", choice: "pin", present: true))
+        try await store.queue.write { try $0.execute(sql: "UPDATE channels SET archived = 0 WHERE channel_id = ?", arguments: [channel]) }
+        service.serverCapabilities[key.server] = ["chat.channels"]
+        XCTAssertFalse(first.supports("chat.reactions")); XCTAssertFalse(first.supports("chat.pins"))
+        XCTAssertThrowsError(try service.setB1(key, channel: channel, message: "m", choice: "👍", present: true))
+    }
+}
+
+extension ChatMessagesTests {
+    func testB1MetadataBatchKeepsHiddenAndPinDebtAndHonorsLimit() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("good", seq: 1), message("missing", seq: 2), message("hidden", seq: 3)]))
+        let path = "/v1/orgs/\(org)/channels/\(channel)/message-metadata"
+        answers.set(path, #"{"as_of_seq":10,"items":[{"message_id":"good","deleted":false,"reactions":[],"pin":null},{"message_id":"missing","deleted":true,"reactions":[],"pin":null}]}"#)
+        let (service, _) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store), b1 = try XCTUnwrap(service.orgSessions[key]?.sync?.b1)
+        let channel = channel
+        try await store.queue.write { db in
+            try ChatB1.watch(db, channel: channel, ids: ["hidden"])
+            try db.execute(sql: "INSERT OR IGNORE INTO b1_pins (channel_id) VALUES (?)", arguments: [channel])
+        }
+        let owner = UUID()
+        b1.show(owner, channel: channel, ids: ["good", "missing"])
+        try await waitUntil { try self.int(store, "SELECT as_of_seq FROM b1_metadata WHERE message_id = 'good'") == 10 && self.int(store, "SELECT dirty FROM b1_metadata WHERE message_id = 'missing'") == 0 }
+        XCTAssertEqual(try int(store, "SELECT dirty FROM b1_metadata WHERE message_id = 'hidden'"), 1)
+        XCTAssertEqual(try int(store, "SELECT dirty FROM b1_pins"), 1)
+        XCTAssertFalse(ChatStubProtocol.seen.contains { $0.request.url?.query?.contains("hidden") == true })
+        var limits = ChatB1.Limits(); limits.metadataIds = 1
+        b1.configure(ChatB1.capabilities, limits: limits)
+        answers.set(path + "?ids=hidden", #"{"as_of_seq":10,"items":[{"message_id":"hidden","deleted":false,"reactions":[],"pin":null}]}"#)
+        b1.show(owner, channel: channel, ids: ["hidden", "another"])
+        try await waitUntil { try self.int(store, "SELECT as_of_seq FROM b1_metadata WHERE message_id = 'hidden'") == 10 }
+        XCTAssertTrue(ChatStubProtocol.seen.filter { $0.request.url?.query?.contains("hidden") == true }.allSatisfy { $0.request.url?.query == "ids=hidden" })
+    }
+
+    func testB1ReactionPanelRestartsAndDiscardsAnInvalidatedPage() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1)]))
+        let path = "/v1/orgs/\(org)/channels/\(channel)/messages/m/reactions"
+        answers.set(path, #"{"as_of_seq":10,"account_ids":["one"],"next":"one"}"#)
+        let (service, _) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let b1 = ChatB1Channel(key: key, channel: channel, store: store, service: service)
+        let list = ChatReactionAccounts(b1: b1, message: "m", emoji: "👍")
+        await list.load(restart: true)
+        XCTAssertEqual(list.accounts, ["one"])
+        var components = URLComponents(); components.queryItems = [URLQueryItem(name: "emoji", value: "👍"), URLQueryItem(name: "after", value: "one"), URLQueryItem(name: "at", value: "10"), URLQueryItem(name: "limit", value: "100")]
+        let more = path + "?" + (components.percentEncodedQuery ?? "")
+        answers.set(more, #"{"error":"snapshot_changed"}"#, status: 409)
+        answers.set(path, #"{"as_of_seq":11,"account_ids":["new"],"next":null}"#)
+        await list.load(restart: false)
+        XCTAssertEqual(list.accounts, ["new"])
+        XCTAssertNil(list.error)
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        let query = try XCTUnwrap(ChatStubProtocol.seen.first { $0.request.url?.path == path }?.request.url?.query)
+        answers.gate = gate; answers.gated = path + "?" + query
+        let count = ChatStubProtocol.seen.filter { $0.request.url?.path == path }.count
+        let late = Task { await list.load(restart: true) }
+        try await waitUntil { ChatStubProtocol.seen.filter { $0.request.url?.path == path }.count > count }
+        list.clear()
+        gate.open(); await late.value
+        XCTAssertTrue(list.accounts.isEmpty, "closing/invalidation cannot be undone by a late page")
+        let channel = channel
+        try await store.queue.write { try ChatB1.watch($0, channel: channel, ids: ["m"]) }
+        try await waitUntil { b1.state.versions["m"] != nil }
+        let version = b1.state.versions["m"]
+        _ = try store.apply(event(11, "reaction.changed", body: #"{"message_id":"m"}"#, message: nil))
+        try await waitUntil { b1.state.versions["m"] != version }
+        let invalidatedVersion = b1.state.versions["m"]
+        try await store.queue.write { db in
+            let token = try XCTUnwrap(ChatB1.readToken(db, channel: channel))
+            try ChatB1.apply(db, page: .init(asOfSeq: 12, items: [.init(messageId: "m", deleted: false, reactions: [], pin: nil)]),
+                             channel: channel, token: token, tickets: ["m": 1])
+        }
+        try await waitUntil { b1.state.versions["m"] != invalidatedVersion }
+        do {
+            _ = try await b1.reactors(message: "m", emoji: "👍", after: nil, at: nil)
+            XCTFail("a reactor page older than accepted metadata is stale even before its event arrives")
+        } catch { }
+    }
+
+    func testB1DefinitiveOrganizationLossClearsDraftsHeldByOpenModels() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1, author: me)]))
+        let (service, _) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let model = ChatChannelModel(key: key, channel: channel); model.follow(store)
+        XCTAssertTrue(model.beginEditing(try XCTUnwrap(model.message("m")), root: nil))
+        model.editing?.text = "unfinished private work"
+        XCTAssertEqual(try int(store, "SELECT COUNT(*) FROM edit_drafts"), 1)
+        service.membershipLost(key)
+        try await waitUntil { model.editing == nil && model.b1?.state.accessible == false }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: files.cacheURL(key).path))
+    }
+
+    func testB1StaleEligibilityRetriesAfterNewThreadEvent() async throws {
+        noticesHere()
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state())
+        let point = "/v1/orgs/\(org)/channels/\(channel)/threads/ancient/participation"
+        answers.set(point, #"{"as_of_seq":10,"participating":true,"eligible_for_reply":true}"#)
+        let (service, transport) = try await started(answers, b1: true)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        sync.b1.retryDelay = { _ in 0.1 }
+        transport.frame(post(11, "new-reply", root: "ancient"))
+        try await waitUntil { ChatStubProtocol.seen.contains { $0.request.url?.path == point } }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(notices.isEmpty, "an eligibility read older than the reply is not evidence")
+        answers.set(point, #"{"as_of_seq":11,"participating":true,"eligible_for_reply":false}"#)
+        try await waitUntil { ChatStubProtocol.seen.filter { $0.request.url?.path == point }.count >= 2 }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(notices.isEmpty)
+    }
+
+    func testB1ReactorsEncodeEmojiPaginateAndRejectLateRevokedPage() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1)]))
+        let path = "/v1/orgs/\(org)/channels/\(channel)/messages/m/reactions"
+        answers.set(path, #"{"as_of_seq":10,"account_ids":["one"],"next":"one"}"#)
+        let (service, _) = try await started(answers, b1: true)
+        let b1 = try XCTUnwrap(service.orgSessions[key]?.sync?.b1), store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let first = try await b1.reactors(channel: channel, message: "m", emoji: "❤️", after: nil, at: nil)
+        XCTAssertEqual(first.accountIds, ["one"])
+        answers.set(path, #"{"as_of_seq":10,"account_ids":["two"],"next":null}"#)
+        let second = try await b1.reactors(channel: channel, message: "m", emoji: "❤️", after: first.next, at: first.asOfSeq)
+        XCTAssertEqual(second.accountIds, ["two"])
+        let requests = ChatStubProtocol.seen.filter { $0.request.url?.path == path }
+        let query = URLComponents(url: try XCTUnwrap(requests.last?.request.url), resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(query.first { $0.name == "emoji" }?.value, "❤️")
+        XCTAssertEqual(query.first { $0.name == "after" }?.value, "one")
+        XCTAssertEqual(query.first { $0.name == "at" }?.value, "10")
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        let full = try XCTUnwrap(requests.first?.request.url?.query)
+        answers.gate = gate; answers.gated = path + "?" + full
+        let channel = channel
+        let late = Task { try await b1.reactors(channel: channel, message: "m", emoji: "❤️", after: nil, at: nil) }
+        try await waitUntil { ChatStubProtocol.seen.filter { $0.request.url?.path == path }.count == 3 }
+        try await store.queue.write { try $0.execute(sql: "UPDATE meta SET rights_in_doubt = 1") }
+        gate.open()
+        do { _ = try await late.value; XCTFail("revoked reactor names were returned") } catch { }
     }
 }

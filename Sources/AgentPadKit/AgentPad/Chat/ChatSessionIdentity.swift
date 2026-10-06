@@ -95,7 +95,7 @@ enum ChatSessionIdentity {
         // Only AppKit/session state is read here. Kernel walks for every tab,
         // SecCode signature checks and author name formatting run away from the UI.
         // The action later checks only these PID/image identities synchronously.
-        let seeds = sessions.filter { $0.channel == nil }.map { (tab($0, processes: []), $0.engine.foregroundPid ?? 0) }
+        let seeds = sessions.filter { !$0.isChat }.map { (tab($0, processes: []), $0.engine.foregroundPid ?? 0) }
         return try await Task.detached(priority: .userInitiated) {
             func identity(_ pid: Int32, _ start: UInt64) -> Bool {
                 start != 0 && kernel.process(pid)?.startedAtUs == start
@@ -150,7 +150,7 @@ enum ChatSessionIdentity {
                   kernel.image(now.pid) == key.image else { throw VerificationError.imageChanged }
         }
         let matches = sessions.filter { session in
-            guard session.channel == nil, let pid = session.engine.foregroundPid,
+            guard !session.isChat, let pid = session.engine.foregroundPid,
                   let foreground = kernel.process(pid), foreground.terminal == tty else { return false }
             return pid != verified.foreground.pid || foreground.startedAtUs == verified.foreground.startedAtUs
         }

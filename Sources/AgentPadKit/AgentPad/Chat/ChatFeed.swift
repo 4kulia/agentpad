@@ -33,6 +33,11 @@ final class ChatFeed: ChatSocketLifecycle {
             let info = try await api.serverInfo()
             guard service?.connection?.sessionId == connection.sessionId else { return }
             service?.serverCapabilities[connection.server] = Set(info.capabilities)
+            service?.serverB1Limits[connection.server] = info.limits?.chatB1
+            if let key = connection.orgKey {
+                service?.orgSessions[key]?.sync?.b1.configure(Set(info.capabilities), limits: info.limits?.chatB1)
+                service?.orgSessions[key]?.outbox?.pump()
+            }
         }
         account = ChatAccountFeed(accountId: connection.accountId, sessionId: connection.sessionId, socket: socket)
         socket.lifecycle = self
@@ -115,6 +120,7 @@ final class ChatFeed: ChatSocketLifecycle {
         await account.prepare(context)
         guard isCurrent, socket.isCurrent(context) else { return false }
         if let sync = session?.sync {
+            sync.b1.configure(service?.serverCapabilities[connection.server] ?? [], limits: service?.serverB1Limits[connection.server], reconnect: true)
             // An organization the account just brought begins here.
             guard sync.beginGeneration(context), await sync.prepare(context), isCurrent, socket.isCurrent(context) else { return false }
         }
@@ -131,6 +137,7 @@ final class ChatFeed: ChatSocketLifecycle {
     }
 
     func socketDisconnected() {
+        session?.sync?.b1.suspend()
         service?.clearChannelActivity()
         session?.outbox?.hold()
     }
@@ -178,7 +185,7 @@ final class ChatFeed: ChatSocketLifecycle {
         // the queue learns it — whether or not a window shows it (C6g p2-4).
         fresh.outbox?.onRefused = { [weak service, weak fresh] record, code in
             // Messages too: a refused post or change says the same of the rights (review F3-1).
-            guard ChatOrgView.commandTypes.contains(record.type) || ChatMessages.eventTypes.contains(record.type),
+            guard ChatOrgView.commandTypes.contains(record.type) || ChatMessages.eventTypes.contains(record.type) || ChatB1.commands.contains(record.type),
                   ["forbidden", "not_found"].contains(code) else { return }
             fresh?.sync?.rightsInDoubt()
             if code == "not_found" { service?.accountFeed?.readMeAgain() }
@@ -224,6 +231,23 @@ final class ChatFeed: ChatSocketLifecycle {
         sync.voidApprovals = { [weak service] generation in
             guard let journal = service?.journal else { return }
             try TeamApprovals.voidOtherGenerations(current: generation, key: key, journal: journal)
+        }
+        sync.b1.onCapabilities = { [weak service, weak fresh] info in
+            service?.serverCapabilities[key.server] = Set(info.capabilities)
+            service?.serverB1Limits[key.server] = info.limits?.chatB1
+            fresh?.outbox?.pump()
+        }
+        sync.b1.canNotify = { [weak service] channel in
+            guard let service else { return false }
+            return ChatNotifications.visible(service, key, channel)
+        }
+        sync.b1.onEligible = { [weak service, weak store] channel, id in
+            guard let service, let store else { return }
+            ChatNotifications.live(service, key, store: store, channel: channel, messageId: id, eligibleReply: true)
+        }
+        sync.b1.configure(service.serverCapabilities[key.server] ?? [], limits: service.serverB1Limits[key.server])
+        fresh.outbox?.maySendCommand = { [weak service] record in
+            !ChatB1.commands.contains(record.type) || service?.supports(ChatB1.capability(for: record.type), key: key) == true
         }
         fresh.sync = sync
         // Posts left "sending" by an earlier run go again with their ids (F3).
