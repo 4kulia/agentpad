@@ -62,69 +62,12 @@ struct TabBarItem: View {
         .overlay(RightClickCatcher { _ in isContextMenuOpen = true })
         .overlay(MiddleClickCatcher { onClose() })
         .popover(isPresented: $isContextMenuOpen, arrowEdge: .bottom) {
-            VStack(alignment: .leading, spacing: 0) {
-                // AgentPad: all export entry points share the provenance gate.
-                if AgentAnswerSource.supports(tab) {
-                    let problem = AgentAnswerSource.problem(tab)
-                    AgentPadMenuRow(title: "Copy as Markdown", shortcut: "⌘⇧C", isDisabled: problem != nil) {
-                        isContextMenuOpen = false
-                        onLastAnswer(true)
-                    }
-                    .help(problem?.rawValue ?? "Copy last agent answer as Markdown")
-                    AgentPadMenuRow(title: "Forward…", shortcut: "⌘⇧F", isDisabled: problem != nil) {
-                        isContextMenuOpen = false
-                        onLastAnswer(false)
-                    }
-                    .help(problem?.rawValue ?? "Forward last agent answer…")
-                    if let problem {
-                        Text(problem.rawValue).font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
-                            .fixedSize(horizontal: false, vertical: true).padding(8)
-                    }
-                    AgentPadMenuDivider()
-                }
-                AgentPadMenuRow(title: "Close Tab", shortcut: "⌘W") {
-                    isContextMenuOpen = false
-                    onClose()
-                }
-                AgentPadMenuRow(title: "Close Other Tabs") {
-                    isContextMenuOpen = false
-                    onCloseOthers()
-                }
-                AgentPadMenuRow(title: "Close Tabs to the Right", isDisabled: !canCloseToRight) {
-                    isContextMenuOpen = false
-                    onCloseToRight()
-                }
-                AgentPadMenuDivider()
-                AgentPadMenuRow(title: "Split Right", shortcut: "⌘D") {
-                    isContextMenuOpen = false
-                    onSplit(.horizontal)
-                }
-                AgentPadMenuRow(title: "Split Down", shortcut: "⌘⇧D") {
-                    isContextMenuOpen = false
-                    onSplit(.vertical)
-                }
-                AgentPadMenuRow(title: "Move to New Window") {
-                    isContextMenuOpen = false
-                    onMoveToNewWindow()
-                }
-                AgentPadMenuDivider()
-                // AgentPad: a chat tab takes its destination’s name (DESIGN-F2).
-                if !tab.isChat {
-                    AgentPadMenuRow(title: "Rename Tab…", shortcut: "⌘R") {
-                        isContextMenuOpen = false
-                        beginRename(deferred: true)
-                    }
-                }
-                AgentPadMenuRow(title: "Duplicate Tab") {
-                    isContextMenuOpen = false
-                    onDuplicate()
-                }
-                AgentPadMenuDivider()
-                RevealInFinderMenuRow(url: tab.currentDirectory) { isContextMenuOpen = false }
-            }
-            .padding(Theme.space1)
-            .frame(minWidth: 240)
-            .background(Theme.chromeBackground)
+            // AgentPad: keep the export explanation inside a bounded tab menu.
+            AgentPadTabMenu(tab: tab, canCloseToRight: canCloseToRight,
+                dismiss: { isContextMenuOpen = false }, onClose: onClose,
+                onCloseOthers: onCloseOthers, onCloseToRight: onCloseToRight,
+                onDuplicate: onDuplicate, onRename: { beginRename(deferred: true) },
+                onSplit: onSplit, onMoveToNewWindow: onMoveToNewWindow, onLastAnswer: onLastAnswer)
         }
         .popover(isPresented: $isRenameOpen, arrowEdge: .bottom) {
             AgentPadRenameField(placeholder: "Tab title", text: $pendingRename) {

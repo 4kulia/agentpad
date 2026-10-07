@@ -1800,7 +1800,8 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     private var optionSelectionDrag = false
 
     override func scrollWheel(with event: NSEvent) {
-        fileLinks.clear()
+        // AgentPad: invalidate link hover without leaving the core's mouse outside the surface.
+        fileLinks.prepareForScroll(event)
         guard let surface else {
             super.scrollWheel(with: event)
             return

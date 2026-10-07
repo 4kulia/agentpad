@@ -6,12 +6,12 @@ enum AgentAnswerTranscript {
     enum Agent: Sendable { case claude, codex }
     enum Problem: String, Error, LocalizedError {
         // AgentPad: ID discovery alone does not establish export provenance.
-        case unbound = "Copy and Forward need a verified hook from this tab's Claude process. Multiplexers, multiple Claude processes and an unverified hook parent cannot be used. Wait for the next answer or copy selected text from the terminal."
-        case unverified = "Copy and Forward are unavailable: AgentPad cannot verify which journal belongs to this Codex process. Copy selected text from the terminal instead."
+        case unbound = "Copy and Forward are available once this tab's Claude answers again."
+        case unverified = "AgentPad cannot verify this Codex journal. Copy selected text from the terminal."
         case missing = "The conversation journal for this tab was not found. Copy from the terminal or retry after the agent has saved its answer."
         case unknown = "This conversation journal uses an unsupported or damaged format. No answer was copied."
         case noAnswer = "This conversation does not contain an assistant answer yet."
-        case changed = "Copy and Forward are unavailable: the conversation or terminal processes changed. Wait for a verified Claude hook or copy selected text from the terminal."
+        case changed = "The conversation or terminal processes changed. Wait for this tab's Claude to answer again."
         case tooLarge = "This journal contains a record too large to read safely. Save a shorter answer and retry."
         case remote = "The journal of a remote agent is not available on this Mac."
         var errorDescription: String? { rawValue }

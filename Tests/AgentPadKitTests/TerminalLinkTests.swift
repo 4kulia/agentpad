@@ -272,6 +272,7 @@ final class LinkTerminal {
     var files: [TerminalFileReference] = []
     var urls: [URL] = []
     var hover: String?
+    let output = LinkTerminalOutput()
     var surface: ghostty_surface_t { view.surface! }
 
     init() throws {
@@ -292,6 +293,8 @@ final class LinkTerminal {
         var sc = ghostty_surface_config_new()
         sc.scale_factor = Double(window.backingScaleFactor)
         sc.io_mode = GHOSTTY_SURFACE_IO_MANUAL
+        sc.io_write_cb = linkTerminalWrite
+        sc.io_write_userdata = Unmanaged.passUnretained(output).toOpaque()
         _ = try XCTUnwrap(view.attachSurface(app: app, config: &sc))
         window.makeFirstResponder(view)
         ghostty_surface_set_focus(surface, true)
@@ -332,4 +335,25 @@ final class LinkTerminal {
         ghostty_app_free(app)
         ghostty_config_free(config)
     }
+}
+
+final class LinkTerminalOutput {
+    private let lock = NSLock()
+    private var bytes = Data()
+
+    func append(_ pointer: UnsafePointer<CChar>, count: Int) {
+        lock.withLock { bytes.append(UnsafeRawPointer(pointer).assumingMemoryBound(to: UInt8.self), count: count) }
+    }
+
+    func take() -> String {
+        lock.withLock {
+            defer { bytes.removeAll(keepingCapacity: true) }
+            return String(decoding: bytes, as: UTF8.self)
+        }
+    }
+}
+
+private let linkTerminalWrite: ghostty_io_write_cb = { userdata, pointer, count in
+    guard let userdata, let pointer else { return }
+    Unmanaged<LinkTerminalOutput>.fromOpaque(userdata).takeUnretainedValue().append(pointer, count: Int(count))
 }

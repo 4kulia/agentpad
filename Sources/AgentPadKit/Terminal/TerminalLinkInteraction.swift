@@ -44,6 +44,17 @@ final class TerminalLinkInteraction {
 
     func receiveCoreHover(_ value: String?) { osc8Target = value }
 
+    func prepareForScroll(_ event: NSEvent) {
+        clear()
+        guard let surface = view.surface else { return }
+        let point = view.convert(event.locationInWindow, from: nil)
+        // clear() invalidates OSC 8's cell cache by reporting a mouse exit.
+        // Mouse-reporting TUIs ignore scroll at that outside position. Restore
+        // the event's actual cell, even if no mouseMoved preceded the gesture.
+        ghostty_surface_mouse_pos(surface, point.x, view.bounds.height - point.y,
+                                  GhosttySurfaceView.mapModifiers(event.modifierFlags))
+    }
+
     func clear() {
         if pressed != nil { dragged = true }
         if hovered != nil { view.restoreNativeMouseCursor() }

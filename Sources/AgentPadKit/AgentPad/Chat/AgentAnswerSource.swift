@@ -27,8 +27,7 @@ enum AgentAnswerSource {
         session.answerBinding = nil
         guard session.displayAgent.rosterId == AgentTemplate.claudeCodeID,
               session.effectiveRemoteHost == nil, UUID(uuidString: conversation) != nil,
-              let provenance, session.engine.foregroundPid == provenance.process.pid,
-              provenance.isCurrent(inspector: inspector) else { return }
+              let provenance, provenance.matchesForeground(session.engine.foregroundPid, inspector: inspector) else { return }
         session.answerBinding = Binding(conversation: conversation, process: provenance.process, provenance: provenance)
     }
 
@@ -39,9 +38,8 @@ enum AgentAnswerSource {
         // both actions disabled even for a resumed tab or a stable process.
         guard session.displayAgent.rosterId != AgentTemplate.codex.id else { return .unverified }
         guard let binding = session.answerBinding else { return .unbound }
-        guard session.engine.foregroundPid == binding.process.pid,
-              let provenance = binding.provenance, provenance.process == binding.process,
-              provenance.isCurrent(inspector: inspector) else { return .changed }
+        guard let provenance = binding.provenance, provenance.process == binding.process,
+              provenance.matchesForeground(session.engine.foregroundPid, inspector: inspector) else { return .changed }
         return nil
     }
 
