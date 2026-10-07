@@ -170,7 +170,7 @@ final class ChatReactionAccounts {
 enum ChatEmoji {
     private struct Fixture: Decodable { var version: String; var aliases: [String: String] }
     static let aliases: [String: String] = {
-        guard let url = Bundle.module.url(forResource: "emoji-16.0", withExtension: "json"),
+        guard let url = agentPadResourceBundle()?.url(forResource: "emoji-16.0", withExtension: "json"),
               let data = try? Data(contentsOf: url), let fixture = try? JSONDecoder().decode(Fixture.self, from: data), fixture.version == "16.0" else { return [:] }
         return fixture.aliases
     }()

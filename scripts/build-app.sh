@@ -4,9 +4,8 @@
 # What this does:
 #   1. swift build -c release
 #   2. Assemble dist/AgentPad.app/Contents/{MacOS,Resources,Info.plist,PkgInfo}
-#   3. Copy AgentPad + AgentPadHook binaries + the SPM resource bundle into MacOS/
-#      (Bundle.module looks next to the executable, which is why fonts +
-#      icons live alongside the binary, not under Resources/)
+#   3. Copy binaries into MacOS/ and the SPM resource bundle into Resources/
+#      (agentPadResourceBundle() resolves this packaged layout)
 #   4. Generate Info.plist with CFBundleShortVersionString sourced from
 #      Sources/AgentPadKit/App/AppInfo.swift's displayVersion — single source
 #      of truth, no manual sync
@@ -57,9 +56,8 @@ cp .build/release/AgentPadHook "${APP}/Contents/MacOS/AgentPadHook"
 # refreshes at launch (Gatekeeper story in
 # ShellIntegration.mirroredHelperBinaryPath).
 cp .build/release/agentpad-cli "${APP}/Contents/MacOS/agentpad-cli"
-# Bundle.module's first lookup candidate is `Bundle.main.resourceURL`
-# (= Contents/Resources/), so the resource bundle has to live there or
-# the running .app will silently fall back to .build/release/ on disk.
+# agentPadResourceBundle() checks Contents/Resources/ before the SwiftPM
+# fallback, whose generated accessor only checks the app root and .build/.
 cp -R .build/release/AgentPad_AgentPadKit.bundle "${APP}/Contents/Resources/"
 # AgentPad: the MIT license and notices (kooky's copyright among them) travel
 # with every copy of the app.
