@@ -57,8 +57,9 @@ enum HookMessage {
     /// it on the originating Session and reuse it as `--resume <id>` on
     /// next launch. The agent slug is implicit in the routing (only Claude
     /// pipes session_id today) and the consumer doesn't dispatch per-agent
-    /// — so the payload only carries surface + id.
-    case conversationId(conversationId: String, sessionId: UUID)
+    /// AgentPad: the socket adds process evidence separately from these fields.
+    // AgentPad: only evidence captured from the socket peer may authorize export.
+    case conversationId(conversationId: String, sessionId: UUID, provenance: AgentAnswerProvenance? = nil)
     /// PreToolUse / PostToolUse event for the activity strip. `agent` is
     /// the base AgentTemplate the slug resolves to (Claude builtin today —
     /// custom Claude-based agents share its slug since `from(hookSlug:)`
@@ -136,9 +137,12 @@ final class HookServer {
 
     /// `socketPath` is injectable so integration tests can bind a throwaway
     /// path instead of racing a live AgentPad's production socket.
-    init(socketPath: String = HookServer.socketPath, handler: @escaping Handler) {
+    init(socketPath: String = HookServer.socketPath,
+         // AgentPad: injectable kernel/signature boundary, also used by socket tests.
+         answerInspector: AgentAnswerProvenance.Inspector = .init(), handler: @escaping Handler) {
         self.path = socketPath
         self.handler = handler
+        gate.set { $0.answerInspector = answerInspector }
     }
 
     /// Path agents and the CLI both target. `AgentPadHookKit.socketPath` is the
@@ -273,7 +277,7 @@ final class HookServer {
 
     /// AgentPad: what the accepting queue hands the main queue.
     private enum Received: @unchecked Sendable {
-        case hook([String: Any])
+        case hook([String: Any], AgentAnswerProvenance?)
         case shellCommand(AgentPadShellCommandRequest?, fd: Int32)
         case cli(dict: [String: Any], data: Data, fd: Int32, origin: AgentPadCallerOrigin)
     }
@@ -283,6 +287,7 @@ final class HookServer {
         var readPeerPID: @Sendable (Int32) -> pid_t? = AgentPadCallerOrigin.peerPID(of:)
         var originOf: @Sendable (pid_t?) -> AgentPadCallerOrigin = { AgentPadCallerOrigin.of(peerPID: $0) }
         var isSelfOrAncestor: @Sendable (pid_t, pid_t) -> Bool = TeamProcesses.isSelfOrAncestor
+        var answerInspector = AgentAnswerProvenance.Inspector()
     }
 
     final class OriginGate: @unchecked Sendable {
@@ -384,7 +389,15 @@ final class HookServer {
         // AgentPad: a confirmed team run never speaks for a tab (Y4). Queued
         // for the main queue before the sender is answered, so its next
         // message cannot overtake it (review C4-12).
-        if case .teamRun = origin {} else { deliver(.hook(dict)) }
+        if case .teamRun = origin {} else {
+            // AgentPad: keep the authenticated sender's parent with this UUID.
+            // Signature/TTY verification runs here, off the main queue, before ACK.
+            let provenance = dict["kind"] as? String == "conversationId"
+                ? AgentAnswerProvenance.capture(parentPID: (dict["claudeParentPID"] as? String).flatMap(Int32.init),
+                                               origin: origin, inspector: hooks.answerInspector)
+                : nil
+            deliver(.hook(dict, provenance))
+        }
         // AgentPad: the sender waits for this byte, not for the main queue.
         var ack: UInt8 = 0x0A
         _ = write(clientFd, &ack, 1)
@@ -393,8 +406,8 @@ final class HookServer {
     /// AgentPad: the main-queue half of a connection.
     private func dispatch(_ received: Received) {
         switch received {
-        case .hook(let dict):
-            guard let message = Self.parseMessage(dict) else { return }
+        case .hook(let dict, let provenance):
+            guard let message = Self.parseMessage(dict, provenance: provenance) else { return }
             handler(message)
         case .shellCommand(let request, let fd):
             let command = !Self.peerHasHungUp(fd) ? request.flatMap { onShellCommandRequest?($0) } : nil
@@ -513,7 +526,7 @@ final class HookServer {
         return parseMessage(dict)
     }
 
-    static func parseMessage(_ dict: [String: Any]) -> HookMessage? {
+    static func parseMessage(_ dict: [String: Any], provenance: AgentAnswerProvenance? = nil) -> HookMessage? {
         guard
             let surface = dict["surface"] as? String,
             let id = UUID(uuidString: surface)
@@ -529,7 +542,7 @@ final class HookServer {
         if dict["kind"] as? String == "conversationId",
            let conversationId = dict["conversationId"] as? String,
            !conversationId.isEmpty {
-            return .conversationId(conversationId: conversationId, sessionId: id)
+            return .conversationId(conversationId: conversationId, sessionId: id, provenance: provenance)
         }
 
         if dict["kind"] as? String == AgentPadHookKit.toolBatchKind {

@@ -121,6 +121,7 @@ struct ClaudeCodeRunner: TeamAgentRunner {
     /// Explicit test-fixture injection after filtering. Production never
     /// inherits CLAUDE_CONFIG_DIR from the app or a caller's environment.
     var isolatedConfigDirectory: URL? = nil
+    var isolatedHomeDirectory: URL? = nil
 
     func executionEnvironment(claudePath: String, isolateGit: Bool, ownersPath: Bool,
                               base: [String: String] = ProcessInfo.processInfo.environment) throws -> [String: String] {
@@ -131,22 +132,33 @@ struct ClaudeCodeRunner: TeamAgentRunner {
             }
             environment["CLAUDE_CONFIG_DIR"] = config.path
         }
+        if let home = isolatedHomeDirectory {
+            guard isolatedConfigDirectory != nil else {
+                throw TeamRunnerError.didNotStart("isolated Claude HOME requires a config directory")
+            }
+            environment["HOME"] = home.path
+            environment["CFFIXED_USER_HOME"] = home.path
+        }
         return environment
     }
 
     /// The real `claude`, never AgentPad's wrapper: a call is not a tab and
     /// must not report to the sidebar as one (R-5).
-    static func locateClaude(environment: [String: String] = ProcessInfo.processInfo.environment) -> String? {
+    static func locateClaude(environment: [String: String] = ProcessInfo.processInfo.environment,
+                             includeLegacyInstallation: Bool = true) -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let ownBin = AgentPadShellIntegration.agentPadAppSupport("bin", isDirectory: true).path
         var candidates = [
-            "\(home)/.local/bin/claude", "\(home)/.claude/local/claude",
+            "\(home)/.local/bin/claude",
             "/opt/homebrew/bin/claude", "/usr/local/bin/claude",
         ]
+        if includeLegacyInstallation { candidates.insert("\(home)/.claude/local/claude", at: 1) }
         for dir in (environment["PATH"] ?? "").split(separator: ":") where !String(dir).hasPrefix(ownBin) {
             candidates.append("\(dir)/claude")
         }
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+        return candidates.first {
+            (includeLegacyInstallation || !$0.hasPrefix("\(home)/.claude")) && FileManager.default.isExecutableFile(atPath: $0)
+        }
     }
 
     static func selectClaude(explicit: String?, configured: String?, locate: () -> String? = { locateClaude() }) throws -> String {
@@ -409,7 +421,8 @@ struct ClaudeCodeRunner: TeamAgentRunner {
                 directory: request.agent.folder, stdin: stdin, stdout: stdout, stderr: stderr
             )
         } catch {
-            throw TeamRunnerError.didNotStart(error.localizedDescription)
+            throw TeamRunnerError.didNotStart(ClaudeLaunchDiagnostic(
+                version: ready.version, exitCode: nil, fallback: .spawn).message)
         }
         let pid = spawned.pid
         let identity = spawned.identity
@@ -493,11 +506,12 @@ struct ClaudeCodeRunner: TeamAgentRunner {
 
         if Task.isCancelled { throw TeamRunnerError.stopped(stopped) }
         let outcome = ended == nil ? nil : exited.exitCode
-        if let result = parser.result { return result }
-
-        if outcome == nil { throw TeamRunnerError.timedOut }
-        let tail = errors.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        throw TeamRunnerError.failed(tail.isEmpty ? "Claude Code ended without an answer." : "Claude Code ended without an answer: \(tail.suffix(400))")
+        if let result = parser.result, !result.isError, outcome == 0 { return result }
+        let diagnostic = ClaudeLaunchDiagnostic(
+            version: ready.version, exitCode: outcome,
+            output: errors.text + "\n" + (parser.result?.text ?? ""),
+            fallback: outcome == nil ? .timeout : (parser.result?.isError == true ? .execution : .noAnswer))
+        throw TeamRunnerError.failed(diagnostic.message)
     }
 
     /// What a run inherits from the app's environment, by name: who and where
@@ -1207,7 +1221,8 @@ final class TeamStreamParser: @unchecked Sendable {
             let isError = (object["is_error"] as? Bool) ?? false
             var text = object["result"] as? String ?? ""
             if text.isEmpty, isError {
-                text = (object["subtype"] as? String).map { "The agent stopped: \($0.replacingOccurrences(of: "_", with: " "))." }
+                text = (object["errors"] as? [String])?.joined(separator: "\n")
+                    ?? (object["subtype"] as? String).map { "The agent stopped: \($0.replacingOccurrences(of: "_", with: " "))." }
                     ?? "The agent stopped with an error."
             }
             let result = TeamRunResult(

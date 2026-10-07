@@ -11,45 +11,60 @@ struct ChatSidebarAgentCard: View {
     @State private var problem: String?
 
     var body: some View {
-        let snapshot = ChatSidebarSnapshot(model: model, active: active)
         VStack(alignment: .leading, spacing: 12) {
-            if let agent = snapshot.agents.first(where: { $0.id == agentID }), let model {
+            if let model, let actions = ChatSidebarAgentActions(agentID: agentID, active: active, model: model) {
+                let agent = actions.agent
                 HStack {
                     Text(agent.name).font(Theme.display(14, weight: .semibold))
                     Text("BOT").font(Theme.mono(10)).foregroundStyle(ChatSidebarStyle.secondary)
                 }
                 Text("Owner: \(agent.owner)").font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary)
                 if !agent.description.isEmpty { Text(agent.description).font(Theme.display(12)) }
-                Text(TeamAccessProfile(rawValue: agent.access)?.title ?? agent.access)
-                    .font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary)
-                if let active, let key = model.key, active.belongs(to: key), let card = model.visibleChannel(active.channel) {
-                    if let member = model.agents(in: card.channelId).first(where: { $0.agentId == agentID }) {
-                        Text("In #\(card.name)").font(Theme.display(11))
-                        if member.enabled, member.address != nil, !card.archived {
-                            Button("Mention in #\(card.name)") {
-                                if ChatSidebarMention.insert(agentID: agentID, ref: active, window: window, model: model, store: store) { close() }
-                                else { problem = "The channel editor is not available. Finish composing text and try again." }
-                            }
-                        }
+                Text(actions.accessLabel).font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(TeamAccessProfile(rawValue: agent.access)?.summary ?? "")
+                Divider()
+                ForEach(actions.channels, id: \.channelId) { channel in
+                    Button("Open #\(channel.name)") {
+                        if ChatSidebarAgentActions.open(agentID: agentID, channel: channel.channelId, model: model, show: { store.showChannel($0) }) { close() }
+                        else { problem = "The agent's channel is no longer available." }
+                    }
+                }
+                if let channel = actions.mentionChannel {
+                    Button("Mention in #\(channel.name)") {
+                        let ref = ChannelRef(actions.key, channel: channel.channelId)
+                        if ChatSidebarMention.insert(agentID: agentID, ref: ref, window: window, model: model, store: store) { close() }
+                        else { problem = "The channel editor is not available. Finish composing text and try again." }
+                    }
+                    if let member = model.agents(in: channel.channelId).first(where: { $0.agentId == agentID }) {
                         if model.canRemoveAgent(member) {
-                            Button("Remove from Channel…") { close(); ChatSidebarActions.removeAgent(member, from: card, model) }
+                            Button("Remove from Channel…") { close(); ChatSidebarActions.removeAgent(member, from: channel, model) }
                         }
-                    } else if let own = model.addableAgents(card).first(where: { $0.agentId == agentID }) {
-                        Button("Add to #\(card.name)…") { close(); ChatSidebarActions.addAgent(own, to: card, model) }
-                    } else {
-                        Text("This agent is not in #\(card.name).").font(Theme.display(11))
+                    } else if let own = model.addableAgents(channel).first(where: { $0.agentId == agentID }) {
+                        Button("Add to #\(channel.name)…") { close(); ChatSidebarActions.addAgent(own, to: channel, model) }
+                    }
+                }
+                if agent.mine {
+                    Button("Edit publication…") {
+                        guard let current = ChatSidebarAgentActions(agentID: agentID, active: active, model: model), current.agent.mine,
+                              let editing = TeamAgentEditing.resolve(agentID: agentID, key: current.key,
+                                  currentKey: TeamService.shared.calls.serverKey, agents: TeamService.shared.calls.agents) else {
+                            problem = "This publication cannot be edited here. Open it on the Mac that publishes this agent."; return
+                        }
+                        close(); TeamWindows.showAgentEditor(editing)
                     }
                 } else {
-                    Text("Open a channel to mention an agent.").font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary)
+                    Button("Ask…") { close(); ChatSidebarActions.askAgent(actions, model) }
+                        .disabled(actions.address == nil)
                 }
-                if agent.mine { Button("Published Agents…") { close(); TeamUI.showAgents() } }
+                Button("Published Agents…") { close(); TeamUI.showAgents() }
                 if let problem { Text(problem).font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary) }
             } else {
                 Text("Agent unavailable").font(Theme.display(12))
             }
             Button("Close", action: close).keyboardShortcut(.cancelAction)
         }
-        .padding(16).frame(width: 288, alignment: .leading)
+        .padding(16).frame(width: 320, alignment: .leading)
         .foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
     }
@@ -90,14 +105,13 @@ enum ChatSidebarMention {
             isActive: { [weak store, weak session] in
                 guard let session else { return false }
                 return store?.active?.activeSession === session
-            }, openChannel: { engine.conversation.model?.openThread(nil) })
+            }, openChannel: { engine.conversation.showChannelComposer() })
     }
 
     private static func address(agentID: String, ref: ChannelRef, model: ChatOrgModel) -> String? {
         guard let key = model.key, ref.belongs(to: key),
-              let card = model.visibleChannel(ref.channel), !card.archived,
-              let agent = model.agents(in: ref.channel).first(where: { $0.agentId == agentID && $0.enabled }),
-              let address = agent.address else { return nil }
+              let actions = ChatSidebarAgentActions(agentID: agentID, active: ref, model: model),
+              actions.mentionChannel != nil, let address = actions.address else { return nil }
         return address
     }
 
@@ -122,7 +136,7 @@ enum ChatSidebarMention {
         return true
     }
 
-    /// A narrow thread can hide the channel composer. Open it in this same
+    /// A narrow thread or pin panel can hide the channel composer. Open it in this same
     /// host and deliver only after its normal draft restoration has finished.
     @discardableResult
     static func request(agentID: String, ref: ChannelRef, window: NSWindow?, destination: NSView, model: ChatOrgModel,

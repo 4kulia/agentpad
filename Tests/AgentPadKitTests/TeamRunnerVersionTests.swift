@@ -487,17 +487,26 @@ enum NativeVersionFixture {
             if (argc == 2 && !strcmp(argv[1], "--version")) {
                 save("versions", "x", "a"); save("version-path", argv[0], "w");
                 save("version-env-path", getenv("PATH") ? getenv("PATH") : "", "w");
+                save("version-home", getenv("HOME") ? getenv("HOME") : "", "w");
+                save("version-config", getenv("CLAUDE_CONFIG_DIR") ? getenv("CLAUDE_CONFIG_DIR") : "", "w");
                 char version[8192] = "2.1.289 (Claude Code)\n";
                 FILE *f = fopen("version.txt", "r");
                 if (f) { size_t n = fread(version, 1, sizeof(version)-1, f); version[n] = 0; fclose(f); }
                 if (!strcmp(version, "hang")) { sleep(30); return 0; }
                 if (!strcmp(version, "error")) { puts("2.1.289 (Claude Code)"); return 1; }
+                if (!strcmp(version, "auth-error")) { fputs("Not logged in; synthetic-credential", stderr); return 7; }
                 if (!strcmp(version, "overflow")) { for (int i=0; i<5000; i++) putchar(' '); puts("2.1.289 (Claude Code)"); return 0; }
                 while (!access("version-hold", F_OK)) usleep(10000);
                 fputs(version, stdout); return 0;
             }
             save("runs", "x", "a"); save("executed-path", argv[0], "w");
             save("executor-env-path", getenv("PATH") ? getenv("PATH") : "", "w");
+            save("executor-home", getenv("HOME") ? getenv("HOME") : "", "w");
+            save("executor-config", getenv("CLAUDE_CONFIG_DIR") ? getenv("CLAUDE_CONFIG_DIR") : "", "w");
+            FILE *err = fopen("executor-error.txt", "r");
+            if (err) { int c; while ((c = fgetc(err)) != EOF) fputc(c, stderr); fclose(err); return 17; }
+            FILE *result = fopen("executor-result.txt", "r");
+            if (result) { int c; while ((c = fgetc(result)) != EOF) fputc(c, stdout); fclose(result); return 0; }
             while (!access("run-hold", F_OK)) usleep(10000);
             puts("{\"type\":\"result\",\"result\":\"fixture answer\",\"is_error\":false}");
             return 0;

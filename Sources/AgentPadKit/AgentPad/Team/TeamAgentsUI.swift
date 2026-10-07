@@ -48,21 +48,8 @@ struct TeamAgentsView: View {
         .padding(18)
         .frame(width: 480)
         .sheet(item: $editing) { open in
-            // The organization the form was opened for (review D3-p1-3, D3b-p1-2).
-            let agent = open.agent, opened = open.key
-            let teams = opened.map { ChatService.shared.myTeams($0) }
-            TeamAgentEditor(agent: agent, teams: teams, chosen: chosenTeams(agent, opened, teams ?? [])) { saved, chosen in
-                if let opened { try await calls.saveAndPublish([saved], teams: chosen, key: opened) } else { try await calls.save(saved) }
-            } onClose: {
-                editing = nil
-            }
+            TeamPublicationEditor(open: open, service: service) { editing = nil }
         }
-    }
-
-    /// The teams the owner chose for it, else General.
-    private func chosenTeams(_ agent: TeamPublishedAgent, _ key: ChatOrgKey?, _ teams: [ChatSnapshot.Team]) -> [String] {
-        if let key, let chosen = ChatService.shared.chosenTeams(agent.id, key: key) { return chosen }
-        return teams.filter(\.isGeneral).map(\.teamId)
     }
 
     private func status(_ agent: TeamPublishedAgent) -> (text: String, note: String?, unconfirmed: Bool)? {
@@ -164,6 +151,30 @@ struct TeamAgentEditing: Identifiable {
     var agent: TeamPublishedAgent
     let key: ChatOrgKey?
     var id: UUID { agent.id }
+
+    static func resolve(agentID: String, key: ChatOrgKey, currentKey: ChatOrgKey?, agents: [TeamPublishedAgent]) -> Self? {
+        guard key == currentKey, let id = UUID(uuidString: agentID), let agent = agents.first(where: { $0.id == id }) else { return nil }
+        return Self(agent: agent, key: key)
+    }
+}
+
+/// The same editor from the catalog and an individual sidebar card. Both capture
+/// the publication and its organization before the user begins changing it.
+struct TeamPublicationEditor: View {
+    let open: TeamAgentEditing
+    let service: TeamService
+    let onClose: () -> Void
+
+    var body: some View {
+        let agent = open.agent, opened = open.key
+        let teams = opened.map { ChatService.shared.myTeams($0) }
+        let chosen = opened.flatMap { ChatService.shared.chosenTeams(agent.id, key: $0) }
+            ?? (teams ?? []).filter(\.isGeneral).map(\.teamId)
+        TeamAgentEditor(agent: agent, teams: teams, chosen: chosen) { saved, chosen in
+            if let opened { try await service.calls.saveAndPublish([saved], teams: chosen, key: opened) }
+            else { try await service.calls.save(saved) }
+        } onClose: { onClose() }
+    }
 }
 
 /// One agent's settings (A-1…A-6).

@@ -30,6 +30,9 @@ struct PersistedState: Codable, Equatable {
     /// written before the inspector existed decode (nil → nothing collapsed);
     /// stored sorted so the saved file is byte-stable across saves.
     var collapsedInfoSections: [String]?
+    /// 1.1.5 hides the panel once for existing windows, then keeps their choice.
+    /// Optional so older state files decode without resetting workspaces/tabs.
+    var rightSidebarDefault115Applied: Bool?
 }
 
 /// Root of the multi-window `state.json`. Each `PersistedWindow` is one

@@ -93,10 +93,9 @@ final class CodexUsageMonitor {
     /// re-resolved mid-flight (same generation-drop idea as `GitStatusFetcher`).
     private var generation: [UUID: Int] = [:]
     /// Rollout paths that already existed the first time this session's monitor
-    /// started — captured before Codex wrote its own file. The session's own
-    /// rollout is the one that appears *afterwards* and isn't in this set, so we
-    /// adopt it by identity rather than a fragile launch-time comparison, and
-    /// never mistake a prior/concurrent run's file for ours. Cleared on `stop`.
+    /// started — captured before Codex wrote its own file. AgentPad: exclusion
+    /// avoids older runs, but simultaneous launches in one cwd are ambiguous.
+    /// This is a usage/history heuristic, never export provenance. Cleared on `stop`.
     private var preexisting: [UUID: Set<String>] = [:]
     /// A restored/moved Codex process resumes by appending its original rollout,
     /// so that file is intentionally inside `preexisting`. Preserve the exact
@@ -104,13 +103,13 @@ final class CodexUsageMonitor {
     /// `start` calls and retries; `stop` clears it before any fresh manual run.
     private var resumedConversationIds: [UUID: String] = [:]
 
-    /// (Re)points the watcher for `sessionId` at this session's own rollout:
+    /// (Re)points the watcher for `sessionId` at a candidate rollout:
     /// either the exact pre-existing UUID being resumed, or the fresh
     /// cwd-matching file that did NOT pre-exist at first start. When that file
     /// doesn't exist yet (the launch → first-write race), it retries.
     ///
-    /// The gauge reflects only THIS session's own quota readings — it appears
-    /// once Codex writes the session's first `token_count` (after the first
+    /// AgentPad: no PID binding is established by this lookup. The gauge appears
+    /// once Codex writes the candidate's first `token_count` (after the first
     /// turn). We deliberately don't seed from a prior session's file: the
     /// rate-limit windows reset over time, so a days-old reading could show a
     /// stale percentage. Accuracy over immediacy.
@@ -336,8 +335,9 @@ final class CodexUsageMonitor {
     }
 
     /// Newest rollout whose `session_meta` cwd matches `cwd` and that is NOT in
-    /// `excluding` — i.e. *this* session's own file, which appeared after the
-    /// launch snapshot. A rollout that pre-existed belongs to an earlier (or
+    /// `excluding` — a candidate that appeared after the launch snapshot.
+    /// AgentPad: another simultaneous run can create it; cwd/mtime prove no owner.
+    /// A rollout that pre-existed belongs to an earlier (or
     /// concurrent) run, so it's skipped even during the launch race when this
     /// session's own file doesn't exist yet — that's what keeps the gauge from
     /// flashing a prior session's usage on a fresh tab.

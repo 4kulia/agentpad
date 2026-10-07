@@ -211,6 +211,7 @@ enum AgentPadSettings {
         let parsed = loadParsed()
         applyBaseline(to: config, parsed: parsed)
         apply(parsed: parsed, to: config)
+        TerminalLinkInteraction.configure(config)
         ghostty_config_finalize(config)
         return config
     }

@@ -25,6 +25,13 @@ final class ChatChannelSession {
     private(set) var model: ChatChannelModel?
     private(set) var ownerModel: ChatChannelOwnerModel?
 
+    /// Restore the channel composer before a deferred sidebar mention is
+    /// delivered. Both a thread and a pin panel can remove it from the view.
+    func showChannelComposer() {
+        model?.pins.close()
+        model?.openThread(nil)
+    }
+
     func update(_ state: ChannelTabState, key: ChatOrgKey?, store: ChatStore?, service: ChatService) {
         switch state {
         case .checking: model?.setAccessConfirmed(false)

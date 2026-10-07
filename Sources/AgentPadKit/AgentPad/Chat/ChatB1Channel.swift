@@ -11,6 +11,8 @@ final class ChatB1Channel {
         var metadata: [String: ChatB1.Metadata] = [:]
         var versions: [String: Version] = [:]
         var pins: [ChatB1.PinnedMessage]?
+        var pinMessages: [String: ChatMessage] = [:]
+        var bannerHidden = false
         var loadError: String?
         var intents: [String: [Intent]] = [:]
         var accessible = false
@@ -29,6 +31,8 @@ final class ChatB1Channel {
     private var problems: [String: String] = [:]
     func problem(_ message: String) -> String? { problems[message] }
     private let owner = UUID()
+    private let pinsOwner = UUID()
+    private var pinReadRevisions: [String: Int] = [:]
     @ObservationIgnored private var observation: AnyDatabaseCancellable?
     private var reader: ChatB1Sync? { service.orgSessions[key]?.sync?.b1 }
 
@@ -37,6 +41,7 @@ final class ChatB1Channel {
         observation = ValueObservation.tracking { db -> State in
             guard try ChatB1.readToken(db, channel: channel) != nil else { return State() }
             var state = State(accessible: true)
+            state.bannerHidden = try ChatPins.bannerHidden(db, channel: channel)
             state.loadError = try String.fetchOne(db, sql: "SELECT error FROM b1_pins WHERE channel_id = ? AND error IS NOT NULL UNION SELECT error FROM b1_metadata WHERE channel_id = ? AND error IS NOT NULL LIMIT 1", arguments: [channel, channel])
             for row in try Row.fetchAll(db, sql: "SELECT message_id, data, ticket, as_of_seq FROM b1_metadata WHERE channel_id = ?", arguments: [channel]) {
                 state.versions[row["message_id"]] = Version(ticket: row["ticket"], head: row["as_of_seq"])
@@ -44,6 +49,11 @@ final class ChatB1Channel {
             }
             if let data = try Data.fetchOne(db, sql: "SELECT data FROM b1_pins WHERE channel_id = ?", arguments: [channel]) {
                 state.pins = try JSONDecoder().decode([ChatB1.PinnedMessage].self, from: data)
+            }
+            for pin in state.pins ?? [] {
+                if let row = try Row.fetchOne(db, sql: "\(ChatMessages.select) WHERE m.channel_id = ? AND m.message_id = ?", arguments: [channel, pin.id]) {
+                    state.pinMessages[pin.id] = ChatMessage(row: row)
+                }
             }
             for row in try Row.fetchAll(db, sql: """
                 SELECT i.*, o.state, o.error FROM b1_intents i JOIN outbox o USING(command_id) WHERE i.channel_id = ?
@@ -62,7 +72,8 @@ final class ChatB1Channel {
             }) == true
     }
     func show(_ ids: Set<String>) { reader?.show(owner, channel: channel, ids: ids) }
-    func hide() { reader?.hide(owner) }
+    func hideMetadata() { reader?.hide(owner) }
+    func hide() { hideMetadata(); reader?.hide(pinsOwner); pinReadRevisions = [:] }
     func retryReads() {
         try? store.queue.write { db in
             for table in ["b1_metadata", "b1_pins"] {
@@ -71,7 +82,25 @@ final class ChatB1Channel {
         }
         reader?.schedule()
     }
-    func showPins(_ shown: Bool) { reader?.showPins(owner, channel: channel, shown: shown) }
+    func showPins(_ shown: Bool) { reader?.showPins(pinsOwner, channel: channel, shown: shown) }
+    func setBannerHidden(_ hidden: Bool) {
+        guard state.accessible else { return }
+        try? store.queue.write { try ChatPins.setBannerHidden($0, channel: channel, hidden: hidden) }
+    }
+    /// Uses the same guarded, deduplicated reads as conversation navigation,
+    /// without changing the selected message, thread, draft or read marks.
+    func loadPinBodies(retry: Bool = false) {
+        guard state.accessible, supports("chat.pins"), service.socket?.state == .connected,
+              let sync = service.orgSessions[key]?.sync else { return }
+        let missing = ChatPins.missing(state.pins ?? [], messages: state.pinMessages)
+        let ids = Set(missing.map(\.id))
+        pinReadRevisions = retry ? [:] : pinReadRevisions.filter { ids.contains($0.key) }
+        for read in missing where pinReadRevisions[read.id] != read.revision {
+            pinReadRevisions[read.id] = read.revision
+            sync.readOne(channel, id: read.id, seq: read.sequence, atLeast: read.revision)
+        }
+    }
+    func unpin(_ message: String) { set(message, choice: "pin", present: false) }
     func pending(_ message: String, choice: String) -> Bool {
         state.intents[message]?.contains { $0.choice == choice && $0.error == nil } == true
     }

@@ -97,6 +97,13 @@ enum ChatMarkdownInsertion: String, CaseIterable {
 final class ChatEditorControl {
     @ObservationIgnored weak var view: ChatMentionEditor.Editor?
     var focused = false
+    func clearAfterSend() {
+        // AppKit can receive another keystroke before SwiftUI updates the view.
+        // Clear synchronously so it cannot save the sent text as a new draft.
+        view?.string = ""
+        view?.setSelectedRange(NSRange(location: 0, length: 0))
+        view?.needsDisplay = true
+    }
     func focus() {
         guard let view, let window = view.window, !view.isHiddenOrHasHiddenAncestor else { return }
         window.makeFirstResponder(view)

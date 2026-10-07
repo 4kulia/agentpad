@@ -30,6 +30,10 @@ struct FilePreviewPanel: View {
                     .font(Theme.display(12.5, weight: .medium))
                     .foregroundStyle(Theme.chromeForeground)
                     .lineLimit(1)
+                if let location = model.sourceLocation {
+                    Text(location.column.map { "Ln \(location.line), Col \($0)" } ?? "Ln \(location.line)")
+                        .font(Theme.mono(10)).foregroundStyle(Theme.chromeMuted)
+                }
                 Text(relativeParent(url))
                     .font(Theme.mono(10))
                     .foregroundStyle(Theme.chromeFaint)
@@ -41,7 +45,7 @@ struct FilePreviewPanel: View {
                         .foregroundStyle(Theme.activityAttention)
                 }
                 Spacer(minLength: 4)
-                if case .markdown = model.content {
+                if hasRenderedPreview {
                     Picker("", selection: Binding(get: { model.showsMarkdownSource }, set: { model.showsMarkdownSource = $0 })) {
                         Text("Preview").tag(false)
                         Text("Source").tag(true)
@@ -66,6 +70,13 @@ struct FilePreviewPanel: View {
         .frame(height: 32)
     }
 
+    private var hasRenderedPreview: Bool {
+        switch model.content {
+        case .markdown, .html: true
+        default: false
+        }
+    }
+
     private func relativeParent(_ url: URL) -> String {
         let parent = url.deletingLastPathComponent().path
         if let root = root?.standardizedFileURL.path, parent.hasPrefix(root) {
@@ -81,10 +92,10 @@ struct FilePreviewPanel: View {
         case nil:
             ProgressView().controlSize(.small)
         case .text(let text, _, _, let spans):
-            CodeTextView(text: text, spans: spans, revision: model.revision)
+            CodeTextView(text: text, spans: spans, revision: model.revision, location: model.sourceLocation)
         case .markdown(let text, let html):
             if model.showsMarkdownSource {
-                CodeTextView(text: text, spans: [], revision: model.revision)
+                CodeTextView(text: text, spans: [], revision: model.revision, location: model.sourceLocation)
             } else if let url = model.url {
                 MarkdownWebView(
                     html: html,
@@ -94,6 +105,18 @@ struct FilePreviewPanel: View {
                     onOpenLocal: { model.open($0) }
                 )
             }
+        case .html(let text):
+            if model.showsMarkdownSource {
+                CodeTextView(text: text, spans: [], revision: model.revision, location: model.sourceLocation)
+            } else if let url = model.url {
+                MarkdownWebView(
+                    html: HTMLPreview.document(text), documentURL: url,
+                    allowedRoot: url.deletingLastPathComponent(), revision: model.revision,
+                    onOpenLocal: { model.open($0) }, allowsStylesheets: true
+                )
+            }
+        case .image(let image):
+            FilePreviewImageView(image: image)
         case .quickLook:
             if let url = model.url {
                 QuickLookView(url: url, revision: model.revision)
@@ -113,12 +136,43 @@ struct FilePreviewPanel: View {
     }
 }
 
-/// Quick Look's own view: images, PDF, office documents, audio, video.
+/// One stable view/image per decoded bitmap. No URL-backed NSImage (which
+/// defers decoding until drawing), file watching, or clearing during reloads.
+struct FilePreviewImageView: NSViewRepresentable {
+    let image: FilePreviewModel.DecodedImage
+
+    final class Coordinator { var image: FilePreviewModel.DecodedImage? }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class ImageView: NSImageView {
+        override var intrinsicContentSize: NSSize {
+            NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+        }
+    }
+
+    func makeNSView(context: Context) -> NSImageView {
+        let view = ImageView()
+        view.imageScaling = .scaleProportionallyUpOrDown
+        view.imageAlignment = .alignCenter
+        return view
+    }
+
+    func updateNSView(_ view: NSImageView, context: Context) {
+        guard context.coordinator.image != image else { return }
+        context.coordinator.image = image
+        view.image = NSImage(cgImage: image.cgImage, size: NSSize(width: image.cgImage.width, height: image.cgImage.height))
+    }
+}
+
+/// Quick Look's own view: unsupported images, PDF, office documents, audio, video.
 struct QuickLookView: NSViewRepresentable {
     let url: URL
     let revision: Int
 
-    final class Coordinator { var revision = -1 }
+    final class Coordinator {
+        var url: URL?
+        var revision = -1
+    }
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> QLPreviewView {
@@ -129,11 +183,15 @@ struct QuickLookView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: QLPreviewView, context: Context) {
-        guard context.coordinator.revision != revision || (view.previewItem as? URL) != url else { return }
+        let changedURL = context.coordinator.url != url
+        guard changedURL || context.coordinator.revision != revision else { return }
+        context.coordinator.url = url
         context.coordinator.revision = revision
-        // Re-setting the same URL is how Quick Look picks up a changed file.
-        view.previewItem = nil
-        view.previewItem = url as NSURL
+        if changedURL {
+            view.previewItem = url as NSURL
+        } else {
+            view.refreshPreviewItem()
+        }
     }
 
     static func dismantleNSView(_ view: QLPreviewView, coordinator: Coordinator) {
@@ -153,6 +211,7 @@ struct MarkdownWebView: NSViewRepresentable {
     let allowedRoot: URL
     let revision: Int
     let onOpenLocal: (URL) -> Void
+    var allowsStylesheets = false
 
     static let scheme = "agentpad-doc"
 
@@ -163,7 +222,10 @@ struct MarkdownWebView: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
             guard action.navigationType == .linkActivated, let url = action.request.url else {
-                decisionHandler(.allow)
+                // loadHTMLString's initial document is local. HTML refreshes,
+                // forms and frames must not navigate to a remote page.
+                let scheme = action.request.url?.scheme
+                decisionHandler(scheme == "about" || scheme == MarkdownWebView.scheme ? .allow : .cancel)
                 return
             }
             decisionHandler(.cancel)
@@ -204,6 +266,7 @@ struct MarkdownWebView: NSViewRepresentable {
     func updateNSView(_ view: WKWebView, context: Context) {
         context.coordinator.onOpenLocal = onOpenLocal
         context.coordinator.resources.allowedRoot = allowedRoot
+        context.coordinator.resources.allowsStylesheets = allowsStylesheets
         guard context.coordinator.revision != revision else { return }
         context.coordinator.revision = revision
         // Relative paths in the page resolve against the document's folder,
@@ -221,6 +284,7 @@ struct MarkdownWebView: NSViewRepresentable {
 /// elsewhere on disk.
 final class LocalResourceHandler: NSObject, WKURLSchemeHandler {
     var allowedRoot: URL?
+    var allowsStylesheets = false
     static let maxBytes = 20 * 1024 * 1024
 
     /// Tasks WebKit has cancelled; they must not be answered afterwards.
@@ -233,9 +297,10 @@ final class LocalResourceHandler: NSObject, WKURLSchemeHandler {
         }
         let id = ObjectIdentifier(task)
         let path = url.path
+        let allowsStylesheets = allowsStylesheets
         // Disk reads (possibly a slow network volume) happen off the main thread.
         DispatchQueue.global(qos: .userInitiated).async {
-            let data = Self.resource(at: path, root: root)
+            let data = Self.resource(at: path, root: root, allowsStylesheets: allowsStylesheets)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.stopped.remove(id) == nil else { return }
                 guard let data else {
@@ -255,14 +320,27 @@ final class LocalResourceHandler: NSObject, WKURLSchemeHandler {
     }
 
     /// The bytes of an image inside `root`, or nil.
-    static func resource(at path: String, root: URL) -> Data? {
+    static func resource(at path: String, root: URL, allowsStylesheets: Bool = false) -> Data? {
         let file = URL(fileURLWithPath: path)
         let real = FileOperations.realPath(file)
         guard FileOperations.isInside(real, FileOperations.realPath(root)),
-              let type = UTType(filenameExtension: file.pathExtension), type.conforms(to: .image),
+              let type = UTType(filenameExtension: file.pathExtension),
+              type.conforms(to: .image) || (allowsStylesheets && file.pathExtension.lowercased() == "css"),
               let size = (try? FileManager.default.attributesOfItem(atPath: real))?[.size] as? Int,
               size <= maxBytes
         else { return nil }
         return try? Data(contentsOf: URL(fileURLWithPath: real))
+    }
+}
+
+enum HTMLPreview {
+    /// Local preview has the same passive behavior as Markdown. In particular,
+    /// scripts, frames and network resources in agent output cannot navigate
+    /// the app or launch anything; only user-activated links leave the view.
+    static func document(_ source: String) -> String {
+        """
+        <!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src agentpad-doc: data:; style-src agentpad-doc: 'unsafe-inline'; font-src data:; form-action 'none'; base-uri 'none'">
+        \(source)
+        """
     }
 }

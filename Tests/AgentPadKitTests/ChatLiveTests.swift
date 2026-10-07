@@ -40,6 +40,8 @@ final class ChatLiveTests: XCTestCase {
         try live.validate(email: address)
         let tokens = FakeTokenStore()
         let service = ChatService(files: ChatFiles(directory: root), tokens: tokens)
+        service.executorRunner = UnconfiguredLiveRunner()
+        service.claudeProjectsRoot = root.appendingPathComponent("claude-projects")
         // 1. Sign-in (the service's steps: the window also needs `events.ws`,
         // which production announces only with stage B).
         try await service.requestCode(server: server, email: address)

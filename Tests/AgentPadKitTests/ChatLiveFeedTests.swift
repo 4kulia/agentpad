@@ -134,8 +134,7 @@ final class ChatLiveFeedTests: XCTestCase {
 
         // The guest asks it, as `team ask` does.
         let b = try await signIn(guestAddress, org: org, name: "guest")
-        let team = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("team-guest")), runner: ClaudeCodeRunner(),
-                               offCalls: TeamOffCallStore())
+        let team = makeTeam("team-guest", service: b.service)
         team.calls.useServer(b.store.calls, key: b.key)
         ChatOutgoing.asksOn = true
         defer { ChatOutgoing.asksOn = false }
@@ -209,6 +208,13 @@ final class ChatLiveFeedTests: XCTestCase {
         }
     }
 
+    private func makeTeam(_ name: String, service: ChatService) -> TeamService {
+        let team = TeamService(storage: TeamStorage(directory: root.appendingPathComponent(name)),
+                               runner: UnconfiguredLiveRunner(), offCalls: TeamOffCallStore())
+        team.calls.sessionFilesRoot = service.claudeProjectsRoot
+        return team
+    }
+
     /// Signs in through the service's own steps and starts the feed with
     /// the real socket; returns once the organization's queue may send.
     private func signIn(_ address: String, org: String, name: String, executor: TeamAgentRunner? = nil) async throws -> Client {
@@ -216,7 +222,7 @@ final class ChatLiveFeedTests: XCTestCase {
         let files = ChatFiles(directory: root.appendingPathComponent(name))
         let service = ChatService(files: files, tokens: FakeTokenStore())
         service.claudeProjectsRoot = root.appendingPathComponent("\(name)-claude-projects")
-        if let executor { service.executorRunner = executor }
+        service.executorRunner = executor ?? UnconfiguredLiveRunner()
         services.append(service)
         let box = Box()
         service.makeSocketTransport = {
@@ -457,7 +463,7 @@ final class ChatLiveFeedTests: XCTestCase {
 
         // The owner publishes to General, as the Published Agents window does.
         let general = try XCTUnwrap(a.service.myTeams(a.key).first(where: \.isGeneral)?.teamId)
-        let team = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("owner-team")), offCalls: TeamOffCallStore())
+        let team = makeTeam("owner-team", service: a.service)
         team.calls.serverMode = true
         team.calls.publishing = a.service
         team.calls.useServer(a.store.calls, key: a.key)
@@ -479,7 +485,7 @@ final class ChatLiveFeedTests: XCTestCase {
         let card = try XCTUnwrap(b.store.calls.catalog().first { $0.agentId == id })
         XCTAssertEqual(card.name, "e2e-billing")
         XCTAssertEqual(card.access, "read")
-        let memberTeam = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("member-team")), offCalls: TeamOffCallStore())
+        let memberTeam = makeTeam("member-team", service: b.service)
         memberTeam.enterServerMode()
         memberTeam.calls.useServer(b.store.calls, key: b.key)
         func ownerHandle() throws -> String? {
@@ -611,7 +617,7 @@ final class ChatLiveFeedTests: XCTestCase {
         try await waitUntil("owner: the invitation is there") { owner.invitations.contains { $0.email == memberAddress } }
 
         // The owner's Mac: its agent published, its side installed.
-        let ownerTeam = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("owner-team")), offCalls: TeamOffCallStore())
+        let ownerTeam = makeTeam("owner-team", service: a.service)
         isolated?.configure(service: a.service, calls: ownerTeam.calls)
         ownerTeam.calls.serverMode = true
         ownerTeam.calls.publishing = a.service
@@ -636,7 +642,7 @@ final class ChatLiveFeedTests: XCTestCase {
 
         // The member's Mac asks.
         let b = try await signIn(memberAddress, org: org, name: "member")
-        let memberTeam = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("member-team")), offCalls: TeamOffCallStore())
+        let memberTeam = makeTeam("member-team", service: b.service)
         memberTeam.calls.serverMode = true
         memberTeam.calls.useServer(b.store.calls, key: b.key)
         b.service.onCallsChanged = { _ in memberTeam.calls.reload() }
@@ -981,7 +987,7 @@ final class ChatLiveFeedTests: XCTestCase {
         try await waitUntil("owner: invitation") { owner.invitations.contains { $0.email == memberAddress } }
         let channel = try owner.createChannel("agent-\(mark)", in: channelTeam)
         try await waitUntil("owner: channel") { owner.visibleChannel(channel) != nil }
-        let team = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("owner-team")), offCalls: TeamOffCallStore())
+        let team = makeTeam("owner-team", service: a.service)
         team.calls.serverMode = true
         team.calls.publishing = a.service
         team.calls.useServer(a.store.calls, key: a.key)
@@ -1100,7 +1106,7 @@ final class ChatLiveFeedTests: XCTestCase {
         try await waitUntil("owner: invitation") { owner.invitations.contains { $0.email == memberAddress } }
         let channel = try owner.createChannel("agent-\(mark)", in: channelTeam)
         try await waitUntil("owner: channel") { owner.visibleChannel(channel) != nil }
-        let team = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("owner-team")), offCalls: TeamOffCallStore())
+        let team = makeTeam("owner-team", service: a.service)
         team.calls.serverMode = true
         team.calls.publishing = a.service
         team.calls.useServer(a.store.calls, key: a.key)

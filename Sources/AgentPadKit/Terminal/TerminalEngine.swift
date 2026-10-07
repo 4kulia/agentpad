@@ -116,8 +116,10 @@ protocol TerminalEngine: AnyObject {
     /// own judgment (`confirm-close-surface` config × a live child process).
     var needsConfirmQuit: Bool { get }
     /// ⌘-hover entered (url) / left (nil) a link — drives the URL preview
-    /// badge. Emission is gated core-side by `link-previews`.
+    /// badge. The core and host matcher share the `link-previews` preference.
     var onLinkHover: ((String?) -> Void)? { get set }
+    /// Explicit link activation, routed by the store owning this surface.
+    var onOpenFile: ((TerminalFileReference) -> Void)? { get set }
     func start(config: TerminalSessionConfig)
     func terminate()
     /// True while ANY owner holds a size-propagation suspension. While set, AppKit
@@ -179,4 +181,9 @@ protocol TerminalEngine: AnyObject {
 
 extension TerminalEngine {
     func setOnScreen(_ onScreen: Bool) {}
+    // Non-terminal tabs have no filesystem links.
+    var onOpenFile: ((TerminalFileReference) -> Void)? {
+        get { nil }
+        set {}
+    }
 }

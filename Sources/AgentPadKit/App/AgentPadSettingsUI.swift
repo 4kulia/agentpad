@@ -2836,10 +2836,6 @@ private struct OpenWithPreferences: View {
     @Bindable var model: AgentPadSettingsModel
     @State private var refreshTick = 0
 
-    private var fileApps: [OpenInApp] {
-        OpenInResolver.installedFileLinkApps()
-    }
-
     private var browserApps: [OpenInApp] {
         OpenInResolver.installedBrowserLinkApps()
     }
@@ -2848,7 +2844,7 @@ private struct OpenWithPreferences: View {
         let _ = refreshTick
         return SettingsSection(title: "Open With") {
             SettingsRow(label: "file-links") {
-                appPicker(selection: $model.fileLinkAppId, apps: fileApps)
+                Text("AgentPad preview").foregroundStyle(.secondary)
             }
             SettingsHairline()
             SettingsRow(label: "web-links") {

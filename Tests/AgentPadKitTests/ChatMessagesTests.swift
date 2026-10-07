@@ -291,6 +291,7 @@ final class ChatMessagesTests: XCTestCase {
         private var map: [String: (Int, String)] = [:]
         var gate: Gate?
         var gated: String?
+        var freezeBeforeGate = false
         func set(_ path: String, _ body: String, status: Int = 200) { lock.withLock { map[path] = (status, body) } }
         func get(_ path: String) -> (Int, String)? { lock.withLock { map[path] } }
     }
@@ -316,8 +317,9 @@ final class ChatMessagesTests: XCTestCase {
         ChatStubProtocol.reset { request, _ in
             let path = request.url?.path ?? ""
             let full = path + (request.url?.query.map { "?\($0)" } ?? "")
+            let frozen = answers.freezeBeforeGate ? answers.get(full) ?? answers.get(path) : nil
             if full == answers.gated { answers.gate?.pass() }
-            if let (status, body) = answers.get(full) ?? answers.get(path) { return .success(.init(status: status, body: Data(body.utf8))) }
+            if let (status, body) = frozen ?? answers.get(full) ?? answers.get(path) { return .success(.init(status: status, body: Data(body.utf8))) }
             return .success(.init(status: 200, body: Data(#"{"events":[],"result":{}}"#.utf8)))
         }
         let service = ChatService(files: files, tokens: FakeTokenStore())
@@ -2068,6 +2070,78 @@ extension ChatMessagesTests {
         XCTAssertTrue(notices.isEmpty)
     }
 
+    func testB1DelayedEligibilityRetriesEvenWhenMetadataAlreadyIncludesDeletion() async throws {
+        noticesHere()
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("mine", seq: 1, root: "ancient", author: me)]))
+        let point = "/v1/orgs/\(org)/channels/\(channel)/threads/ancient/participation"
+        answers.set(point, #"{"as_of_seq":11,"participating":true,"eligible_for_reply":true}"#)
+        let (service, transport) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store), sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        sync.b1.retryDelay = { _ in 0.01 }
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        answers.gate = gate; answers.gated = point + "?reply_id=reply"; answers.freezeBeforeGate = true
+        let scope = try readDB(store) { try ChatB1.readToken($0, channel: self.channel) }
+        transport.frame(post(11, "reply", root: "ancient"))
+        try await waitUntil { ChatStubProtocol.seen.contains { $0.request.url?.path == point } }
+        // Hydration wins the race: every watched row is already at deletion head 12.
+        let channel = channel
+        let deletion = try event(12, "message.delete", body: #"{"message_id":"mine","revision":2}"#, message: nil)
+        try await store.queue.write { db in
+            try ChatB1.watch(db, channel: channel, ids: ["mine"])
+            let rows = try Row.fetchAll(db, sql: "SELECT message_id, ticket FROM b1_metadata")
+            let tickets = Dictionary(uniqueKeysWithValues: rows.map { ($0["message_id"] as String, $0["ticket"] as Int) })
+            let items = tickets.keys.map { ChatB1.Metadata(messageId: $0, deleted: $0 == "mine", reactions: [], pin: nil, threadSummary: nil) }
+            _ = try ChatB1.apply(db, page: .init(asOfSeq: 12, items: items), channel: channel,
+                                 token: XCTUnwrap(ChatB1.readToken(db, channel: channel)), tickets: tickets)
+            // Isolate B1's freshness from the content cache's separate rights
+            // epoch: its own event invalidation must reject the delayed answer.
+            try ChatB1.invalidate(db, event: deletion)
+        }
+        XCTAssertEqual(try readDB(store) { try ChatB1.readToken($0, channel: channel) }, scope)
+        XCTAssertEqual(try int(store, "SELECT MAX(seq) FROM b1_reply_heads"), 12)
+        XCTAssertEqual(try int(store, "SELECT MAX(invalidated) FROM b1_metadata"), 11)
+        answers.set(point, #"{"as_of_seq":12,"participating":false,"eligible_for_reply":false}"#)
+        gate.open()
+        try await waitUntil { ChatStubProtocol.seen.filter { $0.request.url?.path == point }.count >= 2 || !self.notices.isEmpty }
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertTrue(notices.isEmpty, "removing the last contribution invalidates the delayed eligible answer")
+        XCTAssertEqual(ChatStubProtocol.seen.filter { $0.request.url?.path == point }.count, 2)
+        XCTAssertEqual(try int(store, "SELECT COUNT(*) FROM notified WHERE object_id = 'reply'"), 0)
+    }
+
+    func testB1OldParticipationPassCannotWithdrawNewlyConfirmedReply() async throws {
+        noticesHere()
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state())
+        let threads = "/v1/orgs/\(org)/my-threads"
+        let point = "/v1/orgs/\(org)/channels/\(channel)/threads/ancient/participation"
+        answers.set(point, #"{"as_of_seq":12,"participating":true,"eligible_for_reply":true}"#)
+        let (service, transport) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        try await waitUntil { try self.int(store, "SELECT dirty FROM b1_participation") == 0 }
+        let before = ChatStubProtocol.seen.filter { $0.request.url?.path == threads }.count
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        answers.gate = gate; answers.gated = threads + "?limit=200"; answers.freezeBeforeGate = true
+        try await store.queue.write { try $0.execute(sql: "UPDATE b1_participation SET dirty = 1, ticket = ticket + 1") }
+        try await waitUntil { ChatStubProtocol.seen.filter { $0.request.url?.path == threads }.count > before }
+        transport.frame(post(11, "mine", author: me, root: "ancient"))
+        transport.frame(post(12, "reply", root: "ancient"))
+        try await waitUntil { self.notices.count == 1 }
+        let notice = ChatNotifications.messageId(key, channel: channel, message: "reply")
+        // The member signal has not arrived. Only a fresh pass can see this membership.
+        answers.set(threads, #"{"member_head":5,"items":[{"channel_id":"\#(channel)","root_id":"ancient","first_message_seq":11}],"next":null}"#)
+        gate.open()
+        try await waitUntil { try self.int(store, "SELECT dirty FROM b1_participation") == 0 }
+        XCTAssertGreaterThanOrEqual(ChatStubProtocol.seen.filter { $0.request.url?.path == threads }.count, before + 2)
+        XCTAssertEqual(try int(store, "SELECT head FROM b1_participation"), 5)
+        XCTAssertEqual(try int(store, "SELECT withdrawn FROM notified WHERE object_id = 'reply'"), 0)
+        XCTAssertTrue(ChatNotifications.stillDue(notice, service))
+        XCTAssertTrue(shown.contains(notice))
+        XCTAssertEqual(notices.count, 1)
+        XCTAssertEqual(try store.cursor("member:\(org):\(me)"), 4)
+    }
+
     func testB1ReactorsEncodeEmojiPaginateAndRejectLateRevokedPage() async throws {
         let answers = Answers()
         answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1)]))
@@ -2094,5 +2168,61 @@ extension ChatMessagesTests {
         try await store.queue.write { try $0.execute(sql: "UPDATE meta SET rights_in_doubt = 1") }
         gate.open()
         do { _ = try await late.value; XCTFail("revoked reactor names were returned") } catch { }
+    }
+}
+
+extension ChatMessagesTests {
+    func testR115PinsLoadFullBodiesWithoutMovingConversationAndUnpinWithoutMetadata() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("latest", seq: 10)], before: 10))
+        let pinsPath = "/v1/orgs/\(org)/channels/\(channel)/pins"
+        answers.set(pinsPath, #"{"as_of_seq":10,"pins":[{"message_id":"old","seq":1,"author_account_id":"someone","excerpt":"short preview","pinned_by":"someone","pinned_at":"now"}]}"#)
+        let full = "## Complete message\n\n" + String(repeating: "Long Markdown paragraph. ", count: 20) + "\n\nFinal searchable detail"
+        var old = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(message("old", seq: 1).utf8)) as? [String: Any])
+        old["text"] = full
+        let fullMessage = String(decoding: try JSONSerialization.data(withJSONObject: old), as: UTF8.self)
+        answers.set("/v1/orgs/\(org)/channels/\(channel)/messages?before=2", page([fullMessage], next: nil))
+        let (service, _) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let model = ChatChannelModel(key: key, channel: channel); model.service = service; model.follow(store)
+        let b1 = try XCTUnwrap(model.b1)
+        let before = try int(store, "SELECT last_read_seq FROM read_marks LIMIT 1")
+        b1.showPins(true)
+        try await waitUntil { b1.state.pins?.count == 1 }
+        b1.loadPinBodies()
+        try await waitUntil { b1.state.pinMessages["old"]?.text == full }
+        XCTAssertNil(model.revealMessageID)
+        XCTAssertNil(model.threadRoot)
+        XCTAssertEqual(try int(store, "SELECT last_read_seq FROM read_marks LIMIT 1"), before)
+        XCTAssertNil(b1.state.metadata["old"], "the unpin action must not require pin metadata")
+        let gate = Gate(); gate.close(); defer { gate.open() }
+        answers.gated = "/v1/commands"; answers.gate = gate
+        b1.unpin("old")
+        try await waitUntil { b1.pending("old", choice: "pin") }
+        let command = try XCTUnwrap(store.commands().first { $0.type == "message.pin.set" })
+        XCTAssertEqual(ChatService.args(command)["message_id"], .string("old"))
+        XCTAssertEqual(ChatService.args(command)["present"], .bool(false))
+        // The cached full message must disappear through the same gate as its excerpt.
+        try await store.queue.write { try $0.execute(sql: "UPDATE meta SET rights_in_doubt = 1") }
+        try await waitUntil { !b1.state.accessible }
+        XCTAssertNil(b1.state.pins)
+        XCTAssertTrue(b1.state.pinMessages.isEmpty)
+    }
+
+    func testR115PinSubscriptionSurvivesHiddenTimeline() async throws {
+        let answers = Answers()
+        answers.set("/v1/orgs/\(org)/state", state([message("m", seq: 1)]))
+        let path = "/v1/orgs/\(org)/channels/\(channel)/pins"
+        answers.set(path, #"{"as_of_seq":10,"pins":[]}"#)
+        let (service, _) = try await started(answers, b1: true)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let b1 = ChatB1Channel(key: key, channel: channel, store: store, service: service)
+        b1.showPins(true)
+        try await waitUntil { b1.state.pins == [] }
+        b1.hideMetadata()
+        answers.set(path, #"{"as_of_seq":11,"pins":[{"message_id":"m","seq":1,"author_account_id":"someone","excerpt":"new pin","pinned_by":"someone","pinned_at":"now"}]}"#)
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        XCTAssertTrue(sync.apply(try event(11, "pin.changed", body: #"{"channel_id":"\#(channel)","message_id":"m"}"#, message: nil)))
+        try await waitUntil { b1.state.pins?.first?.id == "m" }
     }
 }

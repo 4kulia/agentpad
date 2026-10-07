@@ -200,6 +200,12 @@ final class AgentPadHookKitTests: XCTestCase {
 
     // MARK: Tool event payload — happy paths per tool kind
 
+    func testClaudeConversationPayloadCarriesItsOwnParentPID() {
+        let payload = AgentPadHookKit.buildConversationIdPayload(surface: "tab", conversationId: "journal", claudeParentPID: 123)
+        XCTAssertEqual(payload["claudeParentPID"], "123")
+        XCTAssertNil(AgentPadHookKit.buildConversationIdPayload(surface: "tab", conversationId: "journal")["claudeParentPID"])
+    }
+
     // MARK: tool_use_id + PostToolUseFailure
 
     func testParseToolEventExtractsToolUseId() {

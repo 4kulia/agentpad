@@ -1357,6 +1357,44 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(makeStore(initial: legacy).rightSidebarWidth, AgentOverviewSidebar.fullWidth)
     }
 
+    func testRightSidebarStartsHiddenInEveryNewWindow() {
+        let first = makeStore()
+        defer { first.terminate() }
+        XCTAssertEqual(first.rightSidebarMode, .hidden)
+        first.setRightSidebarMode(.full)
+        let second = makeStore()
+        defer { second.terminate() }
+        XCTAssertEqual(second.rightSidebarMode, .hidden)
+    }
+
+    func testRightSidebar115MigrationRunsOnceThenKeepsEachChoice() throws {
+        let persistence = InMemoryPersistence()
+        let original = makeStore(persistence: persistence)
+        defer { original.terminate() }
+        original.setRightSidebarContent(.history)
+        original.setRightSidebarMode(.full)
+        original.flushPersistence()
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(persistence.saved)) as? [String: Any])
+        json.removeValue(forKey: "rightSidebarDefault115Applied")
+        for legacyMode in ["full", "compact", "hidden", ""] {
+            json["rightSidebarMode"] = legacyMode.isEmpty ? nil : legacyMode
+            let legacy = try JSONDecoder().decode(PersistedState.self, from: JSONSerialization.data(withJSONObject: json))
+            let migratedPersistence = InMemoryPersistence(initial: legacy)
+            let migrated = makeStore(persistence: migratedPersistence)
+            defer { migrated.terminate() }
+            XCTAssertEqual(migrated.rightSidebarMode, .hidden, legacyMode)
+            XCTAssertEqual(migrated.rightSidebarContent, .history)
+            for choice in [SidebarMode.full, .compact, .hidden] {
+                migrated.setRightSidebarMode(choice)
+                migrated.flushPersistence()
+                let roundTrip = try JSONDecoder().decode(PersistedState.self, from: JSONEncoder().encode(migratedPersistence.saved))
+                let restored = makeStore(initial: roundTrip)
+                XCTAssertEqual(restored.rightSidebarMode, choice)
+                restored.terminate()
+            }
+        }
+    }
+
     func testRequestRenameActiveWorkspaceLeavesFilesMode() {
         // The rename popover anchors to a workspace row — ⌘⇧R from files
         // mode must flip the sidebar back so the parked request is consumed.

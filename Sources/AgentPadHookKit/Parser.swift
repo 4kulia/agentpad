@@ -193,12 +193,16 @@ public enum AgentPadHookKit {
     /// ConversationId payload routed to `HookServer` so `WorkspaceStore`
     /// can persist it on `Session` and prepend `--resume <id>` to
     /// `AGENTPAD_AGENT` on next launch.
-    public static func buildConversationIdPayload(surface: String, conversationId: String) -> [String: String] {
-        [
+    public static func buildConversationIdPayload(surface: String, conversationId: String,
+                                                   claudeParentPID: Int32? = nil) -> [String: String] {
+        var payload = [
             "kind": "conversationId",
             "surface": surface,
             "conversationId": conversationId,
         ]
+        // AgentPad: supplied by getppid() in the Claude hook, never stdin/env.
+        if let claudeParentPID { payload["claudeParentPID"] = String(claudeParentPID) }
+        return payload
     }
 
     /// Maximum bytes / characters carried by the cross-boundary `identifier`

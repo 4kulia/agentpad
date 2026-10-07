@@ -148,7 +148,9 @@ if AgentPadHookKit.shouldMirrorConversationId(
    let conversationId = AgentPadHookKit.parseConversationId(from: stdinData, agent: agentArg) {
     let payload = AgentPadHookKit.buildConversationIdPayload(
         surface: surface,
-        conversationId: conversationId
+        conversationId: conversationId,
+        // AgentPad: a shell intermediary is intentionally not walked through.
+        claudeParentPID: agentArg == "claude" && readsHookStdin ? getppid() : nil
     )
     _ = AgentPadHookKit.sendPayload(payload, to: socketPath)
 }

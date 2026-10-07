@@ -331,6 +331,36 @@ final class ChatSidebarTests: XCTestCase {
         try await checkDeferredMention(invalidate: nil)
     }
 
+    func testCardMentionRoutesThroughPinAndThreadDismissal() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mention-pins-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let files = ChatFiles(directory: directory), service = ChatService(files: files, tokens: FakeTokenStore())
+        let cache = try ChatStore.open(files: files, key: key).store
+        let workspace = makeTestStore(), org = model(), ref = ChannelRef(key, channel: "one")
+        defer { workspace.terminate() }
+        let active = try XCTUnwrap(workspace.active)
+        let tab = workspace.openChannelTab(ref, in: active, pane: try XCTUnwrap(active.activePane))
+        let engine = try XCTUnwrap(tab.engine as? ChannelTabEngine)
+        engine.conversation.update(.ready(channel("one"), team: "General", offline: true), key: key, store: cache, service: service)
+        let conversation = try XCTUnwrap(engine.conversation.model)
+        conversation.openThread("thread")
+        conversation.pins.open(); conversation.pins.expanded = true
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer {
+            // The native restoration/delivery is covered by ChatPinsTests;
+            // cancel this routing-only request before releasing its window.
+            ChatSidebarMention.request(agentID: "a1", ref: ref, window: nil, destination: engine.view, model: org,
+                isActive: { false }, openChannel: {})
+            window.close()
+        }
+        XCTAssertTrue(ChatSidebarMention.insert(agentID: "a1", ref: ref, window: window, model: org, store: workspace))
+        XCTAssertFalse(conversation.pins.isPresented)
+        XCTAssertNil(conversation.threadRoot)
+        XCTAssertTrue(active.activeSession === tab)
+        XCTAssertTrue(try cache.outbox.commands().isEmpty)
+    }
+
     func testDeferredMentionDropsOnActiveTabChange() async throws { try await checkDeferredMention(invalidate: "tab") }
     func testDeferredMentionDropsOnAccessLoss() async throws { try await checkDeferredMention(invalidate: "access") }
 
@@ -411,5 +441,82 @@ final class ChatSidebarTests: XCTestCase {
             try db.execute(sql: "UPDATE teams SET mine = 0 WHERE team_id = 't'")
             XCTAssertEqual(try ChatUnread.unreadMentions(db), 0)
         }
+    }
+}
+
+extension ChatSidebarTests {
+    func testR115AgentCardLabelsAccessAndRoutesRealChannelActions() throws {
+        let model = model(), active = ChannelRef(key, channel: "two")
+        let actions = try XCTUnwrap(ChatSidebarAgentActions(agentID: "a1", active: active, model: model))
+        XCTAssertEqual(actions.channels.map(\.channelId), ["two", "one"])
+        XCTAssertEqual(actions.mentionChannel?.channelId, "two")
+        XCTAssertEqual(actions.address, "reviewer@me")
+        XCTAssertEqual(actions.accessLabel, "Access: Read")
+        var changed = model.view
+        changed.channelAgents[0].access = "edit-files"; changed.channelAgents[1].access = "edit-files"
+        model.set(changed)
+        XCTAssertEqual(ChatSidebarAgentActions(agentID: "a1", active: active, model: model)?.accessLabel, "Access: Edit files (no shell)")
+        var opened: [ChannelRef] = []
+        XCTAssertTrue(ChatSidebarAgentActions.open(agentID: "a1", channel: "one", model: model) { opened.append($0) })
+        XCTAssertEqual(opened, [ChannelRef(key, channel: "one")])
+        XCTAssertFalse(ChatSidebarAgentActions.open(agentID: "a1", channel: "hidden", model: model) { opened.append($0) })
+        XCTAssertEqual(opened.count, 1)
+        model.isCurrent = { false }
+        XCTAssertFalse(ChatSidebarAgentActions.open(agentID: "a1", channel: "one", model: model) { opened.append($0) })
+        XCTAssertEqual(opened.count, 1)
+    }
+
+    func testR115MentionOfferedInWritableChannelIncludingAgentNotYetAdded() throws {
+        let model = model()
+        let actions = try XCTUnwrap(ChatSidebarAgentActions(agentID: "own", active: ChannelRef(key, channel: "one"), model: model))
+        XCTAssertTrue(actions.channels.isEmpty)
+        XCTAssertEqual(actions.mentionChannel?.channelId, "one")
+        XCTAssertEqual(actions.address, "writer@me")
+        XCTAssertNil(ChatSidebarAgentActions(agentID: "own", active: nil, model: model)?.mentionChannel)
+        XCTAssertNil(ChatSidebarAgentActions(agentID: "own", active: ChannelRef(key, channel: "old"), model: model)?.mentionChannel)
+        var other = ChannelRef(key, channel: "one"); other.account = "other"
+        XCTAssertNil(ChatSidebarAgentActions(agentID: "own", active: other, model: model)?.mentionChannel)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 160), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let editor = ChatMentionEditor.Editor(frame: window.contentView!.bounds)
+        editor.navigationTarget = ChannelRef(key, channel: "one")
+        editor.string = "Draft"; editor.setSelectedRange(NSRange(location: 5, length: 0))
+        window.contentView = editor; ChatSidebarMention.register(editor)
+        XCTAssertTrue(ChatSidebarMention.insert(agentID: "own", ref: ChannelRef(key, channel: "one"), window: window, destination: editor, model: model))
+        XCTAssertEqual(editor.string, "Draft @writer@me ")
+    }
+
+    func testR115AskRechecksColleagueAddressOrganizationAndVisibility() throws {
+        let model = model()
+        var view = model.view
+        view.channelAgents.append(agent("colleague", channel: "one", owner: "other"))
+        model.set(view)
+        let target = try XCTUnwrap(ChatSidebarAgentActions(agentID: "colleague", active: nil, model: model))
+        XCTAssertTrue(target.canAsk(in: model))
+        var sent: [String] = []
+        try target.submitAsk(in: model, resolve: { _ in "colleague" }, send: { sent.append($0) })
+        XCTAssertEqual(sent, ["reviewer@other"])
+        XCTAssertThrowsError(try target.submitAsk(in: model, resolve: { _ in "replacement-agent" }, send: { sent.append($0) }))
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertFalse(try XCTUnwrap(ChatSidebarAgentActions(agentID: "a1", active: nil, model: model)).canAsk(in: model))
+        model.key = ChatOrgKey(server: key.server, accountId: key.accountId, orgId: "elsewhere")
+        XCTAssertFalse(target.canAsk(in: model))
+        model.key = key
+        view.channelAgents[view.channelAgents.count - 1].name = "renamed"; model.set(view)
+        XCTAssertFalse(target.canAsk(in: model))
+        view.channelAgents[view.channelAgents.count - 1].name = "reviewer"; view.rightsInDoubt = true; model.set(view)
+        XCTAssertFalse(target.canAsk(in: model))
+    }
+
+    func testR115PublicationEditorResolvesExactAgentAndCapturedOrganization() throws {
+        let first = TeamPublishedAgent(name: "first", description: "First", folder: "/tmp/first")
+        let second = TeamPublishedAgent(name: "second", description: "Second", folder: "/tmp/second", access: .editFiles)
+        let opened = try XCTUnwrap(TeamAgentEditing.resolve(agentID: second.id.uuidString.lowercased(), key: key, currentKey: key, agents: [first, second]))
+        XCTAssertEqual(opened.agent, second); XCTAssertEqual(opened.key, key)
+        XCTAssertNil(TeamAgentEditing.resolve(agentID: "missing", key: key, currentKey: key, agents: [first, second]))
+        XCTAssertNil(TeamAgentEditing.resolve(agentID: second.id.uuidString, key: key, currentKey: nil, agents: [first, second]))
+        XCTAssertNil(TeamAgentEditing.resolve(agentID: second.id.uuidString, key: key,
+            currentKey: ChatOrgKey(server: key.server, accountId: "other", orgId: key.orgId), agents: [first, second]))
     }
 }

@@ -473,11 +473,12 @@ private let agentPadActionCb: ghostty_runtime_action_cb = { _, target, action in
         dispatchToMain { handleBellRing() }
         return true
     case GHOSTTY_ACTION_MOUSE_OVER_LINK:
-        // ⌘-hover enters/leaves a link (`link-previews` gates emission
-        // core-side). len == 0 = left the link; copy before hopping main.
+        // The host requests OSC-8-only previews so metadata wins over its
+        // text matcher. Capture the hint synchronously during mouse_pos;
+        // it only stores state and never re-enters the core.
         let link = action.action.mouse_over_link
         let url: String? = link.len > 0 ? link.url.map { String(cString: $0) } : nil
-        dispatchToView(userdata) { $0.onLinkHover?(url) }
+        dispatchClipboardToView(userdata) { $0.fileLinks.receiveCoreHover(url) }
         return true
     case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
         // OSC 9 / OSC 777 — copy the core-owned strings BEFORE hopping main.
@@ -613,6 +614,10 @@ final class LibghosttyEngine: TerminalEngine {
     var onLinkHover: ((String?) -> Void)? {
         get { surfaceView.onLinkHover }
         set { surfaceView.onLinkHover = newValue }
+    }
+    var onOpenFile: ((TerminalFileReference) -> Void)? {
+        get { surfaceView.onOpenFile }
+        set { surfaceView.onOpenFile = newValue }
     }
     var onProcessExitedCleanly: (() -> Void)? {
         get { surfaceView.onProcessExitedCleanly }
@@ -765,6 +770,15 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     var onProcessExitedCleanly: (() -> Void)?
     var onDesktopNotification: ((String, String) -> Void)?
     var onLinkHover: ((String?) -> Void)?
+    var onOpenFile: ((TerminalFileReference) -> Void)?
+    /// Injectable URL opener keeps activation tests out of external apps.
+    var openExternalURL: (URL) -> Void = { url in
+        if url.isWebLink,
+           let app = OpenInApp.preferred(id: AgentPadSettingsModel.shared.webLinkAppId,
+               available: OpenInResolver.installedBrowserLinkApps()),
+           OpenInResolver.open(url: url, with: app) { return }
+        NSWorkspace.shared.open(url)
+    }
     var onSearchStart: ((String) -> Void)?
     var onSearchEnd: (() -> Void)?
     var onSearchTotal: ((Int) -> Void)?
@@ -772,6 +786,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     var pasteUploadHostProvider: (() -> String?)?
     var isRemoteSessionProvider: (() -> Bool)?
     var currentDirectory: URL?
+    lazy var fileLinks = TerminalLinkInteraction(view: self)
     var foregroundPid: pid_t? {
         guard let surface else { return nil }
         let pid = pid_t(ghostty_surface_foreground_pid(surface))
@@ -872,7 +887,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         // when the shape *changes*, so without this the I-beam → pointer
         // transition wouldn't recover after the cursor briefly leaves.
         let options: NSTrackingArea.Options = [
-            .activeWhenFirstResponder, .mouseMoved, .cursorUpdate, .inVisibleRect,
+            .activeWhenFirstResponder, .mouseMoved, .mouseEnteredAndExited, .cursorUpdate, .inVisibleRect,
         ]
         addTrackingArea(NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil))
     }
@@ -909,6 +924,8 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         currentCursor = cursor
         cursor.set()
     }
+
+    func restoreNativeMouseCursor() { currentCursor.set() }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not used")
@@ -1332,6 +1349,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
         if resigned {
+            fileLinks.clear()
             if let surface {
                 ghostty_surface_set_focus(surface, false)
                 setNeedsRender()
@@ -1757,6 +1775,9 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
             super.flagsChanged(with: event)
             return
         }
+        if let point = window?.mouseLocationOutsideOfEventStream {
+            fileLinks.move(to: convert(point, from: nil), modifiers: event.modifierFlags)
+        }
         sendKey(event: event, action: GHOSTTY_ACTION_PRESS, surface: surface)
     }
 
@@ -1779,6 +1800,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     private var optionSelectionDrag = false
 
     override func scrollWheel(with event: NSEvent) {
+        fileLinks.clear()
         guard let surface else {
             super.scrollWheel(with: event)
             return
@@ -1806,10 +1828,16 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        forwardMouseEvent(event)
+        fileLinks.move(to: convert(event.locationInWindow, from: nil), modifiers: event.modifierFlags)
     }
 
+    override func mouseExited(with event: NSEvent) { fileLinks.clear() }
+
     override func mouseDragged(with event: NSEvent) {
+        if fileLinks.isHandlingClick {
+            fileLinks.move(to: convert(event.locationInWindow, from: nil), modifiers: event.modifierFlags)
+            return
+        }
         if optionSelectionDrag {
             updateOptionSelection(with: event, starting: false)
             return
@@ -1828,6 +1856,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         if window?.firstResponder !== self {
             window?.makeFirstResponder(self)
         }
+        if fileLinks.mouseDown(event) { return }
         optionSelectionDrag = surface.map { ghostty_surface_mouse_captured($0) } == true
             && event.modifierFlags.contains(.option)
             && event.modifierFlags.intersection([.control, .command]).isEmpty
@@ -1839,12 +1868,14 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if fileLinks.mouseUp(event) { return }
         if optionSelectionDrag {
             updateOptionSelection(with: event, starting: false)
             optionSelectionDrag = false
             return
         }
         forwardMouseEvent(event, button: (.RELEASE, .LEFT))
+        fileLinks.move(to: convert(event.locationInWindow, from: nil), modifiers: event.modifierFlags, force: true)
     }
 
     /// The pinned core exposes tracked selection endpoints. Use those instead
@@ -2041,39 +2072,22 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         }
     }
 
-    /// Open a libghostty link action using the configured editor / browser,
-    /// falling back to the system default. URLs work in both local and remote
-    /// sessions; filesystem paths are local only because a remote path has no
-    /// safe LaunchServices meaning.
+    /// Called only for an explicit link activation, never for output or hover.
     func open(target rawTarget: String) {
         guard let target = TerminalOpenTargetResolver.resolve(
             rawTarget,
-            currentDirectory: currentDirectory
+            currentDirectory: TerminalWorkingDirectory.resolve(pid: foregroundPid, fallback: currentDirectory)
         ) else { return }
 
-        let model = AgentPadSettingsModel.shared
         switch target {
-        case .file:
+        case .file(let reference):
             let isRemote = isRemoteSessionProvider?() == true
                 || TerminalRemoteProcessDetector.isRemoteConnection(pid: foregroundPid)
             guard !isRemote else { return }
-            let apps = OpenInResolver.installedFileLinkApps()
-            if let app = OpenInApp.preferred(id: model.fileLinkAppId, available: apps),
-               OpenInResolver.open(url: target.url, with: app) {
-                return
-            }
+            onOpenFile?(reference)
         case .url(let url):
-            guard url.isWebLink else {
-                NSWorkspace.shared.open(url)
-                return
-            }
-            let apps = OpenInResolver.installedBrowserLinkApps()
-            if let app = OpenInApp.preferred(id: model.webLinkAppId, available: apps),
-               OpenInResolver.open(url: url, with: app) {
-                return
-            }
+            openExternalURL(url)
         }
-        NSWorkspace.shared.open(target.url)
     }
 
     /// Drives the scroll indicator from libghostty's SCROLLBAR action. Skips

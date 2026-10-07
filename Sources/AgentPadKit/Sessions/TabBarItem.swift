@@ -12,6 +12,7 @@ struct TabBarItem: View {
     let onRename: (String) -> Void
     let onSplit: (SplitOrientation) -> Void
     let onMoveToNewWindow: () -> Void
+    var onLastAnswer: (Bool) -> Void = { _ in }
 
     @State private var isHovered = false
     @State private var isContextMenuOpen = false
@@ -27,6 +28,12 @@ struct TabBarItem: View {
             Text(tab.title)
                 .font(Theme.display(12, weight: isActive ? .medium : .regular))
                 .lineLimit(1)
+            // AgentPad: show why an export is unavailable instead of hiding it.
+            if AgentAnswerSource.supports(tab), isActive {
+                HoverableIconButton(systemName: "arrowshape.turn.up.right", fontSize: 11, size: 18,
+                                    help: AgentAnswerSource.problem(tab)?.rawValue ?? "Forward last agent answer…") { onLastAnswer(false) }
+                    .disabled(!AgentAnswerWindow.available(tab))
+            }
             HoverableIconButton(
                 systemName: "xmark",
                 fontSize: 9,
@@ -56,6 +63,25 @@ struct TabBarItem: View {
         .overlay(MiddleClickCatcher { onClose() })
         .popover(isPresented: $isContextMenuOpen, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 0) {
+                // AgentPad: all export entry points share the provenance gate.
+                if AgentAnswerSource.supports(tab) {
+                    let problem = AgentAnswerSource.problem(tab)
+                    AgentPadMenuRow(title: "Copy as Markdown", shortcut: "⌘⇧C", isDisabled: problem != nil) {
+                        isContextMenuOpen = false
+                        onLastAnswer(true)
+                    }
+                    .help(problem?.rawValue ?? "Copy last agent answer as Markdown")
+                    AgentPadMenuRow(title: "Forward…", shortcut: "⌘⇧F", isDisabled: problem != nil) {
+                        isContextMenuOpen = false
+                        onLastAnswer(false)
+                    }
+                    .help(problem?.rawValue ?? "Forward last agent answer…")
+                    if let problem {
+                        Text(problem.rawValue).font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
+                            .fixedSize(horizontal: false, vertical: true).padding(8)
+                    }
+                    AgentPadMenuDivider()
+                }
                 AgentPadMenuRow(title: "Close Tab", shortcut: "⌘W") {
                     isContextMenuOpen = false
                     onClose()

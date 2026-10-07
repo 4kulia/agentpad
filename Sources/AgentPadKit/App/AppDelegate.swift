@@ -75,8 +75,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 store.applyHookEvent(agent: agent, event: event, sessionId: sessionId, details: details)
             case .shellEnvironment(let env, let sessionId):
                 store.applyShellEnvironment(env, sessionId: sessionId)
-            case .conversationId(let conversationId, let sessionId):
-                store.applyConversationId(conversationId: conversationId, sessionId: sessionId)
+            case .conversationId(let conversationId, let sessionId, let provenance):
+                // AgentPad: preserve hook provenance separately from monitor IDs.
+                store.applyHookConversationId(conversationId: conversationId, sessionId: sessionId, provenance: provenance)
             case .toolCall(let agent, let toolName, let identifier, let event, let success, let toolUseId, let sessionId, let mainThread):
                 store.applyToolCallEvent(
                     agent: agent,
@@ -1253,6 +1254,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         mainMenu.addItem(submenu(buildMenu(title: "Edit", entries: [
             responderRow("Cut", #selector(NSText.cut(_:)), "x"),
             responderRow("Copy", #selector(NSText.copy(_:)), "c"),
+            selfRow("Copy as Markdown", #selector(handleCopyAgentAnswer), "c", modifiers: [.command, .shift]),
+            selfRow("Forward…", #selector(handleForwardAgentAnswer), "f", modifiers: [.command, .shift]),
             responderRow("Paste", #selector(NSText.paste(_:)), "v"),
             responderRow("Select All", #selector(NSText.selectAll(_:)), "a"),
             .separator,
@@ -1779,6 +1782,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
         let terminalWindowIsKey = keyAuxiliaryWindow == nil
 
+        if menuItemMatches(menuItem, #selector(handleCopyAgentAnswer), #selector(handleForwardAgentAnswer)) {
+            guard terminalWindowIsKey, let session = activeStore?.active?.activeSession else { return false }
+            // AgentPad: expose the same refusal as the tab's export controls.
+            menuItem.toolTip = AgentAnswerSource.problem(session)?.errorDescription
+            return AgentAnswerWindow.available(session)
+        }
+
         if menuItemMatches(
             menuItem,
             #selector(handleFind),
@@ -1919,6 +1929,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         } else {
             session.engine.performAction("start_search")
         }
+    }
+
+    @objc private func handleCopyAgentAnswer() {
+        guard keyAuxiliaryWindow == nil, let store = activeStore, let session = store.active?.activeSession else { return }
+        AgentAnswerWindow.open(session: session, store: store, copyOnly: true)
+    }
+
+    @objc private func handleForwardAgentAnswer() {
+        guard keyAuxiliaryWindow == nil, let store = activeStore, let session = store.active?.activeSession else { return }
+        AgentAnswerWindow.open(session: session, store: store)
     }
 
     @objc private func handleComposePrompt() {

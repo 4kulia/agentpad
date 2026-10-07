@@ -24,6 +24,8 @@
 #   AGENTPAD_NOTARY_PROFILE  notarytool keychain profile (default: agentpad-notary)
 #   AGENTPAD_NOTARY_KEY_ID   App Store Connect API key id; with
 #   AGENTPAD_NOTARY_ISSUER   its issuer id, used instead of the profile
+#   AGENTPAD_RELEASE_NOTES  optional Markdown file embedded in the Sparkle
+#                            update window; otherwise link to the GitHub release
 #
 # Note: this rebuilds dist/AgentPad.app in place. Quit an AgentPad that is
 # running from dist/ first, or run your everyday copy from /Applications.
@@ -115,23 +117,8 @@ VERSION="$(plutil -extract CFBundleShortVersionString raw "${APP}/Contents/Info.
 ED_ATTRS="$("$SIGN_UPDATE" --account agentpad "$DMG")"
 case "$ED_ATTRS" in *edSignature=*length=*) ;; *) echo "release.sh: sign_update failed: $ED_ATTRS" >&2; exit 1 ;; esac
 DMG_URL="https://github.com/4kulia/agentpad/releases/download/v${VERSION}/$(basename "$DMG")"
-cat > dist/appcast.xml <<APPCAST
-<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
-  <channel>
-    <title>AgentPad</title>
-    <item>
-      <title>AgentPad ${VERSION}</title>
-      <pubDate>$(LC_ALL=C date -u "+%a, %d %b %Y %H:%M:%S +0000")</pubDate>
-      <sparkle:version>${VERSION}</sparkle:version>
-      <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
-      <sparkle:minimumSystemVersion>14.5</sparkle:minimumSystemVersion>
-      <sparkle:releaseNotesLink>https://github.com/4kulia/agentpad/releases/tag/v${VERSION}</sparkle:releaseNotesLink>
-      <enclosure url="${DMG_URL}" type="application/octet-stream" ${ED_ATTRS} />
-    </item>
-  </channel>
-</rss>
-APPCAST
+bash scripts/appcast.sh "$VERSION" "$DMG_URL" "$ED_ATTRS" > dist/appcast.xml
+xmllint --nonet --noout dist/appcast.xml
 echo "    dist/appcast.xml → ${DMG_URL}"
 
 echo "==> Gatekeeper assessment"

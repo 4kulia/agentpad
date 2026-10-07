@@ -511,6 +511,18 @@ enum ChatStoreMigrations {
             try db.execute(sql: "UPDATE edit_drafts SET version = lower(hex(randomblob(16)))")
             try db.alter(table: "notified") { t in t.add(column: "withdrawn", .boolean).notNull().defaults(to: false) }
         }
+        migrator.registerMigration("release-19-chat-reply-heads") { db in
+            try db.create(table: "b1_reply_heads") { t in
+                t.primaryKey("channel_id", .text)
+                t.column("seq", .integer).notNull()
+            }
+        }
+        migrator.registerMigration("release-20-pin-preferences") { db in
+            try db.create(table: "pin_preferences") { t in
+                t.primaryKey("channel_id", .text)
+                t.column("hidden", .boolean).notNull().defaults(to: false)
+            }
+        }
         return migrator
     }
 

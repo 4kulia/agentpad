@@ -265,10 +265,21 @@ enum TeamWindows {
     static var teamWindow: NSWindow? { team }
     private static var agents: NSWindow?
     private static var publishSession: NSWindow?
+    private static var publicationEditor: NSWindow?
     /// The Team tab of the front window's left sidebar.
     static var showCallsTab: @MainActor () -> Void = {}
 
     static func showCalls() { showCallsTab() }
+
+    static func showAgentEditor(_ editing: TeamAgentEditing) {
+        publicationEditor?.close()
+        final class Handle { weak var window: NSWindow? }
+        let handle = Handle()
+        let made = window(title: "Edit publication", content: TeamPublicationEditor(open: editing, service: .shared) { handle.window?.close() })
+        handle.window = made
+        publicationEditor = made
+        present(made)
+    }
 
     static func showPublishSession(sessionId: String, title: String, surfaceId: UUID? = nil) {
         publishSession?.close()

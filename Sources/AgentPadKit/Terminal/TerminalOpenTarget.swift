@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-/// A target emitted by libghostty after Cmd+Click link detection.
+/// A target from libghostty or the host's visible-text matcher after Cmd+Click.
 ///
 /// libghostty sends both real URLs and filesystem paths through the same
 /// `GHOSTTY_ACTION_OPEN_URL` action. Foundation's `URL(string:)` accepts a
@@ -23,9 +23,7 @@ enum TerminalOpenTarget: Equatable {
 struct TerminalFileReference: Equatable {
     let url: URL
     /// One-based source location parsed from `path:line[:column]` or
-    /// `path#Lline[Ccolumn]`. LaunchServices has no generic jump-to-line
-    /// contract, but retaining it keeps parsing honest and leaves a clean seam
-    /// for editor-specific routing later.
+    /// `path#Lline[Ccolumn]`, for the built-in source viewer.
     let line: Int?
     let column: Int?
 }
@@ -38,7 +36,7 @@ enum TerminalOpenTargetResolver {
         currentDirectory: URL?,
         fileExists: FileExists = { FileManager.default.fileExists(atPath: $0) }
     ) -> TerminalOpenTarget? {
-        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = unquote(rawValue.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !value.isEmpty else { return nil }
 
         // `URL(string:)` treats a bare `main.swift:42` as a URL whose scheme
@@ -47,7 +45,8 @@ enum TerminalOpenTargetResolver {
         if let location = parseColonLocation(value),
            let fullURL = fileURL(for: value, currentDirectory: currentDirectory),
            let locationURL = fileURL(for: location.path, currentDirectory: currentDirectory),
-           fileExists(fullURL.path) || fileExists(locationURL.path) {
+           fileExists(fullURL.path) || fileExists(locationURL.path)
+            || looksLikePath(location.path) {
             return resolveFile(
                 path: value,
                 fragment: nil,
@@ -137,8 +136,8 @@ enum TerminalOpenTargetResolver {
         }
 
         // Preserve the useful semantic interpretation when the file disappears
-        // between terminal output and click. LaunchServices will harmlessly
-        // reject a still-missing file, while a recreated file can open.
+        // between terminal output and click, so the preview can explain which
+        // file is missing instead of handing a bogus scheme to LaunchServices.
         if let location {
             return TerminalFileReference(url: locationURL, line: location.0, column: location.1)
         }
@@ -146,7 +145,7 @@ enum TerminalOpenTargetResolver {
     }
 
     private static func fileURL(for rawPath: String, currentDirectory: URL?) -> URL? {
-        let expanded = (rawPath as NSString).expandingTildeInPath
+        let expanded = (unquote(rawPath) as NSString).expandingTildeInPath
         let url: URL
         if (expanded as NSString).isAbsolutePath {
             url = URL(fileURLWithPath: expanded)
@@ -155,6 +154,22 @@ enum TerminalOpenTargetResolver {
             url = currentDirectory.appendingPathComponent(expanded)
         }
         return url.standardizedFileURL
+    }
+
+    /// Quotes delimit terminal prose, not part of the filename. A source
+    /// location may be either inside or after the closing quote.
+    static func unquote(_ value: String) -> String {
+        guard let quote = value.first, ["\"", "'", "`"].contains(quote),
+              let end = value.dropFirst().lastIndex(of: quote) else { return value }
+        let suffix = String(value[value.index(after: end)...])
+        guard suffix.isEmpty || parseColonLocation("file" + suffix) != nil
+                || (suffix.hasPrefix("#") && parseFragmentLocation(String(suffix.dropFirst())) != nil)
+        else { return value }
+        return String(value[value.index(after: value.startIndex)..<end]) + suffix
+    }
+
+    static func looksLikePath(_ value: String) -> Bool {
+        !value.contains("://") && (value.contains("/") || value.contains("."))
     }
 
     private static func parseColonLocation(
@@ -195,6 +210,22 @@ enum TerminalOpenTargetResolver {
               let number = Int(value), number > 0
         else { return nil }
         return number
+    }
+}
+
+enum TerminalWorkingDirectory {
+    /// OSC 7 is a useful fallback, but an agent can chdir without emitting it.
+    /// Read only the foreground process's cwd, never its environment/arguments.
+    static func resolve(pid: pid_t?, fallback: URL?) -> URL? {
+        guard let pid, pid > 0 else { return fallback }
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return fallback }
+        let path = withUnsafeBytes(of: info.pvi_cdir.vip_path) { bytes in
+            String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        guard path.hasPrefix("/") else { return fallback }
+        return URL(fileURLWithPath: path, isDirectory: true)
     }
 }
 

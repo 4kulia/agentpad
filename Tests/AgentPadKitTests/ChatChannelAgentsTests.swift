@@ -180,6 +180,35 @@ final class ChatChannelAgentsTests: XCTestCase {
 
     /// Only the user's own enabled agents not in the channel are offered; none
     /// without the server's agents, in an archived channel or with rights in doubt.
+    func testMissingAgentMentionsUseExistingAddPermissions() throws {
+        let agent = catalogCard("a2")
+        let member = model(mine: [agent])
+        let text = "@agent-a2@anna @AGENT-A2@ANNA"
+        let hint = try XCTUnwrap(member.missingAgentMentions(in: text, channel: "c1", catalog: [agent, agent]).first)
+        XCTAssertEqual(hint.address, "agent-a2@anna")
+        XCTAssertTrue(hint.canAdd)
+        XCTAssertEqual(member.missingAgentMentions(in: text, channel: "c1", catalog: [agent, agent]).count, 1)
+        for text in ["`@agent-a2@anna`", "> @agent-a2@anna", "@agent-a2@anna-x", "\\@agent-a2@anna"] {
+            XCTAssertTrue(member.missingAgentMentions(in: text, channel: "c1", catalog: [agent]).isEmpty)
+        }
+        let archived = model(archived: true, mine: [agent])
+        XCTAssertFalse(try XCTUnwrap(archived.missingAgentMentions(in: text, channel: "c1", catalog: [agent]).first).canAdd)
+        let disabled = catalogCard("a2", enabled: false)
+        XCTAssertFalse(try XCTUnwrap(model(mine: [disabled]).missingAgentMentions(in: text, channel: "c1", catalog: [disabled]).first).canAdd)
+        XCTAssertTrue(model(doubt: true, mine: [agent]).missingAgentMentions(in: text, channel: "c1", catalog: [agent]).isEmpty)
+        XCTAssertTrue(model(served: false, mine: [agent]).missingAgentMentions(in: text, channel: "c1", catalog: [agent]).isEmpty)
+        XCTAssertTrue(model(there: [inChannel("a2", owner: me)], mine: [agent]).missingAgentMentions(in: text, channel: "c1", catalog: [agent]).isEmpty)
+        // Organization admins still cannot add somebody else's agent.
+        let admin = model(role: "admin", mine: [])
+        var view = admin.view
+        view.members.append(.init(accountId: CallJSON.boris, handle: "boris", name: "Boris", role: "member"))
+        admin.set(view)
+        let other = catalogCard("b2", owner: CallJSON.boris)
+        let foreign = try XCTUnwrap(admin.missingAgentMentions(in: "@agent-b2@boris", channel: "c1", catalog: [other]).first)
+        XCTAssertFalse(foreign.canAdd)
+        XCTAssertEqual(foreign.guidance, "Ask its owner to add it before requesting an answer.")
+    }
+
     func testWhoMayAddAndRemove() throws {
         let card = ChatChannelCard(channelId: "c1", teamId: team, name: "billing", archived: false, version: 1)
         let mineThere = inChannel("a1", owner: me), theirs = inChannel("b1", owner: CallJSON.boris)

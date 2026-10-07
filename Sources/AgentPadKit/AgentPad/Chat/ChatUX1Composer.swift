@@ -65,13 +65,14 @@ struct ChatUX1Composer: View {
         guard let version, mentionOnly || called.isEmpty || !tooMuchContext else { return }
         if model.send(text, root: root, members: mentionable, agents: agents, draftVersion: version, mentionOnly: mentionOnly, context: context) {
             text = ""; self.version = nil; selection = NSRange(location: 0, length: 0); contextIds = []; mentionOnly = false
+            control.clearAfterSend()
         }
     }
     private func choose(_ candidate: ChatMentionCandidate) {
         guard let token else { return }
         let inserted = "@\(candidate.address) "
         control.replace(token.range, with: inserted)
-        if candidate.addToChannel, let id = candidate.agentId { add(id) }
+        if candidate.addToChannel, let id = candidate.agentId { ChatAgentMembershipHint.add(id, model: model) }
     }
     private func key(_ code: UInt16, _ modifiers: NSEvent.ModifierFlags) -> Bool {
         if code == 53, modifiers.intersection([.command, .control, .option, .shift]).isEmpty, matches.isEmpty {
@@ -191,36 +192,11 @@ struct ChatUX1Composer: View {
                     }.font(.caption)
                 }
             }
-            ForEach(outsideMentions, id: \.agentId) { agent in
-                HStack {
-                    Text("\(agent.name): agent is not in this channel.")
-                    if agent.ownerAccountId == model.key.accountId { Button("Add…") { add(agent.agentId) } }
-                    else { Text("Its owner must add it.") }
-                }.font(.caption)
-            }
+            ChatAgentMembershipHint(model: model, text: text)
     }
 
     private func mode(_ agent: ChatChannelAgent) -> String {
         return model.service.channelCallIsAutomatic(model.key, channel: model.channel, agent: agent)
             ? "will start and publish automatically" : "waits for a decision on the executor Mac"
-    }
-    private var outsideMentions: [ChatAgentCard] {
-        guard org?.agentsVisible == true, let store = model.service.orgSessions[model.key]?.store else { return [] }
-        let there = Set(agents.map(\.agentId))
-        return ((try? store.calls.catalog()) ?? []).filter { agent in
-            !there.contains(agent.agentId) && members.first(where: { $0.accountId == agent.ownerAccountId })
-                .map { ChatMentions.contains("\(agent.name)@\($0.handle)", in: text) } == true
-        }
-    }
-    private func add(_ id: String) {
-        guard let org, let card, let agent = org.addableAgents(card).first(where: { $0.agentId == id }) else { return }
-        let message = ChatOrgSidebarSection.addAgentText(agent, team: org.channelTeam(card)?.name ?? "this channel",
-            fromSession: model.service.localAgent(id)?.isSession == true)
-        Task { @MainActor in
-            guard await ChatOrgWindow.confirm("Add \(agent.name) to #\(card.name)?", message, "Add", while: {
-                org.isCurrent() && org.addableAgents(card).contains { $0.agentId == id }
-            }) else { return }
-            try? org.addAgent(id, to: card)
-        }
     }
 }

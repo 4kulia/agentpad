@@ -6,6 +6,29 @@ enum ChatSidebarActions {
     // the team, the channel or the rights are gone it closes as cancelled
     // and keeps nothing it showed (review F2-p1-2; `ChatOrgWindow.ask`).
 
+    static func askAgent(_ target: ChatSidebarAgentActions, _ model: ChatOrgModel) {
+        let valid: @MainActor () -> Bool = {
+            target.canAsk(in: model) && TeamService.shared.calls.serverKey == target.key
+        }
+        Task { @MainActor in
+            guard valid() else {
+                await TeamUI.showError("This agent is no longer available", nil); return
+            }
+            guard let prompt = await ChatOrgWindow.ask("Ask \(target.agent.name)",
+                "A personal request to this agent. Its owner may need to allow it; the answer appears in Team calls.",
+                "Send request", field: "", while: valid), valid() else { return }
+            do {
+                try target.submitAsk(in: model, resolve: { address in
+                    guard let catalog = ChatService.shared.orgSessions[target.key]?.store?.calls else { throw TeamError.notConnected }
+                    return try catalog.queue.read { try ChatCallStore.resolve($0, address: address).agentId }
+                }, send: { address in
+                    _ = try TeamService.shared.calls.ask(address, prompt: prompt, threadId: nil, origin: nil, area: .some(target.key))
+                })
+                TeamWindows.showCalls()
+            } catch { await TeamUI.showError("The request was not sent", error) }
+        }
+    }
+
     static func newChannel(in team: ChatOrgView.Team, _ model: ChatOrgModel, navigation: ChatSidebarNavigation) {
         let id = team.teamId
         let valid: @MainActor () -> Bool = { model.isCurrent() && model.channelTeams.contains { $0.teamId == id && model.canCreateChannel(in: $0) } }

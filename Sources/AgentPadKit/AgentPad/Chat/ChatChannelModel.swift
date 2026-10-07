@@ -83,6 +83,7 @@ final class ChatChannelModel {
     private var editDrafts: [String: Editing] = [:]
     private var editOrder: [String] = []
     private(set) var b1: ChatB1Channel?
+    let pins = ChatPinsPresentation()
     @ObservationIgnored private var draftObservation: AnyDatabaseCancellable?
     @ObservationIgnored private var editingObservations: [String: AnyDatabaseCancellable] = [:]
     /// F5: the requests to agents in the thread open.
@@ -468,7 +469,8 @@ final class ChatChannelModel {
     }
 
     private func updateB1Window() {
-        guard accessConfirmed, !reading.isEmpty else { b1?.hide(); return }
+        guard accessConfirmed else { b1?.hide(); return }
+        guard !reading.isEmpty else { b1?.hideMetadata(); return }
         let visible = (reading.contains("") ? feed.messages : []) + (threadRoot.map { reading.contains($0) } == true ? thread : [])
         b1?.show(Set(visible.filter { $0.hasFixed && $0.seq != nil }.map(\.messageId)))
     }
@@ -514,11 +516,13 @@ final class ChatChannelModel {
                 markConversationRead(root: root)
                 return true
             }
-            let id = try service.post(key, channel: channel, root: root, text: text, mentions: Self.mentions(in: text, members: members))
+            let id = try service.post(key, channel: channel, root: root, text: text,
+                                      mentions: Self.mentions(in: text, members: members), draftVersion: draftVersion)
             problem = nil
             markConversationRead(root: root)
-            saveDraft("", root: root)
+            if draftVersion == nil { saveDraft("", root: root) }
             for agent in mentionOnly ? [] : ChatChannelAsk.asked(in: text, agents: agents) {
+                guard !offers.contains(where: { $0.messageId == id && $0.agentId == agent.agentId }) else { continue }
                 offers.append(.init(messageId: id, agentId: agent.agentId, address: agent.address ?? agent.name, text: text, root: root ?? id))
             }
             return true

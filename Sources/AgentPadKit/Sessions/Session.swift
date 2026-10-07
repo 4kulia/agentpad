@@ -160,6 +160,8 @@ final class Session: Identifiable {
     /// drops, so `wireSessionCallbacks` consumers (Codex usage monitor)
     /// don't have to re-derive any gate. Runtime-only.
     var resumedConversationId: String?
+    /// AgentPad: runtime export binding, separate from persisted/monitored IDs.
+    var answerBinding: AgentAnswerSource.Binding?
     /// Exit status of the most recent command — populated from libghostty's
     /// `OSC 133;D` event. `nil` until the shell reports its first finish (or
     /// when it omits the exit field). Not persisted: each launch starts fresh.

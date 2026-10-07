@@ -206,6 +206,7 @@ struct ChatMessageRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 ChatMentionText(markdown: message.text, addresses: mentionable.map(\.handle)
                     + (ChatOrgCurrent.shared.model?.agents(in: message.channelId).compactMap(\.address) ?? []), fontSize: inThread ? 13 : 14)
+                ChatAgentMembershipHint(model: model, text: message.text)
                 if message.stale != nil { Text("updating…").foregroundStyle(.secondary).font(.caption) }
             }
         }

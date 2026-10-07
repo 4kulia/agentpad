@@ -48,13 +48,17 @@ if the default has updated: an unprobed version waits for local owner approval.
 An explicit path never falls back to a different installation, and the normal
 native-file and version checks still apply.
 
-`IsolatedClaudeFixture` supplies a temporary project and AgentPad profile, passes
-`CLAUDE_CONFIG_DIR` explicitly to both the version probe and executor, and points
+`IsolatedClaudeFixture` supplies a temporary project, HOME and AgentPad profile,
+passes `HOME`, `CFFIXED_USER_HOME` and `CLAUDE_CONFIG_DIR` explicitly to both the version probe and executor, and points
 all session-history reads and copies at that configuration's `projects` directory.
 It uses an in-memory version-approval store. Removing a fixture removes only its
 own temporary project/profile; the operator-owned authenticated test configuration
 is retained for later scenarios. The production environment allowlist does not
 inherit `CLAUDE_CONFIG_DIR` or authentication variables from the caller.
+The isolated profile's `projects` directory must not be a symlink. Server-only
+ChatLive scenarios (including F5/F6 stand-ins) refuse unconfigured execution;
+their TeamCalls history roots also stay in the temporary test directory.
+No existing personal sessions are read or deleted.
 
 UX1 live checks require a deployment advertising `chat.channel_ux1` and
 `chat.session_tools`. After deployment, verify feed/thread routing, local self

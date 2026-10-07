@@ -32,52 +32,25 @@ struct ChatChannelView: View {
         GeometryReader { geometry in
             if let model {
                 let narrow = geometry.size.width < 784
+                let pinsAvailable = model.b1?.supports("chat.pins") == true
+                let pinsShown = pinsAvailable && model.pins.isPresented
+                let coversConversation = pinsAvailable && model.pins.coversConversation(width: geometry.size.width)
                 HSplitView {
-                    if !narrow || model.threadRoot == nil {
-                        VStack(spacing: 0) {
-                            header(model)
-                            if let ownerModel { ChatChannelOwnerPanel(model: ownerModel) }
-                            if model.searching { ChatLocalSearch(model: model) }
-                            ChatTimelineView(model: model, root: nil, members: members, mentionable: mentionable,
-                                             me: key.accountId, archived: card.archived, ownerModel: ownerModel)
-                            if !card.archived { ChatAskStrip(model: model, agents: agents) }
-                            composer(model, root: nil)
-                        }.frame(minWidth: narrow ? 0 : 440)
+                    if !coversConversation {
+                        conversationPanes(model, narrow: narrow, pinsShown: pinsShown, width: geometry.size.width)
                     }
-                    if let root = model.threadRoot {
-                        VStack(spacing: 0) {
-                            HStack(spacing: 8) {
-                                if narrow {
-                                    ChatIconButton(title: "Back to #\(card.name)", symbol: "chevron.left") { model.openThread(nil) }
-                                }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Thread").font(Theme.display(14, weight: .semibold))
-                                    if let b1 = model.b1, b1.supports("chat.thread_summary"), let summary = b1.state.metadata[root]?.threadSummary {
-                                        Text(summary.label).font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
-                                    }
-                                }
-                                Text("· #\(card.name)").font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
-                                if narrow { connectionStatus }
-                                Spacer(minLength: 0)
-                                if narrow && model.hasNavigationReturn {
-                                    ChatIconButton(title: "Back to reading", symbol: "arrow.uturn.backward") { model.returnFromNavigation() }
-                                }
-                                if narrow {
-                                    ChatIconButton(title: "Search loaded history (⌘F)", symbol: "magnifyingglass") { model.setSearching(!model.searching) }
-                                        .keyboardShortcut("f", modifiers: .command)
-                                }
-                                ChatIconButton(title: "Close thread", symbol: "xmark") { model.openThread(nil) }
-                                if narrow { pinsButton(model) }
-                                ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markThreadRead(root) }
-                            }.padding(.horizontal, 18).frame(height: 64)
-                                .overlay(alignment: .bottom) { Rectangle().fill(Theme.chromeHairline).frame(height: 1) }
-                            if narrow && model.searching { ChatLocalSearch(model: model) }
-                            ChatTimelineView(model: model, root: root, members: members, mentionable: mentionable,
-                                             me: key.accountId, archived: card.archived, ownerModel: ownerModel).id(root)
-                            composer(model, root: root).id(root)
-                        }.frame(minWidth: narrow ? 0 : 300, idealWidth: 344, maxWidth: narrow ? .infinity : 480)
-                            .background(ChatThreadSplitPosition(enabled: !narrow))
+                    if pinsShown, let b1 = model.b1 {
+                        ChatPinnedMessages(b1: b1, model: model, members: members, width: geometry.size.width)
+                            .frame(minWidth: coversConversation ? 0 : 340, idealWidth: 400,
+                                   maxWidth: coversConversation ? .infinity : 520)
                     }
+                }
+                .onAppear { model.b1?.showPins(pinsAvailable) }
+                .onDisappear { model.b1?.showPins(false) }
+                .onChange(of: model.b1.map { ObjectIdentifier($0) }) { _, _ in model.b1?.showPins(pinsAvailable) }
+                .onChange(of: pinsAvailable) { _, available in model.b1?.showPins(available) }
+                .onChange(of: model.b1?.state.pins) { old, new in
+                    model.pins.reconcile(old: ChatPins.ordered(old ?? []), new: ChatPins.ordered(new ?? []))
                 }
                 .onChange(of: model.focusRequest) { _, request in
                     if narrow, request?.area == .feed { model.openThread(nil) }
@@ -94,12 +67,62 @@ struct ChatChannelView: View {
         .onChange(of: model?.channel) { _, _ in navigatePending() }
     }
 
-    private func navigatePending() {
-        guard let model, let target = ChatMessageNavigation.take(key: key, channel: card.channelId, from: window.view) else { return }
-        model.navigate(to: target)
+    @ViewBuilder private func conversationPanes(_ model: ChatChannelModel, narrow: Bool, pinsShown: Bool, width: Double) -> some View {
+        if !narrow || model.threadRoot == nil || pinsShown {
+            VStack(spacing: 0) {
+                header(model)
+                if let b1 = model.b1, b1.supports("chat.pins") {
+                    ChatPinBanner(b1: b1, model: model, members: members, width: width)
+                }
+                if let ownerModel { ChatChannelOwnerPanel(model: ownerModel) }
+                if model.searching { ChatLocalSearch(model: model) }
+                ChatTimelineView(model: model, root: nil, members: members, mentionable: mentionable,
+                                 me: key.accountId, archived: card.archived, ownerModel: ownerModel)
+                if !card.archived { ChatAskStrip(model: model, agents: agents) }
+                composer(model, root: nil)
+            }.frame(minWidth: narrow ? 0 : 440)
+        }
+        if let root = model.threadRoot, !pinsShown {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    if narrow {
+                        ChatIconButton(title: "Back to #\(card.name)", symbol: "chevron.left") { model.openThread(nil) }
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Thread").font(Theme.display(14, weight: .semibold))
+                        if let b1 = model.b1, b1.supports("chat.thread_summary"), let summary = b1.state.metadata[root]?.threadSummary {
+                            Text(summary.label).font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                        }
+                    }
+                    Text("· #\(card.name)").font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
+                    if narrow { connectionStatus }
+                    Spacer(minLength: 0)
+                    if narrow && model.hasNavigationReturn {
+                        ChatIconButton(title: "Back to reading", symbol: "arrow.uturn.backward") { model.returnFromNavigation() }
+                    }
+                    if narrow {
+                        ChatIconButton(title: "Search loaded history (⌘F)", symbol: "magnifyingglass") { model.setSearching(!model.searching) }
+                            .keyboardShortcut("f", modifiers: .command)
+                    }
+                    ChatIconButton(title: "Close thread", symbol: "xmark") { model.openThread(nil) }
+                    if narrow { pinsButton(model) }
+                    ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markThreadRead(root) }
+                }.padding(.horizontal, 18).frame(height: 64)
+                    .overlay(alignment: .bottom) { Rectangle().fill(Theme.chromeHairline).frame(height: 1) }
+                if narrow && model.searching { ChatLocalSearch(model: model) }
+                ChatTimelineView(model: model, root: root, members: members, mentionable: mentionable,
+                                 me: key.accountId, archived: card.archived, ownerModel: ownerModel).id(root)
+                composer(model, root: root).id(root)
+            }.frame(minWidth: narrow ? 0 : 300, idealWidth: 344, maxWidth: narrow ? .infinity : 480)
+                .background(ChatThreadSplitPosition(enabled: !narrow))
+        }
     }
 
-    @State private var showingPins = false
+    private func navigatePending() {
+        guard let model, let target = ChatMessageNavigation.take(key: key, channel: card.channelId, from: window.view) else { return }
+        model.pins.close()
+        model.navigate(to: target)
+    }
 
     private func header(_ model: ChatChannelModel) -> some View {
         HStack(spacing: 12) {
@@ -108,6 +131,9 @@ struct ChatChannelView: View {
                 if let team { Text(team).font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary) }
             }
             Spacer(minLength: 0)
+            if model.pins.returnsToPins {
+                ChatIconButton(title: "Back to pinned messages", symbol: "pin.fill") { model.pins.open() }
+            }
             if model.hasNavigationReturn {
                 ChatIconButton(title: "Back to reading", symbol: "arrow.uturn.backward") { model.returnFromNavigation() }
             }
@@ -128,8 +154,12 @@ struct ChatChannelView: View {
 
     @ViewBuilder private func pinsButton(_ model: ChatChannelModel) -> some View {
         if let b1 = model.b1, b1.supports("chat.pins") {
-            ChatIconButton(title: "Pinned messages", symbol: "pin") { showingPins.toggle() }
-                .popover(isPresented: $showingPins) { ChatPinnedMessages(b1: b1, model: model, members: members) { showingPins = false } }
+            Button {
+                if model.pins.isPresented { model.pins.close() } else { model.pins.open() }
+            } label: {
+                Label("Pinned \(b1.state.pins?.count ?? 0)", systemImage: "pin")
+                    .font(Theme.display(11, weight: .medium)).lineLimit(1)
+            }.buttonStyle(.borderless).chatFocusRing().help("All pinned messages")
         }
     }
 

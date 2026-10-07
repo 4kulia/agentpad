@@ -24,6 +24,7 @@ final class ChatB1Sync {
     private var stopped = false
     private var active = false
     private var candidates: [String: Task<Void, Never>] = [:]
+    private var replyConfirmationVersion = 0
     var retryDelay: (Int) -> TimeInterval = { min(60, pow(2, Double($0))) }
 
     init(key: ChatOrgKey, store: ChatStore, api: ChatAPI, token: String, socket: ChatSocket) {
@@ -126,6 +127,7 @@ final class ChatB1Sync {
         }
         if capabilities.contains("chat.thread_participation"), valid(epoch),
            let ticket = try readDB({ try Int.fetchOne($0, sql: "SELECT ticket FROM b1_participation WHERE dirty = 1") }) {
+            let confirmations = replyConfirmationVersion
             var items: [ChatB1.Participation] = [], after: String?, head: Int?
             var seen = Set<String>()
             do {
@@ -136,6 +138,10 @@ final class ChatB1Sync {
                     head = page.memberHead; items += page.items; after = page.next
                     if let after, !seen.insert(after).inserted { throw ChatAPIError.unexpectedAnswer("Repeated participation cursor") }
                 } while after != nil
+                // A point check completed after this pass began. Its reply may
+                // be absent from the older member snapshot, before the member
+                // signal arrives. Read again before withdrawing any notices.
+                guard confirmations == replyConfirmationVersion else { again = true; return }
                 let applied = try writeDB { try ChatB1.applyThreads($0, items: items, head: head ?? 0, token: scope, ticket: ticket) }
                 if !applied { throw ChatAPIError.unexpectedAnswer("Participation changed while loading") }
             } catch { try await handle(error, channel: nil, epoch: epoch, scope: scope, required: ["chat.thread_participation"]) }
@@ -208,10 +214,13 @@ final class ChatB1Sync {
                     guard self.valid(epoch), self.canNotify(channel) else { return }
                     let fresh = try self.readDB { db in
                         try ChatB1.readToken(db, channel: channel) == scope &&
-                            answer.asOfSeq >= (Int.fetchOne(db, sql: "SELECT MAX(invalidated) FROM b1_metadata WHERE channel_id = ?", arguments: [channel]) ?? 0)
+                            answer.asOfSeq >= (Int.fetchOne(db, sql: "SELECT seq FROM b1_reply_heads WHERE channel_id = ?", arguments: [channel]) ?? 0)
                     }
                     if fresh {
-                        if answer.eligibleForReply { self.onEligible(channel, id) }
+                        if answer.eligibleForReply {
+                            self.replyConfirmationVersion += 1
+                            self.onEligible(channel, id)
+                        }
                         return
                     }
                 } catch {

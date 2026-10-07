@@ -18,7 +18,7 @@ struct ClaudeExecutable: Codable, Hashable, Sendable {
 
     static func inspect(_ selected: String) throws -> Self {
         func unavailable() -> TeamRunnerError {
-            .didNotStart("Выбранный Claude Code недоступен: \(selected)")
+            .didNotStart(ClaudeLaunchDiagnostic(version: nil, exitCode: nil, fallback: .unavailable).message)
         }
         guard selected.hasPrefix("/") else { throw unavailable() }
         let resolved = URL(fileURLWithPath: selected).resolvingSymlinksInPath().path
@@ -32,7 +32,8 @@ struct ClaudeExecutable: Codable, Hashable, Sendable {
         guard read(fd, &magic, 4) == 4,
               [0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe,
                0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca].contains(magic) else {
-            throw TeamRunnerError.didNotStart("Укажите конечный нативный бинарник Claude Code: \(selected)")
+            throw TeamRunnerError.didNotStart("Укажите конечный нативный бинарник Claude Code. "
+                + ClaudeLaunchDiagnostic(version: nil, exitCode: nil, fallback: .spawn).message)
         }
         return Self(selectedPath: selected, file: File(
             resolvedPath: resolved, device: info.st_dev, inode: info.st_ino, size: info.st_size,
@@ -268,7 +269,7 @@ enum ClaudeVersionCommand {
 
     static func read(_ executable: ClaudeExecutable, request: TeamRunRequest, timeout: Duration,
                      timing: TeamRunStop.Timing = .init(grace: .milliseconds(200), killWait: .seconds(1), output: .seconds(1)),
-                     isolatedConfigDirectory: URL? = nil) async throws -> String {
+                     isolatedConfigDirectory: URL? = nil, isolatedHomeDirectory: URL? = nil) async throws -> String {
         try ClaudeVersionPreflight.checkCancellation()
         let input = Pipe(), output = Pipe(), errors = Pipe()
         let woke = TeamExit(), exited = TeamExit(), outDone = TeamExit(), errDone = TeamExit()
@@ -288,9 +289,12 @@ enum ClaudeVersionCommand {
         do {
             spawned = try TeamSpawn.suspended(
                 path: executable.file.resolvedPath, arguments: ["--version"],
-                environment: try environment(executable: executable.file.resolvedPath, request: request, isolatedConfigDirectory: isolatedConfigDirectory),
+                environment: try environment(executable: executable.file.resolvedPath, request: request,
+                                             isolatedConfigDirectory: isolatedConfigDirectory, isolatedHomeDirectory: isolatedHomeDirectory),
                 directory: request.agent.folder, stdin: input, stdout: output, stderr: errors)
-        } catch { throw unreadable }
+        } catch {
+            throw TeamRunnerError.didNotStart(ClaudeLaunchDiagnostic(version: nil, exitCode: nil, fallback: .spawn).message)
+        }
         try? input.fileHandleForWriting.close()
         spawned.onExit { exited.finish($0); woke.finish(1) }
         let seen = TeamPidSet()
@@ -325,13 +329,17 @@ enum ClaudeVersionCommand {
             throw TeamRunnerError.didNotStart("Не удалось записать завершение проверки версии Claude Code: \(error.localizedDescription)")
         }
         try ClaudeVersionPreflight.checkCancellation()
-        guard registered, recordingError == nil, ended == 1, let code = exited.exitCode else { throw unreadable }
-        return try bytes.version(exitCode: code)
+        guard registered, recordingError == nil, ended == 1, let code = exited.exitCode else {
+            throw bytes.failure(exitCode: exited.exitCode, timedOut: ended == nil)
+        }
+        do { return try bytes.version(exitCode: code) }
+        catch { throw bytes.failure(exitCode: code) }
     }
 
-    static func environment(executable: String, request: TeamRunRequest, isolatedConfigDirectory: URL?) throws -> [String: String] {
+    static func environment(executable: String, request: TeamRunRequest, isolatedConfigDirectory: URL?,
+                            isolatedHomeDirectory: URL? = nil) throws -> [String: String] {
         let runner = ClaudeCodeRunner(claudePath: executable, sessionFilesRoot: isolatedConfigDirectory?.appendingPathComponent("projects") ?? TeamSessionFiles.root,
-                                      isolatedConfigDirectory: isolatedConfigDirectory)
+                                      isolatedConfigDirectory: isolatedConfigDirectory, isolatedHomeDirectory: isolatedHomeDirectory)
         return try runner.executionEnvironment(claudePath: executable, isolateGit: !request.agent.access.takesCommands,
                                                 ownersPath: request.agent.access.runsShell)
     }
@@ -339,6 +347,7 @@ enum ClaudeVersionCommand {
     private final class VersionBytes: @unchecked Sendable {
         private let lock = NSLock()
         private var output = Data()
+        private var errors = Data()
         private var count = 0
         private var overflow = false
         func append(_ data: Data, isError: Bool) -> Bool {
@@ -346,11 +355,21 @@ enum ClaudeVersionCommand {
                 count += data.count
                 overflow = overflow || count > 4096
                 if !isError, !overflow { output.append(data) }
+                if isError, !overflow { errors.append(data) }
                 return overflow
             }
         }
         func version(exitCode: Int32) throws -> String {
             try lock.withLock { try ClaudeVersionCommand.parse(output, exitCode: exitCode, overflow: overflow) }
+        }
+        func failure(exitCode: Int32?, timedOut: Bool = false) -> TeamRunnerError {
+            lock.withLock {
+                let diagnostic = ClaudeLaunchDiagnostic(
+                    version: try? ClaudeVersionCommand.parse(output, exitCode: 0, overflow: overflow),
+                    exitCode: timedOut ? nil : exitCode,
+                    output: String(decoding: errors, as: UTF8.self), fallback: .version)
+                return .didNotStart(diagnostic.message + (timedOut ? " Время ожидания истекло." : ""))
+            }
         }
     }
 }

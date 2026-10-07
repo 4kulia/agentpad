@@ -525,6 +525,124 @@ final class ChatUX1Tests: XCTestCase {
         XCTAssertEqual(m.draft(root: nil), "two")
     }
 
+    func testLegacySendSharesAttemptAcrossWindowsAndKeepsNewerDraft() async throws {
+        let f = try await fixture(), a = model(f), b = model(f)
+        f.service.serverCapabilities[f.key.server] = []
+        for root in [nil, thread] as [String?] {
+            a.saveDraft("как дела?", root: root)
+            let version = try XCTUnwrap(a.draftVersion(root: root))
+            XCTAssertTrue(a.send("как дела?", root: root, members: [], draftVersion: version))
+            b.saveDraft("Next question", root: root)
+            for _ in 0..<3 { XCTAssertTrue(b.send("как дела?", root: root, members: [], draftVersion: version)) }
+            XCTAssertEqual(b.draft(root: root), "Next question")
+            XCTAssertEqual(try f.store.outbox.commands().filter {
+                $0.type == "message.post" && ChatService.args($0)["thread_root_id"]?.string == root
+            }.count, 1)
+            b.saveDraft("как дела?", root: root)
+            let next = try XCTUnwrap(b.draftVersion(root: root))
+            XCTAssertNotEqual(next, version)
+            XCTAssertTrue(b.send("как дела?", root: root, members: [], draftVersion: next))
+        }
+        XCTAssertEqual(try f.store.outbox.commands().filter { $0.type == "message.post" }.count, 4)
+        a.saveDraft("one", root: nil)
+        let stale = try XCTUnwrap(a.draftVersion(root: nil))
+        b.saveDraft("two", root: nil)
+        XCTAssertFalse(a.send("one", root: nil, members: [], draftVersion: stale))
+        XCTAssertEqual(b.draft(root: nil), "two")
+        XCTAssertEqual(try f.store.outbox.commands().filter { $0.type == "message.post" }.count, 4)
+    }
+
+    func testNativeRapidSendClearsEditorBeforeNextKeystroke() async throws {
+        for ux1 in [false, true] {
+            let f = try await fixture(), model = model(f)
+            if !ux1 { f.service.serverCapabilities[f.key.server] = [] }
+            model.saveDraft("как дела?", root: nil)
+            let host = NSHostingView(rootView: ChatUX1Composer(model: model, root: nil, members: [], mentionable: [], agents: [])
+                .frame(width: 700, height: 320))
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 320), styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false; window.contentView = host
+            defer { window.contentView = nil; window.close() }
+            func editors(_ view: NSView) -> [ChatMentionEditor.Editor] {
+                (view as? ChatMentionEditor.Editor).map { [$0] } ?? view.subviews.flatMap(editors)
+            }
+            host.layoutSubtreeIfNeeded()
+            try await wait { editors(host).first?.string == "как дела?" }
+            let editor = try XCTUnwrap(editors(host).first)
+            // No run-loop turn between the send and the repeated keyboard/button action.
+            let send = try XCTUnwrap(editor.consume)
+            XCTAssertTrue(send(36, .command))
+            XCTAssertEqual(editor.string, "", "the native editor must clear in the send action itself")
+            for _ in 0..<4 { XCTAssertTrue(send(36, .command)) }
+            XCTAssertEqual(try f.store.outbox.commands().filter { $0.type == "message.post" }.count, 1)
+            editor.insertText("Next", replacementRange: editor.selectedRange())
+            XCTAssertEqual(model.draft(root: nil), "Next", "typing before SwiftUI redraw must not resurrect sent text")
+            XCTAssertTrue(send(36, .command))
+            XCTAssertEqual(try f.store.outbox.commands().filter { $0.type == "message.post" }.count, 2)
+        }
+    }
+
+    func testNativeChatPolishSnapshots() async throws {
+        guard let output = ProcessInfo.processInfo.environment["AGENTPAD_CHAT_POLISH_CAPTURE"] else { throw XCTSkip("Native screenshots are opt-in") }
+        _ = NSApplication.shared
+        let f = try await fixture(), model = model(f)
+        try f.write("DELETE FROM agent_channels")
+        try f.write("INSERT OR REPLACE INTO agents_catalog (agent_id, owner_account_id, name, description, access, enabled, available) VALUES (?, ?, 'billing', '', 'read', 1, 1)", [CallJSON.agent, f.key.accountId])
+        ChatOrgCurrent.shared.refresh(f.service)
+        defer { ChatOrgCurrent.shared.refresh() }
+        let org = try XCTUnwrap(ChatOrgCurrent.shared.model)
+        let settings = AgentPadSettingsModel.shared
+        let previous = (settings.appearanceMode, settings.lightTerminalThemeSelection, settings.darkTerminalThemeSelection)
+        defer { settings.appearanceMode = previous.0; settings.lightTerminalThemeSelection = previous.1; settings.darkTerminalThemeSelection = previous.2 }
+        settings.lightTerminalThemeSelection = AgentPadSettingsModel.defaultLightThemeSelection
+        settings.darkTerminalThemeSelection = AgentPadSettingsModel.defaultDarkThemeSelection
+        for (name, dark, foreign, sending) in [
+            ("agent-membership-light", false, false, false), ("agent-membership-dark", true, false, false),
+            ("agent-membership-owner-required", false, true, false), ("send-once-light", false, false, true)
+        ] {
+            try f.write("UPDATE agents_catalog SET owner_account_id = ?", [foreign ? CallJSON.boris : f.key.accountId])
+            try f.write("DELETE FROM messages")
+            let text = sending ? "как дела?" : "@billing@\(foreign ? "boris" : "anna") Could you check this question?"
+            if !sending { _ = try message(f, id: "question", text: text) }
+            model.saveDraft(text, root: nil)
+            try await wait { sending ? model.feed.messages.isEmpty : model.feed.messages.first?.text == text }
+            settings.appearanceMode = dark ? .dark : .light
+            func content() -> some View { VStack(alignment: .leading, spacing: 0) {
+                Text("# billing").font(Theme.display(18, weight: .semibold)).padding(24)
+                Divider()
+                ForEach(model.feed.messages) { shown in
+                    ChatMessageRow(model: model, message: shown, members: org.view.members, mentionable: [], me: f.key.accountId,
+                                   archived: false, replies: 0)
+                }
+                Spacer()
+                Divider()
+                ChatUX1Composer(model: model, root: nil, members: org.view.members, mentionable: [], agents: [])
+            }.frame(width: 740, height: 570).background(ChatAppearance.surface).foregroundStyle(Theme.chromeForeground)
+                .environment(\.colorScheme, dark ? .dark : .light)
+            }
+            let host = NSHostingView(rootView: content())
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 740, height: 570), styleMask: [.borderless], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false; window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+            window.contentView = host; window.orderFront(nil)
+            defer { window.contentView = nil; window.close() }
+            func editors(_ view: NSView) -> [ChatMentionEditor.Editor] {
+                (view as? ChatMentionEditor.Editor).map { [$0] } ?? view.subviews.flatMap(editors)
+            }
+            try await wait { editors(host).first?.string == text }
+            if sending {
+                let send = try XCTUnwrap(editors(host).first?.consume)
+                for _ in 0..<4 { XCTAssertTrue(send(36, .command)) }
+                XCTAssertEqual(try f.store.outbox.commands().filter { $0.type == "message.post" }.count, 1)
+                try await wait { model.feed.messages.count == 1 && editors(host).first?.string == "" }
+                host.rootView = content()
+            }
+            try await Task.sleep(for: .milliseconds(300)); host.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to:
+                URL(fileURLWithPath: output).appendingPathComponent("r115-\(name).png"))
+        }
+    }
+
     func testCallDependsOnMessageACKAndHasFixedSourceRoute() async throws {
         let f = try await fixture(), sent = try send(f)
         let commands = try f.store.outbox.commands()
@@ -1055,7 +1173,7 @@ final class ChatUX1Tests: XCTestCase {
         let publishedSurface = UUID()
         try f.service.bindPublication(f.key, agent: CallJSON.agent, surface: publishedSurface)
         let input = try JSONSerialization.data(withJSONObject: ["surface": tab.id.uuidString, "kind": "conversationId", "conversationId": f.agent.sessionId!])
-        guard case .conversationId(let forged, let surface) = HookServer.parseMessage(input) else { return XCTFail("hook not parsed") }
+        guard case .conversationId(let forged, let surface, _) = HookServer.parseMessage(input) else { return XCTFail("hook not parsed") }
         workspace.applyConversationId(conversationId: forged, sessionId: surface)
         XCTAssertEqual(tab.conversationId, f.agent.sessionId, "the real B model has the forged A UUID")
         let processes: [SessionProcessScanner.Raw] = [

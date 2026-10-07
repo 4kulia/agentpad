@@ -130,7 +130,7 @@ final class WorkspaceStore {
     /// the left sidebar's three modes (full / compact / hidden). The content is
     /// the global `AgentMonitor`; each window toggles its own panel. Defaults
     /// to hidden since it's opt-in.
-    var rightSidebarMode: SidebarMode = .full
+    var rightSidebarMode: SidebarMode = .hidden
     /// Left sidebar's middle content — workspace list or file tree. Persisted
     /// like `sidebarMode`; the footer toggle in `SidebarView` flips it.
     var sidebarContent: SidebarContent = .files
@@ -1849,6 +1849,9 @@ final class WorkspaceStore {
                 session.agent = .terminal
             }
         } else if session.agent.isShell {
+            // AgentPad: a new agent must report its own journal and process.
+            session.answerBinding = nil
+            session.resumedConversationId = nil
             // Includes the default Terminal *and* any TerminalPreset — a
             // user starting Claude inside a preset terminal should get
             // the same icon-upgrade the default Terminal does.
@@ -1890,7 +1893,15 @@ final class WorkspaceStore {
         refreshEnvironment(for: session)
     }
 
-    /// Stores the conversation id reported by an agent's hook payload onto
+    /// AgentPad: only a hook can establish export provenance; monitors call
+    /// applyConversationId directly and only update the resumable history ID.
+    func applyHookConversationId(conversationId: String, sessionId: UUID, provenance: AgentAnswerProvenance? = nil) {
+        guard let session = hookSession(id: sessionId) else { return }
+        AgentAnswerSource.recordHook(conversation: conversationId, session: session, provenance: provenance)
+        applyConversationId(conversationId: conversationId, sessionId: sessionId)
+    }
+
+    /// Stores the conversation id reported by an agent's hook or monitor onto
     /// the originating Session and schedules a save so the value survives
     /// across AgentPad launches. Same-value writes are dropped so we don't
     /// churn persistence on every hook firing — Claude pings `session_id`
@@ -2166,7 +2177,7 @@ final class WorkspaceStore {
             ? state.activeWorkspaceId
             : workspaces.first?.id
         sidebarMode = state.sidebarMode ?? .full
-        rightSidebarMode = state.rightSidebarMode ?? .full
+        rightSidebarMode = state.rightSidebarDefault115Applied == true ? (state.rightSidebarMode ?? .hidden) : .hidden
         sidebarContent = state.sidebarSelectedContent.flatMap(SidebarContent.init(rawValue:)) ?? state.sidebarContent ?? .files
         chatSidebarPreferences = state.chatSidebarPreferences ?? ChatSidebarPreferences()
         chatSidebarPreferences.width = ChatSidebarPreferences.clampWidth(chatSidebarPreferences.width)
@@ -2434,8 +2445,8 @@ final class WorkspaceStore {
     /// the cross-window attach path passes `session.conversationId` instead,
     /// because a live Codex tab's rollout predates the DESTINATION store's
     /// monitor snapshot and would otherwise be excluded as another session's
-    /// file (the id is reliable there: the source window's monitor backfilled
-    /// it while the tab ran).
+    /// file. AgentPad: this preserves the source monitor's heuristic; it is not
+    /// a verified journal binding for answer export.
     private func wireSessionCallbacks(engine: any TerminalEngine, session: Session, workspace: Workspace, codexRolloutId: String?) {
         // Initial refresh — without these, the status bar stays empty until
         // the user `cd`s or runs a command. Both fetchers silently hide
@@ -2458,6 +2469,18 @@ final class WorkspaceStore {
         // remote absolute path as a coincidentally-existing local file.
         engine.isRemoteSessionProvider = { [weak session] in
             session?.sshWorkspaceHost != nil || session?.remoteHost != nil
+        }
+        engine.onOpenFile = { [weak self, weak session, weak workspace] reference in
+            guard let self, let session, let workspace else { return }
+            self.activateWorkspace(workspace)
+            self.activateTab(session, in: workspace)
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: reference.url.path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                self.revealFileTree(root: reference.url)
+            } else {
+                FilePreviewModel.for(self).open(reference.url, line: reference.line, column: reference.column)
+            }
         }
         engine.onPwdChange = { [weak self, weak session, weak workspace] pwd in
             guard let session else { return }
@@ -2772,7 +2795,8 @@ final class WorkspaceStore {
         // Resolve CODEX_HOME from the session's live shell env (a Dock-launched
         // AgentPad doesn't inherit it; the codex child does). The monitor snapshots
         // existing rollouts on this first call to tell this session's own file
-        // apart from a prior/concurrent run's.
+        // apart from a prior run's. AgentPad: parallel launches in the same cwd
+        // remain ambiguous; this heuristic must never establish export binding.
         let root = CodexUsageMonitor.sessionsRoot(shellEnv: session.shellEnvironment)
         codexUsageMonitor.start(
             sessionId: session.id,
@@ -3002,7 +3026,8 @@ final class WorkspaceStore {
             rightSidebarWidth: Double(rightSidebarWidth),
             collapsedInfoSections: collapsedInfoSections.isEmpty
                 ? nil
-                : collapsedInfoSections.sorted()
+                : collapsedInfoSections.sorted(),
+            rightSidebarDefault115Applied: true
         )
     }
 

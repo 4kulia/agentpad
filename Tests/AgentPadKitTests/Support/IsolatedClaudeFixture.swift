@@ -2,6 +2,13 @@ import Foundation
 import XCTest
 @testable import AgentPadKit
 
+/// Server-only scenarios must explicitly opt in to a fixture before executing.
+struct UnconfiguredLiveRunner: TeamAgentRunner {
+    func run(_ request: TeamRunRequest, onActivity: @escaping @Sendable (String) -> Void) async throws -> TeamRunResult {
+        throw TeamRunnerError.didNotStart("Live tests require an explicitly isolated executor")
+    }
+}
+
 /// Real Claude tests share this contract. The operator prepares an isolated
 /// Claude profile and authenticates it themselves. Tests never copy
 /// credentials, inspect the personal profile, or fall back to it.
@@ -15,8 +22,9 @@ struct IsolatedClaudeFixture: Sendable {
     }
     private let versionStore = VersionStore()
     private let configuredExecutable: String?
-    var executablePath: String? { configuredExecutable ?? ClaudeCodeRunner.locateClaude() }
+    var executablePath: String? { configuredExecutable ?? ClaudeCodeRunner.locateClaude(includeLegacyInstallation: false) }
     let root: URL
+    let home: URL
     let project: URL
     let profile: URL
     let config: URL
@@ -27,6 +35,7 @@ struct IsolatedClaudeFixture: Sendable {
         configuredExecutable = environment["AGENTPAD_LIVE_CLAUDE_EXECUTABLE"]
         let temp = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
         root = temp.appendingPathComponent("agentpad-e2e-run-\(UUID().uuidString)")
+        home = root.appendingPathComponent("home")
         project = root.appendingPathComponent("project")
         profile = root.appendingPathComponent("agentpad-profile")
         if requireAuthentication {
@@ -46,20 +55,26 @@ struct IsolatedClaudeFixture: Sendable {
             }
             config = resolved
         } else { config = root.appendingPathComponent("claude-config") }
-        for folder in [project, profile, projects] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+        guard projects.resolvingSymlinksInPath() == projects.standardizedFileURL else {
+            throw XCTSkip("The isolated Claude projects directory must not be a symlink")
+        }
+        for folder in [home, project, profile, projects] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
     }
 
     func runner(claudePath: String? = nil, preflight: (any ClaudeVersionChecking)? = nil) -> ClaudeCodeRunner {
         let isolatedPreflight = preflight ?? self.preflight()
         return ClaudeCodeRunner(claudePath: claudePath ?? executablePath ?? "/nonexistent/isolated-claude",
-                                preflight: isolatedPreflight, sessionFilesRoot: projects, isolatedConfigDirectory: config)
+                                preflight: isolatedPreflight, sessionFilesRoot: projects, isolatedConfigDirectory: config,
+                                isolatedHomeDirectory: home)
     }
 
     func preflight(configuration: String = ClaudeVersionMatrix.configuration,
                    approvals: (@MainActor @Sendable () -> ClaudeVersionApprovals)? = nil) -> ClaudeVersionPreflight {
         let config = config
+        let home = home
         return ClaudeVersionPreflight(configuration: configuration, readVersion: { executable, request in
-            try await ClaudeVersionCommand.read(executable, request: request, timeout: .seconds(3), isolatedConfigDirectory: config)
+            try await ClaudeVersionCommand.read(executable, request: request, timeout: .seconds(3),
+                                                isolatedConfigDirectory: config, isolatedHomeDirectory: home)
         }, approvals: approvals ?? { versionStore.get() })
     }
 

@@ -40,7 +40,7 @@ final class ChatStoreTests: XCTestCase {
         try ChatStoreMigrations.journal.migrate(journal)
         try cache.read { db in
             XCTAssertEqual(try String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"),
-                           (1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review", "release-14-ux2-thread-read-floor", "release-15-ux2-draft-options", "release-16-conversation-read-marks", "release-17-b1", "release-18-b1-review"])
+                           (1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review", "release-14-ux2-thread-read-floor", "release-15-ux2-draft-options", "release-16-conversation-read-marks", "release-17-b1", "release-18-b1-review", "release-19-chat-reply-heads", "release-20-pin-preferences"])
             for table in ["requests", "agent_channels", "request_contents", "publication_intents", "my_threads", "channel_sends", "channel_call_intents", "session_posts", "thread_read_marks"] {
                 XCTAssertTrue(try db.tableExists(table), table)
             }

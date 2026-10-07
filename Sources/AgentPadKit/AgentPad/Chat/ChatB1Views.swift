@@ -121,48 +121,6 @@ struct ChatReactorsView: View {
     }
 }
 
-struct ChatPinnedMessages: View {
-    let b1: ChatB1Channel
-    let model: ChatChannelModel
-    let members: [ChatOrgView.Member]
-    var dismiss: () -> Void = {}
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Pinned messages").font(Theme.display(14, weight: .semibold))
-            if let error = b1.state.loadError { Text(error); Button("Retry") { b1.retryReads() } }
-            if !b1.state.accessible { Text("Channel unavailable") }
-            else if let pins = b1.state.pins {
-                if pins.isEmpty { Text("No pinned messages").foregroundStyle(ChatAppearance.secondary) }
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(pins) { pin in
-                            Button {
-                                model.navigate(to: ChatMessageLink(key: model.key, channel: b1.channel, message: pin.messageId, sequence: pin.seq))
-                                dismiss()
-                            } label: {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    HStack {
-                                        Image(systemName: "pin.fill").foregroundStyle(ChatAppearance.accent)
-                                        Text(pin.authorAgentName ?? pin.authorSessionName ?? name(pin.authorAccountId)).fontWeight(.semibold)
-                                        if pin.threadRootId != nil { Text("Thread reply").foregroundStyle(ChatAppearance.secondary) }
-                                    }
-                                    Text(pin.excerpt).lineLimit(4).multilineTextAlignment(.leading)
-                                    Text("Pinned by \(name(pin.pinnedBy)) · \(ChatMessageRow.time(pin.pinnedAt))")
-                                        .font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
-                                }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                                    .background(Theme.chromeHover, in: RoundedRectangle(cornerRadius: 8))
-                            }.buttonStyle(.plain).chatFocusRing()
-                        }
-                    }
-                }.frame(maxHeight: 420)
-            } else if b1.state.loadError == nil { ProgressView("Loading pins…").controlSize(.small) }
-        }.font(Theme.display(12)).padding(16).frame(width: 360)
-            .background(ChatAppearance.surface).foregroundStyle(Theme.chromeForeground)
-            .onAppear { b1.showPins(true) }.onDisappear { b1.showPins(false) }
-    }
-    private func name(_ id: String) -> String { members.first { $0.accountId == id }?.name ?? "Former member" }
-}
-
 struct ChatServerReplies: View {
     let summary: ChatB1.Summary
     let members: [ChatOrgView.Member]

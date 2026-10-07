@@ -80,4 +80,29 @@ final class IsolatedClaudeFixtureTests: XCTestCase {
         try Data().write(to: other.appendingPathComponent("agentpad-e2e-ready"))
         XCTAssertThrowsError(try fixture(other))
     }
+
+    func testVersionAndExecutorUseTheFixturesHomeAndConfig() async throws {
+        let isolated = try IsolatedClaudeFixture(environment: [:], requireAuthentication: false, homeDirectory: home)
+        defer { isolated.remove() }
+        let binary = try NativeVersionFixture.make(in: isolated.project)
+        let request = TeamRunRequest(agent: TeamPublishedAgent(name: "isolated", description: "test", folder: isolated.project.path, access: .read),
+                                     prompt: "fixture", sessionId: UUID().uuidString, resume: false, callerName: "test", callerProject: nil)
+        _ = try await isolated.runner(claudePath: binary.path).run(request, onActivity: { _ in })
+        for phase in ["version", "executor"] {
+            let actualHome = try String(contentsOf: isolated.project.appendingPathComponent("\(phase)-home"), encoding: .utf8)
+            XCTAssertTrue(actualHome.hasPrefix(isolated.root.path + "/"))
+            XCTAssertNotEqual(actualHome, home.path)
+            XCTAssertEqual(try String(contentsOf: isolated.project.appendingPathComponent("\(phase)-config"), encoding: .utf8), isolated.config.path)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".claude").path))
+    }
+
+    func testPreparedProfileCannotRedirectHistoryOutsideTheFixture() throws {
+        try FileManager.default.createDirectory(at: persistent, withIntermediateDirectories: true)
+        let outside = home.appendingPathComponent("outside-history")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: persistent.appendingPathComponent("projects"), withDestinationURL: outside)
+        XCTAssertThrowsError(try fixture(persistent))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: outside.path), [])
+    }
 }

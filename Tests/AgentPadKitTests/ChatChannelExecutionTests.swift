@@ -1730,7 +1730,7 @@ final class ChatChannelExecutionTests: XCTestCase {
         let kept = try await cache.read { try String.fetchOne($0, sql: "SELECT name FROM agent_channels WHERE channel_id = ?", arguments: [Self.channel]) }
         XCTAssertEqual(kept, "billing")
         let versions = try await cache.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier") }
-        XCTAssertEqual(versions, ((1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review", "release-14-ux2-thread-read-floor", "release-15-ux2-draft-options", "release-16-conversation-read-marks", "release-17-b1", "release-18-b1-review"]).sorted())
+        XCTAssertEqual(versions, ((1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review", "release-14-ux2-thread-read-floor", "release-15-ux2-draft-options", "release-16-conversation-read-marks", "release-17-b1", "release-18-b1-review", "release-19-chat-reply-heads", "release-20-pin-preferences"]).sorted())
     }
 
 }

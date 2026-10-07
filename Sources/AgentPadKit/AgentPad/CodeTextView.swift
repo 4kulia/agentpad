@@ -10,10 +10,12 @@ struct CodeTextView: NSViewRepresentable {
     let spans: [SyntaxHighlighter.Span]
     /// Changes whenever the file is reloaded, so the view knows to re-render.
     let revision: Int
+    var location: FilePreviewLocation? = nil
 
     final class Coordinator {
         var revision = -1
         var text = ""
+        var locationID: UUID?
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -52,6 +54,12 @@ struct CodeTextView: NSViewRepresentable {
     }
 
     private func apply(to textView: NSTextView, context: Context) {
+        defer {
+            if let location, context.coordinator.locationID != location.id {
+                context.coordinator.locationID = location.id
+                Self.reveal(location, in: textView)
+            }
+        }
         guard context.coordinator.revision != revision || context.coordinator.text != text else { return }
         let sameFileReload = context.coordinator.revision != -1 && !context.coordinator.text.isEmpty
         context.coordinator.revision = revision
@@ -67,6 +75,13 @@ struct CodeTextView: NSViewRepresentable {
             textView.scroll(.zero)
         }
         textView.enclosingScrollView?.verticalRulerView?.needsDisplay = true
+    }
+
+    static func reveal(_ location: FilePreviewLocation, in textView: NSTextView) {
+        let range = location.range(in: textView.string)
+        textView.setSelectedRange(range)
+        textView.scrollRangeToVisible(range)
+        textView.showFindIndicator(for: range)
     }
 }
 

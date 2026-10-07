@@ -25,13 +25,27 @@ extension ChatService {
     /// anywhere (review F3-2). Returns the message id.
     @discardableResult
     func post(_ key: ChatOrgKey, channel: String, root: String?, text: String, mentions: [String],
-              messageId: String = UUID().uuidString.lowercased()) throws -> String {
+              messageId: String = UUID().uuidString.lowercased(), draftVersion: String? = nil) throws -> String {
         guard let store = orgSessions[key]?.store else { throw ChatError.notConnected }
+        if let draftVersion, let sent = try store.queue.read({ try String.fetchOne($0,
+            sql: "SELECT message_id FROM channel_sends WHERE draft_version = ?", arguments: [draftVersion]) }) { return sent }
         let prepared = try prepareCommand(key, type: "message.post", args: Self.postArgs(messageId, channel, root, text, mentions))
         try store.queue.write { db in
+            if let draftVersion {
+                guard try String.fetchOne(db, sql: "SELECT version FROM drafts WHERE channel_id = ? AND thread_root_id = ? AND text = ?",
+                                          arguments: [channel, root ?? "", text]) == draftVersion else {
+                    throw ChatError.storage("The draft changed in another window. Review it before sending.")
+                }
+            }
             try ChatMessages.insertSending(db, id: messageId, channel: channel, root: root, author: key.accountId, text: text,
                                            mentions: mentions, at: Self.now())
             _ = try prepared.table.insert(db, prepared.record, seq: prepared.record.seq)
+            if let draftVersion {
+                try db.execute(sql: "INSERT INTO channel_sends (draft_version, channel_id, thread_root_id, message_id, command_id) VALUES (?, ?, ?, ?, ?)",
+                               arguments: [draftVersion, channel, root, messageId, prepared.record.commandId])
+                try db.execute(sql: "DELETE FROM drafts WHERE channel_id = ? AND thread_root_id = ? AND version = ?",
+                               arguments: [channel, root ?? "", draftVersion])
+            }
         }
         prepared.sent()
         return messageId

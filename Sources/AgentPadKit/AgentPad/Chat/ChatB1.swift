@@ -190,6 +190,14 @@ enum ChatB1 {
         }
         guard event.stream.hasPrefix("channel:") else { return }
         let channel = String(event.stream.dropFirst(8))
+        // Participation checks must observe posts/deletions even when metadata
+        // was already fetched at this head and needs no invalidation.
+        if ["message.post", "message.delete"].contains(event.type) {
+            try db.execute(sql: """
+                INSERT INTO b1_reply_heads (channel_id, seq) VALUES (?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET seq = MAX(seq, excluded.seq)
+                """, arguments: [channel, event.seq])
+        }
         let id = event.body["message_id"]?.string
         if let id { try watch(db, channel: channel, ids: [id]) }
         // post/delete may lack hydration and the root. All watched roots are then stale.
@@ -214,6 +222,7 @@ enum ChatB1 {
         }
         if channel == nil {
             try db.execute(sql: "UPDATE meta SET b1_epoch = b1_epoch + 1 WHERE id = 1")
+            try db.execute(sql: "DELETE FROM b1_reply_heads")
             try db.execute(sql: "DELETE FROM my_threads WHERE (SELECT b1_participation FROM meta WHERE id = 1) = 1")
             try db.execute(sql: "UPDATE b1_participation SET head = -1, invalidated = 0, dirty = 1, ticket = ticket + 1")
         }
@@ -301,7 +310,7 @@ enum ChatB1 {
     static func dropOrphans(_ db: Database) throws {
         try db.execute(sql: "DELETE FROM skipped_events WHERE stream LIKE 'channel:%' AND substr(stream, 9) NOT IN (SELECT channel_id FROM channels)")
         try cancelIntents(db, condition: "channel_id NOT IN (SELECT channel_id FROM channels)")
-        for table in ["b1_metadata", "b1_pins"] {
+        for table in ["b1_metadata", "b1_pins", "b1_reply_heads"] {
             try db.execute(sql: "DELETE FROM \(table) WHERE channel_id NOT IN (SELECT channel_id FROM channels)")
         }
     }
