@@ -144,6 +144,7 @@ extension ChatService: TeamPublishing {
     /// whole when an agent is paused (`enabled == false`), when the teams
     /// are not the member's, or when another publication of it is on its way.
     func publish(_ agents: [TeamPublishedAgent], teams: [String], key: ChatOrgKey) throws {
+        for agent in agents { try ChatAttachmentStorage.checkFolders([agent.folder] + (agent.extraFolders ?? [])) }
         guard let journal, let connection, connection.orgKey == key else { throw TeamError.notConnected }
         let mine = Set(myTeams(key).map(\.teamId))
         guard !teams.isEmpty, Set(teams).isSubset(of: mine) else {
@@ -484,7 +485,10 @@ extension ChatService: TeamPublishing {
         publishProblems[Self.problemKey("settle", key)] = nil
         publishRevision += 1
         factStored(key)
-        if !again.isEmpty { onNotice(againNotice(again, key: key)) }
+        if !again.isEmpty {
+            onNotice(AttentionEvent(source: "publishing", object: "reannounced", kind: .publication,
+                destination: .recovery("publications"), scope: ChatAttention.scope(key, self)))
+        }
         for agentId in gone { onAgentUnpublished(agentId) }
         settleAudiences(key)
     }

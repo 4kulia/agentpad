@@ -28,8 +28,9 @@ struct ChatChannelContent: Codable, Equatable, Sendable {
     var context: [Message]?
     var declineReason: String?
     var failureReason: String?
+    var attachments: [ChatAttachmentManifest]? = nil
     enum CodingKeys: String, CodingKey {
-        case requestId = "request_id", text, context, declineReason = "decline_reason", failureReason = "failure_reason"
+        case requestId = "request_id", text, context, attachments, declineReason = "decline_reason", failureReason = "failure_reason"
     }
 
     func validates(_ request: ChatRequest, references: [Reference]?) -> Bool {
@@ -38,6 +39,15 @@ struct ChatChannelContent: Codable, Equatable, Sendable {
               Set(context.map(\.messageId)).count == context.count,
               context.allSatisfy({ !$0.messageId.isEmpty && $0.revision > 0 && !$0.authorAccountId.isEmpty }),
               context.reduce(0, { $0 + ($1.text?.utf8.count ?? 0) }) <= ChatChannelAsk.maxContextBytes else { return false }
+        let files = attachments ?? []
+        guard request.conditionsVersion == 2 ? !files.isEmpty : files.isEmpty,
+              files.count <= 4, Set(files.map(\.id)).count == files.count,
+              files.reduce(0, { $0 + $1.file.size }) <= 20 * 1024 * 1024,
+              files.enumerated().allSatisfy({ index, item in
+                  item.file.position == index && item.file.size > 0 && item.file.size <= 10 * 1024 * 1024
+                    && item.sha256.count == 64 && item.sha256.allSatisfy { "0123456789abcdef".contains($0) }
+                    && context.contains { $0.messageId == item.messageId && $0.revision == item.revision && $0.text != nil }
+              }) else { return false }
         return references.map { $0 == context.map(\.reference) } ?? true
     }
 
@@ -61,6 +71,7 @@ struct ChatChannelContent: Codable, Equatable, Sendable {
     }
 
     static func forgetMessage(_ db: Database, _ id: String) throws {
+        try ChatAttachments.forgetMessage(db, id: id)
         try db.execute(sql: """
             DELETE FROM request_contents WHERE EXISTS (
                 SELECT 1 FROM json_each(content, '$.context') WHERE json_extract(value, '$.message_id') = ?)
@@ -169,17 +180,20 @@ extension ChatService {
         if !refresh, try await store.queue.read({ try ChatChannelContent.read($0, request: request.requestId) }) != nil {
             return self.connection?.sessionId == connection.sessionId && channelAgentAllowed(key, channel: channel)
         }
-        let authority = try await store.queue.write { db -> (String, Int)? in
+        let authority = try await store.queue.write { db -> (String, Int, Int)? in
             if refresh {
                 try db.execute(sql: "DELETE FROM request_contents WHERE request_id = ?", arguments: [request.requestId])
-                try db.execute(sql: "UPDATE meta SET channel_access_epoch = channel_access_epoch + 1 WHERE id = 1")
             }
+            // A fresh read invalidates only an older read of this request.
+            // Bumping the membership epoch here would erase another running
+            // call's selected files every time a second call is reviewed.
+            try db.execute(sql: "INSERT INTO content_read_versions (request_id, version) VALUES (?, 1) ON CONFLICT(request_id) DO UPDATE SET version = version + 1", arguments: [request.requestId])
             guard let row = try Row.fetchOne(db, sql: "SELECT generation, pending_generation, channel_access_epoch FROM meta WHERE id = 1"),
                   let generation: String = row["generation"], (row["pending_generation"] as String?) == nil else { return nil }
-            return (generation, row["channel_access_epoch"])
+            return (generation, row["channel_access_epoch"], try Int.fetchOne(db, sql: "SELECT version FROM content_read_versions WHERE request_id = ?", arguments: [request.requestId]) ?? 0)
         }
         guard let authority else { return false }
-        let content = try await makeAPI(connection.server).requestContent(key.orgId, request: request.requestId, token: token)
+        let content = try await readChannelContent(key, request: request.requestId, token: token, session: connection.sessionId, store: store)
         guard self.connection?.sessionId == connection.sessionId, self.connection?.orgKey == key,
               orgSessions[key] === session, channelAgentAllowed(key, channel: channel) else { return false }
         let kept = try await store.queue.write { db -> Bool in
@@ -188,9 +202,12 @@ extension ChatService {
                   now.initiatorAccountId == request.initiatorAccountId, now.threadRootId == request.threadRootId,
                   let meta = try Row.fetchOne(db, sql: "SELECT generation, pending_generation, channel_access_epoch FROM meta WHERE id = 1"),
                   (meta["generation"] as String?) == authority.0, (meta["pending_generation"] as String?) == nil,
-                  (meta["channel_access_epoch"] as Int) == authority.1 else { return false }
+                  (meta["channel_access_epoch"] as Int) == authority.1,
+                  try Int.fetchOne(db, sql: "SELECT version FROM content_read_versions WHERE request_id = ?", arguments: [request.requestId]) == authority.2 else { return false }
             let refs = try String.fetchOne(db, sql: "SELECT context_refs FROM requests WHERE request_id = ?", arguments: [request.requestId])
                 .map { try JSONDecoder().decode([ChatChannelContent.Reference].self, from: Data($0.utf8)) }
+            if now.conditionsVersion == 2, content.requestId == now.requestId, content.text == now.text,
+               content.attachments == [] { throw ChatAttachmentError.contextLost }
             guard content.validates(now, references: refs) else { return false }
             let json = String(decoding: try JSONEncoder().encode(content), as: UTF8.self)
             try db.execute(sql: """
@@ -203,10 +220,19 @@ extension ChatService {
         return kept
     }
 
-    func channelDecisionReady(_ key: ChatOrgKey, request: ChatRequest) -> Bool {
+    func readChannelContent(_ key: ChatOrgKey, request: String, token: String, session: String, store: ChatStore) async throws -> ChatChannelContent {
+        do { return try await makeAPI(key.server).requestContent(key.orgId, request: request, token: token) }
+        catch {
+            attachmentAccessFailed(error, key: key, store: store, session: session)
+            throw error
+        }
+    }
+
+    func channelDecisionReady(_ key: ChatOrgKey, request: ChatRequest, requiresContent: Bool = true) -> Bool {
         guard request.onThisDevice, request.ownerAccountId == key.accountId, request.state == .awaitingDecision,
               let channel = request.channelId, channelAgentAllowed(key, channel: channel),
               let store = orgSessions[key]?.store else { return false }
+        if !requiresContent { return true }
         return (try? store.queue.read { try ChatChannelContent.read($0, request: request.requestId) != nil }) == true
     }
 
@@ -364,6 +390,8 @@ extension ChatService {
     /// for the server's fact chain; end() repeats it if a result arrives later.
     func reconcileChannelResults(revoked: ChatOrgKey? = nil) {
         pruneChannelActivity()
+        reconcileAttachmentCalls()
+        for manager in attachmentManagers.values { manager.scrubConsents() }
         defer { reconcileAutomaticChannels() }
         guard let journal else { return }
         // A transcript belongs to the thread, not to an individual result.

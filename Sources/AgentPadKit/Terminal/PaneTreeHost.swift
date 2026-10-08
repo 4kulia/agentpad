@@ -167,7 +167,16 @@ final class PaneTreeHostView: FlippedLayoutView {
         let changed = key != lastFocusKey
         lastFocusKey = key
         guard changed || force else { return }
-        guard let window, let workspace, let session = pane?.activeTab else { return }
+        guard let window else { return }
+        guard let workspace, let session = pane?.activeTab else {
+            // Empty splits are focusable too: never keep typing into the
+            // previously selected terminal while an empty pane is active.
+            if let responder = window.firstResponder as? NSView,
+               workspaceViews.values.contains(where: { responder.isDescendant(of: $0) }) {
+                window.makeFirstResponder(nil)
+            }
+            return
+        }
         // An open composer / search bar owns the keyboard in its pane. In C2
         // those editors survive a workspace switch (nothing re-mounts), so on
         // return they re-claim focus themselves (`PaneComposerBar` /

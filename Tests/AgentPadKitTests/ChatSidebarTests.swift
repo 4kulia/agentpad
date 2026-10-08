@@ -82,8 +82,11 @@ final class ChatSidebarTests: XCTestCase {
     func testStatePrecedenceAndNoCachedResultsAcrossTheF2Gate() {
         let model = model()
         XCTAssertEqual(snapshot(model).state, .ready(offline: false))
-        model.isOnline = { false }
+        let ref = ChannelRef(key, channel: "one")
+        guard case .ready(_, _, false) = ChannelTabState.of(ref, model: model) else { return XCTFail("channel should share the grace period") }
+        model.showsOffline = { true }
         XCTAssertEqual(snapshot(model).state, .ready(offline: true))
+        guard case .ready(_, _, true) = ChannelTabState.of(ref, model: model) else { return XCTFail("channel should show the persistent outage") }
         model.snapshotOwed = { true }
         XCTAssertEqual(snapshot(model).state, .checking)
         assertHidden(snapshot(model))

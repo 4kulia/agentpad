@@ -152,6 +152,31 @@ final class PaneTreeHostTests: XCTestCase {
         )
     }
 
+    func testEmptyPaneReleasesKeyboardFromPreviousTerminal() throws {
+        let store = makeStore()
+        defer { store.terminate() }
+        let workspace = try XCTUnwrap(store.active)
+        let pane = try XCTUnwrap(workspace.activePane)
+        let terminal = try XCTUnwrap(pane.activeTab?.engine.view)
+        let host = makeHost(store)
+        let window = NSWindow(contentRect: host.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.contentView = nil; window.close() }
+        window.contentView = host
+        sync(host)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        window.makeFirstResponder(terminal)
+        XCTAssertTrue(window.firstResponder === terminal)
+        let empty = try XCTUnwrap(store.splitPane(pane, orientation: .horizontal, in: workspace))
+        sync(host)
+        XCTAssertEqual(workspace.activePaneId, empty.id)
+        XCTAssertFalse(window.firstResponder === terminal)
+        store.focusPane(pane, in: workspace)
+        sync(host)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        XCTAssertTrue(window.firstResponder === terminal)
+    }
+
     func testHostedSplitTreeMountsEngineViewsInsideContainer() throws {
         let store = makeStore()
         let workspace = try XCTUnwrap(store.active)

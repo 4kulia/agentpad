@@ -5,6 +5,7 @@ import XCTest
 final class TeamRunnerDiagnosticsTests: XCTestCase {
     private var isolated: IsolatedClaudeFixture!
     private var binary: URL!
+    private var lastFailure: ClaudeLaunchDiagnostic.Failure?
 
     override func setUp() async throws {
         isolated = try IsolatedClaudeFixture(environment: [:], requireAuthentication: false)
@@ -27,13 +28,17 @@ final class TeamRunnerDiagnosticsTests: XCTestCase {
             _ = try await runner.run(request(), onActivity: { _ in })
             XCTFail("a failed Claude process must not return a successful answer")
             return ""
-        } catch { return error.localizedDescription }
+        } catch {
+            lastFailure = (error as? TeamRunnerError)?.diagnosis
+            return error.localizedDescription
+        }
     }
 
     func testUnauthenticatedFirstRunHasSafeActionVersionAndExitCodeThenCanRetry() async throws {
         try write("executor-error.txt", "Not logged in. Please run /login. synthetic-credential \(isolated.project.path) https://example.invalid/?token=synthetic-query\n")
         let runner = isolated.runner(claudePath: binary.path)
         let message = await failure(runner)
+        XCTAssertEqual(lastFailure, .authentication)
         XCTAssertTrue(message.contains("claude не авторизован — откройте claude и войдите"), message)
         XCTAssertTrue(message.contains("Версия: 2.1.289"), message)
         XCTAssertTrue(message.contains("код возврата: 17"), message)
@@ -50,6 +55,7 @@ final class TeamRunnerDiagnosticsTests: XCTestCase {
     func testUnknownStderrIsNeverEchoed() async throws {
         try write("executor-error.txt", String(repeating: "arbitrary-private-value\n", count: 700))
         let message = await failure(isolated.runner(claudePath: binary.path))
+        XCTAssertEqual(lastFailure, .noAnswer)
         XCTAssertTrue(message.contains("claude не запускается"), message)
         XCTAssertTrue(message.contains("код возврата: 17"), message)
         XCTAssertTrue(message.contains("ответ не получен"), message)

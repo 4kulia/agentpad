@@ -2,6 +2,7 @@ import SwiftUI
 
 struct TabBarItem: View {
     @Bindable var tab: Session
+    let store: WorkspaceStore
     let isActive: Bool
     let canCloseToRight: Bool
     let onActivate: () -> Void
@@ -21,13 +22,16 @@ struct TabBarItem: View {
 
     var body: some View {
         HStack(spacing: 7) {
-            commandStatusDot
-            // AgentPad: saved chat lists have their own navigation symbols.
-            AgentIconView(asset: tab.inbox == nil ? tab.displayAgent.iconAsset : nil,
-                          fallbackSymbol: tab.inbox?.kind.symbol ?? tab.displayAgent.symbol, size: 15)
-            Text(tab.title)
-                .font(Theme.display(12, weight: isActive ? .medium : .regular))
-                .lineLimit(1)
+            HStack(spacing: 7) {
+                commandStatusDot
+                // AgentPad: saved chat lists have their own navigation symbols.
+                AgentIconView(asset: tab.inbox == nil ? tab.displayAgent.iconAsset : nil,
+                              fallbackSymbol: tab.inbox?.kind.symbol ?? tab.displayAgent.symbol, size: 15)
+                Text(tab.title)
+                    .font(Theme.display(12, weight: isActive ? .medium : .regular))
+                    .lineLimit(1)
+            }
+            .overlay(TabDragSource(session: tab, store: store, onActivate: onActivate))
             // AgentPad: show why an export is unavailable instead of hiding it.
             if AgentAnswerSource.supports(tab), isActive {
                 HoverableIconButton(systemName: "arrowshape.turn.up.right", fontSize: 11, size: 18,

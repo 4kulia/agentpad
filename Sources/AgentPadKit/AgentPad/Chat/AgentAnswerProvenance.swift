@@ -2,7 +2,8 @@ import Foundation
 
 /// Evidence collected before acknowledging the hook, while its sender is alive.
 /// The socket peer must descend from the TTY's sole signed Claude through
-/// shell helpers. Foreground process-group leaders may be launch wrappers.
+/// shell helpers, including detached hooks without a controlling terminal.
+/// Foreground process-group leaders may be AgentPad's bash launch wrapper.
 struct AgentAnswerProvenance: Equatable, Sendable {
     struct Snapshot: Equatable, Sendable {
         let process: ChatSessionIdentity.Process
@@ -11,6 +12,7 @@ struct AgentAnswerProvenance: Equatable, Sendable {
 
         var name: String { URL(fileURLWithPath: image.path).lastPathComponent.lowercased() }
         var isShell: Bool { ["sh", "bash", "zsh", "dash", "ksh", "fish"].contains(name) }
+        var isMultiplexer: Bool { ["tmux", "screen", "zellij", "dtach", "abduco"].contains(name) }
     }
 
     struct Inspector: Sendable {
@@ -24,43 +26,85 @@ struct AgentAnswerProvenance: Equatable, Sendable {
 
     static func capture(parentPID: Int32?, origin: AgentPadCallerOrigin,
                         inspector: Inspector = Inspector()) -> Self? {
+        try? verify(parentPID: parentPID, origin: origin, inspector: inspector)
+    }
+
+    static func verify(parentPID: Int32?, origin: AgentPadCallerOrigin,
+                       inspector: Inspector = Inspector()) throws(AgentAnswerTranscript.Problem) -> Self {
         guard let parentPID, parentPID > 1,
               case .localProcess(let peerPID, let start) = origin,
               let peer = inspector.kernel.process(peerPID), peer.startedAtUs == start,
-              peer.parent == parentPID, let tty = peer.terminal else { return nil }
-        let rows = inspector.scan(peerPID)
+              peer.parent == parentPID else { throw .hookIdentity }
+
+        // Claude can launch hooks with setsid(): neither the hook nor its
+        // shell then appears in a TTY scan. First prove their kernel ancestry,
+        // then scan the signed owner's terminal, never a payload-supplied PID.
+        var hookLineage: [Snapshot] = [], visited = Set<Int32>(), next = peerPID
+        var signed: [Int32: Bool] = [:]
+        while next > 1 {
+            guard hookLineage.count < 256, visited.insert(next).inserted,
+                  let process = inspector.kernel.process(next),
+                  let image = inspector.kernel.image(next) else { throw .processUnavailable }
+            let snapshot = Snapshot(process: process, image: image, isForeground: false)
+            hookLineage.append(snapshot)
+            let trusted = inspector.signed(next)
+            signed[next] = trusted
+            if trusted {
+                guard next != peerPID else { throw .hookAncestry }
+                break
+            }
+            if next != peerPID, snapshot.isMultiplexer { throw .multiplexer }
+            next = process.parent
+        }
+        guard hookLineage.first?.process == peer else { throw .processUnavailable }
+        guard let owner = hookLineage.last, signed[owner.process.pid] == true else { throw .claudeSignature }
+        guard hookLineage.dropFirst().dropLast().allSatisfy(\.isShell) else { throw .hookAncestry }
+        let claude = owner.process
+        guard let tty = claude.terminal else { throw .claudeTerminal }
+        guard hookLineage.allSatisfy({ $0.process.terminal == nil || $0.process.terminal == tty }) else {
+            throw .hookAncestry
+        }
+        let rows = inspector.scan(claude.pid)
         var snapshots: [Snapshot] = []
         var candidates: [ChatSessionIdentity.Process] = []
         for row in rows {
             guard let process = inspector.kernel.process(row.pid), process.startedAtUs == row.startedAtUs,
                   process.parent == row.ppid, process.terminal == tty,
-                  let image = inspector.kernel.image(row.pid) else { return nil }
-            if inspector.signed(row.pid) { candidates.append(process) }
+                  let image = inspector.kernel.image(row.pid) else { throw .processUnavailable }
+            if signed[row.pid] ?? inspector.signed(row.pid) { candidates.append(process) }
             snapshots.append(Snapshot(process: process, image: image, isForeground: row.isForeground))
         }
         // Count every signed image, including renamed/background/nested Claude.
-        guard candidates.count == 1, let claude = candidates.first else { return nil }
-        let known = Dictionary(snapshots.map { ($0.process.pid, $0) }, uniquingKeysWith: { a, _ in a })
-        guard known.count == rows.count, known[peerPID]?.process == peer,
-              known[claude.pid]?.isForeground == true,
-              let lineage = ancestry(of: peerPID, in: known),
-              let ownerIndex = lineage.firstIndex(where: { $0.process == claude }), ownerIndex > 0,
-              lineage[1..<ownerIndex].allSatisfy(\.isShell) else { return nil }
+        guard !candidates.isEmpty else { throw .processUnavailable }
+        guard candidates.count == 1 else { throw .ambiguousClaude }
+        var known = Dictionary(snapshots.map { ($0.process.pid, $0) }, uniquingKeysWith: { a, _ in a })
+        guard known.count == rows.count, candidates.first == claude else { throw .processUnavailable }
+        guard known[claude.pid]?.isForeground == true else { throw .claudeBackground }
+        for snapshot in hookLineage {
+            if let scanned = known[snapshot.process.pid] {
+                guard scanned.process == snapshot.process, scanned.image == snapshot.image else { throw .processUnavailable }
+            } else {
+                guard snapshot.process.terminal == nil else { throw .processUnavailable }
+                snapshots.append(snapshot)
+                known[snapshot.process.pid] = snapshot
+            }
+        }
         for snapshot in snapshots where snapshot.process.pid != claude.pid {
-            guard !snapshot.name.contains("claude"),
-                  !["tmux", "screen", "zellij", "dtach", "abduco"].contains(snapshot.name) else { return nil }
+            if snapshot.isMultiplexer { throw .multiplexer }
+            guard !snapshot.name.contains("claude") else { throw .ambiguousClaude }
             if ["node", "nodejs"].contains(snapshot.name) {
                 // Normal MCP servers are Claude descendants. A runtime on the
                 // hook lineage cannot borrow its ancestor's native signature;
                 // a runtime elsewhere on the TTY is another possible session.
                 guard let chain = ancestry(of: snapshot.process.pid, in: known),
-                      chain.contains(where: { $0.process == claude }) else { return nil }
+                      chain.contains(where: { $0.process == claude }) else { throw .ambiguousClaude }
             }
         }
         guard snapshots.allSatisfy({ inspector.kernel.process($0.process.pid) == $0.process
-            && inspector.kernel.image($0.process.pid) == $0.image }) else { return nil }
+            && inspector.kernel.image($0.process.pid) == $0.image }) else { throw .processUnavailable }
         let evidence = Self(process: claude, snapshots: snapshots)
-        return evidence.isCurrent(inspector: inspector) ? evidence : nil
+        guard evidence.isCurrent(inspector: inspector) else { throw .processUnavailable }
+        return evidence
     }
 
     /// A TTY match alone also matches sibling shells and multiplexer panes.
@@ -101,6 +145,17 @@ struct AgentAnswerProvenance: Equatable, Sendable {
                   expected.isForeground == row.isForeground,
                   inspector.kernel.process(row.pid) == expected.process,
                   inspector.kernel.image(row.pid) == expected.image else { return false }
+        }
+        for expected in snapshots where expected.process.terminal == nil {
+            // A detached helper is needed only for the initial authentication.
+            // A reused PID also means that the authenticated helper has exited.
+            guard let current = inspector.kernel.process(expected.process.pid),
+                  current.startedAtUs == expected.process.startedAtUs else { continue }
+            if current != expected.process || inspector.kernel.image(current.pid) != expected.image {
+                // It may have exited or its PID may have been reused between
+                // process/image reads. Reject changes only to the same instance.
+                guard inspector.kernel.process(current.pid)?.startedAtUs != expected.process.startedAtUs else { return false }
+            }
         }
         return inspector.kernel.process(process.pid) == process
     }

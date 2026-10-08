@@ -18,7 +18,7 @@ struct ClaudeExecutable: Codable, Hashable, Sendable {
 
     static func inspect(_ selected: String) throws -> Self {
         func unavailable() -> TeamRunnerError {
-            .didNotStart(ClaudeLaunchDiagnostic(version: nil, exitCode: nil, fallback: .unavailable).message)
+            .didNotStart(ClaudeLaunchDiagnostic(version: nil, exitCode: nil, fallback: .unavailable).message, diagnosis: .unavailable)
         }
         guard selected.hasPrefix("/") else { throw unavailable() }
         let resolved = URL(fileURLWithPath: selected).resolvingSymlinksInPath().path
@@ -33,7 +33,7 @@ struct ClaudeExecutable: Codable, Hashable, Sendable {
               [0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe,
                0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca].contains(magic) else {
             throw TeamRunnerError.didNotStart("Укажите конечный нативный бинарник Claude Code. "
-                + ClaudeLaunchDiagnostic(version: nil, exitCode: nil, fallback: .spawn).message)
+                + ClaudeLaunchDiagnostic(version: nil, exitCode: nil, fallback: .spawn).message, diagnosis: .spawn)
         }
         return Self(selectedPath: selected, file: File(
             resolvedPath: resolved, device: info.st_dev, inode: info.st_ino, size: info.st_size,
@@ -253,7 +253,7 @@ final class ClaudeVersionPreflight: ClaudeVersionChecking, @unchecked Sendable {
 /// as the executor; a separate journal identity, never onProcessStarted.
 enum ClaudeVersionCommand {
     static let unreadable = TeamRunnerError.didNotStart(
-        "Не удалось определить версию Claude Code. Проверьте выбранную установку и повторите запрос")
+        "Не удалось определить версию Claude Code. Проверьте выбранную установку и повторите запрос", diagnosis: .version)
 
     static func parse(_ data: Data, exitCode: Int32, overflow: Bool = false) throws -> String {
         guard exitCode == 0, !overflow, data.count <= 4096, let text = String(data: data, encoding: .utf8) else { throw unreadable }
@@ -293,7 +293,7 @@ enum ClaudeVersionCommand {
                                              isolatedConfigDirectory: isolatedConfigDirectory, isolatedHomeDirectory: isolatedHomeDirectory),
                 directory: request.agent.folder, stdin: input, stdout: output, stderr: errors)
         } catch {
-            throw TeamRunnerError.didNotStart(ClaudeLaunchDiagnostic(version: nil, exitCode: nil, fallback: .spawn).message)
+            throw TeamRunnerError.didNotStart(ClaudeLaunchDiagnostic(version: nil, exitCode: nil, fallback: .spawn).message, diagnosis: .spawn)
         }
         try? input.fileHandleForWriting.close()
         spawned.onExit { exited.finish($0); woke.finish(1) }
@@ -368,7 +368,7 @@ enum ClaudeVersionCommand {
                     version: try? ClaudeVersionCommand.parse(output, exitCode: 0, overflow: overflow),
                     exitCode: timedOut ? nil : exitCode,
                     output: String(decoding: errors, as: UTF8.self), fallback: .version)
-                return .didNotStart(diagnostic.message + (timedOut ? " Время ожидания истекло." : ""))
+                return .didNotStart(diagnostic.message + (timedOut ? " Время ожидания истекло." : ""), diagnosis: timedOut ? .timeout : diagnostic.failure)
             }
         }
     }

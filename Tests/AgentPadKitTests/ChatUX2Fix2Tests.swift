@@ -39,7 +39,7 @@ final class ChatUX2Fix2Tests: XCTestCase {
         }
         XCTAssertEqual(status(.ready(offline: false), .connected), .connected)
         XCTAssertEqual(status(.ready(offline: true), .disconnected), .offline)
-        XCTAssertEqual(status(.ready(offline: false), .disconnected), .offline)
+        XCTAssertEqual(status(.ready(offline: false), .disconnected), .connecting, "backoff within the Offline grace period")
         XCTAssertEqual(status(.notConnected, nil, .off), .notConnected)
         XCTAssertEqual(status(.noChannels, .connected), .unavailable)
         XCTAssertEqual(status(.checking, .connected), .checking)

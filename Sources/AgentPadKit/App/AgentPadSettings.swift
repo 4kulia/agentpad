@@ -33,7 +33,9 @@ enum AgentPadSettings {
       // === agentpad-specific ===
       // "agents": {
       //   "default": "claude",
-      //   "agentPadPrompt": true
+      //   "agentPadPrompt": true,
+      //   "codexAgentPadPrompt": false,
+      //   "agentPadPromptAdditionalInstruction": ""
       // },
       // "ssh": {
       //   "remoteAgentDetection": true

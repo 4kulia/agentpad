@@ -150,34 +150,30 @@ private struct TabBarDoubleClickHandler: NSViewRepresentable {
 /// (from this pane or another) appends it after the last tab, which is
 /// otherwise unreachable inside a horizontal `ScrollView` where there's no
 /// flex space for a trailing drop zone.
-private struct AddTabButton: View {
+struct AddTabButton: View {
     @Bindable var pane: Pane
     @Bindable var workspace: Workspace
     @Bindable var store: WorkspaceStore
     @Binding var isMenuOpen: Bool
+    var size: CGFloat = Theme.chromeToolbarButtonSize
 
     @State private var isTargeted = false
 
-    var body: some View {
+    var trigger: HoverableIconButton<AnyView> {
         HoverableIconButton(
             systemName: "plus",
             fontSize: 12,
-            size: Theme.chromeToolbarButtonSize,
+            size: size,
             help: "New tab"
         ) {
-            // Two short-circuit paths that skip the popover entirely:
-            //   1. user picked a default agent in Settings — open it
-            //   2. every coding agent is hidden so the popover would show
-            //      just Terminal anyway — open Terminal
-            let model = AgentPadSettingsModel.shared
-            if let defaultTemplate = AgentTemplate.defaultLaunchTemplate(model: model) {
-                store.addTab(in: workspace, pane: pane, template: defaultTemplate)
-            } else if AgentTemplate.visibleOrdered(model: model).count <= 1 {
-                store.addTab(in: workspace, pane: pane, template: .terminal)
-            } else {
-                isMenuOpen.toggle()
-            }
+            // The mouse picker must remain reachable even with a default.
+            // ⌘T is the shortcut for opening that default immediately.
+            isMenuOpen.toggle()
         }
+    }
+
+    var body: some View {
+        trigger
         // Indicator sits in the gap just left of the `+` (offset by half its
         // hit-area), not on the button itself, so it reads as "tab will land
         // here, after the last one" rather than "drop on +".
@@ -214,8 +210,8 @@ private struct AddTabButton: View {
 }
 
 /// Wraps `TabBarItem` with drag source + drop target. Same-pane drops
-/// reorder; cross-pane drops move the session into this pane (source pane
-/// collapses if it runs out of tabs). The 2pt indicator follows drag
+/// reorder; cross-pane drops move the session into this pane, leaving an
+/// emptied source pane available for another task. The 2pt indicator follows drag
 /// direction — `leading` for left-of-target sources, `trailing` for
 /// right-of-target — so the line always shows where the dropped tab lands.
 private struct DraggableTabRow: View {
@@ -239,6 +235,7 @@ private struct DraggableTabRow: View {
 
         TabBarItem(
             tab: tab,
+            store: store,
             isActive: pane.activeTabId == tab.id,
             canCloseToRight: canCloseToRight,
             onActivate: { store.activateTab(tab, in: workspace) },
@@ -252,10 +249,6 @@ private struct DraggableTabRow: View {
             onLastAnswer: { AgentAnswerWindow.open(session: tab, store: store, copyOnly: $0) }
         )
         .dropIndicator(active: isTargeted && !isSelfDrag, on: edge)
-        .onDrag {
-            store.draggingTabId = tab.id
-            return NSItemProvider(object: tab.id.uuidString as NSString)
-        }
         .dropDestination(for: String.self) { dropped, _ in
             defer { store.draggingTabId = nil }
             guard let id = dropped.first.flatMap(UUID.init) else { return false }

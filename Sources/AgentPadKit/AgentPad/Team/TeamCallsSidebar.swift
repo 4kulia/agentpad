@@ -43,6 +43,7 @@ struct TeamCallsSidebar: View {
         let waiting = all.filter(\.waitsForMe)
         let open = all.filter { !$0.isFinal && !$0.waitsForMe }
         let history = all.filter(\.isFinal)
+        ScrollViewReader { proxy in
         VStack(alignment: .leading, spacing: 0) {
             header
             Rectangle().fill(Theme.chromeHairline).frame(height: 1)
@@ -51,7 +52,7 @@ struct TeamCallsSidebar: View {
             } else if let problem = calls.storeProblem {
                 // Not "no calls": they could not be read (review D8e-p3-10).
                 empty(problem, action: ("Try Again", { calls.reload() }))
-            } else if all.isEmpty {
+            } else if all.isEmpty && calls.pendingAccess.isEmpty && ClaudeVersionApprovals.shared.pending.isEmpty {
                 empty(filter == .sent ? "You have not called a colleague's agent yet." : "No calls yet.", action: nil)
             } else {
                 ScrollView {
@@ -74,6 +75,18 @@ struct TeamCallsSidebar: View {
                     .padding(.bottom, 8)
                 }
             }
+        }
+        .onChange(of: AttentionSelection.shared.revision, initial: true) { _, _ in
+            let destination = AttentionSelection.shared.destination
+            let target: String?
+            switch destination {
+            case .team(let id?, let outgoing): target = "\(outgoing ? "out" : "in")-\(id)"; expanded = target; filter = .all
+            case .version(let id): target = "version-\(id)"
+            case .folder(let id, _): target = "access-\(id)"
+            default: target = nil
+            }
+            if let target { DispatchQueue.main.async { proxy.scrollTo(target, anchor: .center) } }
+        }
         }
     }
 
@@ -124,9 +137,11 @@ struct TeamCallsSidebar: View {
     @ViewBuilder
     private func row(_ item: Item) -> some View {
         if let call = item.incoming {
-            incomingRow(call, key: item.id)
+            incomingRow(call, key: item.id).id(item.id)
+                .attentionPlace(expanded == item.id ? [.team(request: call.id, outgoing: false)] : [])
         } else if let call = item.outgoing {
-            outgoingRow(call, key: item.id)
+            outgoingRow(call, key: item.id).id(item.id)
+                .attentionPlace(expanded == item.id ? [.team(request: call.id, outgoing: true)] : [])
         }
     }
 
@@ -172,6 +187,9 @@ struct TeamCallsSidebar: View {
                             }
                         default:
                             EmptyView()
+                        }
+                        if let key = calls.serverKey {
+                            ClaudeLaunchHelpView(key: key, request: call.id)
                         }
                         if TeamUI.canWatch(call) {
                             Button("Watch") { TeamUI.watch(call) }

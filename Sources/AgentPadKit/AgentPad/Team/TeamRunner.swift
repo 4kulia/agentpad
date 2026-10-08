@@ -6,7 +6,7 @@ import Foundation
 
 struct TeamRunRequest: Sendable {
     var agent: TeamPublishedAgent
-    let prompt: String
+    var prompt: String
     /// The thread's Claude Code session id.
     let sessionId: String
     /// True when the thread already has a session to continue.
@@ -21,6 +21,8 @@ struct TeamRunRequest: Sendable {
     /// A continuation appends to the call's log instead of starting it anew.
     var continuesLog = false
     /// Rechecked while waiting for a version decision and just before spawn.
+    var attachmentDirectory: String? = nil
+    var validateAttachmentFiles: (@MainActor @Sendable () async throws -> Void)? = nil
     var validateBeforeExecutor: (@MainActor @Sendable () throws -> Void)? = nil
     /// A service process, distinct from the executor and run.started (Y2).
     var onPreflightProcess: (@Sendable (TeamProcessStart?) throws -> Void)? = nil
@@ -66,8 +68,8 @@ extension TeamAgentRunner {
 enum TeamRunnerError: Error, LocalizedError, Equatable {
     case claudeNotFound
     /// `Process.run()` failed: nothing was started (`run.failed_to_start`, D11).
-    case didNotStart(String)
-    case failed(String)
+    case didNotStart(String, diagnosis: ClaudeLaunchDiagnostic.Failure? = nil)
+    case failed(String, diagnosis: ClaudeLaunchDiagnostic.Failure? = nil)
     case timedOut
     /// The run was stopped (cancelled); how the stop ended (Y5).
     case stopped(TeamStopOutcome)
@@ -77,8 +79,8 @@ enum TeamRunnerError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .claudeNotFound: "Claude Code не найден на Mac владельца. Установите его и повторите запрос"
-        case .didNotStart(let detail): "Claude Code did not start: \(detail)"
-        case .failed(let detail): detail
+        case .didNotStart(let detail, _): "Claude Code did not start: \(detail)"
+        case .failed(let detail, _): detail
         case .timedOut: "The agent ran out of time."
         case .stopped(.stopped): "The run was stopped."
         case .stopped(.stillAlive(let left)):
@@ -86,6 +88,14 @@ enum TeamRunnerError: Error, LocalizedError, Equatable {
         case .stopped(.unknown(let why)): "The run was asked to stop, but AgentPad cannot confirm it ended: \(why)."
         case .cancelledBeforeExecutor: "Исполнитель не создавался, служебный процесс завершён."
         case .preflightCleanupUnconfirmed(let start, _): "Не удалось подтвердить завершение служебного процесса Claude Code --version (PID \(start.pid))."
+        }
+    }
+
+    var diagnosis: ClaudeLaunchDiagnostic.Failure? {
+        switch self {
+        case .didNotStart(_, let diagnosis), .failed(_, let diagnosis): return diagnosis
+        case .claudeNotFound: return .unavailable
+        default: return nil
         }
     }
 }
@@ -237,6 +247,9 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         var denied = denyRules(agent.deniedPaths)
         // The same paths may not be written either: an Edit rule covers Write.
         if tools.contains("Edit") { denied += denied.map { "Edit(" + $0.dropFirst("Read(".count) } }
+        if let folder = request.attachmentDirectory {
+            denied += ["Edit(/\(folder)/**)", "Write(/\(folder)/**)", "NotebookEdit(/\(folder)/**)"]
+        }
         if tools.contains("Bash") { denied += gitDenied }
         if !denied.isEmpty { args += ["--disallowedTools"] + denied }
         for dir in agent.extraFolders ?? [] where dir.hasPrefix("/") {
@@ -344,6 +357,9 @@ struct ClaudeCodeRunner: TeamAgentRunner {
     /// Grants store canonical paths. A symlink (including in a parent) or
     /// a noncanonical spelling no longer names the folder the owner gave.
     private static func validateGrantedFolders(_ request: TeamRunRequest) throws {
+        try ChatAttachmentStorage.checkFolders([request.agent.folder] + (request.agent.extraFolders ?? []),
+            executionDirectory: request.attachmentDirectory.map { URL(fileURLWithPath: $0) })
+        if request.attachmentDirectory != nil && request.agent.access.runsShell { throw ChatAttachmentError.bash }
         guard (request.agent.extraFolders ?? []).allSatisfy({
             $0.hasPrefix("/") && URL(fileURLWithPath: $0).resolvingSymlinksInPath().path == $0
         }) else { throw TeamRunnerError.didNotStart("granted_folders_changed") }
@@ -407,6 +423,8 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         // (review C2-14). Its group is its PID (review C4-1).
         let spawned: TeamSpawned
         try await request.validateBeforeExecutor?()
+        try await request.validateAttachmentFiles?()
+        try Self.validateGrantedFolders(request)
         try ClaudeVersionPreflight.checkCancellation()
         try preflight.verify(ready.executable)
         // The version/owner wait may have lasted arbitrarily long. Apply
@@ -422,7 +440,7 @@ struct ClaudeCodeRunner: TeamAgentRunner {
             )
         } catch {
             throw TeamRunnerError.didNotStart(ClaudeLaunchDiagnostic(
-                version: ready.version, exitCode: nil, fallback: .spawn).message)
+                version: ready.version, exitCode: nil, fallback: .spawn).message, diagnosis: .spawn)
         }
         let pid = spawned.pid
         let identity = spawned.identity
@@ -511,7 +529,7 @@ struct ClaudeCodeRunner: TeamAgentRunner {
             version: ready.version, exitCode: outcome,
             output: errors.text + "\n" + (parser.result?.text ?? ""),
             fallback: outcome == nil ? .timeout : (parser.result?.isError == true ? .execution : .noAnswer))
-        throw TeamRunnerError.failed(diagnostic.message)
+        throw TeamRunnerError.failed(diagnostic.message, diagnosis: diagnostic.failure)
     }
 
     /// What a run inherits from the app's environment, by name: who and where

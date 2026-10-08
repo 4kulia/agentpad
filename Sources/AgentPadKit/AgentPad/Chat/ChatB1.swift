@@ -215,6 +215,18 @@ enum ChatB1 {
         }
         if event.type == "message.delete", let id { try deleted(db, id: id) }
     }
+    /// The same confirmed context after reconnect: refresh without removing
+    /// displayed data or lowering the heads that reject stale HTTP responses.
+    static func refresh(_ db: Database) throws {
+        for table in ["b1_metadata", "b1_pins", "b1_participation"] {
+            try db.execute(sql: "UPDATE \(table) SET dirty = 1, ticket = ticket + 1")
+        }
+        for table in ["b1_metadata", "b1_pins"] {
+            try db.execute(sql: "UPDATE \(table) SET error = NULL")
+        }
+        try db.execute(sql: "UPDATE meta SET b1_epoch = b1_epoch + 1 WHERE id = 1")
+    }
+
     static func reset(_ db: Database, channel: String? = nil) throws {
         for table in ["b1_metadata", "b1_pins"] {
             try db.execute(sql: "UPDATE \(table) SET error = NULL, data = NULL, as_of_seq = -1, invalidated = 0, dirty = 1, ticket = ticket + 1"
@@ -313,6 +325,33 @@ enum ChatB1 {
         for table in ["b1_metadata", "b1_pins", "b1_reply_heads"] {
             try db.execute(sql: "DELETE FROM \(table) WHERE channel_id NOT IN (SELECT channel_id FROM channels)")
         }
+    }
+}
+
+extension ChatB1.Metadata {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        messageId = try values.decode(String.self, forKey: .messageId)
+        deleted = try values.decode(Bool.self, forKey: .deleted)
+        pin = try values.decodeIfPresent(ChatB1.Pin.self, forKey: .pin)
+        threadSummary = try values.decodeIfPresent(ChatB1.Summary.self, forKey: .threadSummary)
+        if var summary = threadSummary {
+            var seen = Set<String>()
+            summary.lastParticipants = summary.lastParticipants.filter { seen.insert($0.id).inserted }
+            threadSummary = summary
+        }
+
+        // Both HTTP payloads and caches from older clients reach ForEach here.
+        // An alias and its fully qualified emoji are the same reaction. Keep
+        // the first position and the last snapshot; counts are not additive.
+        var order: [String] = []
+        var byEmoji: [String: ChatB1.Reaction] = [:]
+        for var reaction in try values.decode([ChatB1.Reaction].self, forKey: .reactions) {
+            reaction.emoji = ChatEmoji.canonical(reaction.emoji) ?? reaction.emoji
+            if byEmoji[reaction.emoji] == nil { order.append(reaction.emoji) }
+            byEmoji[reaction.emoji] = reaction
+        }
+        reactions = order.compactMap { byEmoji[$0] }
     }
 }
 

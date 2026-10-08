@@ -69,6 +69,7 @@ struct ConfirmRemoveWorktreeSheet: View {
         .frame(width: 460, alignment: .topLeading)
         .background(Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
+        .attentionConfirmation(busy: isWorking)
     }
 
     private var statusLabel: some View {

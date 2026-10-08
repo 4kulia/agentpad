@@ -304,6 +304,9 @@ enum ChatConnectWindow {
                 busy = false
                 return .busy
             }
+            let attentionID = UUID()
+            PendingConfirmations.shared.register(attentionID, window: host)
+            defer { PendingConfirmations.shared.end(attentionID) }
             // Time and the caller leaving tell no observer: looked at each second.
             let watchman = Task { @MainActor in
                 while !Task.isCancelled {
@@ -380,6 +383,7 @@ private struct ChatConnectView: View {
         }
         .padding(18)
         .frame(width: 400)
+        .attentionPlace([.connect])
         .disabled(model.busy)
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { tick = $0 }
     }

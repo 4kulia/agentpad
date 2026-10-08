@@ -89,13 +89,14 @@ final class TeamModeTests: XCTestCase {
 
     // MARK: Subscribers
 
-    func testEveryNetworkAndWakeSubscriberIsTold() {
-        let watch = TeamNetworkWatch.shared
+    func testEveryNetworkAndWakeSubscriberIsTold() async throws {
+        let watch = TeamNetworkWatch(monitorsNetwork: false, coalescingDelay: .milliseconds(10))
         var told: [String] = []
         watch.add { told.append("a") }
         watch.add { told.append("b") }
-        watch.pathChanged(.unsatisfied)
-        watch.pathChanged(.satisfied)
+        watch.pathChanged(.init(status: .unsatisfied))
+        watch.pathChanged(.init(status: .satisfied))
+        try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(told, ["a", "b"])
 
         var woke: [String] = []

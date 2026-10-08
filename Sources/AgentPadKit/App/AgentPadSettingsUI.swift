@@ -187,9 +187,8 @@ final class AgentPadSettingsModel {
     /// becomes `claude --model opus`. The wrapper rc's `eval` splits on
     /// whitespace, so users handle their own quoting for spaces.
     var agentOptions: [String: String] = [:]
-    /// `id` of the template that `+` / `⌘T` should open without prompting.
-    /// `nil` (or pointing to a now-hidden / unknown agent) means "ask each
-    /// time" — the popover stays. Terminal is always a valid choice.
+    /// `id` of the template that `⌘T` opens without prompting; nil, hidden
+    /// or unknown ids fall back to Terminal. The `+` always opens the picker.
     var defaultAgentId: String? = nil
     /// User-defined agent entries (`agents.custom` in settings.json). Each
     /// becomes a runtime `AgentTemplate` via `AgentTemplate.fromCustom`,
@@ -233,6 +232,9 @@ final class AgentPadSettingsModel {
     /// id stays on disk so turning the toggle back on can resume it later.
     var resumeConversations: Bool = true
     var agentPadPrompt = true
+    // AgentPad: Codex's CLI instructions can override its cloud configuration.
+    var codexAgentPadPrompt = false
+    var agentPadPromptAdditionalInstruction = ""
     /// Last agent picked from an "Ask AI" control — drives the split button's
     /// brand mark + plain-click target, the `lastOpenInAppId` model.
     /// Persisted under `agents.lastAsk`.
@@ -299,6 +301,27 @@ final class AgentPadSettingsModel {
     /// Persisted under `notifications.attention` / `.failure` (non-default only).
     var notifyOnAttention: Bool = true
     var notifyOnFailure: Bool = true
+    var notificationSound = true
+    var disabledNotificationCategories: Set<AttentionCategory> = []
+
+    var notificationPreferences: AttentionPreferences {
+        var disabled = disabledNotificationCategories
+        if !notifyOnAttention { disabled.insert(.attention) }
+        if !notifyOnFailure { disabled.insert(.failure) }
+        return AttentionPreferences(enabled: notificationsEnabled, sound: notificationSound, disabled: disabled)
+    }
+
+    func notificationEnabled(_ category: AttentionCategory) -> Bool {
+        !notificationPreferences.disabled.contains(category)
+    }
+    func setNotificationEnabled(_ category: AttentionCategory, _ enabled: Bool) {
+        if category == .attention { notifyOnAttention = enabled }
+        else if category == .failure { notifyOnFailure = enabled }
+        else if enabled { disabledNotificationCategories.remove(category) }
+        else { disabledNotificationCategories.insert(category) }
+        scheduleSave()
+        AttentionLedger.shared.settingsChanged()
+    }
     /// "Open in" picker (top-chrome split button): user-customised order of
     /// `OpenInApp` ids; installed apps absent from this list follow in catalog
     /// order. Persisted under `openin.order`.
@@ -404,6 +427,8 @@ final class AgentPadSettingsModel {
         defaultAgentId = agents["default"] as? String
         resumeConversations = (agents["resumeConversations"] as? Bool) ?? true
         agentPadPrompt = AgentPadAgentPrompt.isEnabled(in: parsed)
+        codexAgentPadPrompt = AgentPadAgentPrompt.isCodexEnabled(in: parsed)
+        agentPadPromptAdditionalInstruction = AgentPadAgentPrompt.additionalInstruction(in: parsed)
         lastAskAgentId = agents["lastAsk"] as? String
 
         let ssh = parsed["ssh"] as? [String: Any] ?? [:]
@@ -422,9 +447,12 @@ final class AgentPadSettingsModel {
         awakeMode = (general["awakeMode"] as? String).flatMap(AwakeMode.init) ?? .auto
 
         let notifications = parsed["notifications"] as? [String: Any] ?? [:]
-        notificationsEnabled = (notifications["enabled"] as? Bool) ?? true
-        notifyOnAttention = (notifications["attention"] as? Bool) ?? true
-        notifyOnFailure = (notifications["failure"] as? Bool) ?? true
+        let notificationPreferences = AttentionPreferences.read(notifications)
+        notificationsEnabled = notificationPreferences.enabled
+        notifyOnAttention = !notificationPreferences.disabled.contains(.attention)
+        notifyOnFailure = !notificationPreferences.disabled.contains(.failure)
+        notificationSound = notificationPreferences.sound
+        disabledNotificationCategories = notificationPreferences.disabled.subtracting([.attention, .failure])
 
         let openin = parsed["openin"] as? [String: Any] ?? [:]
         openInAppOrder = (openin["order"] as? [String]) ?? []
@@ -607,6 +635,8 @@ final class AgentPadSettingsModel {
             && serialisedCustom.isEmpty
             && resumeConversations  // default-true is the no-op case
             && agentPadPrompt
+            && !codexAgentPadPrompt
+            && agentPadPromptAdditionalInstruction.isEmpty
             && lastAskAgentId == nil
         if allDefaults {
             parsed.removeValue(forKey: "agents")
@@ -620,6 +650,8 @@ final class AgentPadSettingsModel {
             // Only serialise when non-default to keep settings.json lean.
             agents["resumeConversations"] = resumeConversations ? nil : false
             agents["agentPadPrompt"] = agentPadPrompt ? nil : false
+            agents["codexAgentPadPrompt"] = codexAgentPadPrompt ? true : nil
+            agents["agentPadPromptAdditionalInstruction"] = agentPadPromptAdditionalInstruction.isEmpty ? nil : agentPadPromptAdditionalInstruction
             agents["lastAsk"] = lastAskAgentId
             parsed["agents"] = agents
         }
@@ -675,9 +707,7 @@ final class AgentPadSettingsModel {
         }
 
         var notifications = parsed["notifications"] as? [String: Any] ?? [:]
-        notifications["enabled"] = notificationsEnabled ? nil : false
-        notifications["attention"] = notifyOnAttention ? nil : false
-        notifications["failure"] = notifyOnFailure ? nil : false
+        notifications = notificationPreferences.persisted(over: notifications)
         if notifications.isEmpty {
             parsed.removeValue(forKey: "notifications")
         } else {
@@ -1139,7 +1169,7 @@ struct AgentPadSettingsView: View {
             .onChange(of: model.hiddenStatusBarItems) { _, _ in model.scheduleSave() }
             .onChange(of: model.hiddenToolCallAgents) { _, _ in model.scheduleSave() }
             .onChange(of: model.hiddenUsageAgents) { _, _ in model.scheduleSave() }
-            .onChange(of: model.notificationsEnabled) { _, _ in model.scheduleSave() }
+            .onChange(of: model.notificationsEnabled) { _, _ in model.scheduleSave(); AttentionLedger.shared.settingsChanged() }
             .onChange(of: model.notifyOnAttention) { _, _ in model.scheduleSave() }
             .onChange(of: model.notifyOnFailure) { _, _ in model.scheduleSave() }
     }
@@ -1491,13 +1521,30 @@ struct AgentPadSettingsView: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                 }
-                SettingsRow(label: "AgentPad context for Claude Code") {
+                SettingsRow(label: "AgentPad context") {
                     Toggle("", isOn: $model.agentPadPrompt)
                         .labelsHidden()
                         .toggleStyle(.switch)
                         .onChange(of: model.agentPadPrompt) { _, _ in model.scheduleSave() }
                 }
-                SettingsCaption("For new tabs. Replace the built-in context with your own file at ~/Library/Application Support/agentpad/agent-prompt.md. To extend it, copy the built-in text first.")
+                SettingsCaption("Enabled for Claude Code by default. Applies when opening or restoring personal agent tabs. Turning this off also disables the additional owner instruction.")
+                // AgentPad: Codex context is a separate, explicit opt-in.
+                SettingsRow(label: "Include AgentPad context in Codex") {
+                    Toggle("", isOn: $model.codexAgentPadPrompt)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .disabled(!model.agentPadPrompt)
+                        .help("Adds developer_instructions when opening or restoring Codex tabs. This may override Codex cloud configuration.")
+                        .onChange(of: model.codexAgentPadPrompt) { _, _ in model.scheduleSave() }
+                }
+                SettingsCaption("Off by default. Enabling this adds developer_instructions and may override Codex cloud configuration.")
+                SettingsRow(label: "Additional owner instruction") {
+                    TextField("Add to the AgentPad context…", text: $model.agentPadPromptAdditionalInstruction, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .lineLimit(3...8)
+                        .disabled(!model.agentPadPrompt)
+                        .onChange(of: model.agentPadPromptAdditionalInstruction) { _, _ in model.scheduleSave() }
+                }
                 SettingsRow(label: "Built-in context") {
                     Button("Copy prompt") {
                         if let url = AgentPadAgentPrompt.builtInURL, let text = try? String(contentsOf: url, encoding: .utf8) {
@@ -1512,19 +1559,25 @@ struct AgentPadSettingsView: View {
 
     private var notificationsDetail: some View {
         VStack(alignment: .leading, spacing: 0) {
-            SettingsRow(label: "agent") {
-                Toggle("", isOn: $model.notifyOnAttention)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .disabled(!model.notificationsEnabled)
+            ForEach(AttentionCategory.allCases, id: \.self) { category in
+                SettingsRow(label: category.label) {
+                    Toggle("", isOn: Binding(get: { model.notificationEnabled(category) },
+                                             set: { model.setNotificationEnabled(category, $0) }))
+                        .labelsHidden().toggleStyle(.switch).disabled(!model.notificationsEnabled)
+                }
             }
-            SettingsRow(label: "command") {
-                Toggle("", isOn: $model.notifyOnFailure)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .disabled(!model.notificationsEnabled)
+            SettingsRow(label: "Notification sound") {
+                Toggle("", isOn: $model.notificationSound).labelsHidden().toggleStyle(.switch)
+                    .onChange(of: model.notificationSound) { _, _ in model.scheduleSave() }
+            }
+            SettingsRow(label: "macOS notification permission") {
+                Text(String(localized: String.LocalizationValue(NotificationAuthorizationModel.shared.status.label), bundle: .agentPadResources)).font(.caption)
+                Button("System Settings…") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
+                }
             }
         }
+        .task { await AttentionCoordinator.shared.notificationManager?.refreshAuthorization() }
     }
 
     private var advancedDetail: some View {

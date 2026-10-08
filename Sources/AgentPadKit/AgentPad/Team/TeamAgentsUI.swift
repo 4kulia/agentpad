@@ -47,6 +47,7 @@ struct TeamAgentsView: View {
         }
         .padding(18)
         .frame(width: 480)
+        .attentionPlace([.recovery("publications")])
         .sheet(item: $editing) { open in
             TeamPublicationEditor(open: open, service: service) { editing = nil }
         }

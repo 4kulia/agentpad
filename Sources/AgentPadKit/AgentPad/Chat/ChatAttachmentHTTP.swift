@@ -1,0 +1,100 @@
+import Foundation
+
+/// A bounded, cancellable binary lane, separate from the JSON timeout and cache.
+/// Each transfer owns its ephemeral session. URLProtocol is injected by tests.
+private final class ChatAttachmentTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionTask?
+    private var continuation: CheckedContinuation<ChatAPI.Response, Error>?
+    private var cancelled = false
+    private var bytes = Data()
+    private var response: HTTPURLResponse?
+    private let limit: Int
+    private let progress: @Sendable (Double) -> Void
+    init(limit: Int, progress: @escaping @Sendable (Double) -> Void) { self.limit = limit; self.progress = progress }
+    func run(_ request: URLRequest, upload: Data?, protocols: [AnyClass]?) async throws -> ChatAPI.Response {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let config = URLSessionConfiguration.ephemeral
+                config.httpCookieAcceptPolicy = .never; config.httpShouldSetCookies = false
+                config.urlCache = nil; config.requestCachePolicy = .reloadIgnoringLocalCacheData
+                config.timeoutIntervalForRequest = request.timeoutInterval
+                config.timeoutIntervalForResource = request.timeoutInterval
+                if let protocols { config.protocolClasses = protocols }
+                let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+                lock.lock()
+                self.continuation = continuation
+                let task = upload.map { session.uploadTask(with: request, from: $0) } ?? session.dataTask(with: request)
+                self.task = task
+                let cancel = cancelled
+                lock.unlock()
+                if cancel { task.cancel() }
+                task.resume()
+                session.finishTasksAndInvalidate()
+            }
+        } onCancel: { self.cancel() }
+    }
+    private func cancel() {
+        lock.lock(); cancelled = true; let task = task; lock.unlock()
+        task?.cancel()
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) { completionHandler(nil) }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
+        self.response = response as? HTTPURLResponse
+        // Error bodies get a small independent allowance; never allocate an
+        // attacker-controlled Content-Length or decode an unbounded original.
+        let bound = (self.response?.statusCode ?? 500) < 300 ? limit : 64 * 1024
+        completionHandler(response.expectedContentLength > Int64(bound) ? .cancel : .allow)
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let bound = (response?.statusCode ?? 500) < 300 ? limit : 64 * 1024
+        guard bytes.count <= bound - data.count else { dataTask.cancel(); return }
+        bytes.append(data)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
+                    totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        if totalBytesExpectedToSend > 0 { progress(min(1, Double(totalBytesSent) / Double(totalBytesExpectedToSend))) }
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock(); let continuation = continuation; self.continuation = nil; let cancelled = cancelled; lock.unlock()
+        if cancelled { continuation?.resume(throwing: CancellationError()) }
+        else if let response, (300..<400).contains(response.statusCode) { continuation?.resume(throwing: ChatAPIError.redirect(response.statusCode)) }
+        else if error != nil { continuation?.resume(throwing: ChatAPIError.network("File transfer failed")) }
+        else if let response {
+            continuation?.resume(returning: .init(status: response.statusCode, body: bytes,
+                retryAfter: ChatAPI.retryAfter(response.value(forHTTPHeaderField: "Retry-After"))))
+        } else { continuation?.resume(throwing: ChatAPIError.unexpectedAnswer("not HTTP")) }
+    }
+}
+
+extension ChatAPI {
+    func attachmentCommand(org: String, id: String, type: String, args: ChatJSON, token: String) async throws {
+        let bytes = try ChatCommandEnvelope(commandId: id, org: org, type: type, args: args).encoded()
+        try Self.check(try await postCommand(bytes, token: token))
+    }
+    func attachmentMetadata(org: String, id: String, token: String) async throws -> ChatAttachmentMetadata {
+        try await call(ChatAttachmentMetadata.self, "GET", "/v1/orgs/\(org)/attachments/\(id)", token: token)
+    }
+    func attachmentUpload(org: String, id: String, data: Data, token: String, seconds: Int,
+                          progress: @escaping @Sendable (Double) -> Void) async throws {
+        _ = try await attachmentBytes(path: "/v1/orgs/\(org)/attachments/\(id)/content", token: token,
+            upload: data, limit: 64 * 1024, seconds: seconds, progress: progress)
+    }
+    func attachmentBytes(path: String, token: String, upload: Data? = nil, limit: Int, seconds: Int = 150,
+                         progress: @escaping @Sendable (Double) -> Void = { _ in }) async throws -> Data {
+        var request = URLRequest(url: server.baseURL.appendingPathComponent(path))
+        request.httpMethod = upload == nil ? "GET" : "PUT"
+        request.timeoutInterval = Double(seconds)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        if let upload {
+            request.setValue(String(upload.count), forHTTPHeaderField: "Content-Length")
+            request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        }
+        let result = try await ChatAttachmentTransfer(limit: limit, progress: progress).run(request, upload: upload, protocols: attachmentProtocols)
+        try Self.check(result)
+        return result.body
+    }
+}

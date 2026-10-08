@@ -39,8 +39,9 @@ struct ChatSidebarModePicker: View {
     }
 
     private var teamNeedsAttention: Bool {
-        !TeamService.shared.calls.awaitingDecision.isEmpty || !TeamService.shared.calls.pendingAccess.isEmpty
-            || !ClaudeVersionApprovals.shared.pending.isEmpty
+        AttentionLedger.shared.events.contains { event in
+            event.kind.needsDecision && [.decisions, .failure, .account].contains(event.kind.category)
+        }
     }
 
     private func mode(_ content: SidebarContent, title: String, icon: String, badge: String? = nil) -> some View {

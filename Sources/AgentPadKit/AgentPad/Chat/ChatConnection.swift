@@ -137,6 +137,18 @@ struct ChatFiles: Sendable {
     }
     func cacheURL(_ key: ChatOrgKey) -> URL { directory.appendingPathComponent(key.cacheFileName) }
 
+    var attachmentStorage: ChatAttachmentStorage {
+        directory == Self.standard.directory ? .standard : ChatAttachmentStorage(root: directory.appendingPathComponent("attachments"))
+    }
+
+    /// Saved originals belong to this cache even if no attachment manager was
+    /// opened this time. Remove them before their ownership records disappear.
+    func removeCache(_ key: ChatOrgKey) {
+        try? FileManager.default.removeItem(at: attachmentStorage.directory(key))
+        let url = cacheURL(key)
+        for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+    }
+
     private struct ServersFile: Codable {
         var servers: [ChatConnection]
     }

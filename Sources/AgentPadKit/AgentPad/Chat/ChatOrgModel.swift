@@ -202,8 +202,8 @@ final class ChatOrgModel {
     var key: ChatOrgKey?
     /// A snapshot is owed or under way: no channel is shown meanwhile (review F2-p1-4).
     var snapshotOwed: @MainActor () -> Bool = { false }
-    /// The feed is connected now (F2: a channel tab says "Offline" otherwise).
-    var isOnline: @MainActor () -> Bool = { true }
+    /// Presentation only, with a short grace period across reconnects.
+    var showsOffline: @MainActor () -> Bool = { false }
 
     @ObservationIgnored private var observation: AnyDatabaseCancellable?
     @ObservationIgnored private var expiry: Task<Void, Never>?
@@ -812,7 +812,7 @@ extension ChatOrgModel {
         }
         model.isCurrent = isCurrent
         model.key = key
-        model.isOnline = { [weak service] in service?.socket?.state == .connected }
+        model.showsOffline = { [weak service] in service?.socket?.showsOffline ?? true }
         model.snapshotOwed = { [weak service] in service?.orgSessions[key]?.snapshotOwed ?? true }
         model.isFollowed = { [weak service] channel in service?.orgSessions[key]?.followedChannels.contains(channel) ?? false }
         model.dismissRefusals = { [weak service] ids in

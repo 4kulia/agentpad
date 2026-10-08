@@ -47,6 +47,84 @@ final class ChatB1Tests: XCTestCase {
             return token
         }
     }
+
+    func testReconnectRefreshKeepsDisplayedDataAndVersionFloorsUntilFreshReplacement() throws {
+        let s = try store()
+        let socket = ChatSocket(server: key.server, token: "test")
+        let b1 = ChatB1Sync(key: key, store: s, api: ChatAPI(server: key.server), token: "test", socket: socket)
+        defer { b1.stop() }
+        b1.configure(ChatB1.capabilities)
+        let oldToken = try seed(s, head: 20)
+        let pinned = ChatB1.PinnedMessage(messageId: "m", seq: 1, authorAccountId: "me", excerpt: "Pinned", pinnedBy: "me", pinnedAt: "now")
+        let pinsData = try ChatB1.encode([pinned])
+        try write(s) { db in
+            try db.execute(sql: "INSERT INTO b1_pins (channel_id, data, as_of_seq, dirty) VALUES ('c', ?, 20, 0)", arguments: [pinsData])
+            try db.execute(sql: "INSERT INTO my_threads (channel_id, root_id) VALUES ('c', 'm')")
+            try db.execute(sql: "UPDATE b1_participation SET head = 8, dirty = 0")
+            try ChatB1.invalidate(db, event: event("pin.changed", seq: 25))
+        }
+        b1.configure(ChatB1.capabilities, reconnect: true)
+        try write(s) { db in
+            XCTAssertEqual(try ChatB1.metadata(db, id: "m"), meta)
+            XCTAssertEqual(try Data.fetchOne(db, sql: "SELECT data FROM b1_pins"), pinsData)
+            XCTAssertEqual(try String.fetchAll(db, sql: "SELECT root_id FROM my_threads"), ["m"])
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT head FROM b1_participation"), 8)
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT dirty FROM b1_participation"), 1)
+            for table in ["b1_metadata", "b1_pins"] {
+                XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT as_of_seq FROM \(table)"), 20)
+                XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT invalidated FROM \(table)"), 25)
+                XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT dirty FROM \(table)"), 1)
+                XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT ticket FROM \(table)"), 2)
+            }
+            let token = try XCTUnwrap(ChatB1.readToken(db, channel: "c"))
+            XCTAssertNotEqual(token, oldToken)
+            XCTAssertFalse(try ChatB1.apply(db, page: .init(asOfSeq: 99, items: [meta]), channel: "c", token: oldToken, tickets: ["m": 2]))
+            XCTAssertFalse(try ChatB1.apply(db, page: .init(asOfSeq: 99, pins: []), channel: "c", token: oldToken, ticket: 2))
+            XCTAssertFalse(try ChatB1.apply(db, page: .init(asOfSeq: 24, items: [meta]), channel: "c", token: token, tickets: ["m": 2]))
+            XCTAssertFalse(try ChatB1.apply(db, page: .init(asOfSeq: 24, pins: []), channel: "c", token: token, ticket: 2))
+            var fresh = meta; fresh.reactions = []; fresh.pin = nil
+            XCTAssertTrue(try ChatB1.apply(db, page: .init(asOfSeq: 25, items: [fresh]), channel: "c", token: token, tickets: ["m": 2]))
+            XCTAssertTrue(try ChatB1.apply(db, page: .init(asOfSeq: 25, pins: []), channel: "c", token: token, ticket: 2))
+            XCTAssertEqual(try ChatB1.metadata(db, id: "m"), fresh)
+            XCTAssertEqual(try Data.fetchOne(db, sql: "SELECT data FROM b1_pins"), try ChatB1.encode([ChatB1.PinnedMessage]()))
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT dirty FROM b1_metadata"), 0)
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT dirty FROM b1_pins"), 0)
+        }
+    }
+
+    func testReconnectCapabilityChangeStillClearsPrivateProjections() throws {
+        let s = try store()
+        let socket = ChatSocket(server: key.server, token: "test")
+        let b1 = ChatB1Sync(key: key, store: s, api: ChatAPI(server: key.server), token: "test", socket: socket)
+        defer { b1.stop() }
+        b1.configure(ChatB1.capabilities)
+        _ = try seed(s)
+        try write(s) { db in
+            try db.execute(sql: "INSERT INTO b1_pins (channel_id, data) VALUES ('c', ?)", arguments: [try ChatB1.encode([ChatB1.PinnedMessage]())])
+        }
+        b1.configure(ChatB1.capabilities.subtracting(["chat.reactions"]), reconnect: true)
+        try read(s) { db in
+            XCTAssertNil(try ChatB1.metadata(db, id: "m"))
+            XCTAssertNil(try Data.fetchOne(db, sql: "SELECT data FROM b1_pins"))
+        }
+    }
+
+    func testFirstConfigurationWithoutB1CannotKeepCacheFromEarlierCapabilities() throws {
+        let s = try store()
+        _ = try seed(s)
+        try write(s) { db in
+            try db.execute(sql: "INSERT INTO b1_pins (channel_id, data) VALUES ('c', ?)", arguments: [try ChatB1.encode([ChatB1.PinnedMessage]())])
+        }
+        let socket = ChatSocket(server: key.server, token: "test")
+        let b1 = ChatB1Sync(key: key, store: s, api: ChatAPI(server: key.server), token: "test", socket: socket)
+        defer { b1.stop() }
+        b1.configure([])
+        try read(s) { db in
+            XCTAssertNil(try ChatB1.metadata(db, id: "m"))
+            XCTAssertNil(try Data.fetchOne(db, sql: "SELECT data FROM b1_pins"))
+        }
+    }
+
     func testB1PointersCommitDurableDebtWithCursorAndDeduplicate() throws {
         let s = try store()
         _ = try seed(s)
@@ -327,6 +405,35 @@ final class ChatB1Tests: XCTestCase {
         for emoji in ["👍🏽", "👩‍💻", "🇳🇱"] { XCTAssertEqual(ChatEmoji.canonical(emoji), emoji) }
         for invalid in ["hello", "👍👍", "🏽", "", "https://image", "👍\u{200D}👍"] { XCTAssertNil(ChatEmoji.canonical(invalid)) }
         for type in ChatB1.commands { XCTAssertTrue(ChatOutbox.neverResent(type)); XCTAssertFalse(ChatOutbox.carriedOver.contains(type)) }
+    }
+
+    func testReactionIdentitiesAreUniqueWhenReadingServerAndLegacyCache() throws {
+        let data = Data(#"{"message_id":"m","deleted":false,"reactions":[{"emoji":"❤","count":2,"mine":false},{"emoji":"👍🏽","count":1,"mine":false},{"emoji":"❤️","count":3,"mine":true},{"emoji":"❤️","count":3,"mine":true},{"emoji":"👍","count":1,"mine":false}],"pin":null}"#.utf8)
+        let expected: [ChatB1.Reaction] = [
+            .init(emoji: "❤️", count: 3, mine: true),
+            .init(emoji: "👍🏽", count: 1, mine: false),
+            .init(emoji: "👍", count: 1, mine: false),
+        ]
+        let decoded = try JSONDecoder().decode(ChatB1.Metadata.self, from: data)
+        XCTAssertEqual(decoded.reactions, expected, "aliases share an identity; duplicate snapshots must not add their counts")
+        let s = try store()
+        try write(s) { db in
+            try ChatB1.watch(db, channel: "c", ids: ["m"])
+            // An already persisted 1.1.6 payload must be safe before any refresh.
+            try db.execute(sql: "UPDATE b1_metadata SET data = ? WHERE message_id = 'm'", arguments: [data])
+        }
+        let service = ChatService(files: ChatFiles(directory: directory), tokens: FakeTokenStore())
+        let panel = ChatB1Channel(key: key, channel: "c", store: s, service: service)
+        XCTAssertEqual(panel.state.metadata["m"]?.reactions, expected)
+        XCTAssertEqual(try read(s) { try ChatB1.metadata($0, id: "m")?.reactions }, expected)
+    }
+
+    func testReactionMetadataDeduplicatesThreadParticipantsWithoutMergingAgents() throws {
+        var item = meta
+        let participants = try XCTUnwrap(item.threadSummary?.lastParticipants)
+        item.threadSummary?.lastParticipants = participants + participants
+        let decoded = try JSONDecoder().decode(ChatB1.Metadata.self, from: ChatB1.encode(item))
+        XCTAssertEqual(decoded.threadSummary?.lastParticipants, participants)
     }
 
     func testPinsRejectOldReadAndEvictionPurgesRawUnknownContent() throws {

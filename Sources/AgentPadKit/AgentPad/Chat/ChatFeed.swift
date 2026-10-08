@@ -34,6 +34,8 @@ final class ChatFeed: ChatSocketLifecycle {
             guard service?.connection?.sessionId == connection.sessionId else { return }
             service?.serverCapabilities[connection.server] = Set(info.capabilities)
             service?.serverB1Limits[connection.server] = info.limits?.chatB1
+            service?.serverAttachmentLimits[connection.server] = info.limits?.attachments
+            service?.attachmentManagers.values.forEach { $0.reconcile() }
             if let key = connection.orgKey {
                 service?.orgSessions[key]?.sync?.b1.configure(Set(info.capabilities), limits: info.limits?.chatB1)
                 service?.orgSessions[key]?.outbox?.pump()
@@ -70,9 +72,10 @@ final class ChatFeed: ChatSocketLifecycle {
             guard let self, self.isCurrent else { return }
             await self.membership(me)
         }
-        account.onNotice = { [weak self] text in
-            guard let self, self.isCurrent else { return }
-            self.service?.onNotice(text)
+        account.onNotice = { [weak self] event in
+            guard let self, self.isCurrent, let service = self.service, let key = service.connection?.orgKey else { return }
+            service.onNotice(AttentionEvent(source: "account-event", object: String(event.seq), episode: event.type,
+                kind: .account, destination: .organization(key.orgId, section: .devices), scope: ChatAttention.scope(key, service)))
         }
     }
 
@@ -120,9 +123,13 @@ final class ChatFeed: ChatSocketLifecycle {
         await account.prepare(context)
         guard isCurrent, socket.isCurrent(context) else { return false }
         if let sync = session?.sync {
-            sync.b1.configure(service?.serverCapabilities[connection.server] ?? [], limits: service?.serverB1Limits[connection.server], reconnect: true)
             // An organization the account just brought begins here.
-            guard sync.beginGeneration(context), await sync.prepare(context), isCurrent, socket.isCurrent(context) else { return false }
+            guard sync.beginGeneration(context) else { return false }
+            // This sync has a fixed server/account/org; beginGeneration above
+            // cleared any old generation. An unchanged B1 capability set now
+            // only refreshes its projections, preserving what is displayed.
+            sync.b1.configure(service?.serverCapabilities[connection.server] ?? [], limits: service?.serverB1Limits[connection.server], reconnect: true)
+            guard await sync.prepare(context), isCurrent, socket.isCurrent(context) else { return false }
         }
         return true
     }
@@ -137,6 +144,7 @@ final class ChatFeed: ChatSocketLifecycle {
     }
 
     func socketDisconnected() {
+        service?.invalidateAttachments()
         session?.sync?.b1.suspend()
         service?.clearChannelActivity()
         session?.outbox?.hold()
@@ -185,9 +193,12 @@ final class ChatFeed: ChatSocketLifecycle {
         // the queue learns it — whether or not a window shows it (C6g p2-4).
         fresh.outbox?.onRefused = { [weak service, weak fresh] record, code in
             // Messages too: a refused post or change says the same of the rights (review F3-1).
-            guard ChatOrgView.commandTypes.contains(record.type) || ChatMessages.eventTypes.contains(record.type) || ChatB1.commands.contains(record.type),
+            guard ChatOrgView.commandTypes.contains(record.type) || ChatMessages.eventTypes.contains(record.type) || ChatB1.commands.contains(record.type)
+                    || ["message.post_with_attachments", "request.create_in_channel_with_attachments", "attachment.prepare", "attachment.complete", "attachment.cancel"].contains(record.type),
                   ["forbidden", "not_found"].contains(code) else { return }
             fresh?.sync?.rightsInDoubt()
+            service?.attachmentManagers[key]?.suspend()
+            service?.reconcileAttachmentCalls()
             if code == "not_found" { service?.accountFeed?.readMeAgain() }
         }
         let sync = ChatSync(key: key, store: store, api: api, socket: socket, outbox: fresh.outbox, token: token)
@@ -204,6 +215,14 @@ final class ChatFeed: ChatSocketLifecycle {
         sync.onInStep = { [weak fresh] in fresh?.actions?.run() }
         sync.onChannelsPaused = { [weak fresh] paused in if fresh?.pausedChannels != paused { fresh?.pausedChannels = paused } }
         sync.setOpenChannels(service.openChannels(key))
+        sync.onLiveEvent = { [weak service] event in
+            guard let service else { return }
+            let admin = ["invitation.create", "invitation.accept", "invitation.revoke"].contains(event.type)
+            let mine = event.body["account_id"]?.string == key.accountId && ["member.update", "member.remove", "team.remove_member", "team.leave"].contains(event.type)
+            guard admin || mine else { return }
+            service.onNotice(AttentionEvent(source: "organization-event", object: event.stream, episode: String(event.seq),
+                kind: .account, destination: .organization(key.orgId, section: admin ? .invitations : .members), scope: ChatAttention.scope(key, service)))
+        }
         sync.onLiveMessage = { [weak fresh, weak service] channel, id in
             guard let store = fresh?.store, let service else { return }
             ChatNotifications.live(service, key, store: store, channel: channel, messageId: id)
@@ -235,6 +254,8 @@ final class ChatFeed: ChatSocketLifecycle {
         sync.b1.onCapabilities = { [weak service, weak fresh] info in
             service?.serverCapabilities[key.server] = Set(info.capabilities)
             service?.serverB1Limits[key.server] = info.limits?.chatB1
+            service?.serverAttachmentLimits[key.server] = info.limits?.attachments
+            service?.attachmentManagers.values.forEach { $0.reconcile() }
             fresh?.outbox?.pump()
         }
         sync.b1.canNotify = { [weak service] channel in
@@ -246,9 +267,7 @@ final class ChatFeed: ChatSocketLifecycle {
             ChatNotifications.live(service, key, store: store, channel: channel, messageId: id, eligibleReply: true)
         }
         sync.b1.configure(service.serverCapabilities[key.server] ?? [], limits: service.serverB1Limits[key.server])
-        fresh.outbox?.maySendCommand = { [weak service] record in
-            !ChatB1.commands.contains(record.type) || service?.supports(ChatB1.capability(for: record.type), key: key) == true
-        }
+        if let outbox = fresh.outbox { service.configureCommandCapabilities(outbox, key: key) }
         fresh.sync = sync
         // Posts left "sending" by an earlier run go again with their ids (F3).
         service.resendPosts(key)
@@ -258,5 +277,32 @@ final class ChatFeed: ChatSocketLifecycle {
         // does not miss it (review C2-7); what fails now, its snapshot retry
         // finishes (review C16-1).
         if let context = socket.context, isCurrent { _ = await sync.ready(for: context) }
+    }
+}
+
+extension ChatService {
+    func configureCommandCapabilities(_ outbox: ChatOutbox, key: ChatOrgKey) {
+        func attachmentCapability(_ type: String) -> String? {
+            switch type {
+            case "message.post_with_attachments": "chat.attachments"
+            case "request.create_in_channel_with_attachments": "chat.attachments_context"
+            default: nil
+            }
+        }
+        outbox.maySendCommand = { [weak self] record in
+            if let capability = attachmentCapability(record.type) {
+                return self?.supports(capability, key: key) == true && self?.attachments(key)?.limits != nil
+                    && self?.attachments(key)?.postReady(record) == true
+            }
+            return !ChatB1.commands.contains(record.type) || self?.supports(ChatB1.capability(for: record.type), key: key) == true
+        }
+        outbox.isSuspended = { [weak self] record in
+            guard let capability = attachmentCapability(record.type) else { return false }
+            return self?.supports(capability, key: key) != true || self?.attachments(key)?.limits == nil
+        }
+        outbox.permanentRejection = { [weak self] record in
+            guard record.type == "message.post_with_attachments", let store = self?.orgSessions[key]?.store else { return nil }
+            return try? store.queue.read { try ChatAttachments.postFailure($0, record) }
+        }
     }
 }

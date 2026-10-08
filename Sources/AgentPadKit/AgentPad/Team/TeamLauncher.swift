@@ -13,7 +13,7 @@ protocol TeamRunFacts: AnyObject {
     /// review C8-4). Throws when it cannot be written: then neither is
     /// (review C3-11). True when written.
     func end(_ run: ChatRunRecord, outcome: ChatRunRecord.Outcome, reason: String, result: String?, at: Date,
-             journal: ChatJournal, waitForState: Bool) throws -> Bool
+             journal: ChatJournal, waitForState: Bool, diagnosis: ClaudeLaunchDiagnostic.Failure?) throws -> Bool
     /// The run's process exists: `run.started` (and what it needs) goes.
     func processStarted(_ run: ChatRunRecord)
     /// A fact was stored: the queue sends it when it can.
@@ -119,6 +119,11 @@ final class TeamLauncher {
         self.runner = runner
     }
 
+    var prepareAttachmentFiles: @MainActor (TeamLaunchParams, ChatRunRecord) async throws -> ChatAttachmentCallFiles? = { params, _ in
+        if params.inputs.attachments?.isEmpty == false { throw ChatAttachmentError.unavailable }; return nil
+    }
+    var verifyAttachmentFiles: @MainActor (ChatAttachmentCallFiles) async throws -> Void = { _ in throw ChatAttachmentError.unavailable }
+
     func isLive(_ runId: String) -> Bool { live[runId] != nil }
 
     /// No new run from now on; those accepted already go on until stopped.
@@ -163,6 +168,9 @@ final class TeamLauncher {
               TeamLaunchInputs(agent: agentNow, request: current) == params.inputs,
               current.channelId == params.channelId, current.threadRootId == params.threadRootId
         else { throw try void(approval, "params_changed") }
+
+        do { try ChatAttachmentStorage.checkFolders([params.inputs.folder] + params.inputs.extraFolders + (params.grantedFolders ?? [])) }
+        catch { throw try void(approval, error.localizedDescription) }
 
         // An earlier run of this agent whose processes are not confirmed gone
         // blocks it — from the journal, or left over in this app in any mode (review C7-11).
@@ -264,12 +272,24 @@ final class TeamLauncher {
         let journal = self.journal
         let runId = row.runId
         var request: TeamRunRequest
-        do { request = try params.runRequest(logURL: logURL(runId)) } catch {
+        var attachmentFiles: ChatAttachmentCallFiles?
+        defer { attachmentFiles?.remove() }
+        do {
+            request = try params.runRequest(logURL: logURL(runId))
+            attachmentFiles = try await prepareAttachmentFiles(params, row)
+            try attachmentFiles?.apply(to: &request)
+        } catch {
             ended(row, params.segment == nil ? .didNotStart : .failed, reason: error.localizedDescription, result: nil)
             throw error
         }
+        let selectedFiles = attachmentFiles
         request.validateBeforeExecutor = { [weak self] in
             guard let self else { throw TeamRunnerError.didNotStart("executor_unavailable") }
+            try self.validateWaitingSegment(params, row: row)
+        }
+        request.validateAttachmentFiles = { [weak self] in
+            guard let self else { throw ChatAttachmentError.unavailable }
+            if let selectedFiles { try await self.verifyAttachmentFiles(selectedFiles) }
             try self.validateWaitingSegment(params, row: row)
         }
         request.onPreflightProcess = { start in try journal.recordPreflightProcess(runId, start) }
@@ -373,17 +393,18 @@ final class TeamLauncher {
             }
             return answer
         case .failure(let error):
+            let diagnosis = (error as? TeamRunnerError)?.diagnosis
             if let notStarted = Self.notStarted(error) {
                 // Only the first segment did not start; a continuation that
                 // could not is a run that failed (review D4b2-3).
                 if params.segment != nil {
-                    ended(row, .failed, reason: notStarted, result: nil)
+                    ended(row, .failed, reason: notStarted, result: nil, diagnosis: diagnosis)
                     throw error
                 }
-                ended(row, .didNotStart, reason: notStarted, result: nil)
+                ended(row, .didNotStart, reason: notStarted, result: nil, diagnosis: diagnosis)
                 throw Failure.didNotStart(notStarted)
             } else {
-                ended(row, .failed, reason: error.localizedDescription, result: nil)
+                ended(row, .failed, reason: error.localizedDescription, result: nil, diagnosis: diagnosis)
             }
             throw error
         }
@@ -391,11 +412,11 @@ final class TeamLauncher {
 
     /// A run that ended by itself: its outcome, its result and the chain of
     /// its facts in one transaction (D4); without facts, the outcome alone.
-    private func ended(_ row: ChatRunRecord, _ outcome: ChatRunRecord.Outcome, reason: String, result: String?) {
+    private func ended(_ row: ChatRunRecord, _ outcome: ChatRunRecord.Outcome, reason: String, result: String?, diagnosis: ClaudeLaunchDiagnostic.Failure? = nil) {
         if let facts {
-            _ = try? facts.end(row, outcome: outcome, reason: reason, result: result, at: now(), journal: journal, waitForState: false)
+            _ = try? facts.end(row, outcome: outcome, reason: reason, result: result, at: now(), journal: journal, waitForState: false, diagnosis: diagnosis)
         } else {
-            _ = try? journal.finish(row.runId, outcome, at: now(), result: result)
+            _ = try? journal.finish(row.runId, outcome, at: now(), result: result, diagnosis: diagnosis)
         }
     }
 
@@ -422,7 +443,7 @@ final class TeamLauncher {
         let current = ((try? journal.run(row.runId)) ?? nil) ?? row
         if let facts {
             // Made from what it reads itself; not made — the row waits (review C8-4).
-            do { return try facts.end(current, outcome: outcome, reason: reason, result: nil, at: at, journal: journal, waitForState: true) } catch {
+            do { return try facts.end(current, outcome: outcome, reason: reason, result: nil, at: at, journal: journal, waitForState: true, diagnosis: current.launchFailure) } catch {
                 return wait()
             }
         }
@@ -455,6 +476,7 @@ final class TeamLauncher {
         guard let agentNow = agent(row.agentId), assignment.accepted.matches(agentNow),
               TeamLaunchInputs(agent: agentNow, request: current) == params.inputs,
               current.channelId == params.channelId, current.threadRootId == params.threadRootId else { try refuse("params_changed") }
+        try ChatAttachmentStorage.checkFolders([params.inputs.folder] + params.inputs.extraFolders + (params.grantedFolders ?? []))
         if params.segment != nil {
             guard let continuation = try journal.latestContinuation(of: approval), continuation.consumedAt != nil,
                   continuation.voidReason == nil,
@@ -464,7 +486,7 @@ final class TeamLauncher {
 
     private static func notStarted(_ error: Error) -> String? {
         switch error as? TeamRunnerError {
-        case .didNotStart(let detail): detail
+        case .didNotStart(let detail, _): detail
         case .claudeNotFound: TeamRunnerError.claudeNotFound.localizedDescription
         default: nil
         }

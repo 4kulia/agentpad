@@ -60,6 +60,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// Posts macOS notifications when a backgrounded agent needs attention or
     /// a command fails. Bundle-gated, so it no-ops under `swift run`.
     private let notificationManager = NotificationManager()
+    private let notificationNavigation = NotificationNavigation(ledger: .shared)
     /// Native `NSStatusItem` showing the same cross-window live agent set as
     /// the right sidebar. It starts only after `AgentMonitor` is wired below.
     private var agentMenuBarController: AgentMenuBarController?
@@ -75,9 +76,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 store.applyHookEvent(agent: agent, event: event, sessionId: sessionId, details: details)
             case .shellEnvironment(let env, let sessionId):
                 store.applyShellEnvironment(env, sessionId: sessionId)
-            case .conversationId(let conversationId, let sessionId, let provenance):
+            case .conversationId(let conversationId, let sessionId, let provenance, let failure):
                 // AgentPad: preserve hook provenance separately from monitor IDs.
-                store.applyHookConversationId(conversationId: conversationId, sessionId: sessionId, provenance: provenance)
+                store.applyHookConversationId(conversationId: conversationId, sessionId: sessionId, provenance: provenance, failure: failure)
             case .toolCall(let agent, let toolName, let identifier, let event, let success, let toolUseId, let sessionId, let mainThread):
                 store.applyToolCallEvent(
                     agent: agent,
@@ -195,9 +196,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // adhoc binaries run from inside the bundle). Launch-time so the
         // stable path always carries the running build's CLI.
         _ = AgentPadShellIntegration.agentPadCLIBinaryPath
-        notificationManager.onActivate = { [weak self] sessionId in
-            self?.activateFromNotification(sessionId)
+        notificationManager.onActivateLocator = { [weak self] in self?.notificationNavigation.activate($0) }
+        notificationNavigation.shouldWait = { event in
+            guard let scope = event.scope, let key = ChatAttention.key(scope), ChatService.shared.state == .signedIn,
+                  ChatService.shared.connection?.orgKey == key else { return false }
+            return ChatService.shared.orgSessions[key]?.snapshotOwed == true
         }
+        notificationNavigation.validate = { event in
+            AttentionCoordinator.shared.refreshSources()
+            guard AttentionCoordinator.shared.valid(event) else { return false }
+            return !event.kind.needsDecision || AttentionLedger.shared.events.contains { $0.id == event.id }
+        }
+        notificationNavigation.open = { [weak self] in self?.openAttention($0) ?? false }
+        notificationNavigation.unavailable = {
+            Task { await TeamUI.showError("This item is no longer available or no longer needs a decision", TeamError.storage("")) }
+        }
+        AttentionCoordinator.shared.navigation = notificationNavigation
+        AttentionCoordinator.shared.terminalFocused = { [weak self] in self?.isSessionVisible($0) ?? false }
+        AttentionCoordinator.shared.terminalExists = { [weak self] in self?.dockTabLocation(for: $0) != nil }
         notificationManager.start()
         // The right-side agent overview reads the global AgentMonitor; give it
         // the live window stores to aggregate + the same reveal-tab jump.
@@ -213,10 +229,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         AttentionCoordinator.shared.activateOwn = { [weak self] sessionId in
             self?.activateFromNotification(sessionId)
         }
-        notificationManager.onActivateExternal = { id in
-            AttentionCoordinator.shared.activate(.external(id))
-        }
         AttentionCoordinator.shared.start()
+        // Start scheduled checks after notification policy/delivery is ready.
+        // This also records a confirmed installation from the running bundle.
+        _ = AgentPadUpdater.shared
         // AgentPad: team work — off unless the user turned it on.
         TeamUI.install()
         TeamUI.openTab = { [weak self] cwd, command, title in
@@ -317,6 +333,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             peerStores: { [weak self] in self?.windowControllers.map(\.store) ?? [] },
             moveToNewWindow: { [weak self] id in self?.moveTabToNewWindow(sessionId: id) },
             onSessionAlert: { [weak self] id, kind in self?.handleSessionAlert(id, kind) },
+            onSessionWaitingEnded: { AttentionCoordinator.shared.endTerminalWaiting($0) },
             noteRecentFolder: { RecentFolders.shared.note($0) }
         )
         let controller = AgentPadWindowController(windowId: windowId, store: store)
@@ -914,59 +931,30 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// Called by any window's store when a session raises an alert —
     /// attention, command failure, completion, or a program's own OSC 9/777
     /// notification. Every kind lands in the inbox (visible tab → read); the
-    /// system banner only fires for a tab the user can't currently see, and
-    /// only when notifications are enabled.
+    /// Outcomes follow exact-place focus; input waits notify even in focus.
     private func handleSessionAlert(_ sessionId: UUID, _ kind: SessionAlertKind) {
         guard let location = dockTabLocation(for: sessionId) else { return }
-        let tab = location.session.title
-        let workspace = location.workspace.title
-        // A tab that's already on-screen when the event fires lands read — the
-        // user is looking at it, so it shouldn't light the bell. Computed once
-        // and reused below to also suppress the banner.
-        let visible = isSessionVisible(sessionId)
-        // Every kind — including completed — lands in the inbox.
-        NotificationInbox.shared.add(
-            kind: kind,
-            sessionId: sessionId,
-            agent: location.session.displayAgent,
-            tab: tab,
-            workspace: workspace,
-            isRead: visible
-        )
-        // System banner: attention / failure only, gated on the setting + its
-        // sub-toggle + visibility. Completed is inbox-only (never a banner).
-        let settings = AgentPadSettingsModel.shared
+        let session = location.session
+        // Channel runs have their own gated request/publication sources. Never
+        // turn their terminal title or OSC text into a personal notification.
+        guard ChannelConversationFilter.current().allows(agentId: session.displayAgent.id,
+                                                         conversationId: session.conversationId) else { return }
+        let eventKind: AttentionKind
         switch kind {
-        case .completed:
-            return
-        case .programNotification(let title, let body):
-            // Program-originated (own core-side gate: `desktop-notifications`)
-            // — AgentPad's per-kind sub-toggles don't apply, but the master
-            // switch does: a user who turned notifications off must not get
-            // banners (or the OS authorization prompt) from a stray OSC 9.
-            guard settings.notificationsEnabled, !visible else { return }
-            notificationManager.post(
-                title: title.isEmpty ? location.session.displayAgent.title : title,
-                body: body,
-                sessionId: sessionId
-            )
-        case .attention:
-            guard settings.notificationsEnabled, settings.notifyOnAttention,
-                  !visible else { return }
-            notificationManager.post(
-                title: "\(location.session.displayAgent.title) needs you",
-                body: tab == workspace ? tab : "\(tab) · \(workspace)",
-                sessionId: sessionId
-            )
-        case .failure:
-            guard settings.notificationsEnabled, settings.notifyOnFailure,
-                  !visible else { return }
-            notificationManager.post(
-                title: "\(tab) — command failed",
-                body: workspace,
-                sessionId: sessionId
-            )
+        case .attention: eventKind = .input
+        case .completed: eventKind = .completion
+        case .failure: eventKind = .failure
+        case .programNotification: eventKind = .program
         }
+        var event = AttentionEvent(source: "terminal", object: session.id.uuidString,
+            episode: "\(session.notificationIncarnation):\(session.notificationPhase):\(session.notificationEpisode)",
+            kind: eventKind, destination: .terminal(session.id))
+        event.localBody = "\(session.title) · \(location.workspace.title)"
+        if case .programNotification(let title, let body) = kind {
+            event.localTitle = title.isEmpty ? session.displayAgent.title : title
+            event.localBody = body
+        }
+        AttentionLedger.shared.upsert(event)
     }
 
     /// True only when the session is the active tab of the active workspace in
@@ -975,14 +963,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// a zoom hiding this pane all read as not-visible (→ worth a notification).
     private func isSessionVisible(_ sessionId: UUID) -> Bool {
         guard NSApp.isActive,
-              let controller = windowControllers.first(where: { $0.window?.isKeyWindow == true }),
+              let controller = windowControllers.first(where: { $0.window?.isKeyWindow == true && $0.window?.isVisible == true && $0.window?.isMiniaturized == false }),
               let workspace = controller.store.workspaces.first(where: { $0.id == controller.store.activeWorkspaceId }),
               let pane = workspace.root.pane(containingSessionId: sessionId),
               pane.activeTabId == sessionId
         else { return false }
         // Zoom hides every pane but the zoomed one.
         if let zoomed = workspace.zoomedPaneId, zoomed != pane.id { return false }
-        return true
+        guard let location = dockTabLocation(for: sessionId) else { return false }
+        let view = location.session.engine.view
+        return view.window === controller.window && !view.isHiddenOrHasHiddenAncestor && !view.visibleRect.isEmpty
     }
 
     /// Mark the currently-visible tab's notifications read — called when AgentPad
@@ -991,7 +981,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// would otherwise keep the bell lit after the user is plainly looking at it.
     private func markVisibleSessionRead() {
         guard NSApp.isActive,
-              let controller = windowControllers.first(where: { $0.window?.isKeyWindow == true }),
+              let controller = windowControllers.first(where: { $0.window?.isKeyWindow == true && $0.window?.isVisible == true && $0.window?.isMiniaturized == false }),
               let workspace = controller.store.workspaces.first(where: { $0.id == controller.store.activeWorkspaceId }),
               let session = workspace.activeSession
         else { return }
@@ -1017,15 +1007,59 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// Inbox row click → mark that event read, bring AgentPad forward, jump to the
     /// tab. The jump no-ops if the session has since closed (event outlives it).
     private func activateFromInbox(_ event: NotificationInbox.Event) {
-        NotificationInbox.shared.markRead(event.id)
+        notificationNavigation.activate(event.id)
+    }
+
+    private func openAttention(_ event: AttentionEvent) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
-        guard let location = dockTabLocation(for: event.sessionId) else { return }
-        revealTab(location.session, in: location.workspace, controller: location.controller)
-        // Jumping in from a notification means the user has now looked at the
-        // tab, so clear any lingering command-failure dot on it (the same
-        // fields the next-keystroke clear resets) — not just the inbox entry.
-        location.session.lastCommandExit = nil
-        location.session.lastCommandDuration = nil
+        func team(_ destination: AttentionDestination) -> Bool {
+            revealHiddenWindow()
+            let targetWindow = AttentionFocus.window(for: destination)
+            guard let controller = windowControllers.first(where: { targetWindow != nil && $0.window === targetWindow })
+                ?? windowControllers.first(where: { $0.store.sidebarContent == .team }) ?? activeController else { return false }
+            controller.store.setSidebarMode(.full)
+            controller.store.setSidebarContent(.team)
+            controller.window?.deminiaturize(nil); controller.window?.makeKeyAndOrderFront(nil)
+            AttentionSelection.shared.select(destination)
+            return true
+        }
+        func channel(_ id: String) -> Session? {
+            guard let scope = event.scope, let key = ChatAttention.key(scope),
+                  ChatNotifications.allowed(.shared, key, channel: id) else { return nil }
+            let ref = ChannelRef(key, channel: id)
+            let controller = windowControllers.first { $0.store.channelTab(ref) != nil } ?? activeController ?? addWindow()
+            controller.window?.deminiaturize(nil); controller.window?.makeKeyAndOrderFront(nil)
+            return controller.store.showChannel(ref)
+        }
+        switch event.destination {
+        case .terminal(let id):
+            guard let location = dockTabLocation(for: id) else { return false }
+            revealTab(location.session, in: location.workspace, controller: location.controller)
+            return true
+        case .external(let id): AttentionCoordinator.shared.activate(.external(id)); return true
+        case .team, .version: return team(event.destination)
+        case .folder(let id, let request):
+            if let folder = TeamService.shared.calls.accessRequests.first(where: { $0.id == id }), let name = folder.scope?.channelId {
+                guard channel(name) != nil else { return false }
+                AttentionSelection.shared.select(.channel(name, request: request)); return true
+            }
+            return team(event.destination)
+        case .channel(let id, _):
+            guard channel(id) != nil else { return false }
+            AttentionSelection.shared.select(event.destination); return true
+        case .message(let id, let message, _, let sequence):
+            guard let tab = channel(id), let scope = event.scope, let key = ChatAttention.key(scope) else { return false }
+            ChatMessageNavigation.request(ChatMessageLink(key: key, channel: id, message: message, sequence: sequence), key: key, destination: tab.engine.view)
+            return true
+        case .organization: ChatOrgWindow.show(); AttentionSelection.shared.select(event.destination); return true
+        case .connect: ChatConnectWindow.show(); return true
+        case .recovery(let id):
+            if id == "publications" { TeamUI.showAgents() } else { TeamUI.showTeam() }
+            return true
+        case .update: handleCheckForUpdates(NSMenuItem()); return true
+        case .sheet(let id): return PendingConfirmations.shared.open(id)
+        case .invitation, .directMessage, .publicationProposal: return false
+        }
     }
 
     /// The terminal-window controller owning `window`, if it's one of ours.
@@ -1984,6 +2018,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let originalTitle = sender.title
         sender.title = String(localized: "Checking for Updates…", bundle: .agentPadResources)
         sender.isEnabled = false
+        UpdateAttention.shared.beginCheck()
         // AGENTPAD_FAKE_VERSION lets us preview the "newer release" prompt without
         // mutating AgentPadApp.displayVersion. Launch via:
         //   open --env AGENTPAD_FAKE_VERSION=0.11.0 /Applications/AgentPad.app

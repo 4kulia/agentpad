@@ -1,5 +1,19 @@
 import Foundation
 
+/// One foreground command launched by the tab, before the first prompt. Its
+/// result travels on the terminal stream even when the shell omits OSC 133 D.
+enum AgentLaunchExitMarker {
+    static let prefix = "agentpad-launch-exit:"
+
+    static func parse(_ title: String) -> (id: UUID, exit: Int)? {
+        guard title.hasPrefix(prefix) else { return nil }
+        let parts = title.dropFirst(prefix.count).split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2, let id = UUID(uuidString: String(parts[0])),
+              let exit = Int(parts[1]), (0...255).contains(exit) else { return nil }
+        return (id, exit)
+    }
+}
+
 /// Private terminal-title marker used as a remote-friendly fallback for agent
 /// status. Unlike `AgentPadHook`, this rides the terminal byte stream itself, so
 /// an ssh remote can report `claude running` without reaching AgentPad's local

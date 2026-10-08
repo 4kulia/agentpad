@@ -829,7 +829,7 @@ final class WorkspaceStoreTests: XCTestCase {
         // one to verify the DFS picks it up regardless of focus.
         store.splitPane(pane, orientation: .horizontal, in: ws)
         let firstTab = pane.tabs[0]
-        let secondPaneTab = ws.root.allPanes.last!.tabs[0]
+        let secondPaneTab = store.addTab(in: ws, pane: ws.root.allPanes.last!)
         XCTAssertFalse(ws.hasCommandFailure)
         engine(secondPaneTab).emitCommandFinished(exit: 1, duration: 0.1)
         XCTAssertTrue(ws.hasCommandFailure)
@@ -871,7 +871,7 @@ final class WorkspaceStoreTests: XCTestCase {
         let pane = firstPane(ws)
         store.splitPane(pane, orientation: .horizontal, in: ws)
         let firstPaneTab = pane.tabs[0]
-        let secondPaneTab = ws.root.allPanes.last!.tabs[0]
+        let secondPaneTab = store.addTab(in: ws, pane: ws.root.allPanes.last!)
         firstPaneTab.activityState = .attention
         engine(secondPaneTab).emitCommandFinished(exit: 1, duration: 0.1)
         XCTAssertEqual(ws.activityState, .attention)
@@ -1062,7 +1062,8 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertNotNil(new)
         XCTAssertEqual(ws.root.allPanes.count, 2)
         XCTAssertEqual(ws.activePaneId, new?.id)
-        XCTAssertEqual(new?.tabs.count, 1)
+        XCTAssertEqual(new?.tabs.count, 0)
+        XCTAssertNil(new?.activeTabId)
     }
 
     func testRepeatedRightSplitsRebalanceTheAncestorPath() {
@@ -1087,16 +1088,17 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(deepFraction, 0.5, accuracy: 0.001)
     }
 
-    func testSplitPaneInheritsActiveTabAgentAndCwd() {
+    func testSplitPaneStaysEmptyAndExplicitNewTabInheritsCwd() {
         let store = makeStore()
         let ws = store.addWorkspace(workingDirectory: projectA)
         let pane = firstPane(ws)
         store.addTab(in: ws, template: .claudeCode)
         engine(pane.tabs.last!).emitPwd("/tmp/projectA/sub")
         let new = store.splitPane(pane, orientation: .vertical, in: ws)
-        let newSession = new?.tabs.first
-        XCTAssertEqual(newSession?.agent.id, "claude-code")
-        XCTAssertEqual((newSession?.engine as? TestEngine)?.startedConfigs.last?.workingDirectory, "/tmp/projectA/sub")
+        XCTAssertTrue(new?.tabs.isEmpty == true)
+        let newSession = store.addTab(in: ws, pane: new, template: .claudeCode)
+        XCTAssertEqual(newSession.agent.id, "claude-code")
+        XCTAssertEqual((newSession.engine as? TestEngine)?.startedConfigs.last?.workingDirectory, "/tmp/projectA/sub")
     }
 
     func testClosePaneCollapsesSiblingUp() {
@@ -1116,7 +1118,7 @@ final class WorkspaceStoreTests: XCTestCase {
         let pane = firstPane(ws)
         let new = store.splitPane(pane, orientation: .horizontal, in: ws)!
         // Close the lone tab in `new`. Should collapse the split, leaving `pane` alone.
-        store.closeTab(new.tabs[0], in: ws)
+        store.closeTab(store.addTab(in: ws, pane: new), in: ws)
         XCTAssertEqual(ws.root.allPanes.count, 1)
         XCTAssertEqual(ws.root.allPanes.first?.id, pane.id)
     }
@@ -1145,7 +1147,9 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(ws.root.allPanes.count, 2)
         store.moveTab(originalSession, to: new, at: new.tabs.count, in: ws)
         XCTAssertFalse(store.workspaces.isEmpty)
-        XCTAssertEqual(ws.root.allPanes.count, 1)
+        XCTAssertEqual(ws.root.allPanes.count, 2)
+        XCTAssertTrue(original.tabs.isEmpty)
+        XCTAssertNil(original.activeTabId)
         XCTAssertTrue(new.tabs.contains { $0.id == originalSession.id })
         XCTAssertEqual(engine(originalSession).terminateCount, 0)
     }
@@ -1157,7 +1161,7 @@ final class WorkspaceStoreTests: XCTestCase {
         let session = source.tabs[0]
         engine(session).emitPwd("/tmp/projectA/sub")
         let dest = store.splitPane(source, orientation: .horizontal, in: ws)!
-        // splitPane spawns a new session in dest; switch active away first so
+        // Switch active away from the empty split first so
         // the move into dest is the thing that has to sync the cwd.
         store.focusPane(source, in: ws)
         store.moveTab(session, to: dest, at: dest.tabs.count, in: ws)
@@ -1865,7 +1869,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertNotEqual(wsA.workingDirectory.path, "/tmp/projectC", "window A is untouched")
     }
 
-    func testCrossWindowDropOfLastTabEmptiesSourceWindow() {
+    func testCrossWindowDropOfLastTabKeepsEmptySourceWorkspace() {
         let (a, b) = makeWindowPair()
         var aBecameEmpty = 0
         a.onBecameEmpty = { aBecameEmpty += 1 }
@@ -1874,8 +1878,10 @@ final class WorkspaceStoreTests: XCTestCase {
 
         b.handleTabDrop(droppedId: onlyTab.id, to: firstPane(wsB), at: firstPane(wsB).tabs.count, in: wsB)
 
-        XCTAssertTrue(a.workspaces.isEmpty, "window A's last tab left — its workspace collapsed away")
-        XCTAssertEqual(aBecameEmpty, 1, "store A signalled empty so its window can close")
+        XCTAssertEqual(a.workspaces.count, 1)
+        XCTAssertTrue(firstPane(a.workspaces[0]).tabs.isEmpty)
+        XCTAssertNil(firstPane(a.workspaces[0]).activeTabId)
+        XCTAssertEqual(aBecameEmpty, 0, "moving a tab preserves the source workspace")
         XCTAssertTrue(firstPane(wsB).tabs.contains { $0 === onlyTab })
         XCTAssertEqual(engine(onlyTab).terminateCount, 0, "engine survives the source window emptying")
     }
@@ -2027,9 +2033,10 @@ final class WorkspaceStoreTests: XCTestCase {
         guard let paneB = store.splitPane(paneA, orientation: .horizontal, in: ws) else {
             return XCTFail("split failed")
         }
+        let secondTab = store.addTab(in: ws, pane: paneB)
         store.toggleZoom(in: ws, paneId: paneA.id)
         XCTAssertEqual(ws.zoomedPaneId, paneA.id)
-        store.activateTab(paneB.tabs[0], in: ws)
+        store.activateTab(secondTab, in: ws)
         XCTAssertNil(ws.zoomedPaneId)
         XCTAssertEqual(ws.activePaneId, paneB.id)
     }
@@ -2215,9 +2222,10 @@ final class WorkspaceStoreTests: XCTestCase {
         let ws = store.addWorkspace(workingDirectory: projectA, sshRemoteHost: "deploy@example.com")
         let pane = firstPane(ws)
 
-        guard let newPane = store.splitPane(pane, orientation: .horizontal, in: ws),
-              let session = newPane.activeTab
+        guard let newPane = store.splitPane(pane, orientation: .horizontal, in: ws)
         else { return XCTFail("expected split pane") }
+        XCTAssertTrue(newPane.tabs.isEmpty)
+        let session = store.addTab(in: ws, pane: newPane)
 
         XCTAssertEqual(
             engine(session).startedConfigs.last?.environment["AGENTPAD_AGENT"],

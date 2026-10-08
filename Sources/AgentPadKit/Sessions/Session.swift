@@ -68,8 +68,8 @@ final class Session: Identifiable {
     /// itself opened the connection (SSH workspace tabs), never by a manually
     /// typed `ssh`. Stable for the tab's lifetime, which makes it the paste
     /// routing signal: "upload pasted files to this host" must not flicker
-    /// with `remoteHost`'s marker/command-finished lifecycle. Not persisted —
-    /// restore re-derives it from `Workspace.sshRemoteHost` at spawn.
+    /// with `remoteHost`'s marker/command-finished lifecycle. Persisted per
+    /// tab so moving between workspaces preserves its reconnect destination.
     var sshWorkspaceHost: String?
     /// Latest Codex account rate-limit usage (5-hour + weekly windows), parsed
     /// from the active session's rollout file by `CodexUsageMonitor` and shown
@@ -157,11 +157,12 @@ final class Session: Identifiable {
     /// launch. Distinct from `conversationId` (which persists even while the
     /// resume *setting* is off) — `spawnSession` records the value that
     /// reached the command line, mirroring `makeSessionConfig`'s ssh/prompt
-    /// drops, so `wireSessionCallbacks` consumers (Codex usage monitor)
+    /// drops, so `configureSession` consumers (Codex usage monitor)
     /// don't have to re-derive any gate. Runtime-only.
     var resumedConversationId: String?
     /// AgentPad: runtime export binding, separate from persisted/monitored IDs.
     var answerBinding: AgentAnswerSource.Binding?
+    var answerBindingProblem: AgentAnswerTranscript.Problem?
     /// Exit status of the most recent command — populated from libghostty's
     /// `OSC 133;D` event. `nil` until the shell reports its first finish (or
     /// when it omits the exit field). Not persisted: each launch starts fresh.
@@ -407,6 +408,15 @@ final class Session: Identifiable {
     /// AgentPad: subagents and shell commands still running in the background
     /// after the agent ended its turn. Non-nil only while the tab shows
     /// "running" for that reason; the next lifecycle event replaces it.
+    var notificationIncarnation = UUID()
+    var notificationEpisode = 0
+    var notificationPhase = "turn"
+    var attentionReason: SessionAttentionReason = .input
+    var awaitingAgentExitOutcome = false
+    var pendingAgentLaunch: (id: UUID, isAgent: Bool)?
+    /// Some shells emit a first-prompt D after the explicit launch result.
+    /// A preexec command marker opens the next command's result again.
+    var reportedAgentLaunchExit = false
     var backgroundWork: BackgroundWork?
 
     /// AgentPad: when a hook last set `activityState`. Claude Code's own
@@ -500,4 +510,9 @@ final class Session: Identifiable {
         self.customTitle = customTitle
         self.conversationId = conversationId
     }
+}
+
+/// Original hook meaning; activity colour is intentionally independent.
+enum SessionAttentionReason: String, Sendable, Equatable {
+    case input, completion, failure
 }

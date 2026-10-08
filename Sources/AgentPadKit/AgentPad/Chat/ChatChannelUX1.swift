@@ -43,6 +43,7 @@ struct ChatChannelAuthority: Codable, Equatable, Sendable {
     var replyMode: String?
     var deliverBy: String?
     var sourceRevision: Int? = nil
+    var attachments: [ChatAttachmentManifest]? = nil
 
     func matchesScope(_ key: ChatOrgKey, session: String, generation: String, agent: TeamPublishedAgent) -> Bool {
         server == key.server.description && account == key.accountId && org == key.orgId
@@ -54,7 +55,7 @@ struct ChatChannelAuthority: Codable, Equatable, Sendable {
         guard request.sourceMessageId != nil, request.replyMode == "channel" || request.replyMode == "thread",
               request.channelId == channel, request.agentId == agent else { return false }
         if basis == "channel_trust" { return request.requestedPolicyId == id && !settings.inputs.access.contains("git") && ["read", "edit-files"].contains(settings.inputs.access) }
-        guard basis == "self_call", self.request == request.requestId, source == request.sourceMessageId,
+        guard (attachments ?? []) == (content.attachments ?? []), basis == "self_call", self.request == request.requestId, source == request.sourceMessageId,
               request.initiatorAccountId == account, request.ownerAccountId == account,
               text == content.text, request.text == text, request.threadRootId == root,
               request.replyMode == replyMode, request.sourceRevision == (sourceRevision ?? 1),
@@ -191,7 +192,7 @@ extension ChatService {
         guard let json = params.inputs.context,
               let messages = try? JSONDecoder().decode([ChatChannelContent.Message].self, from: Data(json.utf8)),
               let authority = automaticAuthority(key, request: request,
-                content: ChatChannelContent(requestId: request.requestId, text: params.inputs.prompt, context: messages)),
+                content: ChatChannelContent(requestId: request.requestId, text: params.inputs.prompt, context: messages, attachments: params.inputs.attachments)),
               authority.basis == params.consentBasis, authority.id == params.consentReference else { return false }
         return request.decisionBasis == nil || request.decisionBasis == authority.basis
             && (authority.basis != "channel_trust" || request.decisionPolicyId == authority.id)

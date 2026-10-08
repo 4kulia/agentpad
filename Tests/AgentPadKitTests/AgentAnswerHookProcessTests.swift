@@ -24,7 +24,7 @@ final class AgentAnswerHookProcessTests: XCTestCase {
         }
         let verified = expectation(description: "real shell hook bound to its foreground wrapper")
         let server = HookServer(socketPath: path, answerInspector: inspector) { message in
-            guard case .conversationId(let journal, let surface, let provenance) = message else { return }
+            guard case .conversationId(let journal, let surface, let provenance, let failure) = message else { return }
             defer { verified.fulfill() }
             XCTAssertEqual(surface, tab.id)
             XCTAssertEqual(journal, id)
@@ -36,7 +36,7 @@ final class AgentAnswerHookProcessTests: XCTestCase {
             XCTAssertNotEqual(wrapper?.process.pid, provenance.process.pid)
             XCTAssertTrue(provenance.isCurrent())
             (tab.engine as? TestEngine)?.foregroundPid = wrapper?.process.pid
-            AgentAnswerSource.recordHook(conversation: journal, session: tab, provenance: provenance)
+            AgentAnswerSource.recordHook(conversation: journal, session: tab, provenance: provenance, failure: failure)
             XCTAssertEqual(tab.answerBinding?.conversation, id)
             XCTAssertNil(AgentAnswerSource.problem(tab))
         }

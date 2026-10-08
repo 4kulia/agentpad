@@ -37,6 +37,7 @@ struct UpdatePromptView: View {
         .padding(.top, 22)
         .padding(.bottom, 22)
         .frame(width: 460, alignment: .topLeading)
+        .attentionPlace([.update(UpdateAttention.shared.version ?? "")])
         .glassWindowBackground(fallback: Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
     }
@@ -139,13 +140,23 @@ struct UpdatePromptView: View {
 }
 
 @MainActor
-final class UpdatePromptWindowController: NSWindowController {
+final class UpdatePromptWindowController: NSWindowController, NSWindowDelegate {
     static let shared = UpdatePromptWindowController()
 
     private init() { super.init(window: nil) }
     required init?(coder: NSCoder) { fatalError() }
+    private var hasAvailableUpdate = false
+
+    func windowWillClose(_ notification: Notification) {
+        if hasAvailableUpdate { UpdateAttention.shared.chose(.later) }
+    }
 
     static func present(outcome: UpdateChecker.Outcome, currentVersion: String) {
+        switch outcome {
+        case .newer(let version, _, _): UpdateAttention.shared.available(version, manual: true)
+        case .failed: UpdateAttention.shared.failed(shown: true)
+        case .upToDate: break
+        }
         let controller = shared
         controller.build(outcome: outcome, currentVersion: currentVersion)
         if controller.window?.isVisible != true {
@@ -156,10 +167,11 @@ final class UpdatePromptWindowController: NSWindowController {
     }
 
     private func build(outcome: UpdateChecker.Outcome, currentVersion: String) {
+        if case .newer = outcome { hasAvailableUpdate = true } else { hasAvailableUpdate = false }
         let view = UpdatePromptView(
             outcome: outcome,
             currentVersion: currentVersion,
-            onClose: { [weak self] in self?.window?.close() },
+            onClose: { [weak self] in UpdateAttention.shared.chose(.later); self?.window?.close() },
             onDownload: { url in NSWorkspace.shared.open(url) }
         )
         let host = NSHostingController(rootView: view)
@@ -176,6 +188,7 @@ final class UpdatePromptWindowController: NSWindowController {
             new.title = String(localized: "Update", bundle: .agentPadResources)
             new.styleMask = [.titled, .closable]
             new.isReleasedWhenClosed = false
+            new.delegate = self
             new.appearance = Theme.windowAppearance
             new.configureGlassChrome()
             self.window = new

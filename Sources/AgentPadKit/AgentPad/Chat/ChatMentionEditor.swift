@@ -36,10 +36,29 @@ struct ChatMentionEditor: NSViewRepresentable {
     var placeholder = ""
     var accessibilityName = "Message"
     var suggestions: ChatMentionPopup.Content? = nil
+    var attachments: ((NSPasteboard) -> Bool)? = nil
+    var dropTarget: ((Bool) -> Void)? = nil
     var key: (UInt16, NSEvent.ModifierFlags) -> Bool
 
     final class Editor: NSTextView {
         let mentionPopup = ChatMentionPopup()
+        var attachments: ((NSPasteboard) -> Bool)?
+        var dropTarget: ((Bool) -> Void)?
+        override func paste(_ sender: Any?) {
+            if attachments?(NSPasteboard.general) == true { return }
+            super.paste(sender)
+        }
+        override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+            if attachments != nil, ChatAttachmentPaste.accepts(sender.draggingPasteboard) { dropTarget?(true); return .copy }
+            return super.draggingEntered(sender)
+        }
+        override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation { draggingEntered(sender) }
+        override func draggingExited(_ sender: (any NSDraggingInfo)?) { dropTarget?(false); super.draggingExited(sender) }
+        override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+            dropTarget?(false)
+            if attachments?(sender.draggingPasteboard) == true { return true }
+            return super.performDragOperation(sender)
+        }
         var navigationTarget: ChannelRef?
         var consume: ((UInt16, NSEvent.ModifierFlags) -> Bool)?
         var focusOnAttach = false
@@ -153,6 +172,8 @@ struct ChatMentionEditor: NSViewRepresentable {
         defer { context.coordinator.updating = false }
         control?.view = view
         view.consume = key
+        view.attachments = attachments; view.dropTarget = dropTarget
+        if attachments != nil { view.registerForDraggedTypes([.fileURL, .png, .tiff]) }
         view.navigationTarget = navigationTarget
         view.placeholder = placeholder
         view.setAccessibilityLabel(accessibilityName)

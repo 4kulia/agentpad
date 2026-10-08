@@ -110,6 +110,10 @@ final class ChatService {
     var followsFeed = false
     /// Negotiated on each connection; never inferred from cached data.
     var serverCapabilities: [ChatServerAddress: Set<String>] = [:]
+    var serverAttachmentLimits: [ChatServerAddress: ChatAttachmentLimits] = [:]
+    @ObservationIgnored var attachmentManagers: [ChatOrgKey: ChatAttachmentManager] = [:]
+    var attachmentEpoch = 0
+    @ObservationIgnored var attachmentCalls: [String: ChatAttachmentCallFiles] = [:]
     var serverB1Limits: [ChatServerAddress: ChatB1.Limits] = [:]
     // TTL refreshes are bookkeeping, not SwiftUI changes. The display revision
     // is coalesced and expires via one task for the whole service.
@@ -134,7 +138,7 @@ final class ChatService {
     /// The socket's transport; replaced in tests.
     var makeSocketTransport: @MainActor () -> ChatSocketTransport = { ChatURLSessionTransport() }
     /// "A new device signed in…" and other notices for the user.
-    var onNotice: @MainActor (String) -> Void = { _ in }
+    var onNotice: @MainActor (AttentionEvent) -> Void = { _ in }
     /// What a run of this Mac does now (D4b §2.4); the owner's side tells it.
     var onRunActivity: @MainActor (ChatRunRecord, String) -> Void = { _, _ in }
 
@@ -158,6 +162,7 @@ final class ChatService {
     private(set) var state: State = .off {
         didSet {
             if state != oldValue {
+                invalidateAttachments()
                 onStateChange()
                 // F4: signed out, another account, a session ended: notices that no longer apply go.
                 ChatNotifications.reconcile(self)
@@ -189,6 +194,7 @@ final class ChatService {
     private(set) var connection: ChatConnection? {
         didSet {
             if connection != oldValue {
+                invalidateAttachments()
                 activateCalls()
                 // F4: another account or organization — notices that no longer apply go (review F4b-5).
                 ChatNotifications.reconcile(self)
@@ -380,6 +386,7 @@ final class ChatService {
 
     /// Stops the live connection, if any.
     func stopFeed() {
+        invalidateAttachments()
         feed?.stop()
         feed = nil
     }
@@ -392,6 +399,7 @@ final class ChatService {
     /// sending held, the queues kept — and the user signs in again
     /// (review C6d: one path for every 401).
     func sessionEnded(_ reason: String) {
+        attachmentManagers.values.forEach { $0.revoke() }
         stopFeed()
         // The server will not take this token again: it goes, so a restart
         // does not take the session for a live one (DESIGN-D6 §7.1). The
@@ -422,6 +430,7 @@ final class ChatService {
     /// The account is no longer in the organization: its cache goes, the
     /// connection and the account's stream stay.
     func membershipLost(_ key: ChatOrgKey) {
+        attachmentManagers.removeValue(forKey: key)?.revoke()
         // Out of the organization: its runs stop here, with no fact — the
         // account may not tell them any more (DESIGN-D3b-D4b-D5b §10.3).
         if let stopper { Task { await stopper.stopAll(of: key) } }
@@ -430,8 +439,7 @@ final class ChatService {
         reconcileChannelResults(revoked: key)
         clearB1PrivateState(key)
         dropSession(key)
-        let url = files.cacheURL(key)
-        for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+        files.removeCache(key)
         if connection?.orgKey == key {
             state = .notMember(key, "You are no longer a member of \((name ?? nil) ?? "this organization").")
         }
@@ -931,7 +939,7 @@ final class ChatService {
             session.outbox?.replaceJournal(journal.runCommands(key))
             reconcileCalls(session)
         }
-        socket?.reconnectNow(force: true)
+        socket?.reconnectNow(force: true, reason: .journalChanged)
     }
 
     /// At launch, in any mode: a run journal left on disk is opened and its
@@ -939,6 +947,7 @@ final class ChatService {
     /// for when a server is connected again (review C3-9, C3-10). Nothing
     /// is created when there is no journal.
     func recoverRunsAtLaunch() async {
+        ChatAttachmentCallFiles.sweep()
         // One point decides whether agents may start (review C11-3, C12-1):
         // no journal for sure — they may; a journal opened — it says; a
         // journal that cannot be looked at or opened — none may.
@@ -1114,6 +1123,8 @@ final class ChatService {
             let content = try? store.queue.read { try ChatChannelContent.read($0, request: id) }
             guard let channel = request.channelId, let context = frozenContext ?? content?.launchContext else { return nil }
             made.context = context
+            made.attachments = content?.attachments
+            if request.conditionsVersion == 2 && made.attachments?.isEmpty != false { return nil }
             made.channelId = channel
             made.threadRootId = request.threadRootId
             made.sourceMessageId = request.sourceMessageId
@@ -1131,6 +1142,14 @@ final class ChatService {
         let launcher = TeamLauncher(journal: journal, runner: executorRunner)
         launcher.agent = { [weak self] in self?.localAgent($0) }
         launcher.request = { [weak self] in self?.launchRequest($0) }
+        launcher.prepareAttachmentFiles = { [weak self] params, row in
+            guard let self else { throw ChatAttachmentError.unavailable }
+            return try await self.prepareAttachmentFiles(params, row: row)
+        }
+        launcher.verifyAttachmentFiles = { [weak self] files in
+            guard let self else { throw ChatAttachmentError.unavailable }
+            try await self.verifyAttachmentFiles(files)
+        }
         launcher.requestCanExecute = { [weak self] id in
             guard let self, let key = self.connection?.orgKey, let state = self.requestState(key, id) else { return false }
             return ["starting", "running"].contains(state)
@@ -1265,14 +1284,13 @@ final class ChatService {
             }
         }
         var keys = Set(orgSessions.keys.filter { $0.server == connection.server && $0.accountId == connection.accountId })
+        keys.formUnion(attachmentManagers.keys.filter { $0.server == connection.server && $0.accountId == connection.accountId })
         if let key = connection.orgKey { keys.insert(key) }
         for key in keys {
-            let url = files.cacheURL(key)
+            attachmentManagers.removeValue(forKey: key)?.revoke()
             clearB1PrivateState(key)
             dropSession(key)
-            for suffix in ["", "-wal", "-shm"] {
-                try? FileManager.default.removeItem(atPath: url.path + suffix)
-            }
+            files.removeCache(key)
         }
         self.connection = nil
         token = nil
@@ -1302,6 +1320,7 @@ extension ChatService: TeamRunFacts {
 
     /// A connection became ready: runs recovered earlier may get their facts.
     func serverKnown() {
+        attachmentManagers.values.forEach { $0.reconcile() }
         for actions in runners.values { actions.run() }
         // Publications (D3): settled, and announced again after a new session.
         if let key = currentKey, isServerKnown(self, key) {

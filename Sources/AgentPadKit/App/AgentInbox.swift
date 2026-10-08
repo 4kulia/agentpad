@@ -3,105 +3,58 @@ import SwiftUI
 
 // MARK: - Event store
 
-/// App-level (cross-window) inbox of agent events — attention / failure /
-/// completion. Runtime-only (cleared on relaunch), capped LIFO. `@Observable`
-/// so the top-chrome bell's red dot and the panel both invalidate on change;
-/// a singleton because the inbox spans every window (like the Command Palette).
-@MainActor
-@Observable
+/// A view of the shared ledger. Reading a decision does not resolve its source.
+@MainActor @Observable
 final class NotificationInbox {
-    static let shared = NotificationInbox()
-    /// `internal` (not `private`) so tests can build an isolated instance
-    /// rather than mutating the shared singleton. Production uses `.shared`.
-    init() {}
+    static let shared = NotificationInbox(ledger: .shared)
+    let ledger: AttentionLedger
+    init(ledger: AttentionLedger = AttentionLedger()) { self.ledger = ledger }
 
     struct Event: Identifiable {
-        let id = UUID()
-        let kind: SessionAlertKind
-        /// Target tab — the row click resolves this through `dockTabLocation`.
-        let sessionId: UUID
-        let timestamp: Date
-        // Agent + location are snapshotted at capture time: the session may
-        // be closed (or its agent reverted to Terminal) by the time the user
-        // opens the inbox, so the row can't read them live.
-        let agentTitle: String
-        let agentIcon: String?
-        let agentSymbol: String
-        let tabTitle: String
-        let workspaceTitle: String
-        var isRead = false
-
-        @MainActor
+        let notice: AttentionEvent
+        var id: String { notice.id }
+        var sessionId: UUID? { if case .terminal(let id) = notice.destination { return id }; return nil }
+        var timestamp: Date { notice.timestamp }
+        var kind: SessionAlertKind {
+            if notice.kind.needsDecision { return .attention }
+            return notice.kind.category == .failure ? .failure : .completed
+        }
+        var agentIcon: String? { nil }
+        var agentSymbol: String { notice.kind.needsDecision ? "hand.raised" : "bell" }
+        var isRead: Bool { notice.isRead }
         var headline: String {
-            switch kind {
-            case .attention:
-                return String.localizedStringWithFormat(
-                    String(localized: "%@ is waiting on you", bundle: .agentPadResources),
-                    agentTitle
-                )
-            case .failure: return String(localized: "Command failed", bundle: .agentPadResources)
-            case .completed:
-                return String.localizedStringWithFormat(
-                    String(localized: "%@ finished", bundle: .agentPadResources),
-                    agentTitle
-                )
-            case .programNotification(let title, let body):
-                return [title, body].filter { !$0.isEmpty }.joined(separator: ": ")
-            }
+            notice.actionInFlight ? String(localized: "Decision is being sent", bundle: .agentPadResources)
+                : String(localized: String.LocalizationValue(notice.title), bundle: .agentPadResources)
         }
-
         var subtitle: String {
-            tabTitle == workspaceTitle ? tabTitle : "\(tabTitle) · \(workspaceTitle)"
+            if notice.kind.needsDecision { return String(localized: "Waiting for your decision", bundle: .agentPadResources) }
+            return notice.body
         }
+        var tabTitle: String { notice.localBody?.components(separatedBy: " · ").first ?? "" }
     }
-
-    private static let cap = 100
-    private(set) var events: [Event] = []
-
-    /// Drives the bell's red dot — true when any event is unread.
-    var hasUnread: Bool { events.contains { !$0.isRead } }
-    /// Unread count — surfaced as the header badge.
-    var unreadCount: Int { events.lazy.filter { !$0.isRead }.count }
+    var events: [Event] { ledger.events.map { Event(notice: $0) } }
+    var hasUnread: Bool { ledger.unreadCount > 0 }
+    var unreadCount: Int { ledger.unreadCount }
 
     func add(kind: SessionAlertKind, sessionId: UUID, agent: AgentTemplate, tab: String, workspace: String, isRead: Bool = false) {
-        var event = Event(
-            kind: kind,
-            sessionId: sessionId,
-            timestamp: Date(),
-            agentTitle: agent.title,
-            agentIcon: agent.iconAsset,
-            agentSymbol: agent.symbol,
-            tabTitle: tab,
-            workspaceTitle: workspace
-        )
-        // If the tab was already on-screen when the event fired, the user has
-        // effectively seen it — land it read so the bell's dot doesn't light.
-        event.isRead = isRead
-        events.insert(event, at: 0)
-        if events.count > Self.cap { events.removeLast() }
-    }
-
-    func markRead(_ id: UUID) {
-        guard let i = events.firstIndex(where: { $0.id == id }), !events[i].isRead else { return }
-        events[i].isRead = true
-    }
-
-    /// Mark every unread event pointing at `sessionId` as read — called when the
-    /// user switches to that tab, so a notification they've already acted on by
-    /// going to look doesn't keep the bell's red dot lit.
-    func markRead(forSession sessionId: UUID) {
-        for i in events.indices where events[i].sessionId == sessionId && !events[i].isRead {
-            events[i].isRead = true
+        let category: AttentionKind = switch kind {
+        case .attention: .input
+        case .failure: .failure
+        case .completed: .completion
+        case .programNotification: .program
         }
+        var event = AttentionEvent(source: "legacy-terminal", object: sessionId.uuidString, episode: UUID().uuidString,
+                                   kind: category, destination: .terminal(sessionId))
+        event.localBody = "\(tab) · \(workspace)"; event.isRead = isRead
+        ledger.upsert(event)
+        if isRead { ledger.markRead(event.id) }
     }
-
-    func markAllRead() {
-        for i in events.indices where !events[i].isRead { events[i].isRead = true }
+    func markRead(_ id: String) { ledger.markRead(id) }
+    func markRead(forSession sessionId: UUID) {
+        for event in ledger.events where event.destination == .terminal(sessionId) { ledger.markRead(event.id) }
     }
-
-    func clearAll() {
-        events.removeAll()
-    }
+    func markAllRead() { ledger.markAllRead() }
+    func clearAll() { ledger.clearHistory() }
 }
 
 /// "now" / "2m ago" / "3h ago" / "1d ago". Computed once when the panel

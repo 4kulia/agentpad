@@ -151,11 +151,11 @@ extension ChatService {
     /// transaction, its chain of facts as far as the server's state is known
     /// (`TeamRunFacts`). True when written.
     func end(_ given: ChatRunRecord, outcome: ChatRunRecord.Outcome, reason: String, result: String?, at: Date,
-             journal: ChatJournal, waitForState: Bool) throws -> Bool {
+             journal: ChatJournal, waitForState: Bool, diagnosis: ClaudeLaunchDiagnostic.Failure? = nil) throws -> Bool {
         // As the journal has it now: its process recorded since.
         let run = try journal.run(given.runId) ?? given
         guard let approval = try journal.approval(run.approvalId), let key = approval.key else {
-            return try journal.finish(run.runId, outcome, at: at, result: result)
+            return try journal.finish(run.runId, outcome, at: at, result: result, diagnosis: diagnosis)
         }
         let context = chainContext(key, run)
         if waitForState, context == nil { throw ChatError.storage("the request's state is not known") }
@@ -165,7 +165,7 @@ extension ChatService {
         // after the app ended ran only if its process was recorded, or a
         // segment of it went on. Read before the journal's transaction.
         let ran = !waitForState || self.ran(run, journal)
-        let done = try journal.finish(run.runId, outcome, at: at, result: result) { db in
+        let done = try journal.finish(run.runId, outcome, at: at, result: result, diagnosis: diagnosis) { db in
             guard let context else { return }
             let steps = ChatFactChain.plan(state: context.state, outcome: outcome, processStarted: ran,
                                            stopConfirmed: run.stopConfirmedAt != nil,
@@ -654,6 +654,12 @@ final class ChatOwnerSide {
             case .stop: return try await stop(request, key)
             case .notifyOutcome: return .later
             }
+        } catch ChatAttachmentError.contextLost {
+            if kind == .receive { return (try? receive(request, key, refusal: ChatAttachmentError.contextLost.localizedDescription)) ?? .retry }
+            if kind == .notifyDecision {
+                return saveDecision(key, requestId: request.requestId, allow: false, reason: ChatAttachmentError.contextLost.localizedDescription) == nil ? .done : .retry
+            }
+            return .retry
         } catch {
             NSLog("agentpad: \(kind.rawValue) of \(request.requestId) could not be done: \(error.localizedDescription)")
             return .retry
@@ -720,14 +726,14 @@ final class ChatOwnerSide {
     /// `submitted` here: the checks of 1.0.x's `start` — the agent here and
     /// on, published as it is, terms known — then `request.received`; a
     /// check that fails declines it right after, with the reason.
-    private func receive(_ request: ChatRequest, _ key: ChatOrgKey) throws -> ChatActionResult {
+    private func receive(_ request: ChatRequest, _ key: ChatOrgKey, refusal contentRefusal: String? = nil) throws -> ChatActionResult {
         guard let service, let journal = service.journal else { return .later }
         let order = ChatService.requestKey(request.requestId)
         let agent = request.agentId.flatMap { service.localAgent($0) }
         let assignment = try request.agentId.flatMap { try journal.assignment(key, agentId: $0) }
         var refusal: String?
         let thread = service.orgSessions[key]?.store.map { service.threadLookup(request, store: $0, key: key) } ?? .unknown
-        if request.conditionsVersion != 1 {
+        if request.conditionsVersion != 1 && !(request.conditionsVersion == 2 && request.kind == "channel" && service.supports("chat.attachments_context", key: key) && agent?.access.runsShell == false) {
             refusal = "unsupported_conditions"
         } else if request.threadId != nil, thread == .unknown {
             // A thread this Mac never had with this caller and agent (D5b §3.2).
@@ -737,6 +743,7 @@ final class ChatOwnerSide {
         } else {
             refusal = "agent_unavailable"
         }
+        if let contentRefusal { refusal = contentRefusal }
         try store(key) { db in
             guard try Self.told(db, key, order: order, type: "request.received") == nil else { return [] }
             try Self.supersede(db, key, order: order, type: "request.received")
@@ -796,11 +803,15 @@ final class ChatOwnerSide {
         guard let service, let request = try? service.orgSessions[key]?.store?.calls.request(requestId), request.kind == "channel" else {
             return "The channel request is not available."
         }
+        if !allow { return saveDecision(key, requestId: requestId, allow: false, reason: reason) }
         do {
             guard try await service.loadChannelContent(key, request: request, refresh: true) else {
                 return "The channel or its current context is not available; try again."
             }
             return saveDecision(key, requestId: requestId, allow: allow, reason: reason)
+        } catch ChatAttachmentError.contextLost {
+            return saveDecision(key, requestId: requestId, allow: false, reason: ChatAttachmentError.contextLost.localizedDescription)
+                ?? ChatAttachmentError.contextLost.localizedDescription
         } catch { return "The current context could not be loaded; try again." }
     }
 
@@ -811,7 +822,7 @@ final class ChatOwnerSide {
         guard request.onThisDevice, request.state == .awaitingDecision else {
             return request.onThisDevice ? nil : TeamServerCore.decidedElsewhere(request.executorDeviceName)
         }
-        if request.kind == "channel", !service.channelDecisionReady(key, request: request) {
+        if request.kind == "channel", !service.channelDecisionReady(key, request: request, requiresContent: allow) {
             return "The channel or its verified context is not available; try again."
         }
         let order = ChatService.requestKey(requestId)

@@ -35,7 +35,7 @@ final class ChatSessionIdentityTests: XCTestCase {
     /// An arbitrary binary mimics the native installation's version path.
     /// Real kernel name, PTY, parents and LOCAL_PEERPID; no Claude
     /// config, hooks, credentials or production socket are involved.
-    private func startTerminal(request: AgentPadCLIRequest, socket: String) throws {
+    private func startTerminal(request: AgentPadCLIRequest, socket: String, pidWriteDelay: UInt32 = 0) throws {
         let native = root.appendingPathComponent("claude/versions/2.1.291")
         try FileManager.default.createDirectory(at: native.deletingLastPathComponent(), withIntermediateDirectories: true)
         let source = root.appendingPathComponent("native.c")
@@ -46,11 +46,14 @@ final class ChatSessionIdentityTests: XCTestCase {
         #include <sys/wait.h>
         int main(int argc, char **argv) {
             if (argc != 2) return 2;
-            char path[4096];
-            snprintf(path, sizeof(path), "%s/pid", getenv("FIXTURE"));
+            char path[4096], published[4096];
+            snprintf(path, sizeof(path), "%s/pid.tmp", getenv("FIXTURE"));
+            snprintf(published, sizeof(published), "%s/pid", getenv("FIXTURE"));
             FILE *out = fopen(path, "w");
             if (!out) return 3;
-            fprintf(out, "%d", getpid()); fclose(out);
+            usleep(\#(pidWriteDelay));
+            // Existence is the readers' readiness signal: publish only a complete PID.
+            if (fprintf(out, "%d", getpid()) < 0 || fclose(out) != 0 || rename(path, published) != 0) return 3;
             pid_t child = fork();
             if (child < 0) return 4;
             if (!child) { execl("/bin/bash", "bash", "--noprofile", "--norc", argv[1], NULL); _exit(127); }
@@ -100,6 +103,16 @@ final class ChatSessionIdentityTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    func testNativePIDIsReadableWhenPublished() async throws {
+        try startTerminal(request: AgentPadCLIRequest(verb: .team),
+                          socket: root.appendingPathComponent("unused-socket").path,
+                          pidWriteDelay: 1_000_000)
+        let pidFile = root.appendingPathComponent("pid")
+        try await waitFor("native PID") { FileManager.default.fileExists(atPath: pidFile.path) }
+        let nativePID = try XCTUnwrap(Int32(String(contentsOf: pidFile, encoding: .utf8)))
+        XCTAssertNotNil(ChatSessionIdentity.Process.read(nativePID))
     }
 
     func testForgedNativeVersionProcessAndItsSocketChildCannotUseChannelTools() async throws {

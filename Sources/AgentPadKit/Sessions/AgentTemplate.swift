@@ -806,8 +806,8 @@ extension AgentTemplate {
         return [.terminal] + presets + agents
     }
 
-    /// Resolves the user's chosen default template for `+` / `⌘T`. Returns
-    /// `nil` (meaning "no default, show the picker") when the saved id is
+    /// Resolves the user's chosen default template for `⌘T`. Returns
+    /// `nil` (meaning "use Terminal") when the saved id is
     /// missing, unknown, or points to an agent the user has since hidden.
     /// Looking the id up in `visibleOrdered` gives the stale-default-after-
     /// hide fallback for free; Terminal is always present there so it stays

@@ -92,7 +92,7 @@ enum ChatChannelAsk {
         guard try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM channels WHERE channel_id = ?)", arguments: [channel]) == true
         else { return [] }
         return try ChatCommandRecord.fetchAll(db, sql: """
-            SELECT * FROM outbox WHERE type IN (?, 'request.create_in_channel_v2') AND dismissed = 0 AND IFNULL(error, '') != 'dismissed'
+            SELECT * FROM outbox WHERE type IN (?, 'request.create_in_channel_v2', 'request.create_in_channel_with_attachments') AND dismissed = 0 AND IFNULL(error, '') != 'dismissed'
                 AND state IN ('pending', 'sent', 'unconfirmed', 'failed') ORDER BY seq
             """, arguments: [commandType]).compactMap { record in
             guard let envelope = try? JSONDecoder().decode(ChatCommandEnvelope.self, from: record.bodyBytes),
@@ -107,6 +107,7 @@ enum ChatChannelAsk {
     /// A refusal in words (F-API errors of `request.create` in a channel).
     static func reason(_ code: String?) -> String {
         switch code {
+        case "unsupported_conditions": return "Update AgentPad on the executor Mac to use selected files"
         case "context_changed": return "A message of the context was changed or deleted: choose the context again"
         case "too_large": return "The context is too large"
         case "agent_unavailable": return "The agent is not available now"

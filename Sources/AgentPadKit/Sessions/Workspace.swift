@@ -9,7 +9,7 @@ final class Workspace: Identifiable {
     /// workspace, the next new pane / tab inherits the latest path.
     var workingDirectory: URL
     /// Single split tree per workspace. Always non-nil; a fresh workspace
-    /// holds one Pane with one Session.
+    /// holds one Pane. Panes and workspaces may be empty after a tab move.
     var root: PaneNode
     /// Currently focused leaf-pane id. Splits/closes update this so cwd
     /// tracking and ⌘D act on what the user is looking at.

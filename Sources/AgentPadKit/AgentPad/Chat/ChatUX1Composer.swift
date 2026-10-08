@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ChatUX1Composer: View {
     let model: ChatChannelModel
@@ -18,6 +19,47 @@ struct ChatUX1Composer: View {
     @State private var contextIds = Set<String>()
     @State private var choosingContext = false
     @State private var draftLoaded = false
+    @State private var dropping = false
+    @State private var attachmentSelection: [ChatAttachmentManifest] = []
+    @State private var selectingFile = false
+    private var attachments: ChatAttachmentManager? { model.service.attachments(model.key) }
+    private var fileUI: Bool { attachments?.limits != nil }
+    private var fileContextVisible: Bool {
+        fileUI && attachments?.stamp(channel: model.channel) != nil && model.service.supports("chat.attachments_context", key: model.key)
+    }
+    private var contextPause: String? {
+        !attachmentSelection.isEmpty && !mentionOnly && !fileContextVisible
+            ? "Attachment context is paused on this server. Your selection is saved." : nil
+    }
+    private var uploads: [ChatAttachmentDraft] { attachments?.files(channel: model.channel, root: root) ?? [] }
+    private func attach(_ pasteboard: NSPasteboard) -> Bool {
+        guard fileUI, let attachments, ChatAttachmentPaste.accepts(pasteboard) else { return false }
+        do {
+            _ = try ChatAttachmentPaste.take(pasteboard, manager: attachments, channel: model.channel, root: root) { error in
+                if let error { model.attachmentProblem(error) }
+                version = model.draftVersion(root: root)
+            }
+        }
+        catch { model.attachmentProblem(error) }
+        return true
+    }
+    private func chooseFiles() {
+        guard let attachments, let limits = attachments.limits else { return }
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = limits.extensions.compactMap { UTType(filenameExtension: $0) }
+        let destination = root
+        let capture = attachments.stamp(channel: model.channel)
+        panel.begin { result in
+            guard result == .OK, let capture, attachments.current(capture) else { return }
+            do {
+                try attachments.importFiles(panel.urls.map(ChatAttachmentWorker.Input.file), channel: model.channel, root: destination) { error in
+                    if let error { model.attachmentProblem(error) }
+                    version = model.draftVersion(root: root)
+                }
+            }
+            catch { model.attachmentProblem(error) }
+        }
+    }
 
     private var org: ChatOrgModel? { ChatOrgCurrent.shared.model }
     private var card: ChatChannelCard? { org?.visibleChannel(model.channel) }
@@ -58,13 +100,13 @@ struct ChatUX1Composer: View {
         dismissedQuery = nil
     }
     private func saveDraft() {
-        model.saveDraft(text, root: root, mentionOnly: mentionOnly, contextIds: contextIds)
+        model.saveDraft(text, root: root, mentionOnly: mentionOnly, contextIds: contextIds, attachmentSelection: attachmentSelection)
         version = model.draftVersion(root: root)
     }
     private func send() {
-        guard let version, mentionOnly || called.isEmpty || !tooMuchContext else { return }
+        guard canSend, let version else { return }
         if model.send(text, root: root, members: mentionable, agents: agents, draftVersion: version, mentionOnly: mentionOnly, context: context) {
-            text = ""; self.version = nil; selection = NSRange(location: 0, length: 0); contextIds = []; mentionOnly = false
+            text = ""; self.version = nil; selection = NSRange(location: 0, length: 0); contextIds = []; attachmentSelection = []; mentionOnly = false
             control.clearAfterSend()
         }
     }
@@ -93,42 +135,22 @@ struct ChatUX1Composer: View {
     }
 
     private var recipient: String { root == nil ? "Message in #\(card?.name ?? "channel")" : "Reply in thread" }
-    private var canSend: Bool { version != nil && ChatChannelModel.textProblem(text) == nil && (mentionOnly || called.isEmpty || !tooMuchContext) }
+    private var canSend: Bool { contextPause == nil && !selectingFile && attachments?.isImporting(channel: model.channel, root: root) != true && version != nil && (ChatChannelModel.textProblem(text) == nil || text.isEmpty && !uploads.isEmpty) && (uploads.isEmpty || fileUI) && uploads.allSatisfy({ $0.state == .ready }) && (mentionOnly || called.isEmpty || !tooMuchContext) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(recipient)
+                Text(dropping ? "Attach to: \(recipient)" : recipient)
                 Spacer()
                 if !text.isEmpty { Label("Draft", systemImage: "pencil").font(Theme.display(9)) }
             }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
-            VStack(spacing: 0) {
-                if formatting { ChatFormattingBar(control: control) }
-                ChatMentionEditor(text: Binding(get: { text }, set: { changed($0) }), selection: $selection, candidates: candidates,
-                                  autofocus: root != nil, navigationTarget: root == nil && draftLoaded ? ChannelRef(model.key, channel: model.channel) : nil,
-                                  control: control,
-                                  heightChanged: { if editorHeight != $0 { editorHeight = $0 } }, placeholder: recipient,
-                                  accessibilityName: recipient,
-                                  suggestions: .init(sections: sections, selected: min(selected, max(0, matches.count - 1)),
-                                                     title: "Mention in \(root == nil ? "channel" : "thread")", choose: choose),
-                                  key: { key($0, $1) })
-                    .frame(height: editorHeight)
-                    .accessibilityLabel(recipient)
-                HStack(spacing: 2) {
-                    ChatIconButton(title: "Insert emoji", symbol: "face.smiling", action: control.emoji)
-                    ChatIconButton(title: "Mention a person or agent", symbol: "at") { control.insert("@") }
-                    Button("Aa") { formatting.toggle() }.buttonStyle(.plain).frame(width: 28, height: 28)
-                        .help("Show formatting").accessibilityLabel("Show formatting").accessibilityValue(formatting ? "Shown" : "Hidden").chatFocusRing()
-                    Spacer()
-                    Button(action: send) { Image(systemName: "paperplane.fill").frame(width: 32, height: 28) }
-                        .buttonStyle(.plain).foregroundStyle(canSend ? ChatAppearance.surface : ChatAppearance.secondary)
-                        .background(canSend ? ChatAppearance.accent : Theme.chromeSelection, in: RoundedRectangle(cornerRadius: 5))
-                        .disabled(!canSend).help("Send (⌘↩)").accessibilityLabel("Send").chatFocusRing()
-                }.padding(.horizontal, 8).padding(.bottom, 8)
+            inputBox
+            if fileUI, let limits = attachments?.limits {
+                Text("Up to \(limits.messageFiles) files · \(ByteCountFormatter.string(fromByteCount: Int64(limits.fileBytes), countStyle: .file)) each · \(ByteCountFormatter.string(fromByteCount: Int64(limits.messageBytes), countStyle: .file)) total")
+                    .font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
             }
-            .background(ChatAppearance.composerSurface, in: RoundedRectangle(cornerRadius: 9))
-            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(control.focused ? ChatAppearance.accent : ChatAppearance.border, lineWidth: control.focused ? 2 : 1))
             agentContext
+            if let contextPause { Text(contextPause).font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary) }
             if let problem = model.problem { Text(problem).foregroundStyle(ChatAppearance.failure).font(Theme.display(11)).textSelection(.enabled) }
             HStack {
                 if text.utf8.count > ChatChannelModel.maxBytes * 3 / 4 {
@@ -140,6 +162,12 @@ struct ChatUX1Composer: View {
         }
         .padding(.horizontal, root == nil ? 24 : 16).padding(.top, 10).padding(.bottom, 12)
         .background(ChatAppearance.surface)
+        .onChange(of: attachments?.revision) { _, _ in
+            // A shared draft changed in another window, including file-only drafts.
+            let draft = model.composerDraft(root: root)
+            text = draft.text; version = draft.version; contextIds = draft.contextIds
+            mentionOnly = draft.mentionOnly; attachmentSelection = draft.attachmentSelection
+        }
         .onChange(of: model.problem) { _, problem in
             if let problem, control.focused { ChatAccessibility.announce(problem, in: control.view) }
         }
@@ -154,25 +182,102 @@ struct ChatUX1Composer: View {
         .task(id: root ?? "") {
             let draft = model.composerDraft(root: root)
             text = draft.text; version = draft.version
-            contextIds = draft.contextIds; mentionOnly = draft.mentionOnly
+            contextIds = draft.contextIds; mentionOnly = draft.mentionOnly; attachmentSelection = draft.attachmentSelection
             selection = NSRange(location: (text as NSString).length, length: 0)
             selected = 0; dismissedQuery = nil
             draftLoaded = true
         }
-        .sheet(isPresented: $choosingContext) {
+        .sheet(isPresented: $choosingContext) { contextPicker }
+    }
+
+    private var pasteHandler: ((NSPasteboard) -> Bool)? {
+        guard fileUI else { return nil }; return { board in attach(board) }
+    }
+
+    private var inputBox: some View {
+            VStack(spacing: 0) {
+                if let attachments { ChatAttachmentDraftStrip(manager: attachments, channel: model.channel, root: root) }
+                if formatting { ChatFormattingBar(control: control) }
+                ChatMentionEditor(text: Binding(get: { text }, set: { changed($0) }), selection: $selection, candidates: candidates,
+                                  autofocus: root != nil, navigationTarget: root == nil && draftLoaded ? ChannelRef(model.key, channel: model.channel) : nil,
+                                  control: control,
+                                  heightChanged: { if editorHeight != $0 { editorHeight = $0 } }, placeholder: recipient,
+                                  accessibilityName: recipient,
+                                  suggestions: .init(sections: sections, selected: min(selected, max(0, matches.count - 1)),
+                                                     title: "Mention in \(root == nil ? "channel" : "thread")", choose: choose),
+                                  attachments: pasteHandler, dropTarget: { dropping = $0 },
+                                  key: { key($0, $1) })
+                    .frame(height: editorHeight)
+                    .accessibilityLabel(recipient)
+                HStack(spacing: 2) {
+                    if fileUI { ChatIconButton(title: "Attach files", symbol: "paperclip", action: chooseFiles) }
+                    ChatIconButton(title: "Insert emoji", symbol: "face.smiling", action: control.emoji)
+                    ChatIconButton(title: "Mention a person or agent", symbol: "at") { control.insert("@") }
+                    Button("Aa") { formatting.toggle() }.buttonStyle(.plain).frame(width: 28, height: 28)
+                        .help("Show formatting").accessibilityLabel("Show formatting").accessibilityValue(formatting ? "Shown" : "Hidden").chatFocusRing()
+                    Spacer()
+                    Button(action: send) { Image(systemName: "paperplane.fill").frame(width: 32, height: 28) }
+                        .buttonStyle(.plain).foregroundStyle(canSend ? ChatAppearance.surface : ChatAppearance.secondary)
+                        .background(canSend ? ChatAppearance.accent : Theme.chromeSelection, in: RoundedRectangle(cornerRadius: 5))
+                        .disabled(!canSend).help("Send (⌘↩)").accessibilityLabel("Send").chatFocusRing()
+                }.padding(.horizontal, 8).padding(.bottom, 8)
+            }
+            .background(ChatAppearance.composerSurface, in: RoundedRectangle(cornerRadius: 9))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(control.focused ? ChatAppearance.accent : ChatAppearance.border, lineWidth: control.focused ? 2 : 1))
+    }
+
+    private var contextPicker: some View {
             VStack(alignment: .leading) {
                 Text("Context for the agent").font(.headline)
                 Text("Your question and the undeleted thread root are included. Choose additional messages.").font(.caption)
-                List(model.contextCandidates(root: root ?? "").filter { $0.messageId != root }) { message in
-                    Toggle(String(message.text.prefix(160)), isOn: Binding(get: { contextIds.contains(message.messageId) }, set: { on in
-                        if on { contextIds.insert(message.messageId) } else { contextIds.remove(message.messageId) }
-                        saveDraft()
-                    }))
+                List {
+                    ForEach(model.contextCandidates(root: root ?? "")) { message in
+                        VStack(alignment: .leading, spacing: 6) {
+                            if message.messageId != root {
+                                Toggle(String(message.text.prefix(160)), isOn: Binding(get: { contextIds.contains(message.messageId) }, set: { on in
+                                    if on { contextIds.insert(message.messageId) } else {
+                                        contextIds.remove(message.messageId); attachmentSelection.removeAll { $0.messageId == message.id }
+                                    }
+                                    saveDraft()
+                                }))
+                            } else { Text("Thread root · " + String(message.text.prefix(100))) }
+                            if fileContextVisible, contextIds.contains(message.id) || message.id == root {
+                                ForEach(message.attachments) { file in
+                                    Toggle("File: \(file.name) · \(file.sizeText)", isOn: Binding(get: { attachmentSelection.contains { $0.id == file.id } }, set: { on in
+                                        select(file, message: message, on: on)
+                                    })).disabled(selectingFile)
+                                }
+                            }
+                        }
+                    }
+                    if fileContextVisible {
+                        ForEach(uploads) { draft in
+                            Toggle("New file: \(draft.file.name) · \(draft.file.sizeText)", isOn: Binding(get: { attachmentSelection.contains { $0.id == draft.id } }, set: { on in
+                                attachmentSelection.removeAll { $0.id == draft.id }
+                                if on { attachmentSelection.append(.init(file: draft.file, messageId: draft.messageId, revision: 1, sha256: draft.sha256)) }
+                                saveDraft()
+                            })).disabled(draft.state != .ready)
+                        }
+                    }
                 }
                 Text("\(contextCount) / 20 messages · \(contextBytes) / 49152 bytes\(tooMuchContext ? " — reduce the selection before sending" : "")")
                     .font(.caption).foregroundStyle(tooMuchContext ? .red : .secondary)
                 Button("Done") { choosingContext = false }
             }.padding(16).frame(width: 480, height: 340)
+    }
+
+    private func select(_ file: ChatAttachment, message: ChatMessage, on: Bool) {
+        attachmentSelection.removeAll { $0.id == file.id }
+        guard on, let attachments else { saveDraft(); return }
+        selectingFile = true
+        Task {
+            do {
+                let data = try await attachments.load(message, file: file, preview: false)
+                guard attachments.stamp(channel: model.channel, message: message, file: file) != nil else { throw ChatAttachmentError.unavailable }
+                attachmentSelection.append(.init(file: file, messageId: message.id, revision: message.revision, sha256: ChatAttachments.digest(data)))
+                saveDraft()
+            } catch { model.attachmentProblem(error) }
+            selectingFile = false
         }
     }
 
@@ -182,6 +287,12 @@ struct ChatUX1Composer: View {
                     mentionOnly = $0; saveDraft()
                 })).font(.caption)
                 if !mentionOnly {
+                    if fileContextVisible, !attachmentSelection.isEmpty {
+                        Text("Agents receive \(attachmentSelection.count) selected files · \(ByteCountFormatter.string(fromByteCount: Int64(attachmentSelection.reduce(0) { $0 + $1.file.size }), countStyle: .file))")
+                            .font(.caption).foregroundStyle(ChatAppearance.accent)
+                        Text(attachmentSelection.map { $0.file.name }.joined(separator: ", ")).font(.caption)
+                        Text(called.map(\.name).joined(separator: ", ")).font(.caption)
+                    }
                     ForEach(called) { agent in
                         Text("\(agent.name): \(mode(agent))").font(.caption).foregroundStyle(.secondary)
                     }

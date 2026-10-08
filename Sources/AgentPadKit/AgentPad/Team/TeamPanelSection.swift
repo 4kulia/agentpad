@@ -23,7 +23,7 @@ struct TeamPanelSection: View {
 
     var body: some View {
         let access = calls.pendingAccess
-        let versions = ClaudeVersionApprovals.shared.pending
+        let versions = ClaudeVersionApprovals.shared.attentionGroups.compactMap(\.first)
         let needsYou = waiting.count + access.count + versions.count
         VStack(alignment: .leading, spacing: 0) {
             if needsYou > 0 {
@@ -37,6 +37,14 @@ struct TeamPanelSection: View {
                 ForEach(versions) { item in versionRow(item) }
             }
         }
+        .onChange(of: AttentionSelection.shared.revision, initial: true) { _, _ in
+            switch AttentionSelection.shared.destination {
+            case .version(let id): expanded = "version-\(id)"
+            case .folder(let id, _): expanded = "access-\(id)"
+            case .team(let id?, false): expanded = "in-\(id)"
+            default: break
+            }
+        }
     }
 
     private func versionRow(_ item: ClaudeVersionApprovals.Pending) -> some View {
@@ -45,6 +53,9 @@ struct TeamPanelSection: View {
             header(key: key, icon: "exclamationmark.shield", title: "\(item.agentName) · Claude Code \(item.grant.version)",
                    subtitle: item.grant.profile.title, status: "waiting", attention: true)
             if expanded == key {
+                ForEach(ClaudeVersionApprovals.shared.pending.filter { $0.attentionKey == item.attentionKey }) { affected in
+                    Text(affected.agentName).font(.caption)
+                }
                 Text(item.message).fixedSize(horizontal: false, vertical: true)
                 Text("Выбранное имя: \(item.executable.selectedPath)").textSelection(.enabled)
                 Text("Конечный файл: \(item.executable.file.resolvedPath)").textSelection(.enabled)
@@ -59,6 +70,8 @@ struct TeamPanelSection: View {
         .font(Theme.display(11))
         .padding(.horizontal, 14)
         .padding(.vertical, Theme.sidebarRowVerticalPadding)
+        .id(key)
+        .attentionPlace(expanded == key ? [.version(item.id)] : [])
         .onAppear { if expanded == nil { expanded = key } }
     }
 
@@ -118,6 +131,7 @@ struct TeamPanelSection: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, Theme.sidebarRowVerticalPadding)
+        .attentionPlace(isOpen ? [.team(request: call.id, outgoing: false)] : [])
         .onAppear { if expanded == nil, call.needsDecisionHere { expanded = key } }
     }
 
@@ -140,6 +154,7 @@ struct TeamPanelSection: View {
     // MARK: Folder requests
 
     private func accessRow(_ request: TeamCalls.AccessRequest) -> some View {
+        let key = "access-\(request.id)"
         let call = calls.incoming.first { $0.id == request.callId }
         return VStack(alignment: .leading, spacing: 8) {
             header(
@@ -170,6 +185,8 @@ struct TeamPanelSection: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, Theme.sidebarRowVerticalPadding)
+        .id(key)
+        .attentionPlace(expanded == key ? [.folder(request.id, request: request.callId)] : [])
     }
 
     /// What the card says of a call this Mac sent: its note, and the

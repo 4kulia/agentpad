@@ -4,7 +4,7 @@ import Foundation
 /// can contain credentials, prompts, URLs and local paths; redacting a handful
 /// of token patterns would not make an arbitrary diagnostic safe to persist.
 struct ClaudeLaunchDiagnostic {
-    enum Failure: String {
+    enum Failure: String, Codable, Sendable {
         case authentication = "требуется вход"
         case permission = "доступ запрещён"
         case network = "ошибка соединения"

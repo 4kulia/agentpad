@@ -40,7 +40,7 @@ final class HookServerTests: XCTestCase {
     func testParseConversationIdPayload() throws {
         let json = #"{"surface":"\#(Self.surfaceUUID.uuidString)","kind":"conversationId","conversationId":"sess_abc"}"#
         let message = HookServer.parseMessage(data(json))
-        guard case let .conversationId(conversationId, _, _) = message else {
+        guard case let .conversationId(conversationId, _, _, _) = message else {
             return XCTFail("Expected .conversationId, got \(String(describing: message))")
         }
         XCTAssertEqual(conversationId, "sess_abc")

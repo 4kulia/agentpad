@@ -2,7 +2,8 @@ import Foundation
 
 /// The send queue of one organization (docs/agentpad/CHAT-PLAN.md C2). A
 /// command gets its `command_id` and its bytes once; every repeat sends the
-/// same bytes. Commands with one `order_key` go strictly one after another.
+/// same bytes. Commands with one `order_key` go one after another, except
+/// suspended protocol work; its dependents remain suspended as well.
 ///
 /// | Answer | What happens |
 /// |---|---|
@@ -26,6 +27,7 @@ final class ChatOutbox {
     static func neverResent(_ type: String) -> Bool {
         ChatB1.commands.contains(type) || type.hasPrefix("run.") || type == "request.decide" || type == "request.decide_automatic"
             || type == "agent.channel_trust.set"
+            || type == "message.post_with_attachments" || type == "request.create_in_channel_with_attachments"
             || type == "message.post_from_session" || type == "request.create_in_channel_v2" || ChatPublication.isDecision(type)
     }
     static let maxAge: TimeInterval = 30 * 24 * 60 * 60
@@ -83,6 +85,9 @@ final class ChatOutbox {
     /// waited for a known server is looked at again (review C18-1).
     var onReady: @MainActor () -> Void = {}
     var maySendCommand: @MainActor (ChatCommandRecord) -> Bool = { _ in true }
+    /// Unsupported attachment work waits without blocking independent text.
+    var isSuspended: @MainActor (ChatCommandRecord) -> Bool = { _ in false }
+    var permanentRejection: @MainActor (ChatCommandRecord) -> String? = { _ in nil }
     /// The queue's storage failed; the queue stopped.
     var onStorageError: @MainActor (String) -> Void = { _ in }
 
@@ -213,6 +218,17 @@ final class ChatOutbox {
     /// depends on was accepted.
     func pump() {
         guard isSending || sendsFacts, var all = loadAll() else { return }
+        var rejected = false
+        for (record, queue) in all where record.state == .pending && may(send: queue) && !sending.contains(record.orderKey) {
+            guard let code = permanentRejection(record) else { continue }
+            var record = record
+            guard fail(&record, in: queue, code: code) else { return }
+            rejected = true
+        }
+        if rejected {
+            guard let again = loadAll() else { return }
+            all = again
+        }
         // A command whose parent failed fails too, before anything is sent;
         // each is decided once per pump, so a write that does not stick
         // cannot loop (review C-8).
@@ -235,9 +251,17 @@ final class ChatOutbox {
         let state = Dictionary(all.map { ($0.0.commandId, $0.0.state) }, uniquingKeysWith: { a, _ in a })
         let at = now()
         var earliest: Date?
+        var suspended = Set(all.filter { $0.0.state == .pending && isSuspended($0.0) }.map(\.0.commandId))
+        var added = true
+        while added {
+            added = false
+            for (record, _) in all where record.state == .pending && record.dependsOn.map(suspended.contains) == true {
+                if suspended.insert(record.commandId).inserted { added = true }
+            }
+        }
         var heads: [String: (ChatCommandRecord, ChatCommandTable)] = [:]
         // `all` is in queue order: the first pending of a key is its head.
-        for (record, queue) in all where record.state == .pending && heads[record.orderKey] == nil && may(send: queue) {
+        for (record, queue) in all where record.state == .pending && heads[record.orderKey] == nil && may(send: queue) && !suspended.contains(record.commandId) {
             heads[record.orderKey] = (record, queue)
         }
         for (key, (record, queue)) in heads where !sending.contains(key) {
@@ -283,7 +307,12 @@ final class ChatOutbox {
             sending.remove(record.orderKey)
             pump()
         }
-        guard may(send: queue), maySendCommand(original), epoch == sentIn else { return }
+        guard may(send: queue), epoch == sentIn else { return }
+        if let code = permanentRejection(original) {
+            fail(&record, in: queue, code: code)
+            return
+        }
+        guard !isSuspended(original), maySendCommand(original) else { return }
         // A button or revocation may have replaced/deleted a prepared send
         // before this task ran. Re-read the durable intent at the send boundary.
         let started: ChatCommandTable.SendStart

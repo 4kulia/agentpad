@@ -175,6 +175,7 @@ private struct ChatOrgWindowView: View {
             if current.model != nil || current.devices != nil {
                 ChatOrgWindowContent(model: current.model, devices: current.devices)
                     .id(ChatOrgCurrent.identity())
+                    .attentionPlace(ChatService.shared.connection?.orgKey.map { [.organization($0.orgId)] } ?? [])
             } else {
                 VStack(spacing: 10) {
                     Text(ChatOrgSidebarSection.reason(ChatService.shared.state) ?? "Not connected to a server.")
@@ -192,6 +193,7 @@ private struct ChatOrgWindowContent: View {
     let model: ChatOrgModel?
     let devices: ChatDevicesModel?
     @State private var answer: String?
+    @State private var selected: AttentionOrganizationSection = .members
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -201,20 +203,20 @@ private struct ChatOrgWindowContent: View {
             if let notice = model?.notice {
                 Text(notice).font(Theme.display(11)).foregroundStyle(.orange)
             }
-            TabView {
+            TabView(selection: $selected) {
                 if let model {
-                    ChatOrgMembersTab(model: model, act: act).tabItem { Text("Members") }
-                    ChatOrgTeamsTab(model: model, act: act).tabItem { Text("Teams") }
+                    ChatOrgMembersTab(model: model, act: act).tabItem { Text("Members") }.tag(AttentionOrganizationSection.members)
+                    ChatOrgTeamsTab(model: model, act: act).tabItem { Text("Teams") }.tag(AttentionOrganizationSection.teams)
                     if model.actions.contains(.invite) {
-                        ChatOrgInvitationsTab(model: model, act: act).tabItem { Text("Invitations") }
+                        ChatOrgInvitationsTab(model: model, act: act).tabItem { Text("Invitations") }.tag(AttentionOrganizationSection.invitations)
                     }
                 }
                 // The account's devices, in an organization or not (review C6 p1-9).
                 if let devices {
-                    ChatOrgDevicesTab(model: devices).tabItem { Text("Devices") }
+                    ChatOrgDevicesTab(model: devices).tabItem { Text("Devices") }.tag(AttentionOrganizationSection.devices)
                 }
                 if let model, model.actions.contains(.seeAudit) {
-                    ChatOrgAuditTab(model: model).tabItem { Text("Security Log") }
+                    ChatOrgAuditTab(model: model).tabItem { Text("Security Log") }.tag(AttentionOrganizationSection.audit)
                 }
             }
             if let model, !model.refused.isEmpty {
@@ -227,6 +229,17 @@ private struct ChatOrgWindowContent: View {
             if let problem = model?.problem { Text(problem).font(Theme.display(11)).foregroundStyle(.orange) }
         }
         .padding(12)
+        .attentionPlace(ChatService.shared.connection?.orgKey.map { [.organization($0.orgId, section: selected)] } ?? [])
+        .onChange(of: AttentionSelection.shared.revision, initial: true) { _, _ in
+            if model == nil { selected = .devices }
+            guard case .organization(let org, let section?) = AttentionSelection.shared.destination,
+                  ChatService.shared.connection?.orgKey?.orgId == org else { return }
+            if section == .invitations && model?.actions.contains(.invite) != true { return }
+            if section == .audit && model?.actions.contains(.seeAudit) != true { return }
+            if section == .devices && devices == nil { return }
+            if section != .devices && model == nil { return }
+            selected = section
+        }
     }
 
     /// Runs a change; a refusal before it is sent shows here.

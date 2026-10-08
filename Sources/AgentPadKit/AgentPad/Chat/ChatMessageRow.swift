@@ -22,6 +22,7 @@ struct ChatMessageRow: View {
     @AppStorage("chat.ux2.alwaysShowTime") private var alwaysShowTime = false
     private var active: Bool { hovering || toolbarHovering || selected || actionFocused }
     private var identity: ChatAuthorIdentity { ChatAuthorIdentity(message) }
+    private var unreadReplies: Int { model.feed.unreadReplyCounts[message.messageId, default: 0] }
     @State private var hovering = false
     @State private var pointerInside = false
     @State private var toolbarHovering = false
@@ -66,6 +67,9 @@ struct ChatMessageRow: View {
                     }.frame(minHeight: 19, alignment: .leading)
                 }
                 if editing != nil && !message.deleted { editor } else { body(of: message) }
+                if !message.deleted, let attachments = model.service.attachments(model.key), attachments.limits != nil {
+                    ChatMessageAttachments(manager: attachments, message: message, inThread: inThread)
+                }
                 if message.editedAt != nil && !message.deleted { Text("edited").font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary) }
                 marks
                 if !message.deleted, let b1 = model.b1 {
@@ -95,8 +99,10 @@ struct ChatMessageRow: View {
                 ChatSourceProgress(model: model, source: message.messageId)
                 if !inThread {
                     if let b1 = model.b1, b1.supports("chat.thread_summary"), let summary = b1.state.metadata[message.id]?.threadSummary {
-                        if summary.replyCount > 0 { ChatServerReplies(summary: summary, members: members) { model.openThread(message.id) } }
-                    } else if let summary = model.feed.replySummaries[message.messageId], summary.count > 0 { replyButton(summary) }
+                        if summary.replyCount > 0 {
+                            ChatServerReplies(summary: summary, members: members, unreadCount: unreadReplies) { model.openThread(message.id) }
+                        } else if unreadReplies > 0 { localReplies }
+                    } else { localReplies }
                     if requests > 0 {
                         Button("\(requests) \(requests == 1 ? "request" : "requests") to agents") { model.openThread(message.messageId) }
                             .buttonStyle(.link).font(Theme.display(10))
@@ -155,6 +161,10 @@ struct ChatMessageRow: View {
             .monospacedDigit().foregroundStyle(ChatAppearance.secondary).opacity(active || alwaysShowTime ? 1 : 0)
             .help(fullTime).accessibilityHidden(true)
     }
+    @ViewBuilder private var localReplies: some View {
+        if let summary = model.feed.replySummaries[message.messageId], summary.count > 0 { replyButton(summary) }
+    }
+
     private func replyButton(_ summary: ChatReplySummary) -> some View {
         Button { model.openThread(message.messageId) } label: {
             HStack(spacing: 8) {
@@ -166,13 +176,14 @@ struct ChatMessageRow: View {
                     }
                 }
                 Text(summary.label).font(Theme.display(11, weight: .medium)).foregroundStyle(ChatAppearance.accent)
+                ChatUnreadReplyBadge(count: unreadReplies)
                 if let date = summary.latest.flatMap({ ChatFeedLayout.date($0.createdAt) }) {
                     Text(date.formatted(date: .omitted, time: .shortened)).font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
                 }
                 Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(ChatAppearance.accent)
             }.padding(.vertical, 5)
         }.buttonStyle(.plain).help(summary.complete ? "Open thread" : "Loaded replies · more may exist")
-            .accessibilityLabel("\(summary.label), open thread")
+            .accessibilityLabel("\(summary.label)\(unreadReplies > 0 ? ", \(unreadReplies) new" : ""), open thread")
             .focusable(selected || replyFocused)
             .focused($replyFocused)
             .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(replyFocused ? ChatAppearance.accent : .clear, lineWidth: 2))
@@ -184,10 +195,14 @@ struct ChatMessageRow: View {
     @ViewBuilder
     private var marks: some View {
         switch message.localState {
-        case .sending: Text("sending…").foregroundStyle(.secondary).font(.caption)
+        case .sending:
+            Text(message.attachments.isEmpty ? "sending…" : (model.service.attachments(model.key)?.pauseReason ?? "sending…"))
+                .foregroundStyle(.secondary).font(.caption)
         case .failed:
             Text("not sent: \(ChatChannelModel.reason(message.localError))").foregroundStyle(ChatAppearance.failure).font(.caption)
-            Button("Retry") { model.retry(message) }.buttonStyle(.link).font(.caption)
+            if !archived && model.service.canRetryPost(model.key, row: message) {
+                Button("Retry") { model.retry(message) }.buttonStyle(.link).font(.caption)
+            }
             Button("Delete") { model.discard(message) }.buttonStyle(.link).font(.caption)
         case nil:
             if let local = message.localEdit, local.state == "saving" {
@@ -204,7 +219,7 @@ struct ChatMessageRow: View {
             Text("Loading…").foregroundStyle(.secondary)
         } else {
             VStack(alignment: .leading, spacing: 2) {
-                ChatMentionText(markdown: message.text, addresses: mentionable.map(\.handle)
+                ChatMentionText(markdown: message.attachmentOnly && model.service.supports("chat.attachments", key: model.key) ? "" : message.text, addresses: mentionable.map(\.handle)
                     + (ChatOrgCurrent.shared.model?.agents(in: message.channelId).compactMap(\.address) ?? []), fontSize: inThread ? 13 : 14)
                 ChatAgentMembershipHint(model: model, text: message.text)
                 if message.stale != nil { Text("updating…").foregroundStyle(.secondary).font(.caption) }

@@ -7,7 +7,8 @@ struct ChatServerInfo: Codable, Equatable, Sendable {
     struct Limits: Codable, Equatable, Sendable {
         let message, request, result, frame: Int
         var chatB1: ChatB1.Limits? = nil
-        enum CodingKeys: String, CodingKey { case message, request, result, frame, chatB1 = "chat_b1" }
+        var attachments: ChatAttachmentLimits? = nil
+        enum CodingKeys: String, CodingKey { case message, request, result, frame, attachments, chatB1 = "chat_b1" }
     }
 
     let name: String
@@ -188,11 +189,13 @@ final class ChatAPI: Sendable {
 
     let server: ChatServerAddress
     private let session: URLSession
+    let attachmentProtocols: [AnyClass]?
     private let refuser = RedirectRefuser()
 
     /// `protocolClasses` replaces the network in tests.
     init(server: ChatServerAddress, protocolClasses: [AnyClass]? = nil, timeout: TimeInterval = 30) {
         self.server = server
+        self.attachmentProtocols = protocolClasses
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieAcceptPolicy = .never
         config.httpShouldSetCookies = false

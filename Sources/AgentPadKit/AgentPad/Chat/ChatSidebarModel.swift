@@ -139,7 +139,7 @@ struct ChatSidebarSnapshot {
         guard let model, model.isCurrent() else { return }
         guard model.visible, !model.inDoubt, !model.snapshotOwed() else { state = .checking; return }
         guard model.view.channelsServed else { state = .noChannels; return }
-        state = .ready(offline: !model.isOnline())
+        state = .ready(offline: model.showsOffline())
         let currentChannel = model.key.flatMap { key in active?.belongs(to: key) == true ? active?.channel : nil }
         teams = model.channelTeams.map { team in
             Team(card: team, channels: model.channels(of: team).compactMap { card in

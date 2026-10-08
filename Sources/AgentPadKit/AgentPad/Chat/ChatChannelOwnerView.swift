@@ -42,10 +42,15 @@ final class ChatChannelOwnerModel {
                 SELECT r.request_id FROM requests r JOIN channels c ON c.channel_id = r.channel_id
                 WHERE r.kind = 'channel' AND r.channel_id = ? AND (r.owner_account_id = ? OR r.initiator_account_id = ?)
                     AND (r.state IN ('submitted', 'awaiting_decision', 'approved', 'starting', 'running', 'stop_requested')
-                         OR r.publication IN ('awaiting_publish', 'publish_failed'))
+                         OR r.publication IN ('awaiting_publish', 'publish_failed') OR r.request_id = ?)
                 ORDER BY r.created_at
-                """, arguments: [channel, key.accountId, key.accountId]).compactMap { try ChatCallStore.request(db, $0) }
+                """, arguments: [channel, key.accountId, key.accountId, selectedNotificationRequest]).compactMap { try ChatCallStore.request(db, $0) }
         }) ?? []
+    }
+
+    private var selectedNotificationRequest: String? {
+        if case .channel(let channel, let request) = AttentionSelection.shared.destination, channel == self.channel { return request }
+        return nil
     }
 
     func content(_ request: ChatRequest) -> ChatChannelContent? {
@@ -168,6 +173,10 @@ struct ChatChannelOwnerPanel: View {
             }
         }
         .onChange(of: model.visible) { _, visible in if !visible { selected = nil; problem = nil } }
+        .onChange(of: AttentionSelection.shared.revision, initial: true) { _, _ in
+            if case .channel(let channel, let request) = AttentionSelection.shared.destination,
+               channel == model.channel, model.visible { selected = request }
+        }
     }
 }
 
@@ -185,11 +194,20 @@ struct ChatChannelDecisionSheet: View {
             if model.visible, let request = model.requests.first(where: { $0.requestId == requestId }) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
+                        if request.state.isFinal {
+                            Text(request.state.rawValue.replacingOccurrences(of: "_", with: " ")).font(.headline)
+                            if let reason = request.failureReason ?? request.declineReason { Text(reason).font(.callout).textSelection(.enabled) }
+                        }
+                        ClaudeLaunchHelpView(key: model.key, request: requestId, service: model.service)
                         if let terms = model.decisionText(request) { Text(terms).font(.callout).textSelection(.enabled) }
                         if request.state == .awaitingDecision, !model.isAutomatic(request) {
                             Text("Review channel request").font(.headline)
                             Text(ChatMarkdownText.attributed(request.text ?? "")).textSelection(.enabled)
                             if let content = model.content(request) {
+                                ForEach(content.attachments ?? []) { item in
+                                    Label("\(item.file.name) · \(item.file.sizeText) · \(item.file.mime)", systemImage: item.file.isImage ? "photo" : "doc")
+                                        .font(.callout)
+                                }
                                 ForEach(content.context ?? [], id: \.messageId) { message in
                                     Text("\(model.name(message.authorAccountId)) · revision \(message.revision)").font(.caption).foregroundStyle(.secondary)
                                     Text(ChatMarkdownText.attributed(message.text ?? "[Message deleted]")).textSelection(.enabled)
@@ -240,9 +258,11 @@ struct ChatChannelDecisionSheet: View {
             } else { Color.clear.onAppear { close() } }
         }
         .frame(width: 560, height: 540)
+        .attentionPlace([.channel(model.channel, request: requestId)])
         .task(id: requestId) {
             guard let request = model.requests.first(where: { $0.requestId == requestId }), request.state == .awaitingDecision else { return }
             do { _ = try await model.service.loadChannelContent(model.key, request: request) }
+            catch ChatAttachmentError.contextLost { problem = ChatAttachmentError.contextLost.localizedDescription }
             catch { problem = "The context could not be loaded. Close and try again." }
         }
         .onChange(of: model.visible) { _, visible in if !visible { close() } }

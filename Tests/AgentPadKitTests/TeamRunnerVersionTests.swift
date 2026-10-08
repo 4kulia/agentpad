@@ -299,6 +299,35 @@ final class TeamRunnerVersionTests: XCTestCase {
         try await replacedGrantDuringWait(ownerDecision: false)
     }
 
+    func testReview2ManagedCaseAliasIsRecheckedAfterPreflightInitialAndResume() async throws {
+        let managed = ChatAttachmentStorage.dataDirectory
+        let alias = managed.deletingLastPathComponent().appendingPathComponent(managed.lastPathComponent.uppercased()).appendingPathComponent("attachments")
+        let sensitive = try root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames
+        guard sensitive == false else { throw XCTSkip("Case alias regression requires a case-insensitive volume") }
+        let ready = Counter()
+        for resume in [false, true] {
+            let project = root.appendingPathComponent("project-\(resume)")
+            try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+            var req = request(resume: resume)
+            req.agent.folder = project.path
+            let starts = Counter()
+            req.onVersionReady = { _ in ready.increment() }
+            req.validateBeforeExecutor = {
+                try FileManager.default.removeItem(at: project)
+                try FileManager.default.createSymbolicLink(at: project, withDestinationURL: alias)
+            }
+            do {
+                _ = try await runner().run(req, onActivity: { _ in }, onProcessStarted: { _ in
+                    starts.increment()
+                    throw TeamRunnerError.didNotStart("regression test prevents executor from running")
+                })
+                XCTFail("Managed case alias reached the executor")
+            } catch { XCTAssertEqual(error as? ChatAttachmentError, .folders) }
+            XCTAssertEqual(starts.value, 0); XCTAssertEqual(count("runs"), 0)
+        }
+        XCTAssertEqual(ready.value, 2, "The folder changed after version preflight")
+    }
+
     private func replacedGrantDuringWait(ownerDecision: Bool) async throws {
         for resume in [false, true] {
             let store = ClaudeVersionApprovals()

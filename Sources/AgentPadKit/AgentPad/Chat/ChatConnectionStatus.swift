@@ -16,7 +16,7 @@ enum ChatConnectionStatus: Equatable {
         default: break
         }
         switch snapshot {
-        case .ready(let offline): self = offline || socket == .disconnected ? .offline : .connected
+        case .ready(let offline): self = offline ? .offline : (socket == .disconnected ? .connecting : .connected)
         case .checking: self = .checking
         case .noChannels: self = .unavailable
         case .notConnected: self = .notConnected

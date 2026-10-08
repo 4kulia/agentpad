@@ -26,9 +26,9 @@ final class ChatInboxTests: XCTestCase {
     private func write<T>(_ store: ChatStore, _ body: (Database) throws -> T) throws -> T { try store.queue.write(body) }
     private func read<T>(_ store: ChatStore, _ body: (Database) throws -> T) throws -> T { try store.queue.read(body) }
 
-    private func fixture(subdirectory: String? = nil) throws -> (ChatStore, ChatOrgModel) {
+    private func fixture(subdirectory: String? = nil, store suppliedStore: ChatStore? = nil) throws -> (ChatStore, ChatOrgModel) {
         let location = subdirectory.map { directory.appendingPathComponent($0) } ?? directory!
-        let store = try ChatStore.open(files: ChatFiles(directory: location), key: key).store
+        let store = try suppliedStore ?? ChatStore.open(files: ChatFiles(directory: location), key: key).store
         try write(store) { db in
             try db.execute(sql: "UPDATE meta SET me = ?, rights_in_doubt = 0, rights_session = 's', channels_served = 1", arguments: [me])
             try db.execute(sql: "INSERT INTO members (account_id, handle, name, role) VALUES (?, 'andrew', 'Andrew', 'member'), ('other', 'sasha', 'Sasha', 'member')", arguments: [me])
@@ -49,11 +49,17 @@ final class ChatInboxTests: XCTestCase {
     private func post(_ store: ChatStore, _ id: String, seq: Int, channel: String = "alpha", root: String? = nil,
                       author: String = "other", mentions: [String]? = nil, text: String? = nil,
                       at: String = "2026-10-06T10:00:00Z", deleted: Bool = false) throws {
+        let wire = try wire(id, seq: seq, channel: channel, root: root, author: author, mentions: mentions,
+                            text: text, at: at, deleted: deleted)
+        try write(store) { try ChatMessages.write($0, wire) }
+    }
+    private func wire(_ id: String, seq: Int, channel: String = "alpha", root: String? = nil,
+                      author: String = "other", mentions: [String]? = nil, text: String? = nil,
+                      at: String = "2026-10-06T10:00:00Z", deleted: Bool = false) throws -> ChatMessageWire {
         let value: [String: Any] = ["message_id": id, "channel_id": channel, "thread_root_id": root as Any? ?? NSNull(),
             "author_account_id": author, "text": text ?? "Message \(id)", "mentions": (mentions ?? [me]).map { ["account_id": $0] },
             "revision": deleted ? 2 : 1, "seq": seq, "created_at": at, "deleted_at": deleted ? at as Any : NSNull()]
-        let wire = try JSONDecoder().decode(ChatMessageWire.self, from: JSONSerialization.data(withJSONObject: value))
-        try write(store) { try ChatMessages.write($0, wire) }
+        return try JSONDecoder().decode(ChatMessageWire.self, from: JSONSerialization.data(withJSONObject: value))
     }
     private func entries(_ store: ChatStore, _ kind: ChatInboxKind = .unread) throws -> [ChatInbox.Entry] {
         try read(store) { try ChatInbox.read($0, kind: kind, account: me, session: "s") }
@@ -68,6 +74,375 @@ final class ChatInboxTests: XCTestCase {
             guard ContinuousClock.now < end else { return XCTFail("Observation did not settle", file: file, line: line) }
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    func testColdInboxLoadsRootsAndRepliesToTheirReadBoundaries() async throws {
+        for kind in ChatInboxKind.allCases {
+            let (store, org) = try fixture(subdirectory: kind.rawValue)
+            try write(store) { db in
+                try db.execute(sql: "UPDATE read_marks SET last_read_seq = 8, thread_read_seq = 3 WHERE channel_id = 'alpha'")
+                try db.execute(sql: "INSERT INTO thread_read_marks VALUES ('alpha', 'old-root', 10)")
+                try db.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 12)")
+                try db.execute(sql: "UPDATE channel_windows SET bottom_seq = 12, history_next = 12 WHERE channel_id = 'alpha'")
+                try db.execute(sql: "INSERT INTO messages (message_id, channel_id, seq) VALUES ('new', 'alpha', 12)")
+            }
+            try post(store, "private", seq: 15, channel: "hidden")
+            try refresh(store, org)
+            XCTAssertEqual(org.unread("alpha")?.count, 1, "a cold cache already has a badge, but no message text")
+            XCTAssertTrue(try entries(store, kind).allSatisfy { $0.message.loading })
+            XCTAssertEqual(try read(store) { try ChatInboxLoading.snapshot($0, ref: ChatInboxRef(key, kind: kind), session: "s").targets.map(\.channel) }, ["alpha"])
+            let model = ChatInboxModel(ref: ChatInboxRef(key, kind: kind))
+            var requests: [Int?] = []
+            model.follow(store, org: org) { target, before in
+                XCTAssertEqual(target.channel, "alpha", "do not load read or inaccessible channels")
+                requests.append(before)
+                if before == nil {
+                    return try ChatMessagesPage(messages: [self.wire("new", seq: 12), self.wire("reply", seq: 11, root: "old-root")], next: 11, head: 12)
+                }
+                if before == 11 {
+                    return try ChatMessagesPage(messages: [self.wire("read-root", seq: 8), self.wire("read-reply", seq: 7, root: "old-root")], next: 7, head: 12)
+                }
+                XCTAssertEqual(before, 7)
+                return try ChatMessagesPage(messages: [self.wire("unseen-reply", seq: 4, root: "unseen-thread"),
+                    self.wire("wrong-channel", seq: 4, channel: "beta"), self.wire("baseline", seq: 3, root: "unseen-thread", mentions: [])], next: 3, head: 12)
+            }
+            XCTAssertTrue(model.loading)
+            try await wait { !model.loading && model.entries(org).filter { $0.unread && !$0.message.loading }.count == 3 }
+            XCTAssertEqual(Set(model.entries(org).filter(\.unread).map(\.id)), ["new", "reply", "unseen-reply"])
+            if kind == .mentions {
+                XCTAssertEqual(Set(model.entries(org).filter { !$0.unread }.map(\.id)), ["read-root", "read-reply"], "keep the mention history")
+            }
+            XCTAssertEqual(requests, [nil, 11, 7], "stop at the thread baseline, not the newer channel mark")
+            XCTAssertNil(try read(store) { try String.fetchOne($0, sql: "SELECT message_id FROM messages WHERE message_id = 'wrong-channel'") })
+            XCTAssertEqual(try read(store) { try ChatUnread.readSequence($0, channel: "alpha") }, 8)
+            XCTAssertEqual(try read(store) { try ChatUnread.readSequence($0, channel: "alpha", thread: "old-root") }, 10)
+            XCTAssertEqual(try read(store) { try Int.fetchOne($0, sql: "SELECT history_next FROM channel_windows WHERE channel_id = 'alpha'") }, 12)
+            XCTAssertEqual(try read(store) { try Int.fetchOne($0, sql: "SELECT seq FROM cursors WHERE stream = 'channel:alpha'") }, 12)
+            model.stop()
+        }
+    }
+
+    func testOpenInboxLoadsNewHeadsWithoutLoopingOnItsOwnWrites() async throws {
+        let (store, org) = try fixture()
+        org.isFollowed = { _ in false }
+        try write(store) { try $0.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 5)") }
+        let model = ChatInboxModel(ref: ChatInboxRef(key, kind: .mentions))
+        var calls = 0
+        model.follow(store, org: org) { target, _ in
+            calls += 1
+            return try ChatMessagesPage(messages: [self.wire("m\(target.head)", seq: target.head)], next: nil, head: target.head)
+        }
+        try await wait { model.entries(org).count == 1 && !model.loading }
+        try write(store) { try $0.execute(sql: "UPDATE cursors SET seq = 9 WHERE stream = 'channel:alpha'") }
+        try await wait { model.entries(org).count == 2 && !model.loading }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(calls, 2)
+        model.stop()
+    }
+
+    func testNewHeadRefreshStopsAtAlreadyCoveredHistory() async throws {
+        let (store, org) = try fixture()
+        org.isFollowed = { _ in false }
+        try write(store) { try $0.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 5)") }
+        let model = ChatInboxModel(ref: ChatInboxRef(key, kind: .unread))
+        var requests: [Int?] = []
+        model.follow(store, org: org) { target, before in
+            requests.append(before)
+            return try ChatMessagesPage(messages: [self.wire("m\(target.head)", seq: target.head)],
+                                        next: target.head == 9 && before == nil ? 5 : nil, head: target.head)
+        }
+        try await wait { !model.loading && model.entries(org).count == 1 }
+        try write(store) { try $0.execute(sql: "UPDATE cursors SET seq = 9 WHERE stream = 'channel:alpha'") }
+        try await wait { !model.loading && model.entries(org).count == 2 }
+        XCTAssertEqual(requests, [nil, nil], "refresh only the interval above the covered head")
+        XCTAssertFalse(model.limited)
+        model.stop()
+    }
+
+    func testErrorRetryAndPageLimitResumeFromLastCursor() async throws {
+        let (store, org) = try fixture()
+        org.isFollowed = { _ in false }
+        try write(store) { try $0.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 100)") }
+        let model = ChatInboxModel(ref: ChatInboxRef(key, kind: .unread))
+        var fail = true, finish = false
+        var requests: [Int?] = []
+        model.follow(store, org: org) { _, before in
+            requests.append(before)
+            if fail { throw ChatInboxLoadError.unavailable }
+            let seq = (before ?? 101) - 1
+            return try ChatMessagesPage(messages: [self.wire("m\(seq)", seq: seq)], next: finish ? nil : seq, head: 100)
+        }
+        try await wait { model.problem != nil && !model.loading }
+        fail = false; model.retry()
+        try await wait { model.limited && !model.loading }
+        XCTAssertNil(model.problem)
+        XCTAssertEqual(requests, [nil, nil, 100, 99, 98, 97])
+        finish = true; model.retry()
+        try await wait { !model.loading }
+        XCTAssertEqual(requests.last!, 96, "continue below the five pages already loaded")
+        XCTAssertEqual(model.entries(org).count, 6)
+        XCTAssertFalse(model.limited)
+        model.stop()
+    }
+
+    func testNewHeadsPreserveHistoricalCursorAndAutomaticChannelBudget() async throws {
+        for kind in ChatInboxKind.allCases {
+            let (store, org) = try fixture(subdirectory: kind.rawValue)
+            try write(store) { db in
+                try db.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 1000)")
+                try db.execute(sql: "UPDATE channel_windows SET bottom_seq = 1000 WHERE channel_id = 'alpha'")
+            }
+            let model = ChatInboxModel(ref: ChatInboxRef(key, kind: kind))
+            var requests: [Int?] = []
+            var finish = false
+            model.follow(store, org: org) { target, before in
+                requests.append(before)
+                if requests.count <= ChatInboxLoading.pagesPerChannel {
+                    let head = 1000 + requests.count
+                    try self.write(store) { try $0.execute(sql: "UPDATE cursors SET seq = ? WHERE stream = 'channel:alpha'", arguments: [head]) }
+                    try self.post(store, "live\(head)", seq: head)
+                    // Deliver the changed head while the history request is suspended.
+                    try await Task.sleep(for: .milliseconds(30))
+                }
+                let seq = (before ?? 1001) - 1
+                return try ChatMessagesPage(messages: [self.wire("m\(seq)", seq: seq)], next: finish ? nil : seq, head: target.head)
+            }
+            try await wait { !model.loading && model.limited }
+            XCTAssertEqual(requests, [nil, 1000, 999, 998, 997], "new events must not renew the five-page allowance")
+            try write(store) { try $0.execute(sql: "UPDATE cursors SET seq = 1006 WHERE stream = 'channel:alpha'") }
+            try post(store, "live1006", seq: 1006)
+            try await wait { model.entries(org).contains { $0.id == "live1006" } && !model.loading }
+            XCTAssertEqual(requests.count, 5, "a later head must not restart deferred history")
+            XCTAssertTrue(model.limited)
+            let retryStart = requests.count
+            finish = true; model.retry()
+            try await wait { !model.loading }
+            let resumed = try XCTUnwrap(requests.dropFirst(retryStart).first)
+            XCTAssertEqual(resumed, 996, "explicit continuation starts below the pages already fetched")
+            XCTAssertFalse(model.limited)
+            model.stop()
+        }
+    }
+
+    func testReadFollowedChannelIgnoresReactionHeadButKeepsRealGaps() async throws {
+        for kind in ChatInboxKind.allCases {
+            let (store, org) = try fixture(subdirectory: kind.rawValue)
+            try write(store) { db in
+                try db.execute(sql: "UPDATE read_marks SET last_read_seq = 1000, thread_read_seq = 100 WHERE channel_id = 'alpha'")
+                try db.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 1001)")
+                try db.execute(sql: "UPDATE channel_windows SET bottom_seq = 900, history_next = 900 WHERE channel_id = 'alpha'")
+            }
+            try refresh(store, org)
+            XCTAssertEqual(org.unread("alpha"), ChatUnread.Count())
+            let model = ChatInboxModel(ref: ChatInboxRef(key, kind: kind))
+            var requests = 0
+            model.follow(store, org: org) { target, before in
+                requests += 1
+                return ChatMessagesPage(messages: [], next: (before ?? 1001) - 1, head: target.head)
+            }
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(requests, 0, "a reaction above the root mark is not an unread message on a followed channel")
+            XCTAssertFalse(model.loading)
+            XCTAssertFalse(model.limited, "a read inbox must not offer More unread messages / Load more")
+            XCTAssertTrue(ChatInboxPresentation(kind: kind, entries: model.entries(org),
+                                               sidebar: ChatSidebarSnapshot(model: org, active: nil)).isEmpty)
+
+            try write(store) { try $0.execute(sql: "UPDATE channel_windows SET bottom_seq = 1100 WHERE channel_id = 'alpha'") }
+            try await wait { !model.loading && model.limited }
+            XCTAssertEqual(requests, 5, "a real history gap still requires hydration on a followed channel")
+            model.stop()
+
+            try write(store) { try $0.execute(sql: "UPDATE channel_windows SET bottom_seq = 900 WHERE channel_id = 'alpha'") }
+            org.isFollowed = { _ in false }
+            requests = 0
+            model.follow(store, org: org) { target, _ in
+                requests += 1
+                return ChatMessagesPage(messages: [], next: nil, head: target.head)
+            }
+            try await wait { !model.loading }
+            XCTAssertEqual(requests, 1, "unfollowed event uncertainty still matches the sidebar's something badge")
+            model.stop()
+        }
+    }
+
+    func testTotalPageBudgetDefersChannelsUntilExplicitRetry() async throws {
+        let (store, org) = try fixture()
+        org.isFollowed = { _ in false }
+        try write(store) { db in
+            for n in 0..<23 {
+                let id = String(format: "c%02d", n)
+                try db.execute(sql: "INSERT INTO channels (channel_id, team_id, name, archived, version, stamp, created_by, created_at) VALUES (?, 'team', ?, 0, 1, 1, 'other', 'now')", arguments: [id, id])
+                try db.execute(sql: "INSERT INTO cursors VALUES (?, 1)", arguments: ["channel:\(id)"])
+            }
+        }
+        try refresh(store, org)
+        let model = ChatInboxModel(ref: ChatInboxRef(key, kind: .unread))
+        var calls = 0
+        model.follow(store, org: org) { target, _ in
+            calls += 1
+            return try ChatMessagesPage(messages: [self.wire(target.channel, seq: 1, channel: target.channel)], next: nil, head: 1)
+        }
+        try await wait { !model.loading && model.entries(org).count == 20 }
+        XCTAssertEqual(calls, 20)
+        XCTAssertTrue(model.limited)
+        XCTAssertEqual(model.entries(org).count, 20)
+        model.retry()
+        try await wait { !model.loading && model.entries(org).count == 23 }
+        XCTAssertEqual(calls, 23, "completed channels must not consume the next pass's budget")
+        XCTAssertFalse(model.limited)
+        model.stop()
+    }
+
+    func testNewHeadsShareTheTotalAutomaticPageBudget() async throws {
+        let (store, org) = try fixture()
+        org.isFollowed = { _ in false }
+        try write(store) { db in
+            for n in 0..<ChatInboxLoading.pagesPerPass {
+                let id = String(format: "c%02d", n)
+                try db.execute(sql: "INSERT INTO channels (channel_id, team_id, name, archived, version, stamp, created_by, created_at) VALUES (?, 'team', ?, 0, 1, 1, 'other', 'now')", arguments: [id, id])
+                try db.execute(sql: "INSERT INTO cursors VALUES (?, 1)", arguments: ["channel:\(id)"])
+            }
+        }
+        try refresh(store, org)
+        let model = ChatInboxModel(ref: ChatInboxRef(key, kind: .unread))
+        var calls = 0
+        model.follow(store, org: org) { target, _ in
+            calls += 1
+            return try ChatMessagesPage(messages: [self.wire("\(target.channel)-\(target.head)", seq: target.head, channel: target.channel)], next: nil, head: target.head)
+        }
+        try await wait { !model.loading && model.entries(org).count == 20 }
+        try write(store) { try $0.execute(sql: "UPDATE cursors SET seq = 2 WHERE stream = 'channel:c00'") }
+        try post(store, "live", seq: 2, channel: "c00")
+        try await wait { model.entries(org).count > 20 && !model.loading }
+        XCTAssertEqual(calls, 20, "a new head cannot renew the shared automatic budget")
+        XCTAssertTrue(model.limited)
+        model.retry()
+        try await wait { !model.loading }
+        XCTAssertEqual(calls, 21)
+        XCTAssertFalse(model.limited)
+        model.stop()
+    }
+
+    func testNewHeadDuringLoadingIsFetchedAndReadClearsDeferredWork() async throws {
+        let (store, org) = try fixture()
+        org.isFollowed = { _ in false }
+        try write(store) { try $0.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 5)") }
+        let model = ChatInboxModel(ref: ChatInboxRef(key, kind: .unread))
+        var held: CheckedContinuation<ChatMessagesPage, Never>?
+        var heads: [Int] = []
+        model.follow(store, org: org) { target, before in
+            heads.append(target.head)
+            if heads.count == 1 { return await withCheckedContinuation { held = $0 } }
+            let seq = (before ?? 10) - 1
+            return try ChatMessagesPage(messages: [self.wire("m\(seq)", seq: seq)], next: seq, head: 9)
+        }
+        try await wait { held != nil }
+        try write(store) { try $0.execute(sql: "UPDATE cursors SET seq = 9 WHERE stream = 'channel:alpha'") }
+        held?.resume(returning: try ChatMessagesPage(messages: [wire("m5", seq: 5)], next: nil, head: 5))
+        try await wait { !model.loading && model.limited && model.entries(org).count == 5 }
+        XCTAssertEqual(heads, [5, 9, 9, 9, 9], "new heads share the original channel budget")
+        try write(store) { _ = try ChatInbox.markAllRead($0, account: me, session: "s") }
+        try await wait { model.entries(org).isEmpty && !model.limited }
+        model.stop()
+    }
+
+    func testCancelledTransportAndNonprogressingPagesOfferRetry() async throws {
+        let (store, org) = try fixture()
+        org.isFollowed = { _ in false }
+        try write(store) { try $0.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 5)") }
+        let model = ChatInboxModel(ref: ChatInboxRef(key, kind: .unread))
+        var cancelled = true, calls = 0
+        model.follow(store, org: org) { _, _ in
+            calls += 1
+            if cancelled { throw CancellationError() }
+            return ChatMessagesPage(messages: [], next: 4, head: 5)
+        }
+        try await wait { !model.loading && model.problem != nil }
+        XCTAssertEqual(calls, 1)
+        cancelled = false; model.retry()
+        try await wait { !model.loading && model.problem != nil }
+        XCTAssertEqual(calls, 3, "a nondecreasing before cursor is an error, not an infinite read")
+        try write(store) { _ = try ChatInbox.markAllRead($0, account: me, session: "s") }
+        try await wait { model.problem == nil }
+        model.stop()
+    }
+
+    func testLateInboxPagesCannotRestoreRevokedOrReplacedContent() async throws {
+        for mutation in ["team", "rights", "session", "epoch", "stop", "context"] {
+            let (store, org) = try fixture(subdirectory: mutation)
+            org.isFollowed = { _ in false }
+            try write(store) { try $0.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 5)") }
+            let model = ChatInboxModel(ref: ChatInboxRef(key, kind: .unread))
+            var held: CheckedContinuation<ChatMessagesPage, Never>?
+            var calls = 0
+            model.follow(store, org: org) { _, _ in
+                calls += 1
+                if calls > 1 { return ChatMessagesPage(messages: [], next: nil, head: 5) }
+                return await withCheckedContinuation { held = $0 }
+            }
+            try await wait { held != nil }
+            switch mutation {
+            case "team": try write(store) { try $0.execute(sql: "UPDATE teams SET mine = 0") }
+            case "rights": try write(store) { try $0.execute(sql: "UPDATE meta SET rights_in_doubt = 1") }
+            case "session": try write(store) { try $0.execute(sql: "UPDATE meta SET rights_session = 'replacement'") }
+            case "epoch": try write(store) { try $0.execute(sql: "UPDATE channel_windows SET epoch = 2") }
+            case "stop": model.stop()
+            default: org.key = ChatOrgKey(server: key.server, accountId: me, orgId: "another")
+            }
+            held?.resume(returning: try ChatMessagesPage(messages: [wire("late", seq: 5)], next: nil, head: 5))
+            try await wait { !model.loading }
+            XCTAssertEqual(try read(store) { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM messages") }, 0, mutation)
+            model.stop()
+        }
+    }
+
+    func testInboxPageAdmissionRechecksDatabaseAccessBeforeObserversCatchUp() throws {
+        let mutations = [
+            "account": "UPDATE meta SET me = 'another'",
+            "session": "UPDATE meta SET rights_session = 'replacement'",
+            "rights": "UPDATE meta SET rights_in_doubt = 1",
+            "capability": "UPDATE meta SET channels_served = 0",
+            "team": "UPDATE teams SET mine = 0",
+            "epoch": "UPDATE channel_windows SET epoch = 2",
+            "channel": "DELETE FROM channels WHERE channel_id = 'alpha'"
+        ]
+        let target = ChatInboxLoading.Key(channel: "alpha", epoch: 1, head: 5, channelRead: 0, threadRead: 0)
+        for (name, sql) in mutations {
+            let (store, _) = try fixture(subdirectory: name)
+            XCTAssertTrue(try read(store) { try ChatInboxLoading.allowed($0, target: target, account: me, session: "s") })
+            try write(store) { try $0.execute(sql: sql) }
+            XCTAssertFalse(try read(store) { try ChatInboxLoading.allowed($0, target: target, account: me, session: "s") }, name)
+        }
+    }
+
+    func testExactBadgesAlwaysHaveAnActionableRemainderInBothLists() throws {
+        let (store, org) = try fixture()
+        var view = org.view
+        view.unread["alpha"] = .init(count: 4)
+        view.mentionsByChannel["alpha"] = 1
+        view.mentionsUnread = 1
+        org.set(view)
+        for kind in ChatInboxKind.allCases {
+            let presentation = ChatInboxPresentation(kind: kind, entries: [], sidebar: ChatSidebarSnapshot(model: org, active: nil))
+            XCTAssertFalse(presentation.isEmpty)
+            XCTAssertEqual(presentation.groups.map(\.id), ["alpha"])
+            XCTAssertEqual(presentation.missing.map(\.count), [kind == .unread ? 4 : 1])
+            let missing = try XCTUnwrap(presentation.missing.first)
+            XCTAssertTrue(missing.title.contains("#Design — Open channel"))
+        }
+        try post(store, "loaded", seq: 1)
+        let rows = try entries(store)
+        let partial = ChatInboxPresentation(kind: .unread, entries: rows, sidebar: ChatSidebarSnapshot(model: org, active: nil))
+        XCTAssertEqual(partial.missing.map(\.count), [3])
+        let mentions = ChatInboxPresentation(kind: .mentions, entries: rows, sidebar: ChatSidebarSnapshot(model: org, active: nil))
+        XCTAssertTrue(mentions.missing.isEmpty)
+        var loading = rows[0]; loading.message.stale = 2
+        let stale = ChatInboxPresentation(kind: .mentions, entries: [loading], sidebar: ChatSidebarSnapshot(model: org, active: nil))
+        XCTAssertTrue(stale.entries.isEmpty)
+        XCTAssertEqual(stale.missing.map(\.count), [1], "a placeholder or stale text cannot stand for a loaded message")
+        org.snapshotOwed = { true }
+        let hidden = ChatInboxPresentation(kind: .unread, entries: rows, sidebar: ChatSidebarSnapshot(model: org, active: nil))
+        XCTAssertTrue(hidden.isEmpty)
     }
 
     func testUnreadGroupsIncludeRepliesAndMatchSidebarWithoutReadingOnOpen() throws {
@@ -273,6 +648,36 @@ final class ChatInboxTests: XCTestCase {
 }
 
 extension ChatInboxTests {
+    func testNativeInboxBindsWhenContextBecomesReadyWithoutIdentityChange() async throws {
+        _ = NSApplication.shared
+        let service = ChatService(files: ChatFiles(directory: directory), tokens: FakeTokenStore())
+        try service.saveSignIn(.init(server: key.server, accountId: me, sessionId: "s", deviceName: "Fixture", orgId: key.orgId), token: "fixture")
+        defer { service.stopFeed() }
+        let session = service.session(for: key)
+        let (store, _) = try fixture(store: XCTUnwrap(session.store))
+        try post(store, "existing", seq: 1)
+        let current = ChatOrgCurrent()
+        let identity = ChatOrgCurrent.identity(service)
+        let ref = ChatInboxRef(key, kind: .mentions)
+        let model = ChatInboxModel(ref: ref)
+        let host = NSHostingView(rootView: ChatInboxTabView(ref: ref, openMessage: { _ in }, openChannel: { _ in }, close: {},
+                                                           model: model, current: current, service: service))
+        let window = NSWindow(contentRect: NSRect(x: 120, y: 120, width: 900, height: 600),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = host
+        defer { window.contentView = nil; window.close(); model.stop() }
+        window.makeKeyAndOrderFront(nil); host.layoutSubtreeIfNeeded()
+        try await wait { current.model != nil }
+        XCTAssertTrue(model.entries(current.model).isEmpty)
+        for _ in 0..<2 {
+            session.snapshotOwed = false
+            try await wait { model.entries(current.model).map(\.id) == ["existing"] }
+            XCTAssertEqual(ChatOrgCurrent.identity(service), identity)
+            session.snapshotOwed = true
+            try await wait { model.entries(current.model).isEmpty && model.problem == nil }
+        }
+    }
+
     func testTabsRestoreDuplicateMoveAndReopenWithoutAProcessOrMessagePayload() throws {
         var peers: [WorkspaceStore] = []
         let saved = InMemoryPersistence()

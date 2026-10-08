@@ -43,14 +43,56 @@ final class ChatNotificationsTests: XCTestCase {
 
     /// A request waiting for a decision: one notice, however often it is
     /// told — from an event, a snapshot or a start — and no names in it.
-    func testADecisionIsToldOnce() throws {
+    private func decisionService() async throws -> ChatService {
         let service = service()
-        XCTAssertNotNil(service.orgSessions[key]?.store)
+        service.followsFeed = false
+        service.closeRemoteSession = { _, _ in }
+        try service.saveSignIn(ChatConnection(server: key.server, accountId: key.accountId, sessionId: "test-session", deviceName: "Mac", orgId: key.orgId), token: "test-only")
+        try await service.start(mode: .server)
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        try store.finishGeneration("generation-1")
+        try await store.queue.write { db in
+            try db.execute(sql: "UPDATE meta SET rights_in_doubt = 0, rights_session = 'test-session'")
+            for id in ["r1", "r2"] {
+                var body = CallJSON.request(id, state: "awaiting_decision", version: 1, onThisDevice: true)
+                body["deliver_by"] = ChatCallStore.timestamp(Date().addingTimeInterval(3600))
+                try ChatCallStore.apply(db, CallJSON.wire(body), onThisDevice: true)
+            }
+        }
+        service.orgSessions[key]?.snapshotOwed = false
+        return service
+    }
+
+    func testADecisionIsToldOnce() async throws {
+        let service = try await decisionService()
         ChatNotifications.requestAwaitsDecision(key, requestId: "r1", service: service)
         ChatNotifications.requestAwaitsDecision(key, requestId: "r1", service: service)
         ChatNotifications.requestAwaitsDecision(key, requestId: "r2", service: service)
         XCTAssertEqual(posted.map(\.title), ["A request waits for your decision", "A request waits for your decision"])
         XCTAssertEqual(posted.map(\.id), [ChatNotifications.requestId(key, "r1"), ChatNotifications.requestId(key, "r2")])
+        await service.disconnect()
+    }
+
+    func testPersonalDecisionRevokesOnStateOwnerExecutorExpiryAndRights() async throws {
+        let service = try await decisionService()
+        let store = try XCTUnwrap(service.orgSessions[key]?.store)
+        let id = ChatNotifications.requestId(key, "r1")
+        let accountID = key.accountId
+        XCTAssertTrue(ChatNotifications.stillDue(id, service))
+        for change in ["state = 'declined'", "owner_account_id = 'someone-else'", "on_this_device = 0", "deliver_by = '2000-01-01T00:00:00Z'"] {
+            try await store.queue.write { db in
+                try db.execute(sql: "UPDATE requests SET \(change) WHERE request_id = 'r1'")
+            }
+            XCTAssertFalse(ChatNotifications.stillDue(id, service), change)
+            try await store.queue.write { db in
+                try db.execute(sql: "UPDATE requests SET state = 'awaiting_decision', owner_account_id = ?, on_this_device = 1, deliver_by = ? WHERE request_id = 'r1'",
+                               arguments: [accountID, ChatCallStore.timestamp(Date().addingTimeInterval(3600))])
+            }
+        }
+        try await store.queue.write { try $0.execute(sql: "UPDATE meta SET rights_in_doubt = 1") }
+        XCTAssertFalse(ChatNotifications.stillDue(id, service))
+        XCTAssertFalse(ChatNotifications.stillDue(ChatNotifications.requestId(key, "nonexistent"), service))
+        await service.disconnect()
     }
 
     func testRepeatedReadMarksDoNotWakeDatabaseObservers() throws {

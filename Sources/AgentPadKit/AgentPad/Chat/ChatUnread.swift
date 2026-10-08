@@ -24,16 +24,28 @@ enum ChatUnread {
             WHERE type = 'text' AND value = (SELECT me FROM meta WHERE id = 1))
         """
 
-    static func unreadRepliesByChannel(_ db: Database) throws -> [String: Int] {
-        let rows = try Row.fetchAll(db, sql: """
-            SELECT m.channel_id, COUNT(*) AS count FROM messages m
+    private static let unreadRepliesSQL = """
+            FROM messages m
             JOIN channels c ON c.channel_id = m.channel_id JOIN teams t ON t.team_id = c.team_id AND t.mine = 1
             \(readJoins)
             WHERE m.thread_root_id IS NOT NULL
                 AND (m.author_account_id IS NULL OR m.author_account_id != (SELECT me FROM meta WHERE id = 1))
-                AND \(unreadSQL) GROUP BY m.channel_id
+                AND \(unreadSQL)
+            """
+
+    static func unreadRepliesByChannel(_ db: Database) throws -> [String: Int] {
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT m.channel_id, COUNT(*) AS count \(unreadRepliesSQL) GROUP BY m.channel_id
             """)
         return Dictionary(uniqueKeysWithValues: rows.map { ($0["channel_id"] as String, $0["count"] as Int) })
+    }
+
+    /// The channel badge's replies, grouped even when their roots are outside the cache.
+    static func unreadRepliesByRoot(_ db: Database, channel: String) throws -> [(root: String, count: Int)] {
+        try Row.fetchAll(db, sql: """
+            SELECT m.thread_root_id AS root_id, COUNT(*) AS count \(unreadRepliesSQL) AND m.channel_id = ?
+            GROUP BY m.thread_root_id ORDER BY MIN(m.seq), m.thread_root_id
+            """, arguments: [channel]).map { (root: $0["root_id"], count: $0["count"]) }
     }
 
     /// A visit's range is frozen before geometry can advance the persisted mark.

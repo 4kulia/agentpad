@@ -25,17 +25,20 @@ struct HookLifecycleDetails: Equatable, Sendable {
     var backgroundShells = 0
     /// Claude's `notification_type`, e.g. `permission_prompt`, `idle_prompt`.
     var notificationType: String?
+    var reason: SessionAttentionReason?
 
     var hasBackgroundWork: Bool { backgroundSubagents + backgroundShells > 0 }
 }
 
 enum HookEvent: String {
     case running, attention, idle, ended
+    case turnComplete = "turn_complete"
+    case turnFailure = "turn_failure"
 
     var activityState: SessionActivityState {
         switch self {
         case .running: return .running
-        case .attention: return .attention
+        case .attention, .turnComplete, .turnFailure: return .attention
         case .idle, .ended: return .idle
         }
     }
@@ -59,7 +62,8 @@ enum HookMessage {
     /// pipes session_id today) and the consumer doesn't dispatch per-agent
     /// AgentPad: the socket adds process evidence separately from these fields.
     // AgentPad: only evidence captured from the socket peer may authorize export.
-    case conversationId(conversationId: String, sessionId: UUID, provenance: AgentAnswerProvenance? = nil)
+    case conversationId(conversationId: String, sessionId: UUID, provenance: AgentAnswerProvenance? = nil,
+                        failure: AgentAnswerTranscript.Problem? = nil)
     /// PreToolUse / PostToolUse event for the activity strip. `agent` is
     /// the base AgentTemplate the slug resolves to (Claude builtin today —
     /// custom Claude-based agents share its slug since `from(hookSlug:)`
@@ -277,7 +281,7 @@ final class HookServer {
 
     /// AgentPad: what the accepting queue hands the main queue.
     private enum Received: @unchecked Sendable {
-        case hook([String: Any], AgentAnswerProvenance?)
+        case hook([String: Any], AgentAnswerProvenance?, AgentAnswerTranscript.Problem?)
         case shellCommand(AgentPadShellCommandRequest?, fd: Int32)
         case cli(dict: [String: Any], data: Data, fd: Int32, origin: AgentPadCallerOrigin)
     }
@@ -392,11 +396,16 @@ final class HookServer {
         if case .teamRun = origin {} else {
             // AgentPad: keep the authenticated sender's parent with this UUID.
             // Signature/TTY verification runs here, off the main queue, before ACK.
-            let provenance = dict["kind"] as? String == "conversationId"
-                ? AgentAnswerProvenance.capture(parentPID: (dict["claudeParentPID"] as? String).flatMap(Int32.init),
-                                               origin: origin, inspector: hooks.answerInspector)
-                : nil
-            deliver(.hook(dict, provenance))
+            var provenance: AgentAnswerProvenance?
+            var failure: AgentAnswerTranscript.Problem?
+            if dict["kind"] as? String == "conversationId" {
+                do {
+                    provenance = try AgentAnswerProvenance.verify(
+                        parentPID: (dict["claudeParentPID"] as? String).flatMap(Int32.init),
+                        origin: origin, inspector: hooks.answerInspector)
+                } catch { failure = error }
+            }
+            deliver(.hook(dict, provenance, failure))
         }
         // AgentPad: the sender waits for this byte, not for the main queue.
         var ack: UInt8 = 0x0A
@@ -406,8 +415,8 @@ final class HookServer {
     /// AgentPad: the main-queue half of a connection.
     private func dispatch(_ received: Received) {
         switch received {
-        case .hook(let dict, let provenance):
-            guard let message = Self.parseMessage(dict, provenance: provenance) else { return }
+        case .hook(let dict, let provenance, let failure):
+            guard let message = Self.parseMessage(dict, provenance: provenance, failure: failure) else { return }
             handler(message)
         case .shellCommand(let request, let fd):
             let command = !Self.peerHasHungUp(fd) ? request.flatMap { onShellCommandRequest?($0) } : nil
@@ -526,7 +535,8 @@ final class HookServer {
         return parseMessage(dict)
     }
 
-    static func parseMessage(_ dict: [String: Any], provenance: AgentAnswerProvenance? = nil) -> HookMessage? {
+    static func parseMessage(_ dict: [String: Any], provenance: AgentAnswerProvenance? = nil,
+                             failure: AgentAnswerTranscript.Problem? = nil) -> HookMessage? {
         guard
             let surface = dict["surface"] as? String,
             let id = UUID(uuidString: surface)
@@ -542,7 +552,7 @@ final class HookServer {
         if dict["kind"] as? String == "conversationId",
            let conversationId = dict["conversationId"] as? String,
            !conversationId.isEmpty {
-            return .conversationId(conversationId: conversationId, sessionId: id, provenance: provenance)
+            return .conversationId(conversationId: conversationId, sessionId: id, provenance: provenance, failure: failure)
         }
 
         if dict["kind"] as? String == AgentPadHookKit.toolBatchKind {
@@ -597,7 +607,8 @@ final class HookServer {
         let details = HookLifecycleDetails(
             backgroundSubagents: Int(dict[AgentPadHookKit.backgroundSubagentsKey] as? String ?? "") ?? 0,
             backgroundShells: Int(dict[AgentPadHookKit.backgroundShellsKey] as? String ?? "") ?? 0,
-            notificationType: dict[AgentPadHookKit.notificationTypeKey] as? String
+            notificationType: dict[AgentPadHookKit.notificationTypeKey] as? String,
+            reason: (dict["reason"] as? String).flatMap(SessionAttentionReason.init(rawValue:))
         )
         return .agent(agent: agent, event: event, sessionId: id, details: details)
     }

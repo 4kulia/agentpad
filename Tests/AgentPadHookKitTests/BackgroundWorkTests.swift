@@ -32,7 +32,8 @@ final class BackgroundWorkTests: XCTestCase {
         AgentPadHookKit.applyClaudeLifecycleDetails(to: &p, stdin: stdin([
             "hook_event_name": "Stop", "background_tasks": [] as [Any],
         ]))
-        XCTAssertEqual(p, payload("attention"))
+        XCTAssertEqual(p["event"], "attention")
+        XCTAssertEqual(p["reason"], "completion")
     }
 
     func testNotificationCarriesItsType() {
@@ -53,5 +54,18 @@ final class BackgroundWorkTests: XCTestCase {
         var empty = payload("attention")
         AgentPadHookKit.applyClaudeLifecycleDetails(to: &empty, stdin: Data("nope".utf8))
         XCTAssertEqual(empty, payload("attention"))
+    }
+}
+
+
+extension BackgroundWorkTests {
+    func testStopFailurePreservesFailureAndNotificationPreservesInput() {
+        var failure = payload("turn_failure")
+        AgentPadHookKit.applyClaudeLifecycleDetails(to: &failure, stdin: stdin(["hook_event_name": "StopFailure"]))
+        XCTAssertEqual(failure["reason"], "failure")
+        var input = payload("attention")
+        AgentPadHookKit.applyClaudeLifecycleDetails(to: &input, stdin: stdin(["hook_event_name": "Notification", "notification_type": "permission_prompt"]))
+        XCTAssertEqual(input["reason"], "input")
+        XCTAssertEqual(input["notification_type"], "permission_prompt")
     }
 }

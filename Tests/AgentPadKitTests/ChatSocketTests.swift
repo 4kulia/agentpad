@@ -150,12 +150,147 @@ final class ChatSocketTests: XCTestCase {
     /// Connected and subscribed to `org` (cursor 5) and `team` (cursor 2).
     private func connected(_ sink: FakeSink, heartbeat: Int = 25) async throws -> ChatSocket {
         let socket = socket(sink, streams: [org, team])
+        let count = transports.count
         socket.start()
-        try await waitUntil { !self.transports.isEmpty }
+        try await waitUntil { self.transports.count > count }
         transport.push(.opened)
         transport.frame(#"{"frame":"hello","generation":"g1","heartbeat_seconds":\#(heartbeat),"version":"0.1.0"}"#)
         try await waitUntil { socket.state == .connected && !self.transport.subscribes.isEmpty }
         return socket
+    }
+
+    func testUnchangedNetworkPathNeverClosesLiveSocketAndChangesCoalesce() async throws {
+        let sink = FakeSink([org: 0])
+        let socket = try await connected(sink)
+        defer { socket.stop() }
+        let watch = TeamNetworkWatch(monitorsNetwork: false, coalescingDelay: .milliseconds(40))
+        var reconnects = 0
+        watch.add { reconnects += 1; socket.reconnectNow(force: true, reason: .networkPathChanged) }
+        let wifi = TeamNetworkWatch.Path(status: .satisfied, interfaces: ["en0:4"])
+        let original = transport
+        for _ in 0..<10 { watch.pathChanged(wifi) }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(original.closedWith)
+        XCTAssertEqual(reconnects, 0)
+        XCTAssertEqual(transports.count, 1)
+        XCTAssertEqual(socket.state, .connected)
+
+        // A working interface changes while the old socket is still fresh.
+        watch.pathChanged(.init(status: .satisfied, interfaces: ["en1:5"]))
+        watch.pathChanged(.init(status: .satisfied, interfaces: ["en1:5", "utun3:9"]))
+        for _ in 0..<10 { watch.pathChanged(.init(status: .satisfied, interfaces: ["utun3:9", "en1:5"])) }
+        try await waitUntil { self.transports.count == 2 }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(original.closedWith, 1000)
+        XCTAssertEqual(reconnects, 1)
+        XCTAssertEqual(transports.count, 2, "one forced reconnect for the burst")
+    }
+
+    func testNetworkRecoveryCoalescesAndUnavailablePathCancelsPendingChange() async throws {
+        let watch = TeamNetworkWatch(monitorsNetwork: false, coalescingDelay: .milliseconds(40))
+        var calls = 0
+        watch.add { calls += 1 }
+        let wifi = TeamNetworkWatch.Path(status: .satisfied, interfaces: ["en0:4"])
+        watch.pathChanged(.init(status: .unsatisfied))
+        watch.pathChanged(wifi)
+        watch.pathChanged(.init(status: .requiresConnection))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(calls, 0, "the path is no longer usable")
+        for _ in 0..<10 {
+            watch.pathChanged(.init(status: .unsatisfied))
+            watch.pathChanged(wifi)
+        }
+        try await waitUntil { calls == 1 }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(calls, 1)
+        watch.pathChanged(.init(status: .unsatisfied))
+        watch.pathChanged(wifi)
+        try await waitUntil { calls == 2 }
+    }
+
+    func testShortReconnectDoesNotFlashOfflineOrLeaveALateTimer() async throws {
+        let sink = FakeSink([org: 0])
+        let socket = try await connected(sink)
+        defer { socket.stop() }
+        XCTAssertEqual(socket.offlineDelay, .seconds(2))
+        socket.offlineDelay = .milliseconds(100)
+        XCTAssertFalse(socket.showsOffline)
+        socket.reconnectNow(force: true)
+        XCTAssertEqual(socket.state, .connecting, "actual connection state changes immediately")
+        XCTAssertFalse(socket.showsOffline)
+        try await waitUntil { self.transports.count == 2 }
+        transport.frame(#"{"frame":"hello","generation":"g1","heartbeat_seconds":25,"version":"0.1.0"}"#)
+        try await waitUntil { socket.state == .connected }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertFalse(socket.showsOffline, "the cancelled deadline cannot turn a recovered socket offline")
+    }
+
+    func testOfflineDeadlineSpansRetriesAndResetsOnlyAfterRecovery() async throws {
+        let sink = FakeSink([org: 0])
+        let socket = try await connected(sink)
+        defer { socket.stop() }
+        socket.offlineDelay = .milliseconds(120)
+        transport.push(.closed(code: 1006))
+        XCTAssertEqual(socket.state, .disconnected)
+        XCTAssertFalse(socket.showsOffline)
+        // Keep restarting faster than the grace period, beyond its deadline.
+        for _ in 0..<8 {
+            try await Task.sleep(for: .milliseconds(30))
+            socket.reconnectNow(force: true)
+        }
+        XCTAssertTrue(socket.showsOffline, "retries cannot mask a real outage")
+        try await waitUntil { self.transport.request != nil && self.transport.closedWith == nil }
+        transport.frame(#"{"frame":"hello","generation":"g1","heartbeat_seconds":25,"version":"0.1.0"}"#)
+        try await waitUntil { socket.state == .connected }
+        XCTAssertFalse(socket.showsOffline)
+        socket.reconnectNow(force: true)
+        XCTAssertFalse(socket.showsOffline, "a recovered connection has a new grace period")
+        socket.stop()
+        XCTAssertTrue(socket.showsOffline, "an explicit stop is immediate")
+    }
+
+    func testOfflineIsImmediateForColdStartSignOutAndPermanentFailure() async throws {
+        let sink = FakeSink([org: 0])
+        let socket = self.socket(sink, streams: [org])
+        XCTAssertTrue(socket.showsOffline)
+        socket.start()
+        XCTAssertTrue(socket.showsOffline)
+        try await waitUntil { !self.transports.isEmpty }
+        transport.frame(#"{"frame":"hello","generation":"g1","heartbeat_seconds":25,"version":"0.1.0"}"#)
+        try await waitUntil { socket.state == .connected }
+        transport.push(.closed(code: 4401))
+        XCTAssertTrue(socket.showsOffline)
+
+        let second = try await connected(sink)
+        defer { second.stop() }
+        second.checkServer = { throw ChatAPIError.unsuitableServer(missing: ["events.ws"]) }
+        second.reconnectNow(force: true)
+        try await waitUntil { if case .failed = second.state { true } else { false } }
+        XCTAssertTrue(second.showsOffline)
+    }
+
+    func testSocketDiagnosticsContainReasonsAndCloseCodesWithoutPayloads() async throws {
+        let sink = FakeSink([org: 0])
+        let socket = try await connected(sink)
+        defer { socket.stop() }
+        var lines: [String] = []
+        socket.log = { lines.append($0) }
+        socket.reconnectNow(force: true, reason: .networkPathChanged)
+        try await waitUntil { self.transports.count == 2 }
+        transport.push(.failed("secret-error-payload", httpStatus: 503))
+        try await waitUntil { self.transports.count == 3 }
+        transport.push(.text(Data("secret-message-payload".utf8)))
+        transport.push(.closed(code: 1012))
+        let output = lines.joined(separator: "\n")
+        XCTAssertTrue(output.contains("reason=networkPathChanged"))
+        XCTAssertTrue(output.contains("state=connected->disconnected"))
+        XCTAssertTrue(output.contains("state=disconnected->connecting"))
+        XCTAssertTrue(output.contains("direction=local code=1000"))
+        XCTAssertTrue(output.contains("direction=remote code=1012"))
+        XCTAssertTrue(output.contains("reason=transportFailure"))
+        XCTAssertTrue(output.contains("httpStatus=503"))
+        XCTAssertFalse(output.contains("secret-"))
+        XCTAssertFalse(output.contains("aps_t"))
     }
 
     func testRequestAndFirstSubscribe() async throws {

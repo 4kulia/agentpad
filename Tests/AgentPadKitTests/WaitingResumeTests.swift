@@ -203,6 +203,7 @@ final class WaitingResumeTests: XCTestCase {
         reconcile(.idle, secondsAgo: 5)
         XCTAssertEqual(session.activityState, .attention)
         XCTAssertNil(session.backgroundWork)
+        XCTAssertEqual(session.attentionReason, .completion)
     }
 
     /// Review case: a prompt answered while another call still runs, or one

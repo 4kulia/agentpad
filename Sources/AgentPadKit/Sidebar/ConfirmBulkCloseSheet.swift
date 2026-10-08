@@ -70,6 +70,7 @@ struct ConfirmBulkCloseSheet: View {
         .frame(width: 480, alignment: .topLeading)
         .background(Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
+        .attentionConfirmation(busy: isWorking)
     }
 
     private var statusBadge: some View {

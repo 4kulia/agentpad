@@ -18,11 +18,11 @@ final class AnswerProcessFixture: @unchecked Sendable {
     }
 
     func add(_ pid: Int32, parent: Int32, name: String, trusted: Bool = false, start: UInt64 = 100,
-             foreground: Bool = true, terminal: Int32? = 42) {
+             foreground: Bool = true, terminal: Int32? = 42, path: String? = nil) {
         lock.withLock {
             processes[pid] = .init(pid: pid, parent: parent, startedAtUs: start, terminal: terminal)
             self.foreground[pid] = foreground
-            images[pid] = .init(path: "/fixture/\(name)", device: 1, inode: UInt64(pid), size: 10,
+            images[pid] = .init(path: path ?? "/fixture/\(name)", device: 1, inode: UInt64(pid), size: 10,
                 modifiedSeconds: 1, modifiedNanoseconds: 0, changedSeconds: 1, changedNanoseconds: 0, auditToken: nil)
             if trusted { signed.insert(pid) }
         }
@@ -33,7 +33,9 @@ final class AnswerProcessFixture: @unchecked Sendable {
     var inspector: AgentAnswerProvenance.Inspector {
         .init(kernel: .init(process: { pid in self.lock.withLock { self.processes[pid] } },
                            image: { pid in self.lock.withLock { self.images[pid] } }),
-              scan: { _ in self.lock.withLock { self.processes.values.map {
+              scan: { pid in self.lock.withLock { self.processes.values.filter {
+                  self.processes[pid]?.terminal != nil && $0.terminal == self.processes[pid]?.terminal
+              }.map {
                   .init(pid: $0.pid, ppid: $0.parent, name: "fixture", isForeground: self.foreground[$0.pid] == true, startedAtUs: $0.startedAtUs)
               } } }, signed: { pid in self.lock.withLock { self.signed.contains(pid) } })
     }
@@ -53,6 +55,202 @@ final class AnswerProcessFixture: @unchecked Sendable {
 
 @MainActor
 final class AgentAnswerProvenanceTests: XCTestCase {
+    func testResumedLoginZshAgentPadBashWrapperAndVersionedClaudeWithDetachedHook() async throws {
+        let store = makeTestStore(), fixture = AnswerProcessFixture()
+        defer { store.terminate() }
+        for pid in [AnswerProcessFixture.shell, AnswerProcessFixture.claude, AnswerProcessFixture.hook] { fixture.remove(pid) }
+        // The reported 1.1.6 tree, including exact PID/parent/group topology.
+        // proc_pidpath resolves ~/.local/bin/claude to the versioned image;
+        // the AgentPad script's kernel image is /bin/bash, not the script.
+        fixture.add(45905, parent: 45872, name: "login", foreground: false, path: "/usr/bin/login")
+        fixture.add(45908, parent: 45905, name: "zsh", foreground: false, path: "/bin/zsh")
+        fixture.add(45936, parent: 45908, name: "bash", path: "/bin/bash")
+        fixture.add(45968, parent: 45936, name: "2.1.292", trusted: true,
+                    path: "/fixture/home/.local/share/claude/versions/2.1.292")
+        fixture.add(46013, parent: 45968, name: "node")
+        fixture.add(46050, parent: 46013, name: "node")
+        fixture.add(46016, parent: 45968, name: "agentpad-cli")
+        let tab = try XCTUnwrap(store.active?.activeSession)
+        tab.agent = .claudeCode
+        (tab.engine as? TestEngine)?.foregroundPid = 45936 // tpgid, shared with Claude
+        let id = UUID().uuidString.lowercased()
+        tab.conversationId = id
+        tab.resumedConversationId = id // persisted --resume alone is never proof
+        XCTAssertEqual(AgentAnswerSource.problem(tab, inspector: fixture.inspector), .unbound)
+        for terminal: Int32? in [42, nil] {
+            fixture.add(46080, parent: 45968, name: "zsh", foreground: terminal != nil, terminal: terminal)
+            fixture.add(46081, parent: 46080, name: "agentpad-hook", foreground: terminal != nil, terminal: terminal)
+            let proof = try XCTUnwrap(fixture.capture(parent: 46080, origin: .localProcess(pid: 46081, startedAtUs: 100)))
+            AgentAnswerSource.recordHook(conversation: id, session: tab, provenance: proof, inspector: fixture.inspector)
+            XCTAssertEqual(tab.answerBinding?.process.pid, 45968)
+            XCTAssertNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector))
+            fixture.remove(46081); fixture.remove(46080)
+            let answer = try await AgentAnswerSource.read(session: tab, store: store, inspector: fixture.inspector) { _, journal, _ in
+                XCTAssertEqual(journal, id)
+                return "Resumed Claude answer"
+            }
+            XCTAssertEqual(answer.text, "Resumed Claude answer")
+            XCTAssertTrue(answer.isCurrent())
+        }
+    }
+
+    func testDetachedHookStillRejectsForeignAncestryMultiplexersAndMultipleClaude() throws {
+        let fixture = AnswerProcessFixture(), shell: Int32 = 99_999_976
+        fixture.add(shell, parent: AnswerProcessFixture.claude, name: "sh", foreground: false, terminal: nil)
+        fixture.add(AnswerProcessFixture.hook, parent: shell, name: "agentpad-hook", foreground: false, terminal: nil)
+        XCTAssertNotNil(fixture.capture(parent: shell))
+        for name in ["tmux", "screen", "node", "nodejs"] {
+            fixture.add(shell, parent: AnswerProcessFixture.claude, name: name, foreground: false, terminal: nil)
+            XCTAssertNil(fixture.capture(parent: shell), name)
+        }
+        fixture.add(shell, parent: AnswerProcessFixture.shell, name: "sh", foreground: false, terminal: nil)
+        XCTAssertNil(fixture.capture(parent: shell), "same surface cannot replace the authenticated parent chain")
+        fixture.add(shell, parent: AnswerProcessFixture.claude, name: "sh", foreground: false, terminal: nil)
+        fixture.add(99_999_977, parent: AnswerProcessFixture.shell, name: "2.1.292", trusted: true)
+        XCTAssertNil(fixture.capture(parent: shell), "another signed Claude on the TTY is still ambiguous")
+    }
+
+    func testSocketReportsConcreteFailureAndFreshProofClearsIt() async throws {
+        let fixture = AnswerProcessFixture(), store = makeTestStore()
+        defer { store.terminate() }
+        let tab = try XCTUnwrap(store.active?.activeSession), second: Int32 = 99_999_977
+        tab.agent = .claudeCode
+        fixture.add(second, parent: AnswerProcessFixture.shell, name: "2.1.292", trusted: true)
+        let received = expectation(description: "refusal reason delivered with hook")
+        let path = NSTemporaryDirectory() + "answer-reason-\(UUID().uuidString.prefix(8)).sock"
+        let server = HookServer(socketPath: path, answerInspector: fixture.inspector) { message in
+            guard case .conversationId(let journal, let surface, let proof, let failure) = message else { return }
+            XCTAssertNil(proof)
+            XCTAssertEqual(failure, .ambiguousClaude)
+            store.applyHookConversationId(conversationId: journal, sessionId: surface, provenance: proof, failure: failure)
+            XCTAssertEqual(AgentAnswerSource.problem(tab), .ambiguousClaude)
+            XCTAssertFalse(AgentAnswerWindow.available(tab))
+            received.fulfill()
+        }
+        server.originOf = { _ in .localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100) }
+        server.start()
+        defer { server.stop() }
+        let id = UUID().uuidString.lowercased()
+        let payload = AgentPadHookKit.buildConversationIdPayload(surface: tab.id.uuidString,
+            conversationId: id, claudeParentPID: AnswerProcessFixture.claude)
+        let sent = await Task.detached { AgentPadHookKit.sendPayload(payload, to: path) }.value
+        XCTAssertTrue(sent)
+        await fulfillment(of: [received], timeout: 3)
+        fixture.remove(second)
+        try fixture.bind(tab, conversation: id)
+        XCTAssertNil(tab.answerBindingProblem)
+        XCTAssertNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector))
+    }
+
+    func testDetachedHelpersMayExitButCannotReparentOrExecAfterVerification() throws {
+        let fixture = AnswerProcessFixture(), shell: Int32 = 99_999_976
+        fixture.add(shell, parent: AnswerProcessFixture.claude, name: "sh", foreground: false, terminal: nil)
+        fixture.add(AnswerProcessFixture.hook, parent: shell, name: "agentpad-hook", foreground: false, terminal: nil)
+        let proof = try XCTUnwrap(fixture.capture(parent: shell))
+        fixture.add(shell, parent: 1, name: "sh", foreground: false, terminal: nil)
+        XCTAssertFalse(proof.isCurrent(inspector: fixture.inspector))
+        fixture.add(shell, parent: AnswerProcessFixture.claude, name: "node", foreground: false, terminal: nil)
+        XCTAssertFalse(proof.isCurrent(inspector: fixture.inspector))
+        fixture.add(shell, parent: AnswerProcessFixture.claude, name: "sh", foreground: false, terminal: nil)
+        var inspector = fixture.inspector
+        let image = inspector.kernel.image
+        inspector.kernel.image = { pid in pid == AnswerProcessFixture.hook ? nil : image(pid) }
+        XCTAssertFalse(proof.isCurrent(inspector: inspector), "an unreadable image of the same live helper still refuses")
+        fixture.remove(shell)
+        fixture.remove(AnswerProcessFixture.hook)
+        XCTAssertTrue(proof.isCurrent(inspector: fixture.inspector))
+    }
+
+    func testDetachedHookExitDuringImageReadStillBindsAnswer() async throws {
+        let store = makeTestStore(), fixture = AnswerProcessFixture()
+        defer { store.terminate() }
+        let tab = try XCTUnwrap(store.active?.activeSession)
+        tab.agent = .claudeCode
+        fixture.add(AnswerProcessFixture.hook, parent: AnswerProcessFixture.claude,
+                    name: "agentpad-hook", foreground: false, terminal: nil)
+        try fixture.bind(tab, conversation: UUID().uuidString.lowercased())
+        let proof = try XCTUnwrap(fixture.capture()), id = UUID().uuidString.lowercased()
+        var inspector = fixture.inspector
+        let image = inspector.kernel.image
+        inspector.kernel.image = { pid in
+            if pid == AnswerProcessFixture.hook {
+                fixture.remove(pid) // ACK lets the helper exit after the process read.
+                return nil
+            }
+            return image(pid)
+        }
+        AgentAnswerSource.recordHook(conversation: id, session: tab, provenance: proof, inspector: inspector)
+        XCTAssertNil(fixture.inspector.kernel.process(AnswerProcessFixture.hook))
+        XCTAssertEqual(tab.answerBinding?.conversation, id, "hook exit must not leave Copy/Forward unbound")
+        XCTAssertNil(AgentAnswerSource.problem(tab, inspector: inspector))
+        let answer = try await AgentAnswerSource.read(session: tab, store: store, inspector: inspector) { _, journal, _ in
+            XCTAssertEqual(journal, id)
+            return "This tab's answer"
+        }
+        XCTAssertEqual(answer.text, "This tab's answer")
+        XCTAssertTrue(answer.isCurrent())
+    }
+
+    func testDetachedHookPIDReuseOutsideTerminalKeepsAnswerCurrent() async throws {
+        let store = makeTestStore(), fixture = AnswerProcessFixture()
+        defer { store.terminate() }
+        let tab = try XCTUnwrap(store.active?.activeSession)
+        tab.agent = .claudeCode
+        fixture.add(AnswerProcessFixture.hook, parent: AnswerProcessFixture.claude,
+                    name: "agentpad-hook", foreground: false, terminal: nil)
+        let id = UUID().uuidString.lowercased()
+        try fixture.bind(tab, conversation: id)
+        let answer = try await AgentAnswerSource.read(session: tab, store: store, inspector: fixture.inspector) { _, journal, _ in
+            XCTAssertEqual(journal, id)
+            return "Bound answer"
+        }
+        for terminal: Int32? in [nil, 43] {
+            fixture.add(AnswerProcessFixture.hook, parent: 1, name: "unrelated", start: 101, terminal: terminal)
+            XCTAssertTrue(answer.isCurrent(), "a new owner of the detached hook PID outside the tab cannot revoke export")
+            XCTAssertNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector))
+            XCTAssertEqual(tab.answerBinding?.conversation, id)
+        }
+        fixture.add(AnswerProcessFixture.hook, parent: AnswerProcessFixture.shell, name: "claude", trusted: true, start: 101)
+        XCTAssertFalse(answer.isCurrent(), "the reused PID on the tab's TTY still introduces ambiguity")
+        XCTAssertEqual(AgentAnswerSource.problem(tab, inspector: fixture.inspector), .changed)
+    }
+
+    func testDetachedHookPIDReuseDuringImageReadKeepsEvidenceCurrent() throws {
+        for imageUnavailable in [false, true] {
+            let fixture = AnswerProcessFixture()
+            fixture.add(AnswerProcessFixture.hook, parent: AnswerProcessFixture.claude,
+                        name: "agentpad-hook", foreground: false, terminal: nil)
+            let proof = try XCTUnwrap(fixture.capture())
+            var inspector = fixture.inspector
+            let image = inspector.kernel.image
+            inspector.kernel.image = { pid in
+                if pid == AnswerProcessFixture.hook {
+                    fixture.add(pid, parent: 1, name: "unrelated", start: 101, terminal: 43)
+                    if imageUnavailable { return nil }
+                }
+                return image(pid)
+            }
+            XCTAssertTrue(proof.isCurrent(inspector: inspector), "a different start time means the old helper exited")
+            XCTAssertEqual(fixture.inspector.kernel.process(AnswerProcessFixture.hook)?.startedAtUs, 101)
+            XCTAssertTrue(proof.matchesForeground(AnswerProcessFixture.claude, inspector: inspector))
+        }
+    }
+
+    func testPeerPIDReuseBetweenAuthenticationAndAncestryCannotBorrowNewProcess() {
+        let fixture = AnswerProcessFixture()
+        var inspector = fixture.inspector
+        let read = inspector.kernel.process
+        inspector.kernel.process = { pid in
+            let result = read(pid)
+            if pid == AnswerProcessFixture.hook, result?.startedAtUs == 100 {
+                fixture.add(pid, parent: AnswerProcessFixture.claude, name: "agentpad-hook", start: 101)
+            }
+            return result
+        }
+        XCTAssertNil(AgentAnswerProvenance.capture(parentPID: AnswerProcessFixture.claude,
+            origin: .localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100), inspector: inspector))
+    }
+
     func testHookRequiresKernelPeerParentAndStartNotAClaimedForegroundPID() throws {
         let fixture = AnswerProcessFixture()
         XCTAssertNotNil(fixture.capture())
@@ -138,6 +336,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         AgentAnswerSource.recordHook(conversation: UUID().uuidString, session: tab,
             provenance: fixture.capture(), inspector: fixture.inspector)
         XCTAssertNil(tab.answerBinding, "a foreground shell sibling is not the launch wrapper")
+        XCTAssertEqual(AgentAnswerSource.problem(tab, inspector: fixture.inspector), .foregroundMismatch)
         for name in ["tmux", "screen", "zellij"] {
             fixture.add(other, parent: AnswerProcessFixture.shell, name: name)
             fixture.add(AnswerProcessFixture.claude, parent: other, name: "claude")
@@ -198,8 +397,14 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         fixture.add(AnswerProcessFixture.shell, parent: 1, name: "other-image")
         XCTAssertFalse(evidence.isCurrent(inspector: fixture.inspector), "same PID/start after exec is insufficient")
         fixture.add(AnswerProcessFixture.shell, parent: 1, name: "zsh")
+        fixture.add(AnswerProcessFixture.claude, parent: AnswerProcessFixture.shell, name: "other-image")
+        XCTAssertFalse(evidence.isCurrent(inspector: fixture.inspector), "Claude's image must still match after the hook exits")
+        fixture.add(AnswerProcessFixture.claude, parent: AnswerProcessFixture.shell, name: "claude", foreground: false)
+        XCTAssertFalse(evidence.isCurrent(inspector: fixture.inspector), "Claude must remain in the foreground")
         fixture.add(AnswerProcessFixture.claude, parent: AnswerProcessFixture.shell, name: "claude", start: 101)
         XCTAssertFalse(evidence.isCurrent(inspector: fixture.inspector))
+        fixture.remove(AnswerProcessFixture.claude)
+        XCTAssertFalse(evidence.isCurrent(inspector: fixture.inspector), "only helpers may exit without revoking the binding")
     }
 
     func testSocketCannotAuthenticatePayloadPIDWithoutAClaudeParent() async throws {
@@ -211,9 +416,9 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         let path = NSTemporaryDirectory() + "answer-hook-\(UUID().uuidString.prefix(8)).sock"
         let received = expectation(description: "hook dispatched")
         let server = HookServer(socketPath: path) { message in
-            guard case .conversationId(let id, let surface, let provenance) = message else { return }
+            guard case .conversationId(let id, let surface, let provenance, let failure) = message else { return }
             XCTAssertNil(provenance)
-            store.applyHookConversationId(conversationId: id, sessionId: surface, provenance: provenance)
+            store.applyHookConversationId(conversationId: id, sessionId: surface, provenance: provenance, failure: failure)
             received.fulfill()
         }
         server.start()
@@ -248,11 +453,11 @@ final class AgentAnswerProvenanceTests: XCTestCase {
             return signature(pid)
         }
         let server = HookServer(socketPath: path, answerInspector: inspector) { message in
-            guard case .conversationId(let journal, let surface, let provenance) = message else { return }
+            guard case .conversationId(let journal, let surface, let provenance, let failure) = message else { return }
             XCTAssertEqual(surface, tab.id)
             XCTAssertEqual(journal, id)
             XCTAssertEqual(provenance?.process.pid, AnswerProcessFixture.claude)
-            AgentAnswerSource.recordHook(conversation: journal, session: tab, provenance: provenance, inspector: fixture.inspector)
+            AgentAnswerSource.recordHook(conversation: journal, session: tab, provenance: provenance, failure: failure, inspector: fixture.inspector)
             received.fulfill()
         }
         server.originOf = { _ in .localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100) }

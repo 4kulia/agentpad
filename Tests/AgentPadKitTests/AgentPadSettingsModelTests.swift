@@ -419,3 +419,26 @@ final class AgentPadSettingsModelTests: XCTestCase {
         XCTAssertNil(AgentPadSettingsModel.copyOnSelectSavedValue(existing: [true, false], enabled: true))
     }
 }
+
+
+extension AgentPadSettingsModelTests {
+    func testNotificationMigrationPreservesOldFalseAndUnknownKeys() throws {
+        let raw: [String: Any] = ["attention": false, "failure": false, "future": ["mode": "quiet"]]
+        let preferences = AttentionPreferences.read(raw)
+        XCTAssertEqual(preferences.disabled, [.attention, .failure])
+        XCTAssertTrue(preferences.enabled); XCTAssertTrue(preferences.sound)
+        for category in AttentionCategory.allCases where category != .attention && category != .failure {
+            XCTAssertFalse(preferences.disabled.contains(category))
+        }
+        let persisted = preferences.persisted(over: raw)
+        XCTAssertEqual(persisted["attention"] as? Bool, false)
+        XCTAssertEqual(persisted["failure"] as? Bool, false)
+        XCTAssertEqual((persisted["future"] as? [String: String])?["mode"], "quiet")
+        XCTAssertEqual(AttentionPreferences.read(persisted), preferences)
+        XCTAssertNil(persisted["completion"], "enabled defaults remain implicit")
+    }
+    func testAllNotificationCategoriesAndSoundRoundTrip() {
+        let preferences = AttentionPreferences(enabled: false, sound: false, disabled: Set(AttentionCategory.allCases))
+        XCTAssertEqual(AttentionPreferences.read(preferences.persisted(over: [:])), preferences)
+    }
+}

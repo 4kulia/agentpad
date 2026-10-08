@@ -80,12 +80,13 @@ final class NotificationInboxTests: XCTestCase {
         )
     }
 
-    func testClearAllEmptiesInbox() {
+    func testClearAllRetainsLiveDecisions() {
         let inbox = NotificationInbox()
         add(inbox, .attention)
         add(inbox, .failure)
         inbox.clearAll()
-        XCTAssertTrue(inbox.events.isEmpty)
-        XCTAssertFalse(inbox.hasUnread)
+        XCTAssertEqual(inbox.events.count, 1)
+        XCTAssertEqual(inbox.events.first?.notice.kind, .input)
+        XCTAssertTrue(inbox.hasUnread)
     }
 }

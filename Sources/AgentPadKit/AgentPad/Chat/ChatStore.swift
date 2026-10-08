@@ -237,7 +237,7 @@ final class ChatCommandTable: Sendable {
         try queue.write { db in
             guard try String.fetchOne(db, sql: "SELECT state FROM \(table) WHERE command_id = ? AND \(scopeSQL)",
                                       arguments: [record.commandId] + scopeArgs) == "pending" else { return nil }
-            if record.type == "request.create_in_channel_v2" {
+            if ["request.create_in_channel_v2", "request.create_in_channel_with_attachments"].contains(record.type) {
                 guard try Bool.fetchOne(db, sql: "SELECT cancelled FROM channel_call_intents WHERE command_id = ?", arguments: [record.commandId]) == false else { return nil }
                 try db.execute(sql: "UPDATE channel_call_intents SET send_started_at = coalesce(send_started_at, CURRENT_TIMESTAMP) WHERE command_id = ?", arguments: [record.commandId])
             }
@@ -589,6 +589,7 @@ final class ChatStore: Sendable {
             try db.execute(sql: "DELETE FROM my_threads")
             try ChatB1.cancelIntents(db, condition: "1")
             // Messages of the server go; one this Mac is sending stays with its command (F3).
+            try db.execute(sql: "DELETE FROM attachment_deleted_sources")
             try db.execute(sql: "DELETE FROM messages WHERE local_state IS NULL")
             // Unsettled edits of the old generation's messages go too (review F3d-1).
             try db.execute(sql: "DELETE FROM local_edits")

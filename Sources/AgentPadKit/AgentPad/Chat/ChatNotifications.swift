@@ -8,13 +8,11 @@ import GRDB
 @MainActor
 enum ChatNotifications {
     /// Shows a notice; the system's outside tests.
-    static var post: @MainActor (_ id: String, _ title: String) -> Void = { id, title in
-        guard AgentPadSettingsModel.shared.notificationsEnabled else { return }
-        AttentionCoordinator.shared.notificationManager?.postChat(id: id, title: title)
-    }
-    /// Takes notices back by id or id prefix.
-    static var remove: @MainActor (_ ids: [String], _ prefix: String?) -> Void = { ids, prefix in
-        AttentionCoordinator.shared.notificationManager?.removeChat(ids: ids, prefix: prefix)
+    static var post: @MainActor (_ id: String, _ title: String) -> Void = { _, _ in }
+    static var emit: @MainActor (AttentionEvent) -> Void = { _ in }
+    static var projectionChanged: @MainActor () -> Void = {}
+    static var remove: @MainActor (_ ids: [String], _ prefix: String?) -> Void = { ids, _ in
+        AttentionCoordinator.shared.notificationManager?.remove(ids: ids)
     }
 
     /// The Dock's badge counts again; nothing outside the app in tests.
@@ -30,15 +28,13 @@ enum ChatNotifications {
     /// owner's side where `notify_decision` runs (D4, impl-client-d).
     static func requestAwaitsDecision(_ key: ChatOrgKey, requestId request: String, service: ChatService = .shared) {
         guard let store = service.orgSessions[key]?.store else { return }
-        let row = try? store.calls.request(request)
-        if row?.kind == "channel" {
-            guard let row, service.channelDecisionReady(key, request: row) else { return }
-        }
+        guard let row = try? store.calls.request(request), ChatAttention.decisionDue(row, key: key, service: service) else { return }
+        emit(ChatAttention.decision(row, key: key, service: service))
         guard (try? store.queue.write({ db -> Bool in
                   try db.execute(sql: "INSERT OR IGNORE INTO notified (object_id, kind) VALUES (?, 'decision')", arguments: [request])
                   return db.changesCount > 0
               })) == true else { return }
-        let id = row?.kind == "channel" ? messageId(key, channel: row?.channelId ?? "", message: "request-\(request)") : requestId(key, request)
+        let id = row.kind == "channel" ? messageId(key, channel: row.channelId ?? "", message: "request-\(request)") : requestId(key, request)
         post(id, "A request waits for your decision")
         badgeChanged()
     }
@@ -120,7 +116,12 @@ enum ChatNotifications {
                   let root = try String.fetchOne(db, sql: "SELECT thread_root_id FROM messages WHERE message_id = ?", arguments: [message])
                   return (kind, root)
               })) ?? nil else { return }
-        if isLooking(owed.root.map { "t:\($0)" } ?? "c:\(channel)") { return }
+        let seq = (try? store.queue.read { try Int.fetchOne($0, sql: "SELECT seq FROM messages WHERE message_id = ?", arguments: [message]) }) ?? 0
+        var event = ChatAttention.message(key: key, service: service, channel: channel, id: message,
+                                          thread: owed.root, sequence: seq, kind: owed.kind == "mention" ? .mention : .reply)
+        event.isRead = isLooking(owed.root.map { "t:\($0)" } ?? "c:\(channel)")
+        emit(event)
+        if event.isRead { return }
         post(messageId(key, channel: channel, message: message), owed.kind == "mention" ? "New mention in AgentPad" : "New reply in a thread")
         badgeChanged()
     }
@@ -129,7 +130,7 @@ enum ChatNotifications {
 
     /// The ids of chat notices shown or pending; the system's outside tests.
     static var listIds: @MainActor () async -> [String] = {
-        await AttentionCoordinator.shared.notificationManager?.chatIds() ?? []
+        await AttentionCoordinator.shared.notificationManager?.identifiers().filter { $0.hasPrefix("chat:") } ?? []
     }
     private static var reconciling = false
     private static var reconcileAgain = false
@@ -152,6 +153,7 @@ enum ChatNotifications {
     static func reconcile(_ service: ChatService = .shared) {
         MainThreadWatchdog.shared.checkpoint()
         service.reconcileChannelResults()
+        projectionChanged()
         guard !reconciling else { reconcileAgain = true; return }
         reconciling = true
         Task { @MainActor in
@@ -171,13 +173,17 @@ enum ChatNotifications {
         let parts = id.split(separator: ":").map(String.init)
         guard parts.count == 4, parts[0] == "chat", let key = service.connection?.orgKey, key.orgId == parts[1],
               service.state == .signedIn else { return false }
-        if parts[2] == "request" { return parts[3].hasSuffix("@\(key.accountId)") }
+        if parts[2] == "request" {
+            let suffix = "@\(key.accountId)"
+            guard parts[3].hasSuffix(suffix), let store = service.orgSessions[key]?.store,
+                  let request = try? store.calls.request(String(parts[3].dropLast(suffix.count))) else { return false }
+            return ChatAttention.decisionDue(request, key: key, service: service)
+        }
         let (channel, message) = (parts[2], parts[3])
         guard visible(service, key, channel), let store = service.orgSessions[key]?.store else { return false }
         if message.hasPrefix("request-") {
             guard let request = try? store.calls.request(String(message.dropFirst("request-".count))) else { return false }
-            return request.kind == "channel" && request.channelId == channel && request.ownerAccountId == key.accountId
-                && request.onThisDevice && request.state == .awaitingDecision
+            return request.kind == "channel" && request.channelId == channel && ChatAttention.decisionDue(request, key: key, service: service)
         }
         return (try? store.queue.read { db -> Bool in
             guard let row = try Row.fetchOne(db, sql: "SELECT deleted_at FROM messages WHERE message_id = ?", arguments: [message]),

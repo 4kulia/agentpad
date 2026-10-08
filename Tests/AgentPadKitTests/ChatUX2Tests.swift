@@ -340,6 +340,65 @@ final class ChatUX2Tests: XCTestCase {
         }
     }
 
+    func test117EditDraftsLoadAndAutosaveAcrossDatabaseReopen() throws {
+        let store = try store()
+        try insert(message("root"), store: store)
+        let areas: [(id: String, root: String?)] = [("feed", nil), ("reply", "root")]
+        for (index, area) in areas.enumerated() {
+            try insert(message(area.id, seq: index + 2, author: me, root: area.root), store: store)
+            // Written in 1.1.7's format, not by the current ChatMessage encoder.
+            let rootJSON = area.root.map { "\"" + $0 + "\"" } ?? "null"
+            let data = Data("""
+                {"messageId":"\(area.id)","root":\(rootJSON),"text":"Legacy draft \(area.id)",
+                 "revision":1,"version":"json-version",
+                 "message":{"messageId":"\(area.id)","channelId":"\(channel)","threadRootId":\(rootJSON),
+                   "authorAccountId":"\(me)","seq":\(index + 2),"createdAt":"2026-10-06T10:00:00Z",
+                   "hasFixed":true,"hasMutable":true,"text":"Message \(area.id)","mentions":[],"revision":1}}
+                """.utf8)
+            try store.queue.write {
+                try $0.execute(sql: """
+                    INSERT INTO edit_drafts (message_id, channel_id, team_id, data, updated_at, version)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """, arguments: [area.id, channel, team, data, index, "legacy-\(area.id)"])
+            }
+        }
+
+        var versions: [String: String] = [:]
+        do {
+            let model = ChatChannelModel(key: key, channel: channel)
+            model.follow(store)
+            for area in areas {
+                model.openThread(area.root)
+                let restored = try XCTUnwrap(model.editing)
+                XCTAssertEqual(restored.messageId, area.id)
+                XCTAssertEqual(restored.text, "Legacy draft \(area.id)")
+                XCTAssertEqual(restored.version, "legacy-\(area.id)", "The database version remains authoritative")
+                XCTAssertEqual(restored.message.attachments, [])
+                XCTAssertFalse(restored.message.attachmentOnly)
+                XCTAssertTrue(model.beginEditing(try XCTUnwrap(model.message(area.id)), root: area.root))
+                model.editing?.text = "New edit \(area.id) 🐇"
+                let saved = try XCTUnwrap(store.queue.read {
+                    try ChatEditDrafts.read($0, channel: channel).first { $0.messageId == area.id }
+                })
+                XCTAssertEqual(saved.text, "New edit \(area.id) 🐇", "Typing must reach SQLite, not just the editor")
+                XCTAssertEqual(saved.revision, 1)
+                XCTAssertNotEqual(saved.version, restored.version)
+                versions[area.id] = try XCTUnwrap(saved.version)
+            }
+        }
+
+        let reopened = try ChatStore.open(files: ChatFiles(directory: directory), key: key).store
+        let model = ChatChannelModel(key: key, channel: channel)
+        model.follow(reopened)
+        for area in areas {
+            model.openThread(area.root)
+            XCTAssertEqual(model.editing?.messageId, area.id)
+            XCTAssertEqual(model.editing?.text, "New edit \(area.id) 🐇")
+            XCTAssertEqual(model.editing?.version, versions[area.id])
+        }
+        XCTAssertEqual(try reopened.queue.read { try ChatEditDrafts.read($0, channel: channel).count }, 2)
+    }
+
     func testNavigationWithinCurrentThreadPreservesEditAndRevealsOlderReplies() throws {
         let store = try store()
         try insert(message("root", seq: 1), store: store)

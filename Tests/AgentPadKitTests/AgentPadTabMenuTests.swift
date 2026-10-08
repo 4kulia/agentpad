@@ -5,6 +5,29 @@ import XCTest
 
 @MainActor
 final class AgentPadTabMenuTests: XCTestCase {
+    func testPlusOpensAgentPickerEvenWhenDefaultIsSelected() throws {
+        let store = makeTestStore(), model = AgentPadSettingsModel.shared
+        defer { store.terminate() }
+        let savedDefault = model.defaultAgentId, savedHidden = model.hiddenAgents
+        defer { model.defaultAgentId = savedDefault; model.hiddenAgents = savedHidden }
+        model.hiddenAgents = []
+        let workspace = try XCTUnwrap(store.active), pane = try XCTUnwrap(workspace.activePane)
+        let original = pane.tabs.map(\.id)
+        for defaultID in [String?.none, AgentTemplate.claudeCode.id, AgentTemplate.codex.id, AgentTemplate.terminal.id] {
+            model.defaultAgentId = defaultID
+            var open = false
+            let button = AddTabButton(pane: pane, workspace: workspace, store: store,
+                isMenuOpen: Binding(get: { open }, set: { open = $0 }))
+            button.trigger.action()
+            XCTAssertTrue(open, "the actual + action must open the picker for \(defaultID ?? "no default")")
+            XCTAssertEqual(pane.tabs.map(\.id), original, "a click must wait for an agent choice")
+        }
+        let choices = AgentTemplate.visibleOrdered(model: model).map(\.id)
+        for id in [AgentTemplate.terminal.id, AgentTemplate.claudeCode.id, AgentTemplate.codex.id] {
+            XCTAssertTrue(choices.contains(id))
+        }
+    }
+
     func testActualTabPopoverHasBoundedWidthForEveryExportState() async throws {
         let store = makeTestStore()
         defer { store.terminate() }
@@ -34,7 +57,9 @@ final class AgentPadTabMenuTests: XCTestCase {
     }
 
     func testExportExplanationsAreShortAndWrapWithoutTruncation() {
-        for problem in [AgentAnswerTranscript.Problem.unbound, .unverified, .changed, .remote] {
+        for problem in [AgentAnswerTranscript.Problem.unbound, .unverified, .changed, .remote,
+                        .hookIdentity, .hookAncestry, .claudeSignature, .claudeTerminal, .claudeBackground,
+                        .ambiguousClaude, .multiplexer, .processUnavailable, .foregroundMismatch] {
             XCTAssertLessThanOrEqual(problem.rawValue.count, 150)
             let host = NSHostingView(rootView: AgentAnswerMenuExplanation(problem: problem).frame(width: 280))
             let line = NSHostingView(rootView: Text("One line").font(Theme.display(11)).padding(8))

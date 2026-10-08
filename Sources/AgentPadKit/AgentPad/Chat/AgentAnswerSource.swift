@@ -23,12 +23,20 @@ enum AgentAnswerSource {
 
     /// Surface routing and history IDs alone never prove PID → journal.
     static func recordHook(conversation: String, session: Session, provenance: AgentAnswerProvenance?,
+                           failure: AgentAnswerTranscript.Problem? = nil,
                            inspector: AgentAnswerProvenance.Inspector = .init()) {
         session.answerBinding = nil
+        session.answerBindingProblem = failure ?? .hookIdentity
         guard session.displayAgent.rosterId == AgentTemplate.claudeCodeID,
               session.effectiveRemoteHost == nil, UUID(uuidString: conversation) != nil,
-              let provenance, provenance.matchesForeground(session.engine.foregroundPid, inspector: inspector) else { return }
+              let provenance else { return }
+        guard provenance.isCurrent(inspector: inspector) else { session.answerBindingProblem = .changed; return }
+        guard provenance.matchesForeground(session.engine.foregroundPid, inspector: inspector) else {
+            session.answerBindingProblem = .foregroundMismatch
+            return
+        }
         session.answerBinding = Binding(conversation: conversation, process: provenance.process, provenance: provenance)
+        session.answerBindingProblem = nil
     }
 
     static func problem(_ session: Session, inspector: AgentAnswerProvenance.Inspector = .init()) -> AgentAnswerTranscript.Problem? {
@@ -37,7 +45,7 @@ enum AgentAnswerSource {
         // There is currently no verified Codex journal binding provider. Keep
         // both actions disabled even for a resumed tab or a stable process.
         guard session.displayAgent.rosterId != AgentTemplate.codex.id else { return .unverified }
-        guard let binding = session.answerBinding else { return .unbound }
+        guard let binding = session.answerBinding else { return session.answerBindingProblem ?? .unbound }
         guard let provenance = binding.provenance, provenance.process == binding.process,
               provenance.matchesForeground(session.engine.foregroundPid, inspector: inspector) else { return .changed }
         return nil

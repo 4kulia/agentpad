@@ -55,7 +55,10 @@ private struct PaneView: View {
     /// activation alone is enough (Codex P2). The terminal surface itself is
     /// a plain NSView, never matched.
     private func focusThisPane() {
-        guard let active = pane.activeTab else { return }
+        guard let active = pane.activeTab else {
+            store.focusPane(pane, in: workspace)
+            return
+        }
         let view = active.engine.view
         store.activateTab(active, in: workspace)
         guard let window = view.window else { return }
@@ -93,6 +96,13 @@ private struct PaneView: View {
                         transaction.animation = nil
                     }
                     .padding(8)
+                    .overlay {
+                        // Only intercept our tab drags; Finder file drops
+                        // continue to reach the terminal's own paste handler.
+                        if store.draggedTab != nil {
+                            Color.clear.modifier(PaneTabDropTarget(pane: pane, workspace: workspace, store: store))
+                        }
+                    }
                     // AgentPad: a channel tab has no terminal menu (DESIGN-F2).
                     .overlay(RightClickCatcher { unit in
                         guard !active.isChat else { return }
@@ -158,7 +168,7 @@ private struct PaneView: View {
                 Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
                 PaneStatusBar(session: active, paneId: pane.id, workspace: workspace, store: store)
             } else {
-                Color.clear
+                EmptyPaneView(pane: pane, workspace: workspace, store: store)
             }
         }
         .opacity(paneOpacity)
@@ -214,6 +224,57 @@ private struct PaneView: View {
                 }
             }
         }
+    }
+}
+
+/// Both an empty split and a workspace whose last tab moved away use the
+/// same add menu and a full-size drop target.
+private struct EmptyPaneView: View {
+    let pane: Pane
+    let workspace: Workspace
+    let store: WorkspaceStore
+    @State private var isAddMenuOpen = false
+
+    var body: some View {
+        VStack(spacing: 14) {
+            AddTabButton(pane: pane, workspace: workspace, store: store, isMenuOpen: $isAddMenuOpen, size: 44)
+                .background(Theme.chromeHover, in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.chromeHairline))
+            Text(workspace.root.allPanes.allSatisfy { $0.tabs.isEmpty } ? "Empty workspace" : "Empty pane")
+                .font(Theme.display(14, weight: .medium))
+                .foregroundStyle(Theme.chromeForeground)
+            Text("Drag a tab here\nor open one with +")
+                .font(Theme.display(12))
+                .foregroundStyle(Theme.chromeMuted)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .modifier(PaneTabDropTarget(pane: pane, workspace: workspace, store: store))
+    }
+}
+
+private struct PaneTabDropTarget: ViewModifier {
+    let pane: Pane
+    let workspace: Workspace
+    let store: WorkspaceStore
+    @State private var isTargeted = false
+
+    func body(content: Content) -> some View {
+        let highlighted = isTargeted && store.draggedTab != nil
+        content
+        .contentShape(Rectangle())
+        .background(highlighted ? Color.accentColor.opacity(0.08) : .clear)
+        .overlay {
+            if highlighted {
+                RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor, lineWidth: 1)
+                    .padding(8).allowsHitTesting(false)
+            }
+        }
+        .dropDestination(for: String.self) { dropped, _ in
+            defer { store.draggingTabId = nil }
+            guard let id = dropped.first.flatMap(UUID.init) else { return false }
+            return store.handleTabDrop(droppedId: id, to: pane, at: pane.tabs.count, in: workspace)
+        } isTargeted: { isTargeted = $0 }
     }
 }
 

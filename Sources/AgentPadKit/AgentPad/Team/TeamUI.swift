@@ -16,45 +16,17 @@ enum TeamUI {
         let mode = TeamMode.resolve()
         // Colleagues' calls wait in the right panel; when AgentPad is in the
         // background a notification says who calls which agent (R-1).
-        service.calls.onPendingChange = { AttentionCoordinator.shared.refreshBadge() }
-        ClaudeVersionApprovals.shared.onChange = {
-            AttentionCoordinator.shared.refreshBadge()
-            if !ClaudeVersionApprovals.shared.pending.isEmpty { NSApp.requestUserAttention(.criticalRequest) }
-        }
-        service.calls.onAccessRequest = { request, call in
-            guard !request.isChannel else { return }
-            NSApp.requestUserAttention(.criticalRequest)
-            guard !NSApp.isActive, AgentPadSettingsModel.shared.notificationsEnabled else { return }
-            AttentionCoordinator.shared.notificationManager?.postTeam(
-                title: "\(call.agentName) asks for a folder",
-                body: "\(request.path) — for \(call.peerName)'s call"
-            )
-        }
-        service.calls.onIncomingCall = { call in
-            NSApp.requestUserAttention(.criticalRequest)
-            guard !NSApp.isActive, AgentPadSettingsModel.shared.notificationsEnabled else { return }
-            let preview = call.prompt.replacingOccurrences(of: "\n", with: " ")
-            AttentionCoordinator.shared.notificationManager?.postTeam(
-                title: "\(call.peerName) calls \(call.agentName)",
-                body: String(preview.prefix(160)) + (preview.count > 160 ? "…" : "")
-            )
-        }
-        // An answer, or a call that ended without one, when AgentPad is in
-        // the background (D-4).
-        service.calls.onOutgoingFinished = { call in
-            guard !NSApp.isActive, AgentPadSettingsModel.shared.notificationsEnabled else { return }
-            let title = ChatOutgoing.outcomeTitle(call)
-            let body = (call.report.state == .done ? call.report.text : call.report.detail) ?? ""
-            AttentionCoordinator.shared.notificationManager?.postTeam(
-                title: title, body: String(body.replacingOccurrences(of: "\n", with: " ").prefix(160))
-            )
-        }
-        // Waking up or a new network: the server's feed reconnects at once (C3).
-        TeamWake.shared.add { ChatService.shared.socket?.reconnectNow(force: true) }
-        TeamNetworkWatch.shared.add { ChatService.shared.socket?.reconnectNow(force: true) }
-        ChatService.shared.onNotice = { text in
-            guard AgentPadSettingsModel.shared.notificationsEnabled else { return }
-            AttentionCoordinator.shared.notificationManager?.postTeam(title: "AgentPad server", body: text)
+        service.calls.onPendingChange = { AttentionCoordinator.shared.refreshSources() }
+        ClaudeVersionApprovals.shared.onChange = { AttentionCoordinator.shared.refreshSources() }
+        service.calls.onAccessRequest = { _, _ in AttentionCoordinator.shared.refreshSources() }
+        service.calls.onIncomingCall = { _ in AttentionCoordinator.shared.refreshSources() }
+        service.calls.onOutgoingFinished = { _ in AttentionCoordinator.shared.refreshSources() }
+        ChatNotifications.emit = { AttentionLedger.shared.upsert($0) }
+        ChatNotifications.projectionChanged = { AttentionCoordinator.shared.refreshSources() }
+        TeamWake.shared.add { ChatService.shared.socket?.reconnectNow(force: true, reason: .wake) }
+        TeamNetworkWatch.shared.add { ChatService.shared.socket?.reconnectNow(force: true, reason: .networkPathChanged) }
+        ChatService.shared.onNotice = { notice in
+            AttentionLedger.shared.upsert(notice)
         }
         service.onTeamToolsChange = { on in
             if on { AgentPadShellIntegration.writeTeamMCPConfig() } else { AgentPadShellIntegration.removeTeamMCPConfig() }
@@ -62,7 +34,7 @@ enum TeamUI {
         // The config was set before the windows came back (`prepareTeamTools`);
         // from here the session and the mode keep it (DESIGN-D6).
         service.sessionProblem = { ChatService.shared.sessionProblem }
-        ChatService.shared.onStateChange = { service.updateTeamTools() }
+        ChatService.shared.onStateChange = { service.updateTeamTools(); AttentionCoordinator.shared.refreshSources() }
         // In server mode the calls are the organization's requests (D8).
         ChatService.shared.onCallStore = { key, calls in service.calls.useServer(calls, key: key) }
         // Publishing to the organization (D3).
@@ -76,7 +48,7 @@ enum TeamUI {
         // its notice is F4's, without content (`ChatNotifications`).
         ChatService.shared.onDecisionWanted = { _ in
             service.calls.reload()
-            NSApp.requestUserAttention(.criticalRequest)
+            AttentionCoordinator.shared.refreshSources()
         }
         ChatService.shared.onCallsChanged = { key in
             if service.calls.serverKey == key { service.calls.reload() }
@@ -91,6 +63,10 @@ enum TeamUI {
             // first, in any mode (D11).
             await ChatService.shared.recoverRunsAtLaunch()
             await TeamMode.startAtLaunch(mode, service: service) { try await ChatService.shared.start(mode: $0) }
+            AttentionCoordinator.shared.sourcesReady = true
+            AttentionCoordinator.shared.refreshSources()
+            AttentionCoordinator.shared.navigation?.finishStartup()
+            await AttentionCoordinator.shared.reconcileDelivered()
         }
     }
 
@@ -136,6 +112,19 @@ enum TeamUI {
         panel.showsHiddenFiles = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         ClaudeVersionApprovals.shared.selectExecutable(url.path)
+    }
+
+    static func openClaudeForSignIn(_ key: ChatOrgKey, request: String) {
+        guard ChatAttention.localLaunchFailure(key, request: request, service: .shared) == .authentication else { return }
+        do {
+            let selected = try ClaudeCodeRunner.selectClaude(
+                explicit: ClaudeVersionApprovals.shared.admissions[request]?.executable.selectedPath,
+                configured: ClaudeVersionApprovals.shared.selectedPath)
+            let executable = try ClaudeExecutable.inspect(selected)
+            openTab(NSHomeDirectory(), shellQuoted(executable.file.resolvedPath), "Claude Code · sign in")
+        } catch {
+            Task { await showError("Claude Code could not be opened", error) }
+        }
     }
 
     static func stopPublishing(_ agents: [TeamPublishedAgent]) async {
@@ -243,8 +232,11 @@ enum TeamUI {
         guard let host = window else { return .cancel }
         // One sheet at a time: wait for the current one instead of a modal loop.
         while host.attachedSheet != nil { try? await Task.sleep(for: .milliseconds(200)) }
+        let attentionID = UUID()
+        defer { PendingConfirmations.shared.end(attentionID) }
         return await withCheckedContinuation { continuation in
             alert.beginSheetModal(for: host) { continuation.resume(returning: $0) }
+            if alert.buttons.count > 1 { PendingConfirmations.shared.register(attentionID, window: alert.window) }
         }
     }
 
@@ -378,6 +370,7 @@ struct TeamStatusView: View {
         }
         .padding(18)
         .frame(width: 440)
+        .attentionPlace([.recovery(nil)])
     }
 
     /// Colleagues' agents the member may call (D3, answer (а)).

@@ -22,6 +22,7 @@ extension AgentPadHookKit {
         else { return }
         switch parsed["hook_event_name"] as? String {
         case "Stop":
+            payload["reason"] = "completion"
             let running = (parsed["background_tasks"] as? [[String: Any]] ?? [])
                 .filter { $0["status"] as? String == "running" }
             let subagents = running.filter { $0["type"] as? String == "subagent" }.count
@@ -30,7 +31,10 @@ extension AgentPadHookKit {
             payload["event"] = "running"
             payload[backgroundSubagentsKey] = String(subagents)
             payload[backgroundShellsKey] = String(shells)
+        case "StopFailure":
+            payload["reason"] = "failure"
         case "Notification":
+            payload["reason"] = "input"
             if let type = parsed["notification_type"] as? String, !type.isEmpty {
                 payload[notificationTypeKey] = type
             }

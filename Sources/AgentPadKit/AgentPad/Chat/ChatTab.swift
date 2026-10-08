@@ -44,7 +44,7 @@ enum ChannelTabState: Equatable {
         guard model.visible, !model.inDoubt, !model.snapshotOwed() else { return .checking }
         guard model.view.channelsServed else { return .noChannels }
         if let card = model.visibleChannel(ref.channel) {
-            return .ready(card, team: model.channelTeam(card)?.name, offline: !model.isOnline())
+            return .ready(card, team: model.channelTeam(card)?.name, offline: model.showsOffline())
         }
         // A read of the channels under way or cut off: not known to be gone.
         return model.view.channelsReadOpen ? .checking : .noAccess

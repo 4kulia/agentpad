@@ -74,6 +74,7 @@ struct ChatChannelView: View {
                 if let b1 = model.b1, b1.supports("chat.pins") {
                     ChatPinBanner(b1: b1, model: model, members: members, width: width)
                 }
+                ChatUnreadThreadsBanner(model: model)
                 if let ownerModel { ChatChannelOwnerPanel(model: ownerModel) }
                 if model.searching { ChatLocalSearch(model: model) }
                 ChatTimelineView(model: model, root: nil, members: members, mentionable: mentionable,
@@ -187,6 +188,9 @@ struct ChatChannelView: View {
     @ViewBuilder
     private func composer(_ model: ChatChannelModel, root: String?) -> some View {
         if card.archived {
+            if let manager = model.service.attachments(model.key) {
+                ChatAttachmentDraftStrip(manager: manager, channel: model.channel, root: root)
+            }
             Text("The channel is archived: nothing can be posted.")
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity)

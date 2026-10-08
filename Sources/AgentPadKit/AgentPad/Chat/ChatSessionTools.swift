@@ -116,7 +116,7 @@ enum ChatSessionTools {
             // No cache writes and no user read-mark changes.
             result = .object(["org_id": .string(org), "channel_id": .string(channel),
                 "thread_root_id": root.map(ChatJSON.string) ?? .null,
-                "messages": try JSONDecoder().decode(ChatJSON.self, from: JSONEncoder().encode(page.messages)),
+                "messages": try JSONDecoder().decode(ChatJSON.self, from: JSONEncoder().encode(page.messages)).withoutAttachmentDescriptors,
                 "next": page.next.map { .number(Double($0)) } ?? .null])
         default:
             guard let channel, let text = args["text"]?.string, ChatChannelModel.textProblem(text) == nil,

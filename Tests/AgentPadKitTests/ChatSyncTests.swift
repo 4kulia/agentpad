@@ -21,6 +21,7 @@ final class ChatSyncTests: XCTestCase {
     private var otherTeams: [String] = []
     private var heads: [String: Int] = [:]
     private var accountHead = 3
+    private var serverCapabilities = ["auth.email_code", "events.ws"]
 
     private var teamScope: TeamServiceTestScope!
 
@@ -84,7 +85,8 @@ final class ChatSyncTests: XCTestCase {
          "streams":{"account:\#(me)":\#(accountHead)}}
         """#.utf8)
         let state = stateJSON()
-        let info = Data(#"{"name":"s","version":"0.1.0","generation":"g1","api_versions":["v1"],"capabilities":["auth.email_code","events.ws"]}"#.utf8)
+        let capabilities = String(decoding: try! JSONEncoder().encode(serverCapabilities), as: UTF8.self)
+        let info = Data(#"{"name":"s","version":"0.1.0","generation":"g1","api_versions":["v1"],"capabilities":\#(capabilities)}"#.utf8)
         ChatStubProtocol.reset { request, _ in
             if request.url?.path == "/v1/me", failingMe.take() { return .success(.init(status: 500, body: Data(#"{"error":"internal"}"#.utf8))) }
             if request.url?.path == "/v1/me", slowMe.take() { usleep(300_000) }
@@ -161,6 +163,59 @@ final class ChatSyncTests: XCTestCase {
     private var commandRequests: Int { ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/commands" }.count }
 
     private var transport: FakeSocketTransport { transports.last! }
+
+    func testFeedReconnectKeepsB1AndOfflinePresentationButGenerationAndAccessStillClear() async throws {
+        serverCapabilities += ChatB1.capabilities.sorted()
+        serve()
+        let service = try await connected()
+        let socket = try XCTUnwrap(service.socket)
+        let store = try store(service)
+        let general = self.general
+        let model = try XCTUnwrap(ChatOrgModel.current(service))
+        let metadata = ChatB1.Metadata(messageId: "m", deleted: false, reactions: [.init(emoji: "👍", count: 2, mine: false)])
+        let metadataData = try ChatB1.encode(metadata)
+        let pinsData = try ChatB1.encode([ChatB1.PinnedMessage(messageId: "m", seq: 1, authorAccountId: me, excerpt: "Pin", pinnedBy: me, pinnedAt: "now")])
+        // No open B1 reader: inspect the state before replacement HTTP pages.
+        try await store.queue.write { db in
+            try ChatChannels.write(db, .init(channelId: "c", teamId: general, name: "Chat", archived: false, version: 1))
+            try ChatB1.watch(db, channel: "c", ids: ["m"])
+            try db.execute(sql: "UPDATE b1_metadata SET data = ?, as_of_seq = 7, dirty = 0", arguments: [metadataData])
+            try db.execute(sql: "INSERT INTO b1_pins (channel_id, data, as_of_seq, dirty) VALUES ('c', ?, 7, 0)", arguments: [pinsData])
+        }
+        XCTAssertFalse(model.showsOffline())
+        let snapshots = stateRequests
+        socket.reconnectNow(force: true)
+        XCTAssertEqual(socket.state, .connecting)
+        XCTAssertFalse(model.showsOffline(), "UI uses the presentation grace, not raw connection state")
+        try await waitUntil { self.transports.count == 2 }
+        hello()
+        try await waitUntil { socket.state == .connected }
+        XCTAssertEqual(stateRequests, snapshots, "the confirmed generation does not need a new snapshot")
+        try await store.queue.read { db in
+            XCTAssertEqual(try ChatB1.metadata(db, id: "m"), metadata)
+            XCTAssertEqual(try Data.fetchOne(db, sql: "SELECT data FROM b1_pins"), pinsData)
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT dirty FROM b1_metadata"), 1)
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT dirty FROM b1_pins"), 1)
+        }
+        service.clearB1PrivateState(key)
+        try await store.queue.read { db in
+            XCTAssertNil(try ChatB1.metadata(db, id: "m"))
+            XCTAssertNil(try Data.fetchOne(db, sql: "SELECT data FROM b1_pins"))
+        }
+        // Re-seed only to prove a new generation cannot retain displayed data.
+        try await store.queue.write { db in
+            try db.execute(sql: "UPDATE b1_metadata SET data = ?", arguments: [metadataData])
+            try db.execute(sql: "UPDATE b1_pins SET data = ?", arguments: [pinsData])
+        }
+        socket.reconnectNow(force: true)
+        try await waitUntil { self.transports.count == 3 }
+        hello("g2")
+        try await waitUntil { socket.state == .connected }
+        try await store.queue.read { db in
+            XCTAssertNil(try ChatB1.metadata(db, id: "m"))
+            XCTAssertNil(try Data.fetchOne(db, sql: "SELECT data FROM b1_pins"))
+        }
+    }
 
     private func waitUntil(_ condition: @MainActor () throws -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
         let deadline = ContinuousClock.now + .seconds(5)
@@ -427,7 +482,7 @@ final class ChatSyncTests: XCTestCase {
     // (5)
     func testOnlyAnotherDevicesNewSessionNotifiesOnce() async throws {
         let service = try await connected()
-        var notices: [String] = []
+        var notices: [AttentionEvent] = []
         service.onNotice = { notices.append($0) }
         let account = "account:\(me)"
         // History up to the head (3) comes again after a reconnect: skipped.
@@ -438,7 +493,9 @@ final class ChatSyncTests: XCTestCase {
         transport.frame(frame(account, 5, "account.session_opened", ["session_id": "s-other", "device_name": "Boris's iMac"]))
         try await waitUntil { !notices.isEmpty }
         try await Task.sleep(for: .milliseconds(100))
-        XCTAssertEqual(notices, ["A new device signed in to your account: Boris's iMac"])
+        XCTAssertEqual(notices.count, 1)
+        XCTAssertEqual(notices.first?.kind, .account)
+        XCTAssertEqual(notices.first?.body, "")
     }
 
     // (6)

@@ -940,10 +940,10 @@ enum AgentPadShellIntegration {
         let events: [(name: String, state: HookEvent?)] = [
             ("SessionStart", .running),
             ("UserPromptSubmit", .running),
-            ("Stop", .attention),
+            ("Stop", .turnComplete),
             // Stop's failure twin — a turn that ended badly still hands
             // control back to the user, so it reads the same on the dot.
-            ("StopFailure", .attention),
+            ("StopFailure", .turnFailure),
             ("Notification", .attention),
             ("SessionEnd", .ended),
             ("PreToolUse", nil),
@@ -985,7 +985,7 @@ enum AgentPadShellIntegration {
         let events: [(String, HookEvent)] = [
             ("SessionStart", .running),
             ("UserPromptSubmit", .running),
-            ("Stop", .attention),
+            ("Stop", .turnComplete),
             ("Notification", .attention),
             ("SessionEnd", .ended),
         ]
@@ -1020,8 +1020,8 @@ enum AgentPadShellIntegration {
         }
         object["agentpad-managed-do-not-edit"] = [
             "PreInvocation": [handler(.running)],
-            "PostInvocation": [handler(.attention)],
-            "Stop": [handler(.attention)],
+            "PostInvocation": [handler(.turnComplete)],
+            "Stop": [handler(.turnComplete)],
         ]
         return object
     }
@@ -1117,7 +1117,7 @@ enum AgentPadShellIntegration {
         let events: [(String, HookEvent)] = [
             ("SessionStart", .running),
             ("UserPromptSubmit", .running),
-            ("Stop", .attention),
+            ("Stop", .turnComplete),
             ("SessionEnd", .ended),
         ]
         let rules = events.map { event, state in
@@ -1307,7 +1307,8 @@ enum AgentPadShellIntegration {
             events: [
                 "SessionStart":      .idle,
                 "UserPromptSubmit":  .running,
-                "Stop":              .attention,
+                "Stop":              .turnComplete,
+                "StopFailure":       .turnFailure,
                 "Notification":      .attention,
                 "SessionEnd":        .ended,
             ],
@@ -1622,6 +1623,16 @@ enum AgentPadShellIntegration {
 
     \(ttyPassthroughGuard)
 
+    # Isolated executors own their MCP servers, settings and system prompt.
+    # Even if one reaches this shim in a TTY, preserve its complete argv.
+    for _agentpad_arg in "$@"; do
+        [[ "$_agentpad_arg" == "--" ]] && break
+        case "$_agentpad_arg" in
+            --strict-mcp-config|--setting-sources|--setting-sources=*) exec "$real" "$@" ;;
+        esac
+    done
+    unset _agentpad_arg
+
     if [[ -n "$AGENTPAD_SURFACE_ID" || -n "$AGENTPAD_AGENT_MARKERS" ]]; then
         \(agentMarkerCommand(slug: "claude", event: .running))
         # Claude still emits lifecycle hooks (and a session_id) for
@@ -1657,27 +1668,21 @@ enum AgentPadShellIntegration {
         # context. Probe the actual binary's flag, not a guessed minimum version.
         # The alarm bounds even a broken --help; failure leaves launch unchanged.
         _agentpad_prompt=()
-        _agentpad_prompt_path="$AGENTPAD_AGENT_PROMPT_PATH"
-        if [[ -f "$AGENTPAD_AGENT_PROMPT_OVERRIDE" && -r "$AGENTPAD_AGENT_PROMPT_OVERRIDE" ]]; then
-            _agentpad_prompt_path="$AGENTPAD_AGENT_PROMPT_OVERRIDE"
-        fi
+        _agentpad_prompt_text="$AGENTPAD_AGENT_PROMPT_TEXT"
         for _agentpad_arg in "$@"; do
             [[ "$_agentpad_arg" == "--" ]] && break
             case "$_agentpad_arg" in
-                --bare|--help|-h|--version|-v|--system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*|--append-system-prompt|--append-system-prompt=*|--append-system-prompt-file|--append-system-prompt-file=*)
-                    _agentpad_prompt_path=""; break ;;
+                -p|--print|--print=*|--bare|--help|-h|--version|-v|--system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*|--append-system-prompt|--append-system-prompt=*|--append-system-prompt-file|--append-system-prompt-file=*)
+                    _agentpad_prompt_text=""; break ;;
             esac
         done
-        if [[ -n "$AGENTPAD_SURFACE_ID" && -f "$_agentpad_prompt_path" && -r "$_agentpad_prompt_path" ]]; then
+        if [[ -n "$AGENTPAD_SURFACE_ID" && -n "$_agentpad_prompt_text" ]]; then
             if _agentpad_help="$(/usr/bin/perl -e 'alarm 2; exec @ARGV or exit 127' "$real" --help </dev/null 2>/dev/null)" \
                 && printf '%s' "$_agentpad_help" | /usr/bin/grep -Eq -- '(^|[[:space:],])--append-system-prompt([[:space:]=]|$)'; then
-                _agentpad_prompt_text="$(/bin/cat "$_agentpad_prompt_path" 2>/dev/null)"
-                if [[ -n "$_agentpad_prompt_text" ]]; then
-                    _agentpad_prompt=(--append-system-prompt "$_agentpad_prompt_text")
-                fi
+                _agentpad_prompt=(--append-system-prompt "$_agentpad_prompt_text")
             fi
         fi
-        unset _agentpad_help _agentpad_prompt_text _agentpad_prompt_path _agentpad_arg
+        unset _agentpad_help _agentpad_prompt_text _agentpad_arg
         if [[ -n "$AGENTPAD_SURFACE_ID" && -n "$AGENTPAD_HOOKS_PATH" ]]; then
             "$real" ${_agentpad_team[@]+"${_agentpad_team[@]}"} --settings "$AGENTPAD_HOOKS_PATH" ${_agentpad_prompt[@]+"${_agentpad_prompt[@]}"} "$@"
         else
@@ -1708,11 +1713,37 @@ enum AgentPadShellIntegration {
         # then `ended` after exit (revert to terminal). Mid-run state
         # transitions still come from Codex's `notify` config below.
         \(agentMarkerCommand(slug: "codex", event: .running))
+        # AgentPad: only explicit Codex-context opt-in supplies this env value.
+        # With it empty, do not run the resolver or override instructions.
+        # Resolve existing instructions in this shell's cwd and configuration.
+        # Python 3.11+ supplies a real TOML parser. Any failure (including no
+        # parser) leaves the user's argv/config alone. Bound even a stuck read.
+        _agentpad_prompt=()
+        if [[ -n "$AGENTPAD_SURFACE_ID" && -n "$AGENTPAD_AGENT_PROMPT_CODEX_CONFIG" ]]; then
+            if _agentpad_prompt_config="$(/usr/bin/perl -e 'alarm 2; exec @ARGV or exit 127' \
+                python3 -I -c \(quote(CodexPromptConfig.resolverScript)) "$@" </dev/null 2>/dev/null)" \
+                && [[ -n "$_agentpad_prompt_config" ]]; then
+                _agentpad_prompt=(-c "$_agentpad_prompt_config")
+            fi
+        fi
+        # The merged override must follow the user's -c values (last wins),
+        # but precede -- so it cannot become prompt text. Keep every original
+        # argument literal and in order; never evaluate the resolver's output.
+        _agentpad_args=()
+        for _agentpad_arg in "$@"; do
+            if [[ "$_agentpad_arg" == -- ]]; then
+                _agentpad_args+=( ${_agentpad_prompt[@]+"${_agentpad_prompt[@]}"} )
+                _agentpad_prompt=()
+            fi
+            _agentpad_args+=("$_agentpad_arg")
+        done
+        _agentpad_args+=( ${_agentpad_prompt[@]+"${_agentpad_prompt[@]}"} )
+        unset _agentpad_prompt_config _agentpad_prompt _agentpad_arg
         if [[ -n "$AGENTPAD_SURFACE_ID" && -n "$AGENTPAD_HOOK_BIN" ]]; then
             "$AGENTPAD_HOOK_BIN" codex running 2>/dev/null
-            "$real" -c "notify=[\\"$AGENTPAD_HOOK_BIN\\",\\"codex\\",\\"attention\\"]" "$@"
+            "$real" -c "notify=[\\"$AGENTPAD_HOOK_BIN\\",\\"codex\\",\\"turn_complete\\"]" ${_agentpad_args[@]+"${_agentpad_args[@]}"}
         else
-            "$real" "$@"
+            "$real" ${_agentpad_args[@]+"${_agentpad_args[@]}"}
         fi
         status=$?
         if [[ -n "$AGENTPAD_SURFACE_ID" && -n "$AGENTPAD_HOOK_BIN" ]]; then
@@ -2510,6 +2541,7 @@ enum AgentPadShellIntegration {
         # `eval` lets AGENTPAD_AGENT carry multi-word commands (resume flag, prompt,
         # extra options); a single-word `claude` behaves identically.
         eval $_agentpad_cmd
+        set -l _agentpad_status $status
         # The agent ran foreground, so reaching here means it exited (or a user
         # alias shadowed the PATH wrapper before its `ended` ping). Revert the
         # eagerly-promoted tab icon to a plain shell; idempotent if the wrapper
@@ -2517,6 +2549,11 @@ enum AgentPadShellIntegration {
         if test -n "$AGENTPAD_SURFACE_ID"; and test -n "$AGENTPAD_HOOK_BIN"
             "$AGENTPAD_HOOK_BIN" $_agentpad_bin ended 2>/dev/null
         end
+        if test -n "$AGENTPAD_LAUNCH_ID"
+            printf '\\e]2;\(AgentLaunchExitMarker.prefix)%s:%s\\a' "$AGENTPAD_LAUNCH_ID" $_agentpad_status
+            set -e AGENTPAD_LAUNCH_ID
+        end
+        return $_agentpad_status
     end
     """
 
@@ -2590,6 +2627,10 @@ enum AgentPadShellIntegration {
             # this a no-op (`applyHookEvent` dedups same-value writes).
             if [[ -n "$AGENTPAD_SURFACE_ID" && -n "$AGENTPAD_HOOK_BIN" ]]; then
                 "$AGENTPAD_HOOK_BIN" "$_agentpad_agent_bin" ended 2>/dev/null
+            fi
+            if [[ -n "$AGENTPAD_LAUNCH_ID" ]]; then
+                printf '\\e]2;\(AgentLaunchExitMarker.prefix)%s:%s\\a' "$AGENTPAD_LAUNCH_ID" "$_agentpad_status"
+                unset AGENTPAD_LAUNCH_ID
             fi
             # Restore the agent's exit code — the revert ping clobbered `$?`,
             # but the first prompt (and theme hooks / `_agentpad_title_pwd` that

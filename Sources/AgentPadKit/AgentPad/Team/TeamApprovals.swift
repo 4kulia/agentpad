@@ -22,6 +22,7 @@ struct TeamLaunchRequest: Equatable, Sendable {
     var threadRootId: String? = nil
     var sourceMessageId: String? = nil
     var replyMode: String? = nil
+    var attachments: [ChatAttachmentManifest]? = nil
 }
 
 /// Everything a run is started with that comes from this Mac and the
@@ -56,6 +57,7 @@ struct TeamLaunchInputs: Codable, Equatable, Sendable {
     var termsVersion: Int
     var sourceMessageId: String?
     var replyMode: String?
+    var attachments: [ChatAttachmentManifest]? = nil
 
     static let currentTerms = 2
 
@@ -74,6 +76,7 @@ struct TeamLaunchInputs: Codable, Equatable, Sendable {
         requestId = request.requestId
         prompt = request.prompt
         context = request.context
+        attachments = request.attachments
         callerName = request.callerName
         callerProject = request.callerProject
         thread = request.thread

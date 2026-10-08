@@ -135,7 +135,7 @@ final class AgentAnswerSourceTests: XCTestCase {
         await assertRefused(tab, .changed, inspector: fixture.inspector)
         store.applyHookConversationId(conversationId: id, sessionId: tab.id)
         XCTAssertNil(tab.answerBinding, "a hook without a readable process establishes nothing")
-        await assertRefused(tab, .unbound)
+        await assertRefused(tab, .hookIdentity)
     }
 
     func testClaudePersistedAndResumedIDsDoNotAuthorizeReadingBeforeHook() async throws {

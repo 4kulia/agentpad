@@ -100,6 +100,8 @@ enum ClipboardConfirmPresenter {
 /// closing means CANCEL, never silently allow.
 final class ConsentSheetController: NSWindowController, DismissablePanel {
     private var pending: (@MainActor (Bool) -> Void)?
+    private let attentionID = UUID()
+    private var closeObserver: NSObjectProtocol?
     private var keepAlive: ConsentSheetController?
     private weak var parentWindow: NSWindow?
     /// Presenter-specific bookkeeping run once at teardown, before the
@@ -118,11 +120,17 @@ final class ConsentSheetController: NSWindowController, DismissablePanel {
         keepAlive = self
         guard let sheet = window else { return }
         parent.beginSheet(sheet)
+        PendingConfirmations.shared.register(attentionID, window: sheet)
+        closeObserver = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: parent, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.finish(false) }
+        }
     }
 
     func finish(_ allowed: Bool) {
         guard let decide = pending else { return }
         pending = nil
+        PendingConfirmations.shared.end(attentionID)
+        if let closeObserver { NotificationCenter.default.removeObserver(closeObserver); self.closeObserver = nil }
         if let parent = parentWindow {
             if let sheet = window {
                 parent.endSheet(sheet)

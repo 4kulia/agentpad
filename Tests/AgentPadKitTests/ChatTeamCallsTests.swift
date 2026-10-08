@@ -2415,10 +2415,12 @@ final class ChatTeamCallsTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: agentsFile, encoding: .utf8), before, "agents.json is not written")
         XCTAssertNil(try assignmentOf(service, local))
         // Taken: told, and not asked again.
-        var told: [String] = []
+        var told: [AttentionEvent] = []
         service.onNotice = { told.append($0) }
         try answer(service, .sent)
-        XCTAssertEqual(told, ["Agents billing are available again from this Mac."])
+        XCTAssertEqual(told.count, 1)
+        XCTAssertEqual(told.first?.kind, .publication)
+        XCTAssertEqual(told.first?.body, "")
         service.announceAfterNewSession(anna)
         XCTAssertTrue(try publishCommands(service).allSatisfy { $0.state != .pending })
     }

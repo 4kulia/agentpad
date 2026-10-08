@@ -377,8 +377,11 @@ struct SidebarView: View {
         } else if store.sidebarContent == .chat && !isCompact {
             ChatSidebarView(store: store, navigation: store.chatNavigation, model: ChatOrgCurrent.shared.model)
         } else {
-            ScrollViewReader { proxy in
-                list(isCompact: isCompact, proxy: proxy)
+            VStack(spacing: 0) {
+                ScrollViewReader { proxy in
+                    list(isCompact: isCompact, proxy: proxy)
+                }
+                NewWorkspaceDropZone(store: store, isCompact: isCompact)
             }
         }
     }
@@ -580,6 +583,7 @@ struct SidebarView: View {
                 // badge: worktree children sit one rhythm step inside their
                 // source workspace while keeping the row itself lightweight.
                 .padding(.leading, Theme.space3)
+                .workspaceTabDropTarget(store: store, workspace: worktree)
             }
         }
     }
@@ -665,16 +669,20 @@ private struct DraggableWorkspaceRow: View {
             onCreateWorktree: onCreateWorktree,
             onGoToSource: onGoToSource
         )
-        .dropIndicator(active: isTargeted && !isSelfDrag, on: edge)
+        .dropIndicator(active: isTargeted && draggingId != nil && !isSelfDrag, on: edge)
+        .tabDropHighlight(isTargeted && store.draggedTab.map { store.canDropTab($0.id, in: workspace) } == true)
         .onDrag {
             draggingId = workspace.id
             return NSItemProvider(object: workspace.id.uuidString as NSString)
         }
         .dropDestination(for: String.self) { dropped, _ in
-            defer { draggingId = nil }
-            guard let id = dropped.first.flatMap(UUID.init),
-                  let from = store.workspaces.firstIndex(where: { $0.id == id })
-            else { return false }
+            defer {
+                draggingId = nil
+                store.draggingTabId = nil
+            }
+            guard let id = dropped.first.flatMap(UUID.init) else { return false }
+            if store.handleTabDrop(droppedId: id, in: workspace) { return true }
+            guard let from = store.workspaces.firstIndex(where: { $0.id == id }) else { return false }
             withAnimation(.easeInOut(duration: 0.18)) {
                 store.moveWorkspace(from: from, to: myIndex)
             }

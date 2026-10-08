@@ -523,6 +523,9 @@ enum ChatStoreMigrations {
                 t.column("hidden", .boolean).notNull().defaults(to: false)
             }
         }
+        migrator.registerMigration("release-21-attachments") { db in try ChatAttachments.migrate(db) }
+        migrator.registerMigration("release-22-attachment-access") { db in try ChatAttachments.migrateExecutionAccess(db) }
+        migrator.registerMigration("release-23-attachment-retention") { db in try ChatAttachments.migrateRetention(db) }
         return migrator
     }
 
@@ -710,6 +713,9 @@ enum ChatStoreMigrations {
                 t.column("generation", .text).notNull()
                 t.primaryKey(["server", "account_id", "org_id", "agent_id"])
             }
+        }
+        migrator.registerMigration("release-11-notification-diagnostics") { db in
+            try db.alter(table: "runs") { t in t.add(column: "launch_failure", .text) }
         }
         return migrator
     }

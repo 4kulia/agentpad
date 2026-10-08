@@ -268,6 +268,9 @@ struct PersistedTab: Codable, Equatable {
     /// `decodeIfPresent` so state.json files written by pre-resume AgentPad
     /// versions still load.
     var conversationId: String?
+    /// nil is legacy (inherit workspace host); empty explicitly means local.
+    /// Moving a tab must not change where it reconnects on the next launch.
+    var sshWorkspaceHost: String?
     // AgentPad: set for a channel tab; older files have none and read as terminals.
     var channel: ChannelRef?
     // AgentPad: a saved list persists its organization address and kind only.
@@ -281,6 +284,7 @@ struct PersistedTab: Codable, Equatable {
         // AgentPad: a channel tab keeps no title — its name is its card's (DESIGN-F2).
         self.customTitle = !session.isChat ? session.customTitle : nil
         self.conversationId = session.conversationId
+        self.sshWorkspaceHost = session.sshWorkspaceHost ?? ""
         self.channel = session.channel
         self.inbox = session.inbox
     }

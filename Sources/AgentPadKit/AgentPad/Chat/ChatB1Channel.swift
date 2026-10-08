@@ -155,7 +155,9 @@ final class ChatReactionAccounts {
         do {
             let page = try await b1.reactors(message: message, emoji: emoji, after: next, at: head)
             guard request == current, !Task.isCancelled, b1.state.accessible else { return }
-            loadedAccounts += page.accountIds.filter { !loadedAccounts.contains($0) }; head = page.asOfSeq; next = page.next
+            var seen = Set(loadedAccounts)
+            loadedAccounts += page.accountIds.filter { seen.insert($0).inserted }
+            head = page.asOfSeq; next = page.next
         } catch ChatAPIError.server(_, "snapshot_changed", _) {
             guard request == current, !Task.isCancelled else { return }
             loadedAccounts = []; head = nil; next = nil; loading = false

@@ -48,7 +48,7 @@ final class RecordingFacts: TeamRunFacts {
     /// The next facts that cannot be made.
     var failing = 0
     func end(_ run: ChatRunRecord, outcome: ChatRunRecord.Outcome, reason: String, result: String?, at: Date,
-             journal: ChatJournal, waitForState: Bool) throws -> Bool {
+             journal: ChatJournal, waitForState: Bool, diagnosis: ClaudeLaunchDiagnostic.Failure?) throws -> Bool {
         if failing > 0 {
             failing -= 1
             throw ChatError.storage("cannot make the fact")
@@ -58,7 +58,7 @@ final class RecordingFacts: TeamRunFacts {
         var record = ChatCommandRecord(commandId: ChatUUID.v7(), sessionId: "s", type: "run.failed_to_start", bodyBytes: Data("{}".utf8),
                                        orderKey: "exec:run:\(run.runId)", dependsOn: nil, createdAt: Date(), state: .pending)
         record.seq = Int64(facts.count) + 1_000
-        return try journal.finish(run.runId, outcome, at: at, result: result) { db in
+        return try journal.finish(run.runId, outcome, at: at, result: result, diagnosis: diagnosis) { db in
             _ = try journal.runCommands(key).insert(db, record, seq: record.seq)
         }
     }
@@ -145,6 +145,25 @@ final class TeamLauncherTests: XCTestCase {
 
     private func fixture(_ runner: RecordingRunner = RecordingRunner()) throws -> (ExecutorFixture, RecordingRunner) {
         (try ExecutorFixture(root: root, runner: runner), runner)
+    }
+
+    func testLaunchDiagnosisIsCommittedWithOutcomeAndSurvivesRestart() async throws {
+        struct AuthenticationRunner: TeamAgentRunner {
+            func run(_ request: TeamRunRequest, onActivity: @escaping @Sendable (String) -> Void) async throws -> TeamRunResult {
+                throw TeamRunnerError.failed("safe diagnostic", diagnosis: .authentication)
+            }
+        }
+        let f = try ExecutorFixture(root: root, runner: AuthenticationRunner())
+        let facts = RecordingFacts(); f.launcher.facts = facts
+        let approval = try f.approve()
+        do { _ = try await f.launcher.launch(approvalId: approval.id); XCTFail("expected failure") } catch {}
+        let reopened = try ChatJournal.open(files: f.files)
+        let run = try XCTUnwrap(reopened.run(approval.runId))
+        XCTAssertEqual(run.outcome, .failed)
+        XCTAssertEqual(run.launchFailure, .authentication)
+        XCTAssertNil(run.resultText)
+        XCTAssertEqual(ChatAttention.launchHelp(run.launchFailure), .signIn)
+        XCTAssertEqual(facts.facts.count, 1)
     }
 
     private func expectFailure(_ expected: TeamLauncher.Failure, _ launch: () async throws -> TeamRunResult,

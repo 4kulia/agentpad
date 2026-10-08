@@ -25,7 +25,11 @@ struct ChatMessageWire: Codable, Equatable, Sendable {
     let authorSessionName: String?
     let inReplyToMessageId: String?
 
+    var attachments: [ChatAttachment] = []
+    var attachmentOnly = false
+
     enum CodingKeys: String, CodingKey {
+        case attachments, attachmentOnly = "attachment_only"
         case text, mentions, revision, seq
         case messageId = "message_id", channelId = "channel_id", threadRootId = "thread_root_id",
              authorAccountId = "author_account_id", createdAt = "created_at", editedAt = "edited_at", deletedAt = "deleted_at",
@@ -51,6 +55,8 @@ struct ChatMessageWire: Codable, Equatable, Sendable {
         authorAgentName = try c.decodeIfPresent(String.self, forKey: .authorAgentName)
         authorSessionName = try c.decodeIfPresent(String.self, forKey: .authorSessionName)
         inReplyToMessageId = try c.decodeIfPresent(String.self, forKey: .inReplyToMessageId)
+        attachments = deletedAt == nil ? try c.decodeIfPresent([ChatAttachment].self, forKey: .attachments) ?? [] : []
+        attachmentOnly = try deletedAt == nil && (c.decodeIfPresent(Bool.self, forKey: .attachmentOnly) ?? false)
     }
 }
 
@@ -95,6 +101,9 @@ struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
         var state: String
         var error: String?
     }
+    var attachments: [ChatAttachment] = []
+    var attachmentOnly = false
+    var displayText: String { attachmentOnly ? "" : text }
     var localEdit: LocalEdit?
     var id: String { messageId }
     var deleted: Bool { deletedAt != nil }
@@ -105,6 +114,35 @@ struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     var needsRead: Bool { loading || localState == .sending && seq != nil }
     /// What shows is not the message as it is: a placeholder, or a newer revision known.
     var loading: Bool { !hasFixed && localState == nil || !hasMutable && localState == nil || stale != nil }
+
+    /// Edit drafts embed this snapshot as JSON. Property defaults alone do
+    /// not let synthesized Decodable read drafts saved before attachments.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        messageId = try c.decode(String.self, forKey: .messageId)
+        channelId = try c.decode(String.self, forKey: .channelId)
+        threadRootId = try c.decodeIfPresent(String.self, forKey: .threadRootId)
+        authorAccountId = try c.decode(String.self, forKey: .authorAccountId)
+        seq = try c.decodeIfPresent(Int.self, forKey: .seq)
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        hasFixed = try c.decode(Bool.self, forKey: .hasFixed)
+        hasMutable = try c.decode(Bool.self, forKey: .hasMutable)
+        text = try c.decode(String.self, forKey: .text)
+        mentions = try c.decode([String].self, forKey: .mentions)
+        revision = try c.decode(Int.self, forKey: .revision)
+        editedAt = try c.decodeIfPresent(String.self, forKey: .editedAt)
+        deletedAt = try c.decodeIfPresent(String.self, forKey: .deletedAt)
+        authorAgentId = try c.decodeIfPresent(String.self, forKey: .authorAgentId)
+        authorAgentName = try c.decodeIfPresent(String.self, forKey: .authorAgentName)
+        authorSessionName = try c.decodeIfPresent(String.self, forKey: .authorSessionName)
+        inReplyToMessageId = try c.decodeIfPresent(String.self, forKey: .inReplyToMessageId)
+        stale = try c.decodeIfPresent(Int.self, forKey: .stale)
+        localState = try c.decodeIfPresent(LocalState.self, forKey: .localState)
+        localError = try c.decodeIfPresent(String.self, forKey: .localError)
+        localEdit = try c.decodeIfPresent(LocalEdit.self, forKey: .localEdit)
+        attachments = try c.decodeIfPresent([ChatAttachment].self, forKey: .attachments) ?? []
+        attachmentOnly = try c.decodeIfPresent(Bool.self, forKey: .attachmentOnly) ?? false
+    }
 
     init(row: Row) {
         messageId = row["message_id"]
@@ -124,6 +162,9 @@ struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
         authorAgentName = row["author_agent_name"]
         authorSessionName = row["author_session_name"]
         inReplyToMessageId = row["in_reply_to_message_id"]
+        attachments = (try? JSONDecoder().decode([ChatAttachment].self, from: Data(((row["attachments"] as String?) ?? "[]").utf8))) ?? []
+        attachmentOnly = row["attachment_only"] ?? false
+        if deletedAt != nil { attachments = []; attachmentOnly = false }
         stale = row["stale"]
         localState = (row["local_state"] as String?).flatMap(LocalState.init)
         localError = row["local_error"]
@@ -165,7 +206,8 @@ enum ChatMessages {
             // F4: a deleted message's notice is read — out of the Dock's count (review F4-C).
             try db.execute(sql: "UPDATE notified SET read = 1 WHERE object_id = ?", arguments: [m.messageId])
         }
-        let row = try Row.fetchOne(db, sql: "SELECT has_fixed, has_mutable, revision FROM messages WHERE message_id = ?", arguments: [m.messageId])
+        let row = try Row.fetchOne(db, sql: "SELECT has_fixed, has_mutable, revision, deleted_at FROM messages WHERE message_id = ?", arguments: [m.messageId])
+        if let row, (row["deleted_at"] as String?) != nil, m.deletedAt == nil { return false }
         var changed = false
         // UX1 attribution and source are immutable, including text edits/deletions.
         if row == nil {
@@ -177,6 +219,7 @@ enum ChatMessages {
                 """, arguments: [m.messageId, m.channelId, m.threadRootId, m.authorAccountId, m.seq, m.createdAt,
                                  m.text, mentionsJSON(m), m.revision, m.editedAt, m.deletedAt, m.authorAgentId, m.runId])
             try writeAttribution(db, m)
+            try ChatAttachments.write(db, id: m.messageId, files: m.deletedAt == nil ? m.attachments : [], only: m.deletedAt == nil && m.attachmentOnly)
             try ChatUnread.sent(db, channel: m.channelId, thread: m.threadRootId, author: m.authorAccountId, through: m.seq)
             return true
         }
@@ -196,6 +239,7 @@ enum ChatMessages {
                     stale = CASE WHEN stale IS NOT NULL AND stale > ? THEN stale ELSE NULL END
                 WHERE message_id = ?
                 """, arguments: [m.text, mentionsJSON(m), m.revision, m.editedAt, m.deletedAt, m.revision, m.messageId])
+            try ChatAttachments.write(db, id: m.messageId, files: m.deletedAt == nil ? m.attachments : [], only: m.deletedAt == nil && m.attachmentOnly)
             // Deleted: no copy of its text stays here — an edit asked or in
             // conflict goes with it (review F3-p1-2).
             changed = true
@@ -231,7 +275,7 @@ enum ChatMessages {
             try db.execute(sql: "DELETE FROM local_edits WHERE message_id = ?", arguments: [id])
             try db.execute(sql: "UPDATE notified SET read = 1 WHERE object_id = ?", arguments: [id])
             // Deleted, though its tombstone is still to be read: no text, no notice (review F4c-3).
-            try db.execute(sql: "UPDATE messages SET deleted_at = IFNULL(deleted_at, ?), text = '', mentions = '[]' WHERE message_id = ?",
+            try db.execute(sql: "UPDATE messages SET deleted_at = IFNULL(deleted_at, ?), text = '', mentions = '[]', attachments = '[]', attachment_only = 0 WHERE message_id = ?",
                            arguments: [event.at, id])
         }
         let channel = String(event.stream.dropFirst("channel:".count))
@@ -332,6 +376,7 @@ enum ChatMessages {
         try db.execute(sql: "DELETE FROM messages WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM channel_windows WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM thread_cursors WHERE channel_id NOT IN (\(kept))")
+        try db.execute(sql: "DELETE FROM attachment_drafts WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM drafts WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM local_edits WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM read_marks WHERE channel_id NOT IN (\(kept))")

@@ -71,6 +71,15 @@ extension ChatService {
               let row = try store.queue.read({ db in
                   try Row.fetchOne(db, sql: "SELECT * FROM messages WHERE message_id = ? AND local_state = 'failed'", arguments: [messageId])
               }).map(ChatMessage.init(row:)) else { return }
+        guard try store.queue.read({ try Bool.fetchOne($0, sql: "SELECT archived FROM channels WHERE channel_id = ?", arguments: [row.channelId]) }) == false else {
+            throw ChatAttachmentError.unavailable
+        }
+        let original = try store.outbox.commands().last { $0.type == "message.post_with_attachments" && Self.args($0)["message_id"]?.string == messageId }
+        if !row.attachments.isEmpty || row.attachmentOnly || original != nil {
+            guard let original, canRepeatAttachmentPost(key, row: row, original: original) else { throw ChatAttachmentError.unavailable }
+            try retryAttachmentPost(key, row: row, original: original)
+            return
+        }
         let prepared = try prepareCommand(key, type: "message.post",
                                           args: Self.postArgs(messageId, row.channelId, row.threadRootId, row.text, row.mentions))
         try store.queue.write { db in
@@ -80,11 +89,36 @@ extension ChatService {
         prepared.sent()
     }
 
+    private func canRepeatAttachmentPost(_ key: ChatOrgKey, row: ChatMessage, original: ChatCommandRecord) -> Bool {
+        supports("chat.attachments", key: key) && original.sessionId == connection?.sessionId
+            && original.state != .dropped && original.state != .unconfirmed
+            && !row.attachments.isEmpty
+            && Self.args(original)["attachment_ids"] == .array(row.attachments.map { .string($0.id) })
+    }
+
+    func canRetryPost(_ key: ChatOrgKey, row: ChatMessage) -> Bool {
+        guard row.localState == .failed, let store = orgSessions[key]?.store,
+              (try? store.queue.read { try Bool.fetchOne($0, sql: "SELECT archived FROM channels WHERE channel_id = ?", arguments: [row.channelId]) }) == false else { return false }
+        let original = try? store.outbox.commands().last { $0.type == "message.post_with_attachments" && Self.args($0)["message_id"]?.string == row.id }
+        if !row.attachments.isEmpty || row.attachmentOnly || original != nil {
+            guard let original else { return false }
+            return canRepeatAttachmentPost(key, row: row, original: original) && attachments(key)?.uploadStamp(channel: row.channelId) != nil
+        }
+        return true
+    }
+
     /// "Delete" of a post not sent: its row goes; its commands are failed already.
     func discard(_ key: ChatOrgKey, messageId: String) throws {
-        try orgSessions[key]?.store?.queue.write { db in
+        guard let store = orgSessions[key]?.store else { return }
+        let removed = try store.queue.write { db -> [String] in
+            guard try String.fetchOne(db, sql: "SELECT local_state FROM messages WHERE message_id = ?", arguments: [messageId]) == "failed" else { return [] }
+            let owned = try ChatAttachments.drafts(db, includingQueued: true).filter { $0.queued == true && $0.messageId == messageId }
+            for file in owned { try db.execute(sql: "DELETE FROM attachment_drafts WHERE attachment_id = ?", arguments: [file.id]) }
             try db.execute(sql: "DELETE FROM messages WHERE message_id = ? AND local_state = 'failed'", arguments: [messageId])
+            return owned.map(\.id)
         }
+        for id in removed { files.attachmentStorage.remove(key, id: id) }
+        attachmentManagers[key]?.reconcile()
     }
 
     /// `message.edit` / `message.delete` of the user's own message, marked
@@ -132,6 +166,7 @@ extension ChatService {
     /// Owners of `message.*` answers, by the one dispatcher (D5's way).
     func installConversations() {
         installB1()
+        commandOwners["message.post_with_attachments"] = { [weak self] key, record, outcome in self?.postAnswered(key, record, outcome) }
         commandOwners["message.post"] = { [weak self] key, record, outcome in self?.postAnswered(key, record, outcome) }
         commandOwners["message.post_from_session"] = { [weak self] key, record, outcome in
             if case .taken(let answer) = outcome, let answer, let store = self?.orgSessions[key]?.store,
@@ -208,6 +243,7 @@ extension ChatService {
     /// (review F3b-3).
     func resendPosts(_ key: ChatOrgKey) {
         guard let store = orgSessions[key]?.store else { return }
+        _ = try? store.queue.write { try ChatAttachments.reconcileOwnership($0) }
         reconcileSessionPosts(key)
         let rows = (try? store.queue.read { db in
             try Row.fetchAll(db, sql: "SELECT * FROM messages WHERE local_state = 'sending' AND has_fixed = 0").map(ChatMessage.init(row:))
@@ -217,8 +253,10 @@ extension ChatService {
         // generation) waits for the user's word, as C2 has it; dropped (its
         // session ended) is "not sent" for the user to retry (review F3-p1-5).
         var states: [String: Set<ChatCommandRecord.State>] = [:]
-        for command in (try? store.outbox.commands()) ?? [] where command.type == "message.post" {
+        var filePosts: [String: ChatCommandRecord] = [:]
+        for command in (try? store.outbox.commands()) ?? [] where ["message.post", "message.post_with_attachments"].contains(command.type) {
             if let id = Self.args(command)["message_id"]?.string { states[id, default: []].insert(command.state) }
+            if command.type == "message.post_with_attachments", let id = Self.args(command)["message_id"]?.string { filePosts[id] = command }
         }
         for row in rows {
             if (try? store.queue.read { try Bool.fetchOne($0, sql: "SELECT EXISTS(SELECT 1 FROM session_posts WHERE message_id = ?)", arguments: [row.messageId]) }) == true { continue }
@@ -231,8 +269,21 @@ extension ChatService {
                 }
                 continue
             }
-            guard let prepared = try? prepareCommand(key, type: "message.post",
-                                                     args: Self.postArgs(row.messageId, row.channelId, row.threadRootId, row.text, row.mentions))
+            let type: String, args: ChatJSON
+            if !row.attachments.isEmpty || row.attachmentOnly || filePosts[row.messageId] != nil {
+                guard let original = filePosts[row.messageId], original.state == .sent,
+                      canRepeatAttachmentPost(key, row: row, original: original) else {
+                    try? store.queue.write { db in
+                        try db.execute(sql: "UPDATE messages SET local_state = 'failed', local_error = ? WHERE message_id = ?",
+                            arguments: [filePosts[row.messageId]?.error ?? "attachment_expired", row.messageId])
+                    }
+                    continue
+                }
+                type = original.type; args = .object(Self.args(original))
+            } else {
+                type = "message.post"; args = Self.postArgs(row.messageId, row.channelId, row.threadRootId, row.text, row.mentions)
+            }
+            guard let prepared = try? prepareCommand(key, type: type, args: args)
             else { continue }
             _ = try? store.queue.write { db in try prepared.table.insert(db, prepared.record, seq: prepared.record.seq) }
             prepared.sent()

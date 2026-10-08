@@ -124,6 +124,7 @@ struct ChatReactorsView: View {
 struct ChatServerReplies: View {
     let summary: ChatB1.Summary
     let members: [ChatOrgView.Member]
+    var unreadCount = 0
     var action: () -> Void
     var body: some View {
         Button(action: action) {
@@ -136,11 +137,12 @@ struct ChatServerReplies: View {
                     }
                 }
                 Text(summary.label).font(Theme.display(11, weight: .medium)).foregroundStyle(ChatAppearance.accent)
+                ChatUnreadReplyBadge(count: unreadCount)
                 if let date = summary.lastReplyAt.flatMap(ChatFeedLayout.date) {
                     Text(date.formatted(date: .omitted, time: .shortened)).font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
                 }
                 Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(ChatAppearance.accent)
             }.padding(.vertical, 5)
-        }.buttonStyle(.plain).help("Open thread").accessibilityLabel("\(summary.label), \(summary.lastParticipants.map { participant in participant.authorAgentName ?? participant.authorSessionName ?? members.first { $0.accountId == participant.authorAccountId }?.name ?? "Former member" }.joined(separator: ", ")), open thread").chatFocusRing()
+        }.buttonStyle(.plain).help("Open thread").accessibilityLabel("\(summary.label)\(unreadCount > 0 ? ", \(unreadCount) new" : ""), \(summary.lastParticipants.map { participant in participant.authorAgentName ?? participant.authorSessionName ?? members.first { $0.accountId == participant.authorAccountId }?.name ?? "Former member" }.joined(separator: ", ")), open thread").chatFocusRing()
     }
 }

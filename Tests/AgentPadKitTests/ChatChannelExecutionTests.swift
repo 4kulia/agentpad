@@ -1673,10 +1673,11 @@ final class ChatChannelExecutionTests: XCTestCase {
             XCTAssertEqual(restored.channelRevoked, release == 7)
             XCTAssertNil(restored.stopConfirmedAt)
             XCTAssertNil(restored.preflightPID)
+            XCTAssertNil(restored.launchFailure)
             let kept = try await legacy.read { try ChatApproval.fetchOne($0, key: approval.id) }
             XCTAssertEqual(kept?.params, approval.params)
             let versions = try await legacy.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier") }
-            XCTAssertEqual(versions, ((1...9).map { "release-\($0)" } + ["release-10-ux1"]).sorted())
+            XCTAssertEqual(versions, ((1...9).map { "release-\($0)" } + ["release-10-ux1", "release-11-notification-diagnostics"]).sorted())
         }
     }
 
@@ -1730,7 +1731,93 @@ final class ChatChannelExecutionTests: XCTestCase {
         let kept = try await cache.read { try String.fetchOne($0, sql: "SELECT name FROM agent_channels WHERE channel_id = ?", arguments: [Self.channel]) }
         XCTAssertEqual(kept, "billing")
         let versions = try await cache.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier") }
-        XCTAssertEqual(versions, ((1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review", "release-14-ux2-thread-read-floor", "release-15-ux2-draft-options", "release-16-conversation-read-marks", "release-17-b1", "release-18-b1-review", "release-19-chat-reply-heads", "release-20-pin-preferences"]).sorted())
+        XCTAssertEqual(versions, ((1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review", "release-14-ux2-thread-read-floor", "release-15-ux2-draft-options", "release-16-conversation-read-marks", "release-17-b1", "release-18-b1-review", "release-19-chat-reply-heads", "release-20-pin-preferences", "release-21-attachments", "release-22-attachment-access", "release-23-attachment-retention"]).sorted())
     }
 
+}
+
+
+extension ChatChannelExecutionTests {
+    func testAttentionRetainsOldDecisionAndPublicationBeyondCompletedHistoryLimit() async throws {
+        let f = try await fixture()
+        _ = try await f.finish()
+        try f.move("awaiting_decision", 1, id: "old-decision", kind: "personal")
+        try f.write("UPDATE requests SET channel_id = NULL WHERE request_id = 'old-decision'")
+        try f.write("UPDATE requests SET updated_at = '2020-01-01T00:00:00Z'")
+        let ledger = AttentionLedger(), client = RecordingNotificationCenter()
+        let manager = NotificationManager(client: client)
+        ledger.delivery = manager
+        let waits = ChatAttention.events(service: f.service, calls: f.calls).filter { $0.kind.needsDecision }
+        XCTAssertEqual(Set(waits.map(\.kind)), [.decision, .publicationReview])
+        for wait in waits { ledger.upsert(wait) }
+        await manager.drain()
+
+        try await f.store.queue.write { db in
+            for index in 0..<501 {
+                var body = CallJSON.request("new-outcome-\(index)", state: "failed", version: 1, onThisDevice: true)
+                body["updated_at"] = ChatCallStore.timestamp(Date(timeIntervalSince1970: 1_800_000_000 + Double(index)))
+                try ChatCallStore.apply(db, CallJSON.wire(body), onThisDevice: true)
+            }
+        }
+        let projected = ChatAttention.events(service: f.service, calls: f.calls)
+        XCTAssertEqual(projected.filter { !$0.kind.needsDecision }.count, 500, "only completed history is bounded")
+        XCTAssertEqual(Set(projected.filter { $0.kind.needsDecision }.map(\.id)), Set(waits.map(\.id)))
+        let ids = Set(projected.map(\.id))
+        for source in ["request", "publication-review"] { ledger.reconcile(source: source, keeping: ids) }
+        for wait in projected where wait.kind.needsDecision { ledger.upsert(wait) }
+        await manager.drain()
+        XCTAssertEqual(ledger.pendingCount, 2)
+        XCTAssertEqual(client.delivered, Set(waits.map(\.id)), "history churn cannot revoke a live banner")
+        XCTAssertEqual(client.submitted.count, 2)
+    }
+
+    func testAttentionOutcomesKeepSourceTimestampsAcrossProjection() async throws {
+        let f = try await fixture()
+        let sourceTime = Date(timeIntervalSince1970: 1_700_000_000)
+        try await f.store.queue.write { db in
+            for index in 0..<101 {
+                var body = CallJSON.request("history-\(index)", state: "failed", version: 1, onThisDevice: true)
+                body["updated_at"] = ChatCallStore.timestamp(sourceTime.addingTimeInterval(Double(index)))
+                try ChatCallStore.apply(db, CallJSON.wire(body), onThisDevice: true)
+            }
+        }
+        let events = ChatAttention.events(service: f.service, calls: f.calls)
+        XCTAssertEqual(events.count, 101)
+        XCTAssertEqual(events.first?.timestamp, sourceTime.addingTimeInterval(100))
+        XCTAssertEqual(events.last?.timestamp, sourceTime)
+        XCTAssertEqual(ChatAttention.events(service: f.service, calls: f.calls), events,
+                       "a periodic projection must not manufacture fresh event dates")
+        let ledger = AttentionLedger(), client = RecordingNotificationCenter()
+        let manager = NotificationManager(client: client)
+        ledger.delivery = manager
+        for event in events { ledger.upsert(event) }
+        await manager.drain()
+        XCTAssertEqual(ledger.events.first?.id, events.first?.id)
+        XCTAssertEqual(ledger.events.last?.timestamp, sourceTime.addingTimeInterval(1))
+        XCTAssertEqual(client.delivered, Set(events.prefix(100).map(\.id)))
+    }
+
+    func testAttentionProjectionOffersPublicationReviewInsteadOfSuccess() async throws {
+        let f = try await fixture()
+        _ = try await f.finish()
+        let events = ChatAttention.events(service: f.service, calls: f.calls)
+        XCTAssertEqual(events.filter { $0.kind == .publicationReview }.count, 1)
+        XCTAssertFalse(events.contains { $0.kind == .completion || $0.kind == .publication })
+        let review = try XCTUnwrap(events.first { $0.kind == .publicationReview })
+        XCTAssertEqual(review.body, "")
+        XCTAssertTrue(ChatAttention.valid(review, service: f.service))
+        try f.write("UPDATE requests SET publication = 'published'")
+        XCTAssertFalse(ChatAttention.valid(review, service: f.service))
+        XCTAssertFalse(ChatAttention.events(service: f.service, calls: f.calls).contains { $0.kind == .publication },
+                       "ACK without the actual published message is not a message notification")
+    }
+
+    func testAttentionCannotRevealCachedChannelAfterRevocation() async throws {
+        let f = try await fixture()
+        _ = try await f.finish()
+        let event = try XCTUnwrap(ChatAttention.events(service: f.service, calls: f.calls).first { $0.kind == .publicationReview })
+        try f.write("UPDATE meta SET rights_in_doubt = 1")
+        XCTAssertFalse(ChatAttention.valid(event, service: f.service))
+        XCTAssertTrue(ChatAttention.events(service: f.service, calls: f.calls).isEmpty)
+    }
 }

@@ -66,12 +66,37 @@ struct ChatInboxTabView: View {
     var openChannel: (String) -> Void
     var close: () -> Void
     @State private var model: ChatInboxModel
-    private var current = ChatOrgCurrent.shared
+    private let current: ChatOrgCurrent
+    private let service: ChatService
 
     init(ref: ChatInboxRef, openMessage: @escaping (ChatMessage) -> Void, openChannel: @escaping (String) -> Void,
-         close: @escaping () -> Void) {
+         close: @escaping () -> Void, model: ChatInboxModel? = nil, current: ChatOrgCurrent = .shared,
+         service: ChatService = .shared) {
         self.ref = ref; self.openMessage = openMessage; self.openChannel = openChannel; self.close = close
-        _model = State(initialValue: ChatInboxModel(ref: ref))
+        self.current = current; self.service = service
+        _model = State(initialValue: model ?? ChatInboxModel(ref: ref))
+    }
+
+    private struct Binding: Equatable {
+        var org, store, sync: ObjectIdentifier?
+        var session: String?
+        var state: ChatSidebarSnapshot.State
+    }
+
+    private var binding: Binding {
+        let org = current.model
+        let session = org?.key.flatMap { service.orgSessions[$0] }
+        return Binding(org: org.map(ObjectIdentifier.init), store: session?.store.map(ObjectIdentifier.init),
+                       sync: session?.sync.map(ObjectIdentifier.init), session: org?.session, state: ref.state(org))
+    }
+
+    private func follow() {
+        guard let org = current.model, let key = org.key, case .ready = ref.state(org),
+              let session = service.orgSessions[key], let store = session.store else { model.stop(); return }
+        model.follow(store, org: org) { [weak sync = session.sync] target, before in
+            guard let sync else { throw ChatInboxLoadError.unavailable }
+            return try await sync.readInboxPage(target, before: before)
+        }
     }
 
     var body: some View {
@@ -81,7 +106,8 @@ struct ChatInboxTabView: View {
                 if let org = current.model {
                     ChatInboxView(kind: ref.kind, entries: model.entries(org), sidebar: ChatSidebarSnapshot(model: org, active: nil),
                                   members: org.members, problem: model.problem,
-                                  markAllRead: { model.markAllRead(org) }, openMessage: openMessage, openChannel: openChannel)
+                                  loading: model.loading, limited: model.limited, retry: { model.retry() },
+                                  markAllRead: { model.markAllRead(org, service: service) }, openMessage: openMessage, openChannel: openChannel)
                 }
             case .checking:
                 unavailable("Checking access…", detail: "Your messages will appear when access is confirmed.")
@@ -93,11 +119,10 @@ struct ChatInboxTabView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(ChatAppearance.surface)
-        .task(id: ChatOrgCurrent.identity()) {
-            ChatOrgCurrent.shared.refresh()
-            if let org = current.model, let key = org.key, ref.belongs(to: key),
-               let store = ChatService.shared.orgSessions[key]?.store { model.follow(store, org: org) }
-        }
+        .task(id: ChatOrgCurrent.identity(service)) { current.refresh(service); follow() }
+        // Readiness can arrive after the identity's task has already finished.
+        .onChange(of: binding, initial: true) { _, _ in model.stop(); follow() }
+        .onDisappear { model.stop() }
     }
 
     private func unavailable(_ title: String, detail: String) -> some View {
@@ -110,6 +135,41 @@ struct ChatInboxTabView: View {
     }
 }
 
+/// A positive badge must always have either messages or an actionable remainder.
+struct ChatInboxPresentation {
+    struct Missing: Identifiable {
+        var channel: ChatSidebarSnapshot.Channel
+        var count: Int
+        var kind: ChatInboxKind
+        var id: String { channel.id }
+        var title: String {
+            let noun = kind == .unread ? "message" : "mention"
+            let amount = count > 0 ? "\(count) \(noun)\(count == 1 ? "" : "s")" : "More \(noun)s may be available"
+            return "\(amount) in #\(channel.card.name) — Open channel"
+        }
+    }
+    var entries: [ChatInbox.Entry]
+    var groups: [ChatSidebarSnapshot.Channel]
+    var missing: [Missing]
+    var isEmpty: Bool { entries.isEmpty && missing.isEmpty }
+
+    init(kind: ChatInboxKind, entries: [ChatInbox.Entry], sidebar: ChatSidebarSnapshot) {
+        let channels = sidebar.teams.flatMap(\.channels)
+        let ids = Set(channels.map(\.id))
+        self.entries = entries.filter { ids.contains($0.message.channelId) && !$0.message.loading }
+        let byChannel = Dictionary(grouping: self.entries, by: { $0.message.channelId })
+        missing = channels.compactMap { channel in
+            let shown = byChannel[channel.id, default: []].filter(\.unread).count
+            let expected = kind == .unread ? channel.unread.count : channel.mentions
+            let remaining = max(0, expected - shown)
+            guard remaining > 0 || channel.unread.more || channel.unread.something else { return nil }
+            return Missing(channel: channel, count: remaining, kind: kind)
+        }
+        let missingIDs = Set(missing.map(\.id))
+        groups = channels.filter { byChannel[$0.id] != nil || missingIDs.contains($0.id) }
+    }
+}
+
 /// Native list content, shared by the tab and the isolated AppKit render test.
 struct ChatInboxView: View {
     let kind: ChatInboxKind
@@ -117,33 +177,50 @@ struct ChatInboxView: View {
     let sidebar: ChatSidebarSnapshot
     let members: [ChatOrgView.Member]
     var problem: String?
+    var loading = false
+    var limited = false
+    var retry: () -> Void = {}
     var markAllRead: () -> Void
     var openMessage: (ChatMessage) -> Void
     var openChannel: (String) -> Void
 
     private var channels: [ChatSidebarSnapshot.Channel] { sidebar.teams.flatMap(\.channels) }
-    private var groups: [ChatSidebarSnapshot.Channel] {
-        let ids = Set(entries.map { $0.message.channelId })
-        return channels.filter { ids.contains($0.id) || $0.unread.more || $0.unread.something }
-    }
+    private var presentation: ChatInboxPresentation { ChatInboxPresentation(kind: kind, entries: entries, sidebar: sidebar) }
 
     var body: some View {
+        let presentation = presentation
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Image(systemName: kind.symbol).foregroundStyle(ChatAppearance.accent)
                 Text(kind.title).font(Theme.display(18, weight: .semibold))
-                Text(kind == .unread ? (ChatSidebarSnapshot.unreadLabel(sidebar.unread) ?? "0") : "\(entries.count)")
+                Text(kind == .unread ? (ChatSidebarSnapshot.unreadLabel(sidebar.unread) ?? "0") : "\(sidebar.mentions) unread")
                     .font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary)
                 Spacer()
                 if kind == .unread {
                     Button("Mark all read", action: markAllRead).chatFocusRing()
-                        .disabled(entries.isEmpty && !sidebar.incomplete)
+                        .disabled(entries.isEmpty && sidebar.unread.count == 0 && !sidebar.incomplete)
                         .accessibilityIdentifier("chat-inbox-mark-all-read")
                 }
             }.padding(.horizontal, 24).frame(height: 62)
             Divider().overlay(ChatAppearance.border)
-            if let problem { Text(problem).font(Theme.display(12)).foregroundStyle(ChatAppearance.failure).padding(16) }
-            if entries.isEmpty && (kind == .mentions || groups.isEmpty) && problem == nil {
+            if loading {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading unread messages…").font(Theme.display(12))
+                }.padding(16).accessibilityIdentifier("chat-inbox-loading")
+            }
+            if let problem {
+                HStack {
+                    Text(problem).font(Theme.display(12)).foregroundStyle(ChatAppearance.failure)
+                    Button("Retry", action: retry).disabled(loading).chatFocusRing()
+                }.padding(16).accessibilityIdentifier("chat-inbox-error")
+            } else if limited {
+                HStack {
+                    Text("More unread messages are available.").font(Theme.display(12))
+                    Button("Load more", action: retry).disabled(loading).chatFocusRing()
+                }.padding(16)
+            }
+            if presentation.isEmpty && !loading && !limited && problem == nil {
                 VStack(spacing: 12) {
                     Image(systemName: kind == .unread ? "checkmark.circle" : "at")
                         .font(.system(size: 32)).foregroundStyle(ChatAppearance.accent)
@@ -156,31 +233,35 @@ struct ChatInboxView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         if kind == .unread {
-                            ForEach(groups) { channel in
+                            ForEach(presentation.groups) { channel in
                                 HStack {
                                     Text("# \(channel.card.name)").font(Theme.display(14, weight: .semibold))
                                     Spacer()
                                     Text(channel.unreadLabel ?? "").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
                                 }.padding(.horizontal, 24).padding(.vertical, 14)
                                     .background(Theme.chromeBackground)
-                                ForEach(entries.filter { $0.message.channelId == channel.id }) { row($0) }
-                                if channel.unread.more || channel.unread.something {
-                                    Button("Open channel to see more unread messages") { openChannel(channel.id) }
-                                        .buttonStyle(.borderless).padding(.horizontal, 24).padding(.vertical, 12).chatFocusRing()
-                                }
+                                ForEach(presentation.entries.filter { $0.message.channelId == channel.id }) { row($0) }
+                                ForEach(presentation.missing.filter { $0.id == channel.id }) { remainder($0) }
                             }
                         } else {
-                            ForEach(entries) { row($0) }
+                            ForEach(presentation.entries) { row($0) }
+                            ForEach(presentation.missing) { remainder($0) }
                         }
                     }.padding(.vertical, 8)
                 }
             }
             HStack {
-                Text("From loaded history" + (sidebar.incomplete ? " · More messages may be available in your channels" : ""))
+                Text("Open a message or channel to read it.")
                 Spacer()
                 if case .ready(offline: true) = sidebar.state { Text("Offline") }
             }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary).padding(.horizontal, 24).padding(.vertical, 10)
         }.foregroundStyle(Theme.chromeForeground).background(ChatAppearance.surface)
+    }
+
+    private func remainder(_ missing: ChatInboxPresentation.Missing) -> some View {
+        Button(missing.title) { openChannel(missing.id) }
+            .buttonStyle(.borderless).padding(.horizontal, 24).padding(.vertical, 12).chatFocusRing()
+            .accessibilityIdentifier("chat-inbox-remainder-\(missing.id)")
     }
 
     private func row(_ entry: ChatInbox.Entry) -> some View {

@@ -125,6 +125,13 @@ final class WorkspaceStore {
     /// all `TabBarView` instances so target panes can show drop indicators
     /// even when the source lives in a different pane.
     var draggingTabId: UUID?
+    /// Shared with peer windows so every sidebar can identify a tab drag.
+    var draggedTab: Session? {
+        for owner in [self] + peerStores().filter({ $0 !== self }) {
+            if let id = owner.draggingTabId, let session = owner.findSession(id: id) { return session }
+        }
+        return nil
+    }
     var sidebarMode: SidebarMode = .full
     /// Right-side agent-overview sidebar — per-window collapse state, sharing
     /// the left sidebar's three modes (full / compact / hidden). The content is
@@ -407,6 +414,7 @@ final class WorkspaceStore {
     /// notification — only when the originating tab isn't currently visible.
     /// Tests default to a no-op.
     private let onSessionAlert: @MainActor (UUID, SessionAlertKind) -> Void
+    private let onSessionWaitingEnded: @MainActor (UUID) -> Void
     /// Reports a user-chosen project folder for File → Open Recent / ⌘P.
     /// Defaults to a no-op like the other side-effecting callbacks
     /// (`onSessionAlert`, `moveToNewWindow`) — a write must never be the
@@ -470,6 +478,9 @@ final class WorkspaceStore {
         /// Captured conversation id so `⌘⇧T` resumes the agent session
         /// the user just closed (subject to `resumeConversations` setting).
         let conversationId: String?
+        /// The tab's own destination; nil means explicitly local, even if
+        /// it was moved into an SSH workspace before being closed.
+        let sshWorkspaceHost: String?
         // AgentPad: a closed channel tab comes back a channel tab; no title kept.
         var channel: ChannelRef? = nil
         var inbox: ChatInboxRef? = nil
@@ -527,6 +538,7 @@ final class WorkspaceStore {
         peerStores: @escaping @MainActor () -> [WorkspaceStore] = { [] },
         moveToNewWindow: @escaping @MainActor (UUID) -> Void = { _ in },
         onSessionAlert: @escaping @MainActor (UUID, SessionAlertKind) -> Void = { _, _ in },
+        onSessionWaitingEnded: @escaping @MainActor (UUID) -> Void = { _ in },
         noteRecentFolder: @escaping @MainActor (URL) -> Void = { _ in },
         claudeProjectsRoot: URL = TeamSessionFiles.root
     ) {
@@ -537,6 +549,7 @@ final class WorkspaceStore {
         self.peerStores = peerStores
         self.moveToNewWindow = moveToNewWindow
         self.onSessionAlert = onSessionAlert
+        self.onSessionWaitingEnded = onSessionWaitingEnded
         self.noteRecentFolder = noteRecentFolder
         self.claudeProjectsRoot = claudeProjectsRoot
         if let saved = persistence.load(), !saved.workspaces.isEmpty {
@@ -600,7 +613,7 @@ final class WorkspaceStore {
             customTitle: customTitle,
             spawnInBackground: spawnInBackground
         )
-        wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: session.resumedConversationId)
+        configureSession(session, in: workspace, codexRolloutId: session.resumedConversationId)
         pane.tabs.append(session)
         pane.activeTabId = session.id
         // Worktrees insert right after their source (or after the source's
@@ -1082,6 +1095,12 @@ final class WorkspaceStore {
 
     // MARK: - Tabs
 
+    enum TabConnection {
+        case inheritWorkspace
+        case local
+        case ssh(String)
+    }
+
     /// `rawLaunchCommand` (the CLI's `open -e`) rides AGENTPAD_AGENT verbatim —
     /// see `makeSessionConfig(rawLaunchCommand:)`. Only meaningful with the
     /// plain `.terminal` template; the CLI controller is its one caller.
@@ -1101,7 +1120,8 @@ final class WorkspaceStore {
         rawLaunchCommand: String? = nil,
         customTitle: String? = nil,
         activate: Bool = true,
-        spawnInBackground: Bool = false
+        spawnInBackground: Bool = false,
+        connection: TabConnection = .inheritWorkspace
     ) -> Session {
         // The raw channel replaces the template's own launch command inside
         // makeSessionConfig, but everything else (Session.agent identity,
@@ -1121,8 +1141,13 @@ final class WorkspaceStore {
         let cwd = initialCwd
             ?? template.extraCwd.map { resolvedSpawnCwd(($0 as NSString).expandingTildeInPath) }
             ?? workspace.workingDirectory
-        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, initialPrompt: initialPrompt, sshRemoteHost: workspace.sshRemoteHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, spawnInBackground: spawnInBackground)
-        wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: session.resumedConversationId)
+        let sshHost: String? = switch connection {
+        case .inheritWorkspace: workspace.sshRemoteHost
+        case .local: nil
+        case .ssh(let host): host
+        }
+        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, initialPrompt: initialPrompt, sshRemoteHost: sshHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, spawnInBackground: spawnInBackground)
+        configureSession(session, in: workspace, codexRolloutId: session.resumedConversationId)
         target.tabs.append(session)
         // `activate: false` (CLI --no-focus) appends WITHOUT touching the
         // active-tab/pane identity — the browser's background-tab shape. The
@@ -1394,15 +1419,14 @@ final class WorkspaceStore {
         scheduleSave()
     }
 
-    /// Move a tab from its current pane to a different pane at a specific
-    /// index. If the source pane runs out of tabs as a result, it collapses
-    /// (sibling pane takes its place in the split tree). The session itself
-    /// is preserved — same engine, same scrollback, same agent state.
+    /// Move a live tab between panes, keeping the source layout even when
+    /// emptied. Closing a tab still has its existing collapse semantics.
     func moveTab(_ session: Session, to destPane: Pane, at destIndex: Int, in workspace: Workspace) {
-        guard let sourcePane = workspace.root.pane(containingSessionId: session.id) else { return }
+        guard workspace.root.pane(id: destPane.id) === destPane,
+              let sourcePane = workspace.root.pane(containingSessionId: session.id) else { return }
         if sourcePane.id == destPane.id { return }
         guard let sourceIndex = sourcePane.tabs.firstIndex(where: { $0.id == session.id }) else { return }
-        detachSession(session, from: sourcePane, at: sourceIndex, in: workspace)
+        detachSession(session, from: sourcePane, at: sourceIndex, in: workspace, keepingEmptyPane: true)
         attachSession(session, to: destPane, at: destIndex, in: workspace)
     }
 
@@ -1412,13 +1436,15 @@ final class WorkspaceStore {
     /// workspace cwd re-syncs. Structural only: the engine keeps running, so
     /// this serves both `closeTab` (which terminates first) and a tab move
     /// (which re-homes the live session elsewhere).
-    private func detachSession(_ session: Session, from pane: Pane, at idx: Int, in workspace: Workspace) {
+    private func detachSession(_ session: Session, from pane: Pane, at idx: Int, in workspace: Workspace, keepingEmptyPane: Bool = false) {
         pane.tabs.remove(at: idx)
         if pane.tabs.isEmpty {
-            closePane(pane, in: workspace)
-            return
-        }
-        if pane.activeTabId == session.id {
+            pane.activeTabId = nil
+            if !keepingEmptyPane {
+                closePane(pane, in: workspace)
+                return
+            }
+        } else if pane.activeTabId == session.id {
             let next = pane.tabs[min(idx, pane.tabs.count - 1)]
             pane.activeTabId = next.id
             if workspace.activePane?.id == pane.id, workspace.workingDirectory != next.currentDirectory {
@@ -1438,6 +1464,7 @@ final class WorkspaceStore {
         holdChannelClose(session)
         destPane.activeTabId = session.id
         workspace.activePaneId = destPane.id
+        if let zoomed = workspace.zoomedPaneId, zoomed != destPane.id { workspace.zoomedPaneId = nil }
         // Promoting to active mirrors `activateTab` so the sidebar title and
         // the next tab's spawn cwd follow the new focus without waiting for
         // the next OSC 7.
@@ -1456,6 +1483,8 @@ final class WorkspaceStore {
     /// `destPane.tabs.count` for "drop at end").
     @discardableResult
     func handleTabDrop(droppedId: UUID, to destPane: Pane, at destIndex: Int, in workspace: Workspace) -> Bool {
+        guard !isTerminated, workspaces.contains(where: { $0 === workspace }),
+              workspace.root.pane(id: destPane.id) === destPane else { return false }
         if let sourcePane = workspace.root.pane(containingSessionId: droppedId),
            let session = sourcePane.tabs.first(where: { $0.id == droppedId }) {
             if sourcePane.id == destPane.id {
@@ -1468,17 +1497,63 @@ final class WorkspaceStore {
             }
             return true
         }
+        // Same store: only the callbacks' workspace changes. Keep monitor
+        // state, including a Codex launch's exclusion snapshot and retries;
+        // conversationId may still belong to a previous run in this tab.
+        if let (sourceWorkspace, sourcePane) = location(ofSessionId: droppedId),
+           let index = sourcePane.tabs.firstIndex(where: { $0.id == droppedId }) {
+            let session = sourcePane.tabs[index]
+            draggingTabId = nil
+            detachSession(session, from: sourcePane, at: index, in: sourceWorkspace, keepingEmptyPane: true)
+            attachSession(session, to: destPane, at: destIndex, in: workspace)
+            wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace)
+            return true
+        }
         // The drag started in another window: take the session from the peer
         // store that owns it, slot it in here, and re-point its engine
         // callbacks at this store so focus / title / activity events follow.
         for source in peerStores() where source !== self {
             if let session = source.surrenderSession(id: droppedId) {
                 attachSession(session, to: destPane, at: destIndex, in: workspace)
-                wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: session.conversationId)
+                configureSession(session, in: workspace, codexRolloutId: session.conversationId)
                 return true
             }
         }
         return false
+    }
+
+    func canDropTab(_ id: UUID, in workspace: Workspace) -> Bool {
+        guard workspaces.contains(where: { $0 === workspace }),
+              workspace.root.pane(containingSessionId: id) == nil else { return false }
+        return findSession(id: id) != nil || peerStores().contains { $0 !== self && !$0.isTerminated && $0.findSession(id: id) != nil }
+    }
+
+    /// Sidebar drops append to the destination's focused pane and reveal it.
+    @discardableResult
+    func handleTabDrop(droppedId: UUID, in workspace: Workspace) -> Bool {
+        guard canDropTab(droppedId, in: workspace), let pane = workspace.activePane,
+              handleTabDrop(droppedId: droppedId, to: pane, at: pane.tabs.count, in: workspace) else { return false }
+        activateWorkspace(workspace)
+        return true
+    }
+
+    /// A workspace born from a tab has no throwaway shell or agent process.
+    @discardableResult
+    func moveTabToNewWorkspace(_ id: UUID) -> Workspace? {
+        guard !isTerminated,
+              let session = findSession(id: id) ?? peerStores().lazy
+                .filter({ $0 !== self && !$0.isTerminated }).compactMap({ $0.findSession(id: id) }).first else { return nil }
+        let workspace = Workspace(workingDirectory: session.currentDirectory, root: PaneNode(pane: Pane()))
+        // Workspace titles are persisted without a channel access check.
+        // Never copy the channel's currently visible name into that state.
+        workspace.customTitle = session.channel == nil ? normalizedTitle(session.title) : "Channel"
+        workspace.sshRemoteHost = session.sshWorkspaceHost
+        workspaces.append(workspace)
+        guard handleTabDrop(droppedId: id, in: workspace) else {
+            workspaces.removeAll { $0 === workspace }
+            return nil
+        }
+        return workspace
     }
 
     /// Removes the session with `id` from this store and returns it for a
@@ -1487,7 +1562,7 @@ final class WorkspaceStore {
     /// store doesn't own the id. `internal`, not `private`: `handleTabDrop`
     /// calls it on each peer store.
     func surrenderSession(id: UUID) -> Session? {
-        guard let (workspace, pane) = location(ofSessionId: id),
+        guard !isTerminated, let (workspace, pane) = location(ofSessionId: id),
               let idx = pane.tabs.firstIndex(where: { $0.id == id }) else { return nil }
         let session = pane.tabs[idx]
         // The drag started in this window, so `onDrag` set our `draggingTabId`
@@ -1495,7 +1570,7 @@ final class WorkspaceStore {
         // its own. Clear ours so this window's drop indicators reset.
         draggingTabId = nil
         teardownSessionMonitors(session, keepForTransfer: true)
-        detachSession(session, from: pane, at: idx, in: workspace)
+        detachSession(session, from: pane, at: idx, in: workspace, keepingEmptyPane: true)
         return session
     }
 
@@ -1580,6 +1655,7 @@ final class WorkspaceStore {
             workspaceId: workspace.id,
             paneId: pane.id,
             conversationId: session.conversationId,
+            sshWorkspaceHost: session.sshWorkspaceHost,
             channel: session.channel,
             inbox: session.inbox
         ))
@@ -1624,7 +1700,8 @@ final class WorkspaceStore {
             pane: pane,
             template: state.agent,
             initialCwd: cwd,
-            conversationId: state.conversationId
+            conversationId: state.conversationId,
+            connection: state.sshWorkspaceHost.map(TabConnection.ssh) ?? .local
         )
         if let custom = state.customTitle, !custom.isEmpty {
             session.customTitle = custom
@@ -1728,18 +1805,14 @@ final class WorkspaceStore {
     }
 
     /// Splits `pane` in two. The existing pane stays as the first child of the
-    /// new split; the second child is a fresh `Pane` with a single new tab
-    /// inheriting the source pane's active-tab agent + cwd. Returns the new
+    /// new split; the second child is empty until a tab is opened or moved
+    /// into it. Splitting never starts a terminal or agent. Returns the new
     /// pane (now focused) or nil if `pane` isn't found.
     @discardableResult
     func splitPane(_ pane: Pane, orientation: SplitOrientation, in workspace: Workspace) -> Pane? {
         guard let leafNode = workspace.root.paneNode(paneId: pane.id) else { return nil }
         guard case .pane(let existing) = leafNode.content else { return nil }
-        let template = existing.activeTab?.agent ?? .terminal
-        let cwd = existing.activeTab?.currentDirectory ?? workspace.workingDirectory
-        let newSession = spawnSession(template: template, initialCwd: cwd, sshRemoteHost: workspace.sshRemoteHost)
-        wireSessionCallbacks(engine: newSession.engine, session: newSession, workspace: workspace, codexRolloutId: newSession.resumedConversationId)
-        let newPane = Pane(tabs: [newSession], activeTabId: newSession.id)
+        let newPane = Pane()
         let firstChild = PaneNode(pane: existing)
         let secondChild = PaneNode(pane: newPane)
         leafNode.content = .split(orientation: orientation, first: firstChild, second: secondChild, fraction: 0.5)
@@ -1842,10 +1915,10 @@ final class WorkspaceStore {
             // `AgentTemplate.baseAgentId`) so a mid-run Settings edit
             // can't leave the tab pill stuck.
             if session.agent.id == agent.id || session.agent.baseAgentId == agent.id {
-                // Report completion to the inbox *before* reverting to
-                // Terminal, so the event still knows which agent finished
-                // (handleSessionAlert reads displayAgent synchronously).
-                onSessionAlert(session.id, .completed)
+                // Auto-launch reports its own exit code. Interactive Bash
+                // has no command-finished marker, so ended is its completion.
+                handleAgentEnded(session, awaitExitOutcome: session.pendingAgentLaunch != nil
+                                 || AgentPadShellIntegration.detectedUserShell != .bash)
                 session.agent = .terminal
             }
         } else if session.agent.isShell {
@@ -1873,10 +1946,8 @@ final class WorkspaceStore {
             ? Session.BackgroundWork(subagents: details.backgroundSubagents, shells: details.backgroundShells)
             : nil
         session.hookStateAt = Date()
-        if session.activityState != event.activityState {
-            session.activityState = event.activityState
-            if event.activityState == .attention { onSessionAlert(session.id, .attention) }
-        }
+        applyNotificationTransition(session, state: event.activityState,
+                                    reason: details.reason ?? (event == .turnComplete ? .completion : event == .turnFailure ? .failure : .input))
         if session.agent.id != agentBefore { scheduleSave() }
         // A non-`ended` event means the agent just (re)started — for Codex,
         // (re)point the usage watcher so a manually-typed `codex` lights up
@@ -1895,9 +1966,10 @@ final class WorkspaceStore {
 
     /// AgentPad: only a hook can establish export provenance; monitors call
     /// applyConversationId directly and only update the resumable history ID.
-    func applyHookConversationId(conversationId: String, sessionId: UUID, provenance: AgentAnswerProvenance? = nil) {
+    func applyHookConversationId(conversationId: String, sessionId: UUID, provenance: AgentAnswerProvenance? = nil,
+                                 failure: AgentAnswerTranscript.Problem? = nil) {
         guard let session = hookSession(id: sessionId) else { return }
-        AgentAnswerSource.recordHook(conversation: conversationId, session: session, provenance: provenance)
+        AgentAnswerSource.recordHook(conversation: conversationId, session: session, provenance: provenance, failure: failure)
         applyConversationId(conversationId: conversationId, sessionId: sessionId)
     }
 
@@ -1995,14 +2067,11 @@ final class WorkspaceStore {
                     // The turn is over and nothing runs in the background —
                     // e.g. background work ended without waking the agent.
                     session.backgroundWork = nil
-                    if session.activityState != .attention {
-                        session.activityState = .attention
-                        onSessionAlert(session.id, .attention)
-                    }
+                    applyNotificationTransition(session, state: .attention, reason: .completion)
                 case .busy where session.activityState == .attention:
                     // Working again: the prompt was answered.
                     session.openMainThreadCalls.removeAll()
-                    session.activityState = .running
+                    applyNotificationTransition(session, state: .running)
                 default:
                     break
                 }
@@ -2032,7 +2101,36 @@ final class WorkspaceStore {
         var open = session.openMainThreadCalls
         if let key { open.remove(key) }
         guard open.isEmpty else { return }
-        session.activityState = .running
+        applyNotificationTransition(session, state: .running)
+    }
+
+    private func handleAgentEnded(_ session: Session, awaitExitOutcome: Bool) {
+        onSessionWaitingEnded(session.id)
+        session.awaitingAgentExitOutcome = awaitExitOutcome
+        if !awaitExitOutcome {
+            session.notificationPhase = "exit"
+            session.notificationEpisode += 1
+            onSessionAlert(session.id, .completed)
+        }
+    }
+
+    /// Hook, status scan and tool progress use the same episode boundary.
+    private func applyNotificationTransition(_ session: Session, state: SessionActivityState,
+                                             reason: SessionAttentionReason = .input) {
+        let changed = session.activityState != state
+        let changedMeaning = state == .attention && session.attentionReason != reason
+        if changed || changedMeaning {
+            onSessionWaitingEnded(session.id)
+            if state == .attention {
+                session.notificationEpisode += 1
+                session.notificationPhase = "turn"
+                session.attentionReason = reason
+            }
+            session.activityState = state
+            if state == .attention {
+                onSessionAlert(session.id, reason == .completion ? .completed : reason == .failure ? .failure : .attention)
+            }
+        }
     }
 
     /// The workspace + pane holding the session with `id`, or nil. One DFS
@@ -2163,7 +2261,7 @@ final class WorkspaceStore {
             // the workspace ref for cwd-sync callbacks).
             for pane in workspace.root.allPanes {
                 for session in pane.tabs {
-                    wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: session.resumedConversationId)
+                    configureSession(session, in: workspace, codexRolloutId: session.resumedConversationId)
                 }
             }
             if let id = ws.activePaneId, workspace.root.allPanes.contains(where: { $0.id == id }) {
@@ -2212,7 +2310,7 @@ final class WorkspaceStore {
                     initialCwd: resolvedSpawnCwd(tab.currentDirectoryPath),
                     sessionId: tab.id,
                     conversationId: tab.conversationId,
-                    sshRemoteHost: sshRemoteHost
+                    sshRemoteHost: tab.sshWorkspaceHost.map(Self.normalizedSSHHost) ?? sshRemoteHost
                 )
                 session.customTitle = tab.customTitle
                 pane.tabs.append(session)
@@ -2293,7 +2391,7 @@ final class WorkspaceStore {
     func openInboxTab(_ ref: ChatInboxRef, in workspace: Workspace, pane: Pane? = nil) -> Session {
         guard let target = pane ?? workspace.activePane ?? workspace.root.firstPane else { preconditionFailure("workspace has no panes") }
         let session = makeInboxSession(ref, cwd: workspace.workingDirectory)
-        wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: nil)
+        configureSession(session, in: workspace, codexRolloutId: nil)
         target.tabs.append(session); target.activeTabId = session.id; workspace.activePaneId = target.id
         scheduleSave()
         return session
@@ -2327,7 +2425,7 @@ final class WorkspaceStore {
             preconditionFailure("workspace has no panes")
         }
         let session = makeChannelSession(ref, cwd: workspace.workingDirectory)
-        wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: nil)
+        configureSession(session, in: workspace, codexRolloutId: nil)
         target.tabs.append(session)
         target.activeTabId = session.id
         if workspace.activePaneId != target.id { workspace.activePaneId = target.id }
@@ -2400,6 +2498,8 @@ final class WorkspaceStore {
         config.environment.merge(
             AgentPadShellIntegration.agentPadEnvironment(for: sessionId, claudeCustomSettingsAgentId: claudeCustomId)
         ) { _, new in new }
+        let launchID = sshHost == nil && config.environment["AGENTPAD_AGENT"] != nil ? UUID() : nil
+        config.environment["AGENTPAD_LAUNCH_ID"] = launchID?.uuidString
         engine.start(config: config)
         let session = Session(
             id: sessionId,
@@ -2409,6 +2509,7 @@ final class WorkspaceStore {
             customTitle: customTitle,
             conversationId: normalizedConversationId
         )
+        session.pendingAgentLaunch = launchID.map { ($0, !template.isShell) }
         // Mirror the drops `makeSessionConfig` applies downstream, so the
         // field records what actually reached the command line: an SSH host
         // never carries the LOCAL resume id (M5.rrrr), a non-empty initial
@@ -2447,7 +2548,7 @@ final class WorkspaceStore {
     /// monitor snapshot and would otherwise be excluded as another session's
     /// file. AgentPad: this preserves the source monitor's heuristic; it is not
     /// a verified journal binding for answer export.
-    private func wireSessionCallbacks(engine: any TerminalEngine, session: Session, workspace: Workspace, codexRolloutId: String?) {
+    private func configureSession(_ session: Session, in workspace: Workspace, codexRolloutId: String?) {
         // Initial refresh — without these, the status bar stays empty until
         // the user `cd`s or runs a command. Both fetchers silently hide
         // results for non-applicable cwds, so the calls are harmless.
@@ -2459,6 +2560,11 @@ final class WorkspaceStore {
             resumingConversationId: codexRolloutId
         )
         startKiroConversationIfNeeded(for: session)
+        wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace)
+    }
+
+    /// Retarget engine events without restarting session-owned monitors.
+    private func wireSessionCallbacks(engine: any TerminalEngine, session: Session, workspace: Workspace) {
         // Paste-time upload routing. Deliberately `sshWorkspaceHost` (spawn
         // pinned), NOT `remoteHost`: the latter is the status-bar display
         // signal with a marker→command-finished lifecycle that a remote
@@ -2526,12 +2632,23 @@ final class WorkspaceStore {
         engine.onTitleChange = { [weak self, weak session] title in
             guard let session else { return }
             if session.consumeShellControlTitle(title) { return }
+            if title.hasPrefix(AgentLaunchExitMarker.prefix) {
+                if let result = AgentLaunchExitMarker.parse(title),
+                   let launch = session.pendingAgentLaunch, launch.id == result.id {
+                    let ranAgent = launch.isAgent || session.awaitingAgentExitOutcome || session.transientAgent != nil || !session.agent.isShell
+                    session.pendingAgentLaunch = nil
+                    session.reportedAgentLaunchExit = true
+                    self?.finishShellCommand(session, exit: result.exit, duration: 0, ranAgent: ranAgent)
+                }
+                return
+            }
             // A `agentpad-command:*` title is the preexec-reported command line,
             // not a visible title. Checked first: it's by far the most frequent
             // marker (one per command). Riding this stream rather than the
             // socket is what guarantees it lands before the OSC 133;D result it
             // labels — see `CommandMarker`.
             if let command = CommandMarker.parseTitle(title) {
+                session.reportedAgentLaunchExit = false
                 session.lastCommandText = command
                 return
             }
@@ -2580,54 +2697,10 @@ final class WorkspaceStore {
             self.activateTab(session, in: workspace)
         }
         engine.onCommandFinished = { [weak self, weak session] exit, duration in
-            guard let session else { return }
-            // A remote agent surfaced via an OSC marker (transientAgent) emits
-            // no `ended` marker when the ssh drops abnormally (network loss,
-            // killed connection), so command-finished stays its safety net.
-            // Safe even though a REMOTE shell integration's 133;D also lands
-            // here: while a remote agent runs it owns the remote foreground,
-            // so no remote prompt (hence no D) can fire mid-agent.
-            // `remoteHost` is different — it must survive remote-command D's
-            // for the whole connection, so it's cleared by the wrapper's
-            // logout marker in onTitleChange, NOT here.
-            if session.transientAgent != nil {
-                session.transientAgent = nil
-                session.activityState = .idle
-            }
-            // Codex blocks the shell while it runs, so this firing means Codex
-            // exited (or any other command finished) — drop the usage gauge and
-            // stop watching the now-static rollout. Reliable even on an abnormal
-            // codex exit where the `ended` hook never fires, since the shell
-            // always returns to the prompt. stop() is unconditional (a true
-            // no-op for sessions that never started a watcher) so it also frees
-            // the fd when codex exited before its first `token_count` — e.g. an
-            // auth failure or `codex --help`, where `codexUsage` stayed nil.
-            if session.codexUsage != nil { session.codexUsage = nil }
-            self?.codexUsageMonitor.stop(sessionId: session.id)
-            // Kiro has returned control to the shell too, so its full ACP
-            // trace is now static and can be removed after the id was saved.
-            self?.kiroConversationMonitor.stop(sessionId: session.id, removeRecord: true)
-            session.lastCommandExit = exit
-            session.lastCommandDuration = duration
-            // Inspector snapshot — taken here (completion), NOT cleared on
-            // input like the pair above. Exit-less results (a shell that
-            // omits the 133;D field) are skipped, matching the old
-            // `lastCommandExit != nil` display gate.
-            if let exit {
-                session.lastCompletedCommand = .init(
-                    text: session.lastCommandText,
-                    exit: exit,
-                    duration: duration
-                )
-            }
-            // A non-zero exit on a backgrounded tab is worth a nudge;
-            // AppDelegate gates on visibility + the notifications setting.
-            if let exit, exit != 0 { self?.onSessionAlert(session.id, .failure) }
-            // A finished command may have changed the working tree (commit /
-            // git add / file edits) or installed a venv / dropped an .nvmrc.
-            // Refresh so the bar doesn't lie.
-            self?.refreshGitStatus(for: session)
-            self?.refreshEnvironment(for: session)
+            guard let session, session.pendingAgentLaunch == nil, !session.reportedAgentLaunchExit else { return }
+            let ranAgent = session.awaitingAgentExitOutcome || session.transientAgent != nil
+                || (!session.agent.isShell && session.hookStateAt != .distantPast)
+            self?.finishShellCommand(session, exit: exit, duration: duration, ranAgent: ranAgent)
         }
         engine.onUserInput = { [weak session] in
             // libghostty exposes no command-START, so a keystroke (the first
@@ -2647,6 +2720,8 @@ final class WorkspaceStore {
         }
         engine.onDesktopNotification = { [weak self, weak session] title, body in
             guard let self, let session else { return }
+            session.notificationPhase = "program"
+            session.notificationEpisode += 1
             self.onSessionAlert(session.id, .programNotification(title: title, body: body))
         }
         engine.onLinkHover = { [weak session] url in
@@ -2676,13 +2751,71 @@ final class WorkspaceStore {
         }
     }
 
+    private func finishShellCommand(_ session: Session, exit: Int?, duration: TimeInterval, ranAgent: Bool) {
+        // A remote agent surfaced via an OSC marker (transientAgent) emits
+        // no `ended` marker when the ssh drops abnormally (network loss,
+        // killed connection), so command-finished stays its safety net.
+        // Safe even though a REMOTE shell integration's 133;D also lands
+        // here: while a remote agent runs it owns the remote foreground,
+        // so no remote prompt (hence no D) can fire mid-agent.
+        // `remoteHost` is different — it must survive remote-command D's
+        // for the whole connection, so it's cleared by the wrapper's
+        // logout marker in onTitleChange, NOT here.
+        if session.transientAgent != nil {
+            session.transientAgent = nil
+            session.activityState = .idle
+        }
+        // Codex blocks the shell while it runs, so this firing means Codex
+        // exited (or any other command finished) — drop the usage gauge and
+        // stop watching the now-static rollout. Reliable even on an abnormal
+        // codex exit where the `ended` hook never fires, since the shell
+        // always returns to the prompt. stop() is unconditional (a true
+        // no-op for sessions that never started a watcher) so it also frees
+        // the fd when codex exited before its first `token_count` — e.g. an
+        // auth failure or `codex --help`, where `codexUsage` stayed nil.
+        if session.codexUsage != nil { session.codexUsage = nil }
+        self.codexUsageMonitor.stop(sessionId: session.id)
+        // Kiro has returned control to the shell too, so its full ACP
+        // trace is now static and can be removed after the id was saved.
+        self.kiroConversationMonitor.stop(sessionId: session.id, removeRecord: true)
+        session.lastCommandExit = exit
+        session.lastCommandDuration = duration
+        // Inspector snapshot — taken here (completion), NOT cleared on
+        // input like the pair above. Exit-less results (a shell that
+        // omits the 133;D field) are skipped, matching the old
+        // `lastCommandExit != nil` display gate.
+        if let exit {
+            session.lastCompletedCommand = .init(
+                text: session.lastCommandText,
+                exit: exit,
+                duration: duration
+            )
+        }
+        // A non-zero exit on a backgrounded tab is worth a nudge;
+        // AppDelegate gates on visibility + the notifications setting.
+        self.onSessionWaitingEnded(session.id)
+        let agentExited = ranAgent
+        session.awaitingAgentExitOutcome = false
+        session.notificationPhase = "exit"
+        session.notificationEpisode += 1
+        if let exit, exit != 0 { self.onSessionAlert(session.id, .failure) }
+        else if agentExited { self.onSessionAlert(session.id, .completed) }
+        if agentExited { session.agent = .terminal; session.activityState = .idle }
+        // A finished command may have changed the working tree (commit /
+        // git add / file edits) or installed a venv / dropped an .nvmrc.
+        // Refresh so the bar doesn't lie.
+        self.refreshGitStatus(for: session)
+        self.refreshEnvironment(for: session)
+    }
+
     private func applyAgentStatusMarker(agent: AgentTemplate, event: HookEvent, session: Session) {
         let agentBefore = session.agent.id
         if event == .ended {
             if session.transientAgent?.id == agent.id || session.transientAgent?.baseAgentId == agent.id {
-                // Remote agent done — inbox completion before clearing, so
-                // displayAgent still resolves to the remote agent.
-                onSessionAlert(session.id, .completed)
+                // The remote wrapper reports no exit code; a local command
+                // result may arrive only when SSH closes. Complete before
+                // clearing so displayAgent still resolves to the remote agent.
+                handleAgentEnded(session, awaitExitOutcome: false)
                 session.transientAgent = nil
             }
             if session.agent.id == agent.id || session.agent.baseAgentId == agent.id {
@@ -2692,10 +2825,8 @@ final class WorkspaceStore {
             session.transientAgent = agent
         }
 
-        if session.activityState != event.activityState {
-            session.activityState = event.activityState
-            if event.activityState == .attention { onSessionAlert(session.id, .attention) }
-        }
+        applyNotificationTransition(session, state: event.activityState,
+                                    reason: event == .turnComplete ? .completion : event == .turnFailure ? .failure : .input)
         if session.agent.id != agentBefore { scheduleSave() }
     }
 
@@ -2909,6 +3040,7 @@ final class WorkspaceStore {
     /// surrender variant: the destination store re-wires the session, so
     /// the engine stays alive and agent records survive.
     private func teardownSessionMonitors(_ session: Session, keepForTransfer: Bool = false) {
+        if !keepForTransfer { onSessionWaitingEnded(session.id) }
         removeGitWatch(sessionId: session.id)
         codexUsageMonitor.stop(sessionId: session.id)
         kiroConversationMonitor.stop(sessionId: session.id, removeRecord: !keepForTransfer)

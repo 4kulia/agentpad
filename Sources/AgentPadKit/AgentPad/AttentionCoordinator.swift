@@ -9,6 +9,13 @@ final class AttentionCoordinator {
     static let shared = AttentionCoordinator()
 
     var notificationManager: NotificationManager?
+    var navigation: NotificationNavigation?
+    var terminalFocused: (UUID) -> Bool = { _ in false }
+    var terminalExists: (UUID) -> Bool = { _ in false }
+    private var refreshTask: Task<Void, Never>?
+    var observedScopes: Set<AttentionScope> = []
+    var refreshing = false
+    var sourcesReady = false
     /// Focus one of our own tabs (wired to the same reveal path notifications use).
     var activateOwn: (UUID) -> Void = { _ in }
 
@@ -42,6 +49,18 @@ final class AttentionCoordinator {
     init() {}
 
     func start() {
+        let ledger = AttentionLedger.shared
+        ledger.delivery = notificationManager
+        ledger.preferences = { AgentPadSettingsModel.shared.notificationPreferences }
+        ledger.isFocused = { [weak self] in self?.focused($0) ?? false }
+        ledger.isValid = { [weak self] in self?.valid($0) ?? false }
+        ledger.onChange = { [weak self] in self?.refreshBadge() }
+        refreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.refreshSources()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
         ExternalSessionMonitor.shared.onRefresh = { [weak self] sessions in
             self?.externalSessionsRefreshed(sessions)
         }
@@ -117,63 +136,28 @@ final class AttentionCoordinator {
     }
 
     private func externalSessionsRefreshed(_ sessions: [ExternalAgentSession]) {
-        updateBadge(external: sessions)
         let waiting = sessions.filter { $0.monitorState == .attention }
         let keys = Set(waiting.map(Self.episodeKey))
-        guard let seen = seenWaitingEpisodes else {
-            seenWaitingEpisodes = keys
-            return
+        let first = seenWaitingEpisodes == nil
+        for session in waiting {
+            var event = AttentionEvent(source: "external", object: session.id, episode: Self.episodeKey(session),
+                                       kind: .input, destination: .external(session.id))
+            event.isRead = first
+            if first { AttentionLedger.shared.metadata.update(event.id) { $0.delivered = true } }
+            AttentionLedger.shared.upsert(event)
         }
-        for session in waiting where !seen.contains(Self.episodeKey(session)) {
-            notifyWaiting(session)
-        }
-        // Forget episodes that ended, so the set stays small.
+        let ids = Set(waiting.map { AttentionEvent(source: "external", object: $0.id, episode: Self.episodeKey($0), kind: .input, destination: .external($0.id)).id })
+        AttentionLedger.shared.reconcile(source: "external", keeping: ids)
         seenWaitingEpisodes = keys
+        refreshBadge()
     }
 
     /// AgentPad: recount now, e.g. when a team call waits for a decision.
     func refreshBadge() { updateBadge(external: ExternalSessionMonitor.shared.sessions) }
 
     private func updateBadge(external: [ExternalAgentSession]) {
-        let count = Self.waitingTargets(own: AgentMonitor.shared.entries, external: external).count
-            + TeamService.shared.calls.awaitingDecision.count
-            + TeamService.shared.calls.pendingAccess.count
-            + ClaudeVersionApprovals.shared.pending.count
-            // F4: mentions not read, of channels that may be seen.
-            + ChatNotifications.mentionsForBadge()
+        let count = AttentionLedger.shared.pendingCount + ChatNotifications.mentionsForBadge()
         let label = count > 0 ? "\(count)" : nil
-        if NSApp.dockTile.badgeLabel != label { NSApp.dockTile.badgeLabel = label }
-    }
-
-    private func notifyWaiting(_ session: ExternalAgentSession) {
-        let settings = AgentPadSettingsModel.shared
-        guard settings.notificationsEnabled, settings.notifyOnAttention else { return }
-        // Skip only when that exact tab is in front of the user: its terminal
-        // is frontmost AND the front window's selected tab is this tty.
-        guard let host = ProcessInfoReader.hostingApp(of: session.pid),
-              host.processIdentifier == NSWorkspace.shared.frontmostApplication?.processIdentifier,
-              let tty = session.tty
-        else {
-            postWaiting(session)
-            return
-        }
-        Task { @MainActor in
-            let frontTTY = await TerminalFocuser.frontTabTTY(of: host.bundleIdentifier)
-            // Re-check after the await: the user may have switched apps meanwhile.
-            let stillFront = host.processIdentifier == NSWorkspace.shared.frontmostApplication?.processIdentifier
-            if !stillFront || frontTTY != "/dev/\(tty)" {
-                postWaiting(session)
-            }
-        }
-    }
-
-    private func postWaiting(_ session: ExternalAgentSession) {
-        var reason = ""
-        if case .waiting(let why?) = session.status { reason = " — \(why)" }
-        notificationManager?.postExternal(
-            title: "Claude Code needs you\(reason)",
-            body: "\(session.displayTitle) · \(session.cwd.lastPathComponent)",
-            externalSessionId: session.id
-        )
+        if NSApp?.dockTile.badgeLabel != label { NSApp?.dockTile.badgeLabel = label }
     }
 }

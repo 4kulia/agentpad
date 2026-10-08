@@ -72,17 +72,18 @@ final class TeamReviewC5Tests: XCTestCase {
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker), "it never ran anywhere")
 
-        // The same through the runner: "did not start".
+        // The runner now rejects an uninspectable folder before spawn preparation.
         let script = root.appendingPathComponent("claude").path
         try "#!/bin/sh\ntouch \(marker)\n".write(toFile: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script)
         let agent = TeamPublishedAgent(name: "x", description: "d", folder: long)
         let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false, callerName: "M", callerProject: nil)
+        let process = TeamValueBox<TeamProcessStart>()
         do {
-            _ = try await ClaudeCodeRunner(fixturePath: script).run(request, onActivity: { _ in }, onProcessStarted: { _ in })
+            _ = try await ClaudeCodeRunner(fixturePath: script).run(request, onActivity: { _ in }, onProcessStarted: { process.set($0) })
             XCTFail("it started")
-        } catch TeamRunnerError.didNotStart {
-        } catch { XCTFail("\(error)") }
+        } catch { XCTAssertEqual(error as? ChatAttachmentError, .folders) }
+        XCTAssertNil(process.get(), "folder validation must finish before a child is created")
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker))
     }
 

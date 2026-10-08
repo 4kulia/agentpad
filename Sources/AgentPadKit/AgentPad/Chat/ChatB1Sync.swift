@@ -11,6 +11,7 @@ final class ChatB1Sync {
     let token: String
     weak var socket: ChatSocket?
     private(set) var capabilities: Set<String> = []
+    private var configured = false
     private(set) var limits = ChatB1.Limits()
     var onCapabilities: (ChatServerInfo) -> Void = { _ in }
     var onAccessRefused: (Int) -> Void = { _ in }
@@ -37,14 +38,15 @@ final class ChatB1Sync {
     private func writeDB<T>(_ body: (Database) throws -> T) throws -> T { try store.queue.write(body) }
     func configure(_ capabilities: Set<String>, limits: ChatB1.Limits? = nil, reconnect: Bool = false) {
         let next = capabilities.intersection(ChatB1.capabilities)
-        let changed = next != self.capabilities
+        let changed = !configured || next != self.capabilities
+        configured = true
         self.capabilities = next
         if let limits { self.limits = limits }
         guard changed || reconnect else { return }
         cancelReads()
         try? writeDB { db in
             try ChatB1.setParticipation(db, enabled: next.contains("chat.thread_participation"))
-            try ChatB1.reset(db)
+            if changed { try ChatB1.reset(db) } else { try ChatB1.refresh(db) }
         }
         schedule()
     }

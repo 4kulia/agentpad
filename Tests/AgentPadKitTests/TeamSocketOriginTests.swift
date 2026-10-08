@@ -209,7 +209,7 @@ final class TeamSocketOriginTests: XCTestCase {
         var seen: [String] = []
         let server = HookServer(socketPath: socketPath) { message in
             switch message {
-            case .conversationId(let id, _, _): seen.append("conversation \(id)")
+            case .conversationId(let id, _, _, _): seen.append("conversation \(id)")
             default: seen.append("other")
             }
         }

@@ -6,7 +6,16 @@ enum AgentAnswerTranscript {
     enum Agent: Sendable { case claude, codex }
     enum Problem: String, Error, LocalizedError {
         // AgentPad: ID discovery alone does not establish export provenance.
-        case unbound = "Copy and Forward are available once this tab's Claude answers again."
+        case unbound = "Copy and Forward: no verified Claude hook has been received for this tab since it opened."
+        case hookIdentity = "Copy and Forward: the hook sender or its parent could not be authenticated. Wait for a new Claude answer."
+        case hookAncestry = "Copy and Forward: the hook is not a verified descendant of this tab's Claude."
+        case claudeSignature = "Copy and Forward: no Claude ancestor with a trusted Anthropic signature was found for the hook."
+        case claudeTerminal = "Copy and Forward: the hook's Claude process has no controlling terminal."
+        case claudeBackground = "Copy and Forward: Claude is outside the terminal's foreground process group."
+        case ambiguousClaude = "Copy and Forward: more than one possible Claude session is attached to this terminal."
+        case multiplexer = "Copy and Forward: tmux, screen or another terminal multiplexer prevents verifying a single Claude session."
+        case processUnavailable = "Copy and Forward: a process exited or changed during hook verification. Wait for a new Claude answer."
+        case foregroundMismatch = "Copy and Forward: the foreground process is neither this Claude nor its launch shell."
         case unverified = "AgentPad cannot verify this Codex journal. Copy selected text from the terminal."
         case missing = "The conversation journal for this tab was not found. Copy from the terminal or retry after the agent has saved its answer."
         case unknown = "This conversation journal uses an unsupported or damaged format. No answer was copied."

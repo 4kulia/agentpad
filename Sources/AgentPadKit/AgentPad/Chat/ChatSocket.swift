@@ -178,11 +178,66 @@ final class ChatSocket {
         case needsSignIn(String)
         /// The server does not fit, or a stream cannot be synchronized.
         case failed(String)
+
+        /// Associated errors may contain server text; diagnostics never do.
+        var logName: String {
+            switch self {
+            case .disconnected: "disconnected"
+            case .connecting: "connecting"
+            case .connected: "connected"
+            case .needsSignIn: "needsSignIn"
+            case .failed: "failed"
+            }
+        }
+    }
+
+    enum ReconnectReason: String {
+        case requested, wake, networkPathChanged, journalChanged
+        case serverCheckFailed, handshakeTimeout, remoteClose, transportFailure
+        case helloRejected, resyncFailed, heartbeatTimeout
     }
 
     static let subprotocol = "agentpad.chat.v1"
 
-    private(set) var state: State = .disconnected
+    private(set) var state: State = .disconnected {
+        didSet {
+            guard state != oldValue else { return }
+            trace("state=\(oldValue.logName)->\(state.logName)")
+            updateOfflineIndicator()
+        }
+    }
+    /// Presentation only: actions still require the actual connected state.
+    private(set) var showsOffline = true
+    var offlineDelay: Duration = .seconds(2)
+    private var offlineTimer: Task<Void, Never>?
+    var log: (String) -> Void = { line in
+        try? FileHandle.standardError.write(contentsOf: Data((line + "\n").utf8))
+    }
+
+    private func trace(_ event: String) { log("[ChatSocket] epoch=\(connection) \(event)") }
+
+    private func updateOfflineIndicator() {
+        switch state {
+        case .connected:
+            offlineTimer?.cancel()
+            offlineTimer = nil
+            showsOffline = false
+        case .disconnected where running, .connecting where running:
+            // One deadline spans backoff and every subsequent attempt.
+            guard !showsOffline, offlineTimer == nil else { return }
+            let delay = offlineDelay
+            offlineTimer = Task { [weak self] in
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled, let self else { return }
+                self.offlineTimer = nil
+                self.showsOffline = true
+            }
+        default:
+            offlineTimer?.cancel()
+            offlineTimer = nil
+            showsOffline = true
+        }
+    }
     /// Streams subscribed but not yet caught up: the UI says "syncing".
     private(set) var syncing: Set<String> = []
     /// Every followed stream is caught up and none is stuck: the one place
@@ -367,17 +422,20 @@ final class ChatSocket {
     func stop() {
         running = false
         reconnecting?.cancel()
+        trace("stop")
         drop()
         state = .disconnected
+        updateOfflineIndicator()
     }
 
     /// A new network or a wake. `force` (the system said so) reconnects even
     /// a connection that looks alive — it may be dead on the old path
     /// (review C-21); otherwise only one that is not connected.
-    func reconnectNow(force: Bool = false) {
+    func reconnectNow(force: Bool = false, reason: ReconnectReason = .requested) {
         guard running else { return }
         if case .needsSignIn = state { return }
         guard force || state != .connected || now() - lastFrame > heartbeat else { return }
+        trace("reconnect reason=\(reason.rawValue) force=\(force)")
         attempts = 0
         reconnecting?.cancel()
         drop()
@@ -405,7 +463,7 @@ final class ChatSocket {
                 return
             } catch {
                 guard id == self.connection else { return }
-                return self.scheduleReconnect(after: nil)
+                return self.scheduleReconnect(after: nil, reason: .serverCheckFailed)
             }
             guard id == self.connection, self.running, !Task.isCancelled else { return }
             self.open(id)
@@ -425,7 +483,7 @@ final class ChatSocket {
         handshake = Task { [weak self] in
             try? await Task.sleep(for: limit)
             guard let self, !Task.isCancelled, self.connection == id, !self.helloSeen else { return }
-            self.scheduleReconnect(after: nil)
+            self.scheduleReconnect(after: nil, reason: .handshakeTimeout)
         }
         let (stream, continuation) = AsyncStream<ChatFrame>.makeStream()
         frames = continuation
@@ -457,7 +515,10 @@ final class ChatSocket {
         watchdog?.cancel()
         frames?.finish()
         frames = nil
-        transport?.close(code: 1000)
+        if let transport {
+            trace("close direction=local code=1000")
+            transport.close(code: 1000)
+        }
         transport = nil
         syncing = []
         catchingUp = []
@@ -469,11 +530,13 @@ final class ChatSocket {
         lifecycle?.socketDisconnected()
     }
 
-    private func scheduleReconnect(after delay: TimeInterval?) {
+    private func scheduleReconnect(after delay: TimeInterval?, reason: ReconnectReason) {
+        trace("reconnect reason=\(reason.rawValue)")
         drop()
         guard running else { return }
         attempts += 1
         let wait = delay ?? retryDelay(attempts)
+        trace("retry attempt=\(attempts) delay=\(wait)")
         reconnecting = Task { [weak self] in
             try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled else { return }
@@ -490,13 +553,16 @@ final class ChatSocket {
             guard let frame = try? ChatFrame.decode(data) else { return }
             frames?.yield(frame)
         case .closed(let code):
+            trace("close direction=remote code=\(code)")
             switch code {
             case 4401: signedOut("The server closed this session. Sign in again.")
-            case 1012: scheduleReconnect(after: restartDelay())
-            default: scheduleReconnect(after: nil)
+            case 1012: scheduleReconnect(after: restartDelay(), reason: .remoteClose)
+            default: scheduleReconnect(after: nil, reason: .remoteClose)
             }
         case .failed(_, let status):
-            if status == 401 { signedOut("The server did not accept this session. Sign in again.") } else { scheduleReconnect(after: nil) }
+            trace("transportFailure httpStatus=\(status.map(String.init) ?? "none")")
+            if status == 401 { signedOut("The server did not accept this session. Sign in again.") }
+            else { scheduleReconnect(after: nil, reason: .transportFailure) }
         }
     }
 
@@ -522,7 +588,7 @@ final class ChatSocket {
             if let lifecycle {
                 let done = await lifecycle.socketHello(context)
                 guard id == connection else { return }
-                guard done else { return scheduleReconnect(after: nil) }
+                guard done else { return scheduleReconnect(after: nil, reason: .helloRejected) }
             }
             handshake?.cancel()
             // Liveness counts from here, for the established connection.
@@ -592,7 +658,7 @@ final class ChatSocket {
             } catch {
                 // Not taken: not counted as done (review C-13); try again later.
                 guard id == connection else { return }
-                return scheduleReconnect(after: nil)
+                return scheduleReconnect(after: nil, reason: .resyncFailed)
             }
             // The sink followed the stream again itself (one owner of that).
             guard id == connection, owners[stream] === sink else { return }
@@ -639,7 +705,7 @@ final class ChatSocket {
                 try? await Task.sleep(for: self.heartbeat / 2)
                 guard !Task.isCancelled, self.state == .connected else { return }
                 if self.now() - self.lastFrame > self.heartbeat * 2 {
-                    self.scheduleReconnect(after: 0)
+                    self.scheduleReconnect(after: 0, reason: .heartbeatTimeout)
                     return
                 }
             }

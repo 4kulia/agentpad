@@ -141,6 +141,8 @@ struct ChatRunRecord: Codable, Equatable, Sendable, FetchableRecord, Persistable
     var startedAt: Date
     var endedAt: Date?
     var outcome: Outcome?
+    /// An allowlisted runner code, never stderr or a localized message.
+    var launchFailure: ClaudeLaunchDiagnostic.Failure? = nil
     /// Being stopped for this reason when the app had to quit.
     var stopReason: String?
     /// When its processes were confirmed gone — by this app's own stop, or by
@@ -166,6 +168,7 @@ struct ChatRunRecord: Codable, Equatable, Sendable, FetchableRecord, Persistable
 
     enum CodingKeys: String, CodingKey {
         case pid, pgid, outcome, kind, org
+        case launchFailure = "launch_failure"
         case channelId = "channel_id", threadRootId = "thread_root_id", resultErased = "result_erased"
         case channelRevoked = "channel_revoked"
         case runId = "run_id", requestId = "request_id", approvalId = "approval_id", agentId = "agent_id"
@@ -336,6 +339,7 @@ extension ChatJournal {
     /// owed for it, inserted in the same transaction (D4: the chain of facts).
     @discardableResult
     func finish(_ runId: String, _ outcome: ChatRunRecord.Outcome, at: Date = Date(), result: String? = nil,
+                diagnosis: ClaudeLaunchDiagnostic.Failure? = nil,
                 facts: ((Database) throws -> Void)? = nil) throws -> Bool {
         try queue.write { db in
             // A run of an approval set aside (another call under its id):
@@ -345,8 +349,8 @@ extension ChatJournal {
                                           arguments: [runId]) == "initial"
             // A confirmed channel revocation is permanent for this run, even
             // when the process ends later during Disconnect or a snapshot.
-            try db.execute(sql: "UPDATE runs SET outcome = ?, ended_at = ?, result_text = CASE WHEN result_erased = 1 THEN NULL ELSE ? END WHERE run_id = ? AND outcome IS NULL",
-                           arguments: [outcome.rawValue, at, own ? result : nil, runId])
+            try db.execute(sql: "UPDATE runs SET outcome = ?, ended_at = ?, launch_failure = ?, result_text = CASE WHEN result_erased = 1 THEN NULL ELSE ? END WHERE run_id = ? AND outcome IS NULL",
+                           arguments: [outcome.rawValue, at, diagnosis?.rawValue, own ? result : nil, runId])
             guard db.changesCount == 1 else { return false }
             if own { try facts?(db) }
             return true

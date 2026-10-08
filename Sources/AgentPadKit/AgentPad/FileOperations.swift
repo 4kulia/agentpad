@@ -384,6 +384,9 @@ enum FileOperations {
             alert.suppressionButton?.title = "Apply to all"
         }
         NSApp.activate()
+        let attentionID = UUID()
+        PendingConfirmations.shared.register(attentionID, window: alert.window)
+        defer { PendingConfirmations.shared.end(attentionID) }
         let choice: ConflictChoice
         switch alert.runModal() {
         case .alertFirstButtonReturn: choice = .keepBoth

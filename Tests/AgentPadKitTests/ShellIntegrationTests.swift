@@ -39,7 +39,8 @@ final class ShellIntegrationTests: XCTestCase {
 
         for (event, state) in [
             "UserPromptSubmit": "running",
-            "Stop": "attention",
+            "Stop": "turn_complete",
+            "StopFailure": "turn_failure",
             "Notification": "attention",
             "SessionEnd": "ended",
         ] {
@@ -402,7 +403,7 @@ final class ShellIntegrationTests: XCTestCase {
         let stop = try XCTUnwrap(hooks["Stop"] as? [[String: Any]])
         XCTAssertEqual(stop.count, 2, "AgentPad's entry must be added alongside the user's, not replace it")
         XCTAssertTrue(String(describing: stop).contains("user-hook"))
-        XCTAssertTrue(String(describing: stop).contains("reasonix attention"))
+        XCTAssertTrue(String(describing: stop).contains("reasonix turn_complete"))
     }
 
     func testReasonixHooksMapEveryLifecycleAndToolEvent() throws {
@@ -416,8 +417,8 @@ final class ShellIntegrationTests: XCTestCase {
         let expected: [String: String] = [
             "SessionStart":     "reasonix running",
             "UserPromptSubmit": "reasonix running",
-            "Stop":             "reasonix attention",
-            "StopFailure":      "reasonix attention",
+            "Stop":             "reasonix turn_complete",
+            "StopFailure":      "reasonix turn_failure",
             "Notification":     "reasonix attention",
             "SessionEnd":       "reasonix ended",
         ]
@@ -462,7 +463,7 @@ final class ShellIntegrationTests: XCTestCase {
         XCTAssertNotNil(object["user-hook"])
         let managed = try XCTUnwrap(object["agentpad-managed-do-not-edit"] as? [String: Any])
         XCTAssertTrue(String(describing: managed["PreInvocation"]).contains("agy running --hook-stdin"))
-        XCTAssertTrue(String(describing: managed["Stop"]).contains("agy attention --hook-stdin"))
+        XCTAssertTrue(String(describing: managed["Stop"]).contains("agy turn_complete --hook-stdin"))
     }
 
     func testKimiManagedTomlBlockIsIdempotentAndPreservesUserConfig() throws {
@@ -484,7 +485,7 @@ final class ShellIntegrationTests: XCTestCase {
         XCTAssertTrue(twice.contains("user-notify"))
         XCTAssertEqual(twice.components(separatedBy: "hooks begin").count - 1, 1)
         XCTAssertTrue(twice.contains("kimi running --hook-stdin"))
-        XCTAssertTrue(twice.contains("kimi attention --hook-stdin"))
+        XCTAssertTrue(twice.contains("kimi turn_complete --hook-stdin"))
     }
 
     func testKimiManagedTomlRejectsHalfMarker() {
@@ -644,6 +645,29 @@ final class ShellIntegrationTests: XCTestCase {
         // before, restore it after, so the first prompt's `$?` is the agent's.
         XCTAssertTrue(block.contains("_agentpad_status=$?"), "must capture the agent exit status before the revert ping")
         XCTAssertTrue(block.contains("( exit $_agentpad_status )"), "must restore the agent exit status after the ping")
+    }
+
+    func testAutoLaunchReportsExitBeforeZshFirstPromptWithoutCommandFinished() throws {
+        let directory = try XCTUnwrap(AgentPadShellIntegration.zshDirectory)
+        let rc = try String(contentsOfFile: (directory as NSString).appendingPathComponent(".zshrc"), encoding: .utf8)
+        let start = try XCTUnwrap(rc.range(of: "__agentpad_133_first=1")).lowerBound
+        let end = try XCTUnwrap(rc.range(of: "add-zsh-hook precmd __agentpad_133_precmd")).lowerBound
+        let hooks = String(rc[start..<end])
+        for exit in [0, 9] {
+            let process = Process(), output = Pipe(), launch = UUID().uuidString
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = ["-f", "-c", hooks + "\n_agentpad_env_status() { return 0; }\n"
+                                 + AgentPadShellIntegration.agentLaunchBlock + "\n__agentpad_133_precmd"]
+            process.environment = ["PATH": "/usr/bin:/bin", "AGENTPAD_AGENT": "(exit \(exit))", "AGENTPAD_LAUNCH_ID": launch]
+            process.standardOutput = output
+            try process.run()
+            let bytes = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            let text = String(decoding: bytes, as: UTF8.self)
+            XCTAssertTrue(text.contains("\u{1b}]2;agentpad-launch-exit:\(launch):\(exit)\u{7}"))
+            XCTAssertTrue(text.contains("\u{1b}]133;A;cl=line\u{7}"))
+            XCTAssertFalse(text.contains("\u{1b}]133;D"), "the first zsh prompt deliberately has no command result")
+        }
     }
 
     func testEnvStatusBlockReportsLiveShellEnvironment() {

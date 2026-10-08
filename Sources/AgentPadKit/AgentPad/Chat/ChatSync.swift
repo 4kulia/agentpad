@@ -121,6 +121,7 @@ final class ChatSync: ChatStreamSink {
     /// A message deleted: its notice goes (F4).
     var onMessageGone: @MainActor (_ channel: String, _ messageId: String) -> Void = { _, _ in }
     /// A message the live feed brought, wholly in the cache now (F4).
+    var onLiveEvent: @MainActor (ChatEvent) -> Void = { _ in }
     var onLiveMessage: @MainActor (_ channel: String, _ messageId: String) -> Void = { _, _ in }
     /// Pause before single read `n` again; shortened in tests.
     var oneRetryDelay: (Int) -> TimeInterval = { n in pow(2, Double(n)) }
@@ -471,6 +472,7 @@ final class ChatSync: ChatStreamSink {
             return false
         }
         guard applied == .applied || applied == .passedOver else { return true }
+        if applied == .applied, !reading, socket?.syncing.contains(event.stream) == false { onLiveEvent(event) }
         // F4: a post the live feed brought — not a catch-up, not during a snapshot — may owe a notice.
         if event.type == "message.post", event.stream.hasPrefix("channel:"), let id = event.body["message_id"]?.string {
             let channel = String(event.stream.dropFirst("channel:".count))
@@ -665,7 +667,7 @@ final class ChatAccountFeed: ChatStreamSink {
     /// `account.membership_changed` of an organization.
     var onMembershipChanged: @MainActor (String) -> Void = { _ in }
     /// "A new device signed in to your account: <name>".
-    var onNotice: @MainActor (String) -> Void = { _ in }
+    var onNotice: @MainActor (ChatEvent) -> Void = { _ in }
     var retryDelay: (Int) -> TimeInterval = { n in max(1, min(60, pow(2, Double(n - 1)) * Double.random(in: 0.5...1.5))) }
 
     /// `/v1/me` is owed until it is read (review C-14); `resetCursor` moves
@@ -752,7 +754,7 @@ final class ChatAccountFeed: ChatStreamSink {
             readMeAgain()
         case "account.session_opened":
             guard event.body["session_id"]?.string != sessionId else { return true }
-            onNotice("A new device signed in to your account: \(event.body["device_name"]?.string ?? "unnamed")")
+            onNotice(event)
         default:
             break
         }
@@ -916,6 +918,31 @@ extension ChatSync {
             // Read: its notice decided now; not read — none (review F4b-3).
             if self?.oneLive.remove(id) != nil, last == .applied { self?.onLiveMessage(channel, id) }
             self?.onOneRead(id)
+        }
+    }
+
+    /// Inbox reads have their own bounded pagination, without moving either a
+    /// channel's event cursor or its feed/thread history cursor.
+    func readInboxPage(_ target: ChatInboxLoading.Key, before: Int?) async throws -> ChatMessagesPage {
+        guard !Task.isCancelled, !stopped, !needsSnapshot else { throw CancellationError() }
+        let epoch = socket?.epoch, revoked = revocations
+        let account = key.accountId, session = sessionId
+        guard try await store.queue.read({ try ChatInboxLoading.allowed($0, target: target, account: account, session: session) }) else {
+            throw CancellationError()
+        }
+        guard !Task.isCancelled, !stopped, !needsSnapshot, socket?.epoch == epoch,
+              revocations == revoked, sessionId == session else { throw CancellationError() }
+        do {
+            let page = try await api.messagesPage(key.orgId, channel: target.channel, before: before, token: token)
+            guard !Task.isCancelled, !stopped, !needsSnapshot, socket?.epoch == epoch,
+                  revocations == revoked, sessionId == session else {
+                throw CancellationError()
+            }
+            return page
+        } catch ChatAPIError.server(_, let code, _) where code == "forbidden" || code == "not_found" {
+            rightsInDoubt()
+            if code == "not_found" { onMembershipInDoubt() }
+            throw ChatInboxLoadError.unavailable
         }
     }
 

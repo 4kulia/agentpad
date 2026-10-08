@@ -14,6 +14,9 @@ final class ChatChannelModel {
         var messages: [ChatMessage] = []
         var replies: [String: Int] = [:]
         var replySummaries: [String: ChatReplySummary] = [:]
+        var unreadReplyCounts: [String: Int] = [:]
+        var unloadedUnreadReplyCount = 0
+        var firstUnloadedUnreadThread: String?
         var unreadID: String?
         var earlierUnread = false
         var boundaryDismissed = false
@@ -233,9 +236,16 @@ final class ChatChannelModel {
             !ids.contains(id) || boundary.map { windowBottom > $0.after + 1 } == true
         } ?? false
         let dismissed = try boundary.map { try ChatUnread.didSend(db, channel: channel, since: $0) } ?? false
+        let unreadReplies = try ChatUnread.unreadRepliesByRoot(db, channel: channel)
+        let loadedRoots = Set((rows + local).map(\.messageId))
+        let unloaded = unreadReplies.filter { !loadedRoots.contains($0.root) }
 
         let next: Int? = window?["history_next"]
-        return Feed(messages: rows + local, replies: replies, replySummaries: summaries, unreadID: earlierUnread ? nil : firstUnread, earlierUnread: earlierUnread, boundaryDismissed: dismissed, requests: try ChatChannelRequests.counts(db, channel: channel, roots: ids),
+        return Feed(messages: rows + local, replies: replies, replySummaries: summaries,
+                    unreadReplyCounts: Dictionary(uniqueKeysWithValues: unreadReplies.map { ($0.root, $0.count) }),
+                    unloadedUnreadReplyCount: unloaded.reduce(0) { $0 + $1.count }, firstUnloadedUnreadThread: unloaded.first?.root,
+                    unreadID: earlierUnread ? nil : firstUnread, earlierUnread: earlierUnread, boundaryDismissed: dismissed,
+                    requests: try ChatChannelRequests.counts(db, channel: channel, roots: ids),
                     hasOlder: older || next != nil, historyNext: next,
                     archived: try Bool.fetchOne(db, sql: "SELECT archived FROM channels WHERE channel_id = ?", arguments: [channel]) ?? true)
     }
@@ -504,9 +514,9 @@ final class ChatChannelModel {
     /// `agents`: the channel's agents seen now — those `text` names are offered to ask (F5).
     func send(_ text: String, root: String?, members: [(account: String, handle: String)], agents: [ChatChannelAgent] = [],
               draftVersion: String? = nil, mentionOnly: Bool = false, context: [ChatMessage] = []) -> Bool {
-        if let problem = Self.textProblem(text) { self.problem = problem; return false }
+        if let problem = Self.textProblem(text), !(text.isEmpty && service.attachments(key)?.files(channel: channel, root: root).isEmpty == false) { self.problem = problem; return false }
         do {
-            if service.supports("chat.channel_ux1", key: key) {
+            if service.supports("chat.channel_ux1", key: key) || service.attachments(key)?.files(channel: channel, root: root).isEmpty == false {
                 if draftVersion == nil { saveDraft(text, root: root) }
                 guard let version = draftVersion ?? self.draftVersion(root: root) else { return false }
                 _ = try service.sendChannel(key, channel: channel, root: root, text: text,
@@ -852,6 +862,7 @@ final class ChatChannelModel {
         var version: String?
         var mentionOnly = false
         var contextIds = Set<String>()
+        var attachmentSelection: [ChatAttachmentManifest] = []
     }
 
     func composerDraft(root: String?) -> Draft {
@@ -865,7 +876,8 @@ final class ChatChannelModel {
     nonisolated private static func readDraft(_ row: Row) -> Draft {
         let context: String = row["context_ids"]
         return Draft(text: row["text"], version: row["version"], mentionOnly: row["mention_only"],
-                     contextIds: (try? JSONDecoder().decode(Set<String>.self, from: Data(context.utf8))) ?? [])
+                     contextIds: (try? JSONDecoder().decode(Set<String>.self, from: Data(context.utf8))) ?? [],
+                     attachmentSelection: (try? JSONDecoder().decode([ChatAttachmentManifest].self, from: Data(((row["attachment_selection"] as String?) ?? "[]").utf8))) ?? [])
     }
 
     func draft(root: String?) -> String {
@@ -879,12 +891,12 @@ final class ChatChannelModel {
     /// Kept only while the channel's card is and the rights are not in doubt:
     /// a save made late — after the user left the team — writes nothing
     /// (review F3-p1-3).
-    func saveDraft(_ text: String, root: String?, mentionOnly: Bool? = nil, contextIds: Set<String>? = nil) {
+    func saveDraft(_ text: String, root: String?, mentionOnly: Bool? = nil, contextIds: Set<String>? = nil, attachmentSelection: [ChatAttachmentManifest]? = nil) {
         let channel = channel
         try? store?.queue.write { db in
             guard try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM channels WHERE channel_id = ?)", arguments: [channel]) == true,
                   try Bool.fetchOne(db, sql: "SELECT rights_in_doubt FROM meta WHERE id = 1") != true else { return }
-            if text.isEmpty {
+            if try text.isEmpty && ChatAttachments.drafts(db, channel: channel, root: root).isEmpty {
                 try db.execute(sql: "DELETE FROM drafts WHERE channel_id = ? AND thread_root_id = ?", arguments: [channel, root ?? ""])
             } else {
                 let row = try Row.fetchOne(db, sql: "SELECT * FROM drafts WHERE channel_id = ? AND thread_root_id = ?",
@@ -892,17 +904,21 @@ final class ChatChannelModel {
                 let previous = row.map(Self.readDraft) ?? Draft()
                 let mentionOnly = mentionOnly ?? previous.mentionOnly
                 let contextIds = contextIds ?? previous.contextIds
-                let unchanged = previous.text == text && previous.mentionOnly == mentionOnly && previous.contextIds == contextIds
+                let attachmentSelection = attachmentSelection ?? previous.attachmentSelection
+                let unchanged = previous.attachmentSelection == attachmentSelection && previous.text == text && previous.mentionOnly == mentionOnly && previous.contextIds == contextIds
                 let version = unchanged ? previous.version ?? UUID().uuidString.lowercased() : UUID().uuidString.lowercased()
                 let context = String(decoding: try JSONEncoder().encode(contextIds.sorted()), as: UTF8.self)
+                let attachments = String(decoding: try JSONEncoder().encode(attachmentSelection), as: UTF8.self)
                 try db.execute(sql: """
-                    INSERT INTO drafts (channel_id, thread_root_id, text, updated_at, version, mention_only, context_ids) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO drafts (channel_id, thread_root_id, text, updated_at, version, mention_only, context_ids, attachment_selection) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(channel_id, thread_root_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at,
-                        version = excluded.version, mention_only = excluded.mention_only, context_ids = excluded.context_ids
-                    """, arguments: [channel, root ?? "", text, Date().timeIntervalSince1970, version, mentionOnly, context])
+                        version = excluded.version, mention_only = excluded.mention_only, context_ids = excluded.context_ids, attachment_selection = excluded.attachment_selection
+                    """, arguments: [channel, root ?? "", text, Date().timeIntervalSince1970, version, mentionOnly, context, attachments])
             }
         }
     }
+
+    func attachmentProblem(_ error: Error) { problem = ChatAttachments.reason(error) }
 
     // MARK: Words
 
@@ -913,6 +929,10 @@ final class ChatChannelModel {
         case "channel_archived": return "The channel is archived"
         case "too_large": return "The message is too long"
         case "invalid_request": return "The server did not take it"
+        case "attachment_expired", "attachment_not_ready": return "The server reservation expired. Retry to upload the saved files again"
+        case "attachment_upload_failed": return "File upload failed. The files are saved locally; retry the message"
+        case "attachment_unconfirmed": return "The server was restored and this post was not confirmed. Saved files can be deleted"
+        case "capability_unavailable": return "Attachments are unavailable on this server. Your post is kept; retry when support returns"
         default: return "Not sent" + (code.map { " (\($0))" } ?? "")
         }
     }

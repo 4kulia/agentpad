@@ -1,168 +1,185 @@
 import AppKit
 import UserNotifications
 
-/// What kind of agent event warrants a notification. Drives the notification
-/// copy; both kinds only fire when the originating tab isn't currently visible.
 enum SessionAlertKind: Equatable {
-    /// The agent entered an attention (waiting-on-you) state.
-    case attention
-    /// The most recent command in the tab exited non-zero.
-    case failure
-    /// The agent finished / exited. Inbox-only — never posts a banner.
-    case completed
-    /// A terminal program posted its own notification (OSC 9 / OSC 777),
-    /// carrying its own text — rides the same alert seam as the fixed kinds.
+    case attention, failure, completed
     case programNotification(title: String, body: String)
 }
 
-/// Thin wrapper over `UNUserNotificationCenter` for AgentPad's agent
-/// notifications. `AppDelegate` decides *whether* to post (only for a tab the
-/// user can't currently see); this type owns the macOS plumbing — permission
-/// request, delivery, and routing a click back to the originating tab via
-/// `onActivate`.
+enum NotificationAuthorization: String, Sendable {
+    case unknown, authorized, denied, unavailable
+    var label: String {
+        switch self {
+        case .unknown: "Permission not requested"
+        case .authorized: "Allowed"
+        case .denied: "Denied in macOS"
+        case .unavailable: "Unavailable outside the app bundle"
+        }
+    }
+}
+
+struct NotificationPayload: Equatable, Sendable {
+    let id: String
+    let title: String
+    let body: String
+    let sound: Bool
+    var category = "attention.open"
+    var userInfo: [String: String] { ["locator": id] }
+}
+
+@MainActor
+protocol NotificationCenterClient: AnyObject {
+    func authorization() async -> NotificationAuthorization
+    func requestAuthorization() async -> Bool
+    func add(_ payload: NotificationPayload) async throws
+    func remove(_ ids: [String])
+    func identifiers() async -> [String]
+}
+
+@MainActor
+private final class SystemNotificationCenter: NotificationCenterClient {
+    let center: UNUserNotificationCenter
+    init(_ center: UNUserNotificationCenter) { self.center = center }
+    func authorization() async -> NotificationAuthorization {
+        switch await center.notificationSettings().authorizationStatus {
+        case .authorized, .provisional, .ephemeral: return .authorized
+        case .denied: return .denied
+        default: return .unknown
+        }
+    }
+    func requestAuthorization() async -> Bool { (try? await center.requestAuthorization(options: [.alert, .sound])) == true }
+    func add(_ payload: NotificationPayload) async throws {
+        let content = UNMutableNotificationContent()
+        content.title = payload.title; content.body = payload.body
+        content.categoryIdentifier = payload.category
+        content.userInfo = payload.userInfo
+        content.sound = payload.sound ? .default : nil
+        try await center.add(UNNotificationRequest(identifier: payload.id, content: content, trigger: nil))
+    }
+    func remove(_ ids: [String]) {
+        center.removePendingNotificationRequests(withIdentifiers: ids)
+        center.removeDeliveredNotifications(withIdentifiers: ids)
+    }
+    func identifiers() async -> [String] {
+        let pending = await center.pendingNotificationRequests().map(\.identifier)
+        let delivered = await center.deliveredNotifications().map(\.request.identifier)
+        return Array(Set(pending + delivered))
+    }
+}
+
+@MainActor @Observable
+final class NotificationAuthorizationModel {
+    static let shared = NotificationAuthorizationModel()
+    var status: NotificationAuthorization = .unknown
+}
+
+/// One serialized chain per locator. Revocation invalidates authorization and add
+/// continuations; a late add is removed before a replacement can be submitted.
 @MainActor
 final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
-    /// Invoked with the originating session id when the user clicks a
-    /// delivered notification. `AppDelegate` wires this to its reveal-tab
-    /// routing (deminiaturize → key → activate workspace + tab).
-    var onActivate: ((UUID) -> Void)?
-    /// AgentPad: clicked a banner about a session in another terminal.
-    var onActivateExternal: ((String) -> Void)?
+    var onActivateLocator: ((String) -> Void)?
+    private var client: (any NotificationCenterClient)?
+    private var revisions: [String: Int] = [:]
+    private var tasks: [String: Task<Void, Never>] = [:]
+    private var queued: [String: NotificationPayload] = [:]
+    private var authorizationTask: Task<Bool, Never>?
+    private var requestedAuthorization = false
+    private(set) var status: NotificationAuthorization = .unknown {
+        didSet { NotificationAuthorizationModel.shared.status = status }
+    }
 
-    /// `UNUserNotificationCenter` needs an app bundle: a bare `swift run`
-    /// binary (the dev build) has no bundle id and `current()` traps. Gate
-    /// every entry point on this so notifications simply no-op under
-    /// `swift run` and work in the packaged, bundle-id'd .app.
-    private let isAvailable = Bundle.main.bundleIdentifier != nil
-    private lazy var center = UNUserNotificationCenter.current()
+    init(client: (any NotificationCenterClient)? = nil) { self.client = client; super.init() }
 
-    /// Registers the delegate and requests banner/sound permission. Called
-    /// once at launch; macOS shows its permission prompt the first time.
     func start() {
-        guard isAvailable else { return }
-        // Set the delegate only. Permission is requested lazily on the first
-        // real post (see `requestAuthorizationIfNeeded`) — a user who disabled
-        // notifications shouldn't get the OS authorization prompt at launch.
-        center.delegate = self
-    }
-
-    /// Delivers a banner immediately. The session id rides `userInfo` so a
-    /// click can route back to the tab. Silently no-ops if the user denied
-    /// permission — the OS drops the request.
-    func post(title: String, body: String, sessionId: UUID) {
-        guard isAvailable else { return }
-        requestAuthorizationIfNeeded()
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-        content.userInfo = ["sessionId": sessionId.uuidString]
-        center.add(UNNotificationRequest(
-            identifier: UUID().uuidString,
-            content: content,
-            trigger: nil
-        ))
-    }
-
-    /// AgentPad: a banner about a Claude Code session in another terminal.
-    /// Carries the Claude session id instead of one of our tab ids.
-    func postExternal(title: String, body: String, externalSessionId: String) {
-        guard isAvailable else { return }
-        requestAuthorizationIfNeeded()
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-        content.userInfo = ["externalSessionId": externalSessionId]
-        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
-    }
-
-    /// AgentPad: a colleague's call waiting for a decision (team work).
-    /// A click only brings AgentPad forward, where the right panel shows it.
-    func postTeam(title: String, body: String) {
-        guard isAvailable else { return }
-        requestAuthorizationIfNeeded()
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
-    }
-
-    /// AgentPad (F4): a chat notice — a title only, nothing of what it is
-    /// about (no text, channel, author or organization); `id` lets it be
-    /// taken back, shown or still pending.
-    func postChat(id: String, title: String) {
-        guard isAvailable else { return }
-        requestAuthorizationIfNeeded()
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.sound = .default
-        center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
-    }
-
-    /// AgentPad (F4): takes back chat notices by id, or every one whose id
-    /// starts with `prefix` — pending and shown alike.
-    func removeChat(ids: [String] = [], prefix: String? = nil) {
-        guard isAvailable else { return }
-        if !ids.isEmpty {
-            center.removePendingNotificationRequests(withIdentifiers: ids)
-            center.removeDeliveredNotifications(withIdentifiers: ids)
+        if client == nil {
+            // current() traps without a bundle identifier (swift run / tests).
+            guard Bundle.main.bundleIdentifier != nil else { status = .unavailable; return }
+            let center = UNUserNotificationCenter.current()
+            center.delegate = self
+            let open = UNNotificationAction(identifier: "open", title: String(localized: "Open", bundle: .agentPadResources), options: [.foreground])
+            center.setNotificationCategories([UNNotificationCategory(identifier: "attention.open", actions: [open], intentIdentifiers: [])])
+            client = SystemNotificationCenter(center)
         }
-        guard let prefix else { return }
-        center.getPendingNotificationRequests { requests in
-            let ids = requests.map(\.identifier).filter { $0.hasPrefix(prefix) }
-            UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ids)
+        Task { await refreshAuthorization() }
+    }
+    func refreshAuthorization() async { status = await client?.authorization() ?? .unavailable }
+
+    private func authorized() async -> Bool {
+        guard let client else { status = .unavailable; return false }
+        if let task = authorizationTask { return await task.value }
+        // Share the status query too: two queries can both report "unknown"
+        // while one event is already presenting the authorization prompt.
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            self.status = await client.authorization()
+            if self.status == .authorized { return true }
+            guard self.status == .unknown, !self.requestedAuthorization else { return false }
+            self.requestedAuthorization = true
+            let granted = await client.requestAuthorization()
+            self.status = granted ? .authorized : .denied
+            return granted
         }
-        center.getDeliveredNotifications { notes in
-            let ids = notes.map(\.request.identifier).filter { $0.hasPrefix(prefix) }
-            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ids)
+        authorizationTask = task
+        let granted = await task.value
+        authorizationTask = nil
+        return granted
+    }
+
+    func upsert(_ event: AttentionEvent, sound: Bool,
+                isCurrent: @escaping @MainActor () -> Bool,
+                didDeliver: @escaping @MainActor () -> Void = {}) {
+        guard client != nil else { return }
+        let payload = NotificationPayload(id: event.id,
+            title: event.localTitle == nil || event.scope != nil
+                ? String(localized: String.LocalizationValue(event.kind.title), bundle: .agentPadResources) : event.title,
+            body: event.body, sound: sound)
+        if queued[event.id] != nil { return }
+        queued[event.id] = payload
+        let revision = (revisions[event.id] ?? 0) + 1
+        revisions[event.id] = revision
+        let previous = tasks[event.id]
+        tasks[event.id] = Task { [weak self] in
+            await previous?.value
+            guard let self, let client = self.client else { return }
+            guard self.revisions[event.id] == revision, isCurrent(), await self.authorized(),
+                  self.revisions[event.id] == revision, isCurrent() else {
+                if self.revisions[event.id] == revision { self.queued[event.id] = nil }
+                return
+            }
+            do {
+                try await client.add(payload)
+                guard self.revisions[event.id] == revision, isCurrent() else {
+                    client.remove([event.id])
+                    if self.revisions[event.id] == revision { self.queued[event.id] = nil }
+                    return
+                }
+                didDeliver()
+            } catch { if self.revisions[event.id] == revision { self.queued[event.id] = nil } }
         }
     }
 
-    /// AgentPad (F4): ids of chat notices shown or pending, to reconcile them.
-    func chatIds() async -> [String] {
-        guard isAvailable else { return [] }
-        let center = UNUserNotificationCenter.current()
-        let pending = await center.pendingNotificationRequests().map(\.identifier)
-        let shown = await center.deliveredNotifications().map(\.request.identifier)
-        return (pending + shown).filter { $0.hasPrefix("chat:") }
+    func remove(ids: [String]) {
+        for id in ids { revisions[id, default: 0] += 1; queued[id] = nil }
+        client?.remove(ids)
     }
-
-    /// Requests banner/sound permission once, on the first notification AgentPad
-    /// actually wants to deliver — so the OS prompt only ever appears for a
-    /// user who has notifications enabled and just hit a notifiable event.
-    private var didRequestAuthorization = false
-    private func requestAuthorizationIfNeeded() {
-        guard !didRequestAuthorization else { return }
-        didRequestAuthorization = true
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    func identifiers() async -> [String] { await client?.identifiers() ?? [] }
+    func reconcile(keeping: Set<String>) async {
+        let ids = await identifiers()
+        // This center belongs to AgentPad. Legacy UUID/Team/chat IDs have no safe route.
+        remove(ids: ids.filter { !keeping.contains($0) })
     }
+    func drain() async { for task in tasks.values { await task.value } }
 
-    // Show the banner even while AgentPad is frontmost: we only post for a tab
-    // the user isn't looking at, so a foreground banner is still wanted.
-    nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {
-        completionHandler([.banner, .sound])
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler(notification.request.content.sound == nil ? [.banner] : [.banner, .sound])
     }
-
-    nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse,
-        withCompletionHandler completionHandler: @escaping () -> Void
-    ) {
-        let userInfo = response.notification.request.content.userInfo
-        let raw = userInfo["sessionId"] as? String
-        let external = userInfo["externalSessionId"] as? String
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void) {
+        let id = response.notification.request.content.userInfo["locator"] as? String
+        let action = response.actionIdentifier
         completionHandler()
-        if let external {
-            Task { @MainActor [weak self] in self?.onActivateExternal?(external) }
-            return
-        }
-        guard let raw, let id = UUID(uuidString: raw) else { return }
-        Task { @MainActor [weak self] in self?.onActivate?(id) }
+        guard action == UNNotificationDefaultActionIdentifier || action == "open", let id else { return }
+        Task { @MainActor [weak self] in self?.onActivateLocator?(id) }
     }
 }

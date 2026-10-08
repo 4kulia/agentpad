@@ -149,7 +149,7 @@ if AgentPadHookKit.shouldMirrorConversationId(
     let payload = AgentPadHookKit.buildConversationIdPayload(
         surface: surface,
         conversationId: conversationId,
-        // AgentPad: a shell intermediary is intentionally not walked through.
+        // Send the immediate kernel parent; the server verifies shell ancestry.
         claudeParentPID: agentArg == "claude" && readsHookStdin ? getppid() : nil
     )
     _ = AgentPadHookKit.sendPayload(payload, to: socketPath)

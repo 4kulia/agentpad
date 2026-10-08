@@ -274,11 +274,11 @@ private final class VersionFacts: TeamRunFacts {
     func factStored(_ key: ChatOrgKey) {}
     func canChooseFact(for run: ChatRunRecord) -> Bool { known }
     func end(_ run: ChatRunRecord, outcome: ChatRunRecord.Outcome, reason: String, result: String?, at: Date,
-             journal: ChatJournal, waitForState: Bool) throws -> Bool {
+             journal: ChatJournal, waitForState: Bool, diagnosis: ClaudeLaunchDiagnostic.Failure?) throws -> Bool {
         let current = try journal.run(run.runId) ?? run
         let next = ChatFactChain.plan(state: state, outcome: outcome, processStarted: current.pid != nil,
                                       stopConfirmed: current.stopConfirmedAt != nil, hasResult: result != nil, answered: false)
-        let done = try journal.finish(run.runId, outcome, at: at, result: result)
+        let done = try journal.finish(run.runId, outcome, at: at, result: result, diagnosis: diagnosis)
         if done { steps += next; reasons.append(reason) }
         return done
     }
