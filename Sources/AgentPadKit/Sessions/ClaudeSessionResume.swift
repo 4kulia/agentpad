@@ -3,6 +3,14 @@ import Foundation
 /// Claude also accepts search text after --resume. Ordinary session entry
 /// points must resolve an exact local transcript before composing that flag.
 enum ClaudeSessionResume {
+    static func projectsRoot(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+        let config = environment["CLAUDE_CONFIG_DIR"].flatMap { path -> URL? in
+            guard !path.isEmpty else { return nil }
+            return URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        }
+        return config?.appendingPathComponent("projects") ?? TeamSessionFiles.root
+    }
+
     enum Refusal: Error, Equatable, LocalizedError {
         case fullIdRequired
         case notFound
@@ -34,7 +42,7 @@ enum ClaudeSessionResume {
 
     static func resolve(
         _ id: String,
-        root: URL = TeamSessionFiles.root,
+        root: URL = projectsRoot(),
         visibility: ChannelConversationFilter = .current()
     ) -> Result<String, Refusal> {
         guard isFullId(id) else { return .failure(.fullIdRequired) }

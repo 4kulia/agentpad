@@ -1215,9 +1215,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         terminationFallback = nil
         systemAppearanceObservation = nil
         // `windowWillClose` is not reliably delivered to every window during
-        // app termination, so flush each live window's store here — the 1s
-        // `scheduleSave` debounce would otherwise drop changes made in the
-        // final second before ⌘Q.
+        // app termination, so flush each retained window's store here. The
+        // store uses its pre-teardown snapshot, preserving changes made in
+        // the final second before ⌘Q without persisting shutdown output.
         for controller in windowControllers {
             controller.store.flushPersistence()
         }

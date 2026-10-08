@@ -34,6 +34,7 @@ final class TestEngine: TerminalEngine {
 
     private(set) var startedConfigs: [TerminalSessionConfig] = []
     private(set) var terminateCount = 0
+    var onTerminate: (() -> Void)?
 
     func start(config: TerminalSessionConfig) {
         startedConfigs.append(config)
@@ -41,6 +42,9 @@ final class TestEngine: TerminalEngine {
 
     func terminate() {
         terminateCount += 1
+        let callback = onTerminate
+        onTerminate = nil
+        callback?()
     }
 
     private var sizeSuspendCount = 0

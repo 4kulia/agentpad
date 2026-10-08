@@ -259,7 +259,7 @@ struct AgentTemplate: Identifiable, Hashable {
         initialPrompt: String? = nil,
         sshHost: String? = nil,
         rawLaunchCommand: String? = nil,
-        claudeProjectsRoot: URL = TeamSessionFiles.root,
+        claudeProjectsRoot: URL = ClaudeSessionResume.projectsRoot(),
         visibility: ChannelConversationFilter = .current()
     ) -> TerminalSessionConfig {
         // Pick a shell that has a AgentPad integration wrapper. Plain terminal

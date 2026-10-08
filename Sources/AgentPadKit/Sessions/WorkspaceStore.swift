@@ -499,6 +499,9 @@ final class WorkspaceStore {
     /// in a store that is about to be dropped and reports success. Hook-socket
     /// ingress gates itself on it instead (`hookSession`).
     private(set) var isTerminated = false
+    /// Final window/app flushes must retain the state from before any engine
+    /// was stopped, even if teardown callbacks still reach the live model.
+    private var terminationSnapshot: PersistedState?
     /// False while this store's window is ordered out (closed-but-alive,
     /// see `AppDelegate.shouldCloseWindow`). Sessions and agents keep
     /// running; only work that exists to paint pixels pauses — terminal
@@ -540,7 +543,8 @@ final class WorkspaceStore {
         onSessionAlert: @escaping @MainActor (UUID, SessionAlertKind) -> Void = { _, _ in },
         onSessionWaitingEnded: @escaping @MainActor (UUID) -> Void = { _ in },
         noteRecentFolder: @escaping @MainActor (URL) -> Void = { _ in },
-        claudeProjectsRoot: URL = TeamSessionFiles.root
+        claudeProjectsRoot: URL = ClaudeSessionResume.projectsRoot(),
+        codexSessionsRoot: URL = CodexUsageMonitor.defaultSessionsRoot()
     ) {
         self.persistence = persistence
         self.windowID = (persistence as? WindowPersistence)?.windowId ?? UUID()
@@ -556,7 +560,15 @@ final class WorkspaceStore {
         self.onSessionWaitingEnded = onSessionWaitingEnded
         self.noteRecentFolder = noteRecentFolder
         self.claudeProjectsRoot = claudeProjectsRoot
-        if let saved = persistence.load(), !saved.workspaces.isEmpty {
+        if var saved = persistence.load(), !saved.workspaces.isEmpty {
+            if saved.agentTabRepair119Applied != true {
+                AgentTabRepair.apply(to: &saved, claudeProjectsRoot: claudeProjectsRoot,
+                                     codexSessionsRoot: codexSessionsRoot, visibility: conversationVisibility())
+                // Commit both repairs and the marker before any engines start.
+                // A missing transcript must not trigger another search next launch.
+                do { try persistence.saveChecked(saved) }
+                catch { persistenceError = error.localizedDescription }
+            }
             restore(from: saved)
         } else if initiallyEmpty {
             addEmptyWorkspace()
@@ -1203,7 +1215,7 @@ final class WorkspaceStore {
         conversationId: String,
         options: @MainActor (String) -> String? = { AgentPadSettingsModel.shared.agentOptions[$0] },
         visibility: ChannelConversationFilter = .current(),
-        claudeProjectsRoot: URL = TeamSessionFiles.root
+        claudeProjectsRoot: URL = ClaudeSessionResume.projectsRoot()
     ) -> ResumeRefusal? {
         guard visibility.allows(agentId: agentId, conversationId: conversationId) else { return .channelConversation }
         guard let template = AgentTemplate.builtin(id: agentId), template.supportsResume else {
@@ -2177,9 +2189,9 @@ final class WorkspaceStore {
     /// agent to exit with the socket still listening, and the agent's own
     /// shutdown hook pings `ended`; applied, that reverts the tab to
     /// `.terminal` and the post-drain flush persists a plain terminal, so
-    /// the next launch neither relaunches nor resumes it (#70). The OSC-2
-    /// marker path needs no twin: `releaseSurface` seals the byte stream
-    /// before the drain starts.
+    /// the next launch neither relaunches nor resumes it (#70). Exit callbacks
+    /// from the terminal stream enforce the same boundary: PTY IO stays alive
+    /// until foreground shutdown finishes.
     private func hookSession(id: UUID) -> Session? {
         guard !isTerminated, let session = findSession(id: id), session.hasProcess else { return nil }
         return session
@@ -2214,7 +2226,7 @@ final class WorkspaceStore {
         pendingSave?.cancel(); pendingSave = nil
         do {
             for session in allSessions { if let state = session.tabState { try tabCloseCoordinator.save(state) } }
-            try persistence.saveChecked(snapshot())
+            try persistence.saveChecked(terminationSnapshot ?? snapshot())
             persistenceError = nil
             return true
         } catch {
@@ -2230,7 +2242,9 @@ final class WorkspaceStore {
     /// `@MainActor` engine state) and stops background work. Does not
     /// mutate `workspaces` or persist — the caller decides slot retention.
     func terminate() {
+        guard !isTerminated else { return }
         isTerminated = true
+        terminationSnapshot = snapshot()
         pendingSave?.cancel()
         pendingSave = nil
         for workspace in workspaces {
@@ -2715,7 +2729,7 @@ final class WorkspaceStore {
             }
         }
         engine.onTitleChange = { [weak self, weak session] title in
-            guard let session else { return }
+            guard let self, !self.isTerminated, let session else { return }
             if session.consumeShellControlTitle(title) { return }
             if title.hasPrefix(AgentLaunchExitMarker.prefix) {
                 if let result = AgentLaunchExitMarker.parse(title),
@@ -2723,7 +2737,7 @@ final class WorkspaceStore {
                     let ranAgent = launch.isAgent || session.awaitingAgentExitOutcome || session.transientAgent != nil || !session.agent.isShell
                     session.pendingAgentLaunch = nil
                     session.reportedAgentLaunchExit = true
-                    self?.finishShellCommand(session, exit: result.exit, duration: 0, ranAgent: ranAgent)
+                    self.finishShellCommand(session, exit: result.exit, duration: 0, ranAgent: ranAgent)
                 }
                 return
             }
@@ -2760,7 +2774,7 @@ final class WorkspaceStore {
             // a known agent) and stop before it reaches `terminalTitle`.
             if AgentStatusMarker.isMarkerTitle(title) {
                 if let marker = AgentStatusMarker.parseTitle(title) {
-                    self?.applyAgentStatusMarker(
+                    self.applyAgentStatusMarker(
                         agent: marker.agent,
                         event: marker.event,
                         session: session
@@ -2782,10 +2796,11 @@ final class WorkspaceStore {
             self.activateTab(session, in: workspace)
         }
         engine.onCommandFinished = { [weak self, weak session] exit, duration in
-            guard let session, session.pendingAgentLaunch == nil, !session.reportedAgentLaunchExit else { return }
+            guard let self, !self.isTerminated, let session,
+                  session.pendingAgentLaunch == nil, !session.reportedAgentLaunchExit else { return }
             let ranAgent = session.awaitingAgentExitOutcome || session.transientAgent != nil
                 || (!session.agent.isShell && session.hookStateAt != .distantPast)
-            self?.finishShellCommand(session, exit: exit, duration: duration, ranAgent: ranAgent)
+            self.finishShellCommand(session, exit: exit, duration: duration, ranAgent: ranAgent)
         }
         engine.onUserInput = { [weak session] in
             // libghostty exposes no command-START, so a keystroke (the first
@@ -2800,7 +2815,7 @@ final class WorkspaceStore {
             session.lastCommandText = nil
         }
         engine.onProcessExitedCleanly = { [weak self, weak session, weak workspace] in
-            guard let self, let session, let workspace else { return }
+            guard let self, !self.isTerminated, let session, let workspace else { return }
             self.closeTab(session, in: workspace)
         }
         engine.onDesktopNotification = { [weak self, weak session] title, body in
@@ -3218,7 +3233,7 @@ final class WorkspaceStore {
     /// dropped the slot, and a late AppKit notification or a click on the
     /// still-visible dead window would otherwise upsert it back. ⌘Q's drain
     /// loses nothing to this — its post-drain `flushPersistence` is ungated
-    /// and snapshots the live state.
+    /// and writes the snapshot captured before engine teardown.
     func scheduleSave() {
         guard !isTerminated else { return }
         pendingSave?.cancel()
@@ -3245,7 +3260,8 @@ final class WorkspaceStore {
             collapsedInfoSections: collapsedInfoSections.isEmpty
                 ? nil
                 : collapsedInfoSections.sorted(),
-            rightSidebarDefault115Applied: true
+            rightSidebarDefault115Applied: true,
+            agentTabRepair119Applied: true
         )
     }
 

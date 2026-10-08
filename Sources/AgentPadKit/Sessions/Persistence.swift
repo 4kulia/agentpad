@@ -33,6 +33,9 @@ struct PersistedState: Codable, Equatable {
     /// 1.1.5 hides the panel once for existing windows, then keeps their choice.
     /// Optional so older state files decode without resetting workspaces/tabs.
     var rightSidebarDefault115Applied: Bool?
+    /// 1.1.9 could save agents as terminals while quitting. Repair each saved
+    /// window once; later intentional agent exits must remain terminals.
+    var agentTabRepair119Applied: Bool?
 }
 
 /// Root of the multi-window `state.json`. Each `PersistedWindow` is one
