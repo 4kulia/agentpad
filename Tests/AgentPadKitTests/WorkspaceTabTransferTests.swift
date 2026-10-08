@@ -255,7 +255,7 @@ final class WorkspaceTabTransferTests: XCTestCase {
                                           worktreeParent: parent, worktreeBranch: "feature")
         let session = try XCTUnwrap(worktree.activeSession)
         XCTAssertTrue(store.handleTabDrop(droppedId: session.id, in: parent))
-        XCTAssertNil(store.pendingRemovalRequest)
+        XCTAssertFalse(store.allSessions.contains { $0.tabState?.closeWorkspaces != nil })
         XCTAssertEqual(worktree.worktreeParentId, parent.id)
         XCTAssertEqual(worktree.worktreeBranch, "feature")
         XCTAssertTrue(worktree.activePane?.tabs.isEmpty == true)

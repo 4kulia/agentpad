@@ -96,6 +96,8 @@ enum AttentionDestination: Codable, Hashable, Sendable {
     case recovery(String?)
     case update(String)
     case sheet(UUID)
+    case tabAction(tabID: TabID, actionID: UUID)
+    case linkFailure(windowID: UUID)
     // Reserved until these have real client sources.
     case invitation(String), directMessage(String), publicationProposal(String)
 }
@@ -128,7 +130,7 @@ struct AttentionEvent: Identifiable, Equatable, Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, source, kind, destination, scope, timestamp, isRead, actionInFlight, suppressesDelivery
     }
-    var title: String { scope == nil ? (localTitle ?? kind.title) : kind.title }
+    var title: String { source == "link-failure" ? "Link could not be opened" : scope == nil ? (localTitle ?? kind.title) : kind.title }
     var body: String { scope == nil ? (localBody ?? "") : "" }
 }
 
@@ -238,7 +240,8 @@ final class AttentionLedger {
         }
         if !live && !event.kind.needsDecision { metadata.update(event.id) { $0.consumed = true } }
         if next.isRead { metadata.update(event.id) { $0.read = true } }
-        metadata.update(next.id) { $0.locator = next }
+        if case .tabAction = next.destination { /* runtime-only consent */ }
+        else { metadata.update(next.id) { $0.locator = next } }
         deliver(next.id)
         if !next.kind.needsDecision { metadata.update(next.id) { $0.consumed = true } }
         onChange()

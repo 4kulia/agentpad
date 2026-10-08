@@ -87,86 +87,6 @@ private struct ColorTagStrip: View {
     }
 }
 
-/// Editor behind "Custom Tag…" — the system colour picker plus a name. Seeded
-/// through `.popover(item:)` with `PopoverPresentation`, per the popover rule
-/// in CLAUDE.md: click-time data has to ride the presentation itself.
-private struct TagEditor: View {
-    let onSave: (WorkspaceTag) -> Void
-    /// The preset this editor opened on, if any — lets save tell "left the
-    /// colour alone" apart from "picked this exact colour".
-    private let seededPreset: WorkspaceColorTag?
-
-    @State private var color: Color
-    @State private var name: String
-
-    init(seed: WorkspaceTag?, onSave: @escaping (WorkspaceTag) -> Void) {
-        self.onSave = onSave
-        self.seededPreset = seed?.color.preset
-        _color = State(initialValue: seed?.swatchColor ?? WorkspaceColorTag.blue.color)
-        _name = State(initialValue: seed?.name ?? "")
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Theme.space3) {
-            HStack(spacing: Theme.space2) {
-                // The stock well is a rounded rect; clipped to a circle it
-                // matches the swatch strip this editor is reached from, so the
-                // panel doesn't introduce a second shape for "a tag colour".
-                ColorPicker("", selection: $color, supportsOpacity: false)
-                    .labelsHidden()
-                    .frame(width: 19, height: 19)
-                    .clipShape(Circle())
-                    .overlay(Circle().stroke(Theme.chromeHairline, lineWidth: 1))
-                Text(String(localized: "color", bundle: .agentPadResources))
-                    .font(Theme.mono(11.5))
-                    .foregroundStyle(Theme.chromeMuted)
-                Spacer(minLength: 0)
-            }
-            AgentPadRenameField(placeholder: "name (optional)", text: $name, onSubmit: save)
-            HStack {
-                Spacer(minLength: 0)
-                BracketButton("save", action: save)
-            }
-        }
-        .padding(Theme.space3)
-        .frame(width: 240)
-        .background(Theme.chromeBackground)
-        .onAppear(perform: parkColorPanelNearAgentPad)
-    }
-
-    /// `NSColorPanel` is a system-wide singleton AgentPad has never positioned, so
-    /// it opens wherever macOS last left it — in practice pinned to a corner of
-    /// the screen, nowhere near the row that summoned it. Park it over the
-    /// window's right half instead: the editor popover hangs off a sidebar row
-    /// so it always sits on the LEFT, and a centred panel covered it. Only while
-    /// the panel is off screen — once it's up the user may have parked it
-    /// somewhere deliberately and we shouldn't yank it back.
-    private func parkColorPanelNearAgentPad() {
-        let panel = NSColorPanel.shared
-        guard !panel.isVisible, let window = NSApp.keyWindow else { return }
-        let size = panel.frame.size
-        // Left edge at the window's midpoint: the popover hangs off a sidebar
-        // row so it occupies the left of the window, and this clears it without
-        // shoving the panel out to the far edge.
-        var origin = NSPoint(
-            x: window.frame.midX,
-            y: window.frame.midY - size.height / 2
-        )
-        // Keep it fully on screen for a window pushed against the right edge.
-        if let visible = window.screen?.visibleFrame {
-            origin.x = min(origin.x, visible.maxX - size.width)
-            origin.x = max(origin.x, visible.minX)
-            origin.y = min(max(origin.y, visible.minY), visible.maxY - size.height)
-        }
-        panel.setFrameOrigin(origin)
-    }
-
-    private func save() {
-        let hex = NSColor(color).hexString ?? WorkspaceColorTag.gray.hex
-        onSave(.edited(seededPreset: seededPreset, pickedHex: hex, name: name))
-    }
-}
-
 /// Shared swatch sizing + selection ring, so the clear slot and the colour
 /// swatches can't drift apart in size or alignment.
 private struct SwatchChrome: ViewModifier {
@@ -207,10 +127,11 @@ struct SidebarWorkspaceRow: View {
     let onDuplicate: () -> Void
     let onRename: (String) -> Void
     let onSetTag: (WorkspaceTag?) -> Void
+    let onDetails: () -> Void
     var disclosure: WorktreeDisclosure? = nil
     /// Non-nil for source (top-level, non-worktree) workspaces — the
     /// right-click menu surfaces a "Create Worktree…" entry that the
-    /// sidebar wires to a sheet. Nil on worktree rows so worktree
+    /// sidebar routes to a tab. Nil on worktree rows so worktree
     /// nesting stays disabled.
     var onCreateWorktree: (() -> Void)? = nil
     /// Non-nil for worktree rows — jumps the active selection back to the
@@ -221,9 +142,6 @@ struct SidebarWorkspaceRow: View {
 
     @State private var isHovered = false
     @State private var isContextMenuOpen = false
-    @State private var isRenameOpen = false
-    @State private var pendingRename = ""
-    @State private var tagEditorSeed: PopoverPresentation<WorkspaceTag?>?
 
     var body: some View {
         let readout = workspace.sidebarReadout
@@ -257,7 +175,8 @@ struct SidebarWorkspaceRow: View {
                 AgentPadMenuDivider()
                 AgentPadMenuRow(title: "Rename Workspace…", shortcut: "⌘⇧R") {
                     isContextMenuOpen = false
-                    beginRename(deferred: true)
+                    if isCompact { onActivate(); workspace.nameEdit.begin(workspace.customTitle ?? workspace.title) }
+                    else { workspace.nameEdit.begin(workspace.customTitle ?? workspace.title) }
                 }
                 AgentPadMenuRow(title: "Duplicate Workspace") {
                     isContextMenuOpen = false
@@ -266,9 +185,7 @@ struct SidebarWorkspaceRow: View {
                 if let onCreateWorktree {
                     AgentPadMenuRow(title: "Create Worktree…") {
                         isContextMenuOpen = false
-                        // Defer one runloop tick so the menu popover finishes
-                        // dismissing before the sheet anchors — back-to-back
-                        // popovers/sheets off the same view glitch otherwise.
+                        // Let the menu finish closing before focusing the tab.
                         DispatchQueue.main.async { onCreateWorktree() }
                     }
                 }
@@ -285,12 +202,11 @@ struct SidebarWorkspaceRow: View {
                 }
                 AgentPadMenuRow(title: workspace.tag == nil ? "Custom Tag…" : "Edit Tag…") {
                     isContextMenuOpen = false
-                    let current = workspace.tag
-                    // One tick so the context popover finishes dismissing before
-                    // the editor anchors on the same row.
-                    DispatchQueue.main.async {
-                        tagEditorSeed = PopoverPresentation(value: current)
-                    }
+                    onDetails()
+                }
+                AgentPadMenuRow(title: "Workspace details…") {
+                    isContextMenuOpen = false
+                    onDetails()
                 }
                 AgentPadMenuDivider()
                 RevealInFinderMenuRow(url: workspace.workingDirectory) { isContextMenuOpen = false }
@@ -299,51 +215,7 @@ struct SidebarWorkspaceRow: View {
             .frame(minWidth: 240)
             .background(Theme.chromeBackground)
         }
-        .popover(item: $tagEditorSeed, arrowEdge: .trailing) { seed in
-            TagEditor(seed: seed.value) { tag in
-                tagEditorSeed = nil
-                onSetTag(tag)
-            }
-        }
-        .popover(isPresented: $isRenameOpen, arrowEdge: .trailing) {
-            AgentPadRenameField(placeholder: "Workspace title", text: $pendingRename) {
-                onRename(pendingRename)
-                isRenameOpen = false
-            }
-        }
         .help(workspace.sidebarTooltip(agents: readout.agents))
-        .onChange(of: workspace.renameRequested) { _, requested in
-            if requested { consumeRenameRequest() }
-        }
-        .onAppear {
-            // ⌘⇧R may reveal a hidden sidebar; this row then mounts with the
-            // flag already set, after onChange's window has passed — onAppear
-            // catches that case.
-            if workspace.renameRequested { consumeRenameRequest() }
-        }
-    }
-
-    /// Consume the `Workspace.renameRequested` flag (the ⌘⇧R menu command) and
-    /// open the rename popover — shared by onChange (row already mounted) and
-    /// onAppear (row just mounted after a hidden sidebar was revealed).
-    private func consumeRenameRequest() {
-        workspace.renameRequested = false
-        beginRename(deferred: false)
-    }
-
-    /// Seed the edit field from the current title and open the rename popover.
-    /// `deferred` waits one runloop tick — needed from the context menu, where
-    /// that popover is mid-dismiss and back-to-back popovers off the same
-    /// anchor glitch; the ⌘⇧R path opens synchronously. Skips when already
-    /// open so a re-trigger mid-edit can't wipe what the user is typing.
-    private func beginRename(deferred: Bool) {
-        guard !isRenameOpen else { return }
-        pendingRename = workspace.customTitle ?? workspace.title
-        if deferred {
-            DispatchQueue.main.async { isRenameOpen = true }
-        } else {
-            isRenameOpen = true
-        }
     }
 
     private func fullBody(agents: [AgentTemplate], dotColor: Color?) -> some View {
@@ -351,10 +223,16 @@ struct SidebarWorkspaceRow: View {
             agentIcons(agents: agents)
                 .padding(.trailing, 3)
             VStack(alignment: .leading, spacing: 2) {
-                Text(workspace.title)
+                if workspace.nameEdit.isEditing {
+                    InlineNameField(edit: workspace.nameEdit, label: "Workspace title") { text in
+                        onRename(text); return nil
+                    }
+                } else {
+                    Text(workspace.title)
                     .font(Theme.display(13, weight: isActive ? .medium : .regular))
                     .foregroundStyle(isActive ? Theme.chromeForeground : Theme.chromeForeground.opacity(0.78))
                     .lineLimit(1)
+                }
                 subtitleRow
             }
             Spacer(minLength: 0)

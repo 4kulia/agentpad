@@ -51,11 +51,14 @@ enum FileOperations {
     static func renameProblem(_ name: String, in directory: URL, current: String? = nil, exists: (URL) -> Bool = defaultExists) -> String? {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty { return "The name can't be empty." }
+        if trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) { return "The name can't contain control characters." }
         if trimmed.contains("/") || trimmed.contains(":") { return "The name can't contain “/” or “:”." }
         if trimmed == "." || trimmed == ".." { return "That name is reserved." }
         if trimmed == current { return nil }
         // A case-only rename on a case-insensitive volume finds "itself".
-        if let current, trimmed.lowercased() == current.lowercased() { return nil }
+        if let current, trimmed.lowercased() == current.lowercased(),
+           (try? FileManager.default.contentsOfDirectory(atPath: directory.path).contains(trimmed)) == false,
+           sameItem(directory.appendingPathComponent(current), directory.appendingPathComponent(trimmed)) { return nil }
         if exists(directory.appendingPathComponent(trimmed)) { return "“\(trimmed)” already exists here." }
         return nil
     }
@@ -63,7 +66,7 @@ enum FileOperations {
     // MARK: Pasteboard
 
     /// What a paste would do with the pasteboard's files.
-    enum PasteMode: Equatable { case copy, move }
+    enum PasteMode: String, Codable, Sendable { case copy, move }
 
     /// Files cut in this app. A cut is just a copy plus this note; it turns the
     /// next paste into a move as long as nobody has written to the pasteboard
@@ -101,12 +104,18 @@ enum FileOperations {
 
     enum ConflictChoice: Equatable, Sendable { case replace, keepBoth, skip, stop }
 
-    struct TransferResult: Equatable, Sendable {
+    struct Failure: Codable, Equatable, Sendable {
+        let url: URL
+        let message: String
+    }
+
+    struct TransferResult: Codable, Equatable, Sendable {
         var done: [URL] = []
         /// Sources that were copied/moved (for keeping a partial cut alive).
         var doneSources: [URL] = []
         var skipped: [URL] = []
-        var failures: [String] = []
+        var issues: [Failure] = []
+        var failures: [String] { issues.map(\.message) }
     }
 
     /// The real location: symlinks resolved, `/private` prefix normalized.
@@ -138,32 +147,47 @@ enum FileOperations {
         _ sources: [URL],
         into directory: URL,
         mode: PasteMode,
-        fileManager: FileManager = .default,
-        resolve: (URL) -> ConflictChoice
-    ) -> TransferResult {
+        fileManager io: TransferFileIO = TransferFileIO(),
+        progress: @Sendable (TransferResult) async -> Void = { _ in },
+        resolve: @Sendable (URL) async -> ConflictChoice
+    ) async -> TransferResult {
+        let fileManager = io.manager
         var result = TransferResult()
         let exists: (URL) -> Bool = { (try? fileManager.attributesOfItem(atPath: $0.path)) != nil }
         let dir = directory.standardizedFileURL
         let realDir = realPath(dir)
         let realSources = sources.map(realPath)
         for source in sources.map(\.standardizedFileURL) {
+            if Task.isCancelled { break }
+            await progress(result)
             let realSource = realPath(source)
             // A folder into itself or its own subfolder would recurse forever.
             if isInside(realDir, realSource) {
-                result.failures.append("Can't put “\(source.lastPathComponent)” inside itself.")
+                result.issues.append(Failure(url: source, message: "Can't put “\(source.lastPathComponent)” inside itself."))
                 continue
             }
+            let directoryIdentity = FileIdentity(dir)?.entry
             var destination = dir.appendingPathComponent(source.lastPathComponent)
             var replacing: URL?
+            var replacementIdentity: FileIdentity?
             if exists(destination) {
                 if sameItem(destination, source) {
                     // Pasting onto itself: Finder makes a copy; a move is a no-op.
                     if mode == .move { result.skipped.append(source); continue }
                     destination = duplicateURL(for: source, exists: exists)
                 } else {
-                    switch resolve(destination) {
+                    let sourceIdentity = FileIdentity(source)
+                    let destinationIdentity = FileIdentity(destination)
+                    let choice = await resolve(destination)
+                    if choice == .stop { return result }
+                    if choice == .skip { result.skipped.append(source); continue }
+                    guard FileIdentity(source) == sourceIdentity, FileIdentity(destination) == destinationIdentity,
+                          FileIdentity(dir)?.entry == directoryIdentity else {
+                        result.issues.append(Failure(url: source, message: "Files changed while awaiting a decision. Nothing was replaced."))
+                        continue
+                    }
+                    switch choice {
                     case .stop:
-                        result.skipped.append(source)
                         return result
                     case .skip:
                         result.skipped.append(source)
@@ -174,10 +198,11 @@ enum FileOperations {
                         // Never trash something that contains an item still to be moved.
                         let realDestination = realPath(destination)
                         if realSources.contains(where: { isInside($0, realDestination) }) {
-                            result.failures.append("Can't replace “\(destination.lastPathComponent)”: it contains an item being moved.")
+                            result.issues.append(Failure(url: source, message: "Can't replace “\(destination.lastPathComponent)”: it contains an item being moved."))
                             continue
                         }
                         replacing = destination
+                        replacementIdentity = destinationIdentity
                     }
                 }
             }
@@ -190,7 +215,7 @@ enum FileOperations {
                 case .move: try fileManager.moveItem(at: source, to: target)
                 }
             } catch {
-                result.failures.append("“\(source.lastPathComponent)”: \(error.localizedDescription)")
+                result.issues.append(Failure(url: source, message: "“\(source.lastPathComponent)”: \(error.localizedDescription)"))
                 continue
             }
             if let replacing {
@@ -200,15 +225,21 @@ enum FileOperations {
                         if mode == .move { try fileManager.moveItem(at: target, to: source) }
                         else { try fileManager.removeItem(at: target) }
                     } catch {
-                        result.failures.append("The new “\(source.lastPathComponent)” was left as “\(target.lastPathComponent)”: \(error.localizedDescription)")
+                        result.issues.append(Failure(url: source, message: "The new “\(source.lastPathComponent)” was left as “\(target.lastPathComponent)”: \(error.localizedDescription)"))
                     }
+                }
+                guard FileIdentity(replacing) == replacementIdentity, FileIdentity(dir)?.entry == directoryIdentity, realPath(dir) == realDir,
+                      !realSources.contains(where: { isInside($0, realPath(replacing)) }) else {
+                    unstage()
+                    result.issues.append(Failure(url: source, message: "The destination changed during staging. Nothing was replaced."))
+                    continue
                 }
                 var trashed: NSURL?
                 do {
                     try fileManager.trashItem(at: replacing, resultingItemURL: &trashed)
                 } catch {
                     unstage()
-                    result.failures.append("Couldn't replace “\(replacing.lastPathComponent)”: \(error.localizedDescription)")
+                    result.issues.append(Failure(url: source, message: "Couldn't replace “\(replacing.lastPathComponent)”: \(error.localizedDescription)"))
                     continue
                 }
                 do {
@@ -220,105 +251,94 @@ enum FileOperations {
                         restored = (try? fileManager.moveItem(at: trashed, to: replacing)) != nil
                     }
                     unstage()
-                    result.failures.append(restored
+                    result.issues.append(Failure(url: source, message: restored
                         ? "Couldn't replace “\(replacing.lastPathComponent)”; it was left unchanged: \(error.localizedDescription)"
-                        : "Couldn't replace “\(replacing.lastPathComponent)”; the original is in the Trash: \(error.localizedDescription)")
+                        : "Couldn't replace “\(replacing.lastPathComponent)”; the original is in the Trash: \(error.localizedDescription)"))
                     continue
                 }
             }
             result.done.append(destination)
             result.doneSources.append(source)
         }
+        await progress(result)
         return result
     }
-
     /// Pastes the general pasteboard into `directory`, asking about clashes.
-    /// The file work runs off the main thread; only the dialogs come back to it.
+    /// File work runs off the main thread; decisions live in the operation tab.
     @MainActor
-    static func paste(into directory: URL) {
+    static func paste(into directory: URL, editor: FileNameEdit? = nil) {
         let sources = pasteboardFiles()
         guard !sources.isEmpty else { return }
         let mode = pasteMode()
-        let changeCountAtStart = NSPasteboard.general.changeCount
-        Task { @MainActor in
-            let result = await transferInBackground(sources, into: directory, mode: mode)
-            // Only touch the clipboard if nobody copied something else meanwhile.
-            if mode == .move, NSPasteboard.general.changeCount == changeCountAtStart {
-                // Whatever didn't move stays cut, so pasting again finishes the job.
+        guard let batch = ProcessTabs.shared.transfer(sources, into: directory, mode: mode) else { return }
+        var expectedChangeCount = NSPasteboard.general.changeCount
+        batch.onResult = { result in
+            // Only our own partial-cut updates may advance this snapshot.
+            if mode == .move, NSPasteboard.general.changeCount == expectedChangeCount {
                 let moved = Set(result.doneSources.map(\.path))
                 let remaining = sources.filter { !moved.contains($0.standardizedFileURL.path) }
                 if remaining.isEmpty { pendingCut = nil } else { copy(remaining, cut: true) }
+                expectedChangeCount = NSPasteboard.general.changeCount
             }
-            report(result.failures)
+            report(result.issues, editor: editor)
         }
+        Task { _ = await batch.start() }
     }
 
-    /// `transfer` on a background thread, asking clash questions on the main
-    /// thread (with an "Apply to all" box when there's more than one item).
+    /// The operation owns its continuation; no thread waits for the UI.
     @MainActor
     static func transferInBackground(_ sources: [URL], into directory: URL, mode: PasteMode) async -> TransferResult {
-        let more = sources.count > 1
-        return await Task.detached(priority: .userInitiated) {
-            var applyToAll: ConflictChoice?
-            return transfer(sources, into: directory, mode: mode) { clash in
-                if let applyToAll { return applyToAll }
-                let (choice, all) = DispatchQueue.main.sync {
-                    MainActor.assumeIsolated { askAboutConflict(clash, more: more) }
-                }
-                if all { applyToAll = choice }
-                return choice
-            }
-        }.value
+        guard let batch = ProcessTabs.shared.transfer(sources, into: directory, mode: mode) else {
+            return TransferResult(issues: sources.map { Failure(url: $0, message: "File operations could not be opened.") })
+        }
+        return await batch.start()
     }
 
     // MARK: Single-item operations
 
     @MainActor
-    static func trash(_ urls: [URL]) {
+    static func trash(_ urls: [URL], editor: FileNameEdit? = nil) {
         Task { @MainActor in
-            let failures = await Task.detached(priority: .userInitiated) { () -> [String] in
-                var failures: [String] = []
+            let failures = await Task.detached(priority: .userInitiated) { () -> [Failure] in
+                var failures: [Failure] = []
                 for url in urls {
                     do { try FileManager.default.trashItem(at: url, resultingItemURL: nil) }
-                    catch { failures.append("“\(url.lastPathComponent)”: \(error.localizedDescription)") }
+                    catch { failures.append(Failure(url: url, message: error.localizedDescription)) }
                 }
                 return failures
             }.value
-            report(failures)
+            report(failures, editor: editor)
         }
     }
 
     @MainActor
-    static func duplicate(_ url: URL) {
+    static func duplicate(_ url: URL, editor: FileNameEdit? = nil) {
         Task { @MainActor in
             let failure = await Task.detached(priority: .userInitiated) { () -> String? in
                 do { try FileManager.default.copyItem(at: url, to: duplicateURL(for: url)); return nil }
                 catch { return "“\(url.lastPathComponent)”: \(error.localizedDescription)" }
             }.value
-            report(failure.map { [$0] } ?? [])
+            report(failure.map { [Failure(url: url, message: $0)] } ?? [], editor: editor)
         }
     }
 
     /// Creates `untitled folder` (or `untitled folder 2`…) and returns it.
     @MainActor
     @discardableResult
-    static func newFolder(in directory: URL) -> URL? {
+    static func newFolder(in directory: URL, editor: FileNameEdit? = nil) -> URL? {
         let url = uniqueURL(for: directory.appendingPathComponent("untitled folder"))
         do {
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
             return url
         } catch {
-            report([error.localizedDescription])
+            report([Failure(url: directory, message: error.localizedDescription)], editor: editor)
             return nil
         }
     }
 
-    /// Asks for a name, then creates an empty file with it.
     @MainActor
-    static func newFile(in directory: URL) {
-        guard let name = askForName(title: "New File", message: "Name for the new file:", initial: "untitled.txt", directory: directory, current: nil) else { return }
-        let url = directory.appendingPathComponent(name)
-        if let problem = createExclusively(url) { report([problem]) }
+    static func newFile(in directory: URL, editor: FileNameEdit? = nil, tabs: LocalFormTabs = .shared) {
+        (editor?.isVisible == true ? editor : tabs.files(directory))?.beginNew(in: directory)
     }
 
     /// Creates an empty file, failing (never truncating) if anything already
@@ -333,78 +353,75 @@ enum FileOperations {
     }
 
     @MainActor
-    static func rename(_ url: URL) {
-        let current = url.lastPathComponent
-        guard let name = askForName(title: "Rename", message: "New name for “\(current)”:", initial: current, directory: url.deletingLastPathComponent(), current: current),
-              name != current
-        else { return }
-        do { try FileManager.default.moveItem(at: url, to: url.deletingLastPathComponent().appendingPathComponent(name)) }
-        catch { report(["Couldn't rename “\(current)”: \(error.localizedDescription)"]) }
+    static func rename(_ url: URL, editor: FileNameEdit? = nil, tabs: LocalFormTabs = .shared) {
+        (editor?.isVisible == true ? editor : tabs.files(url.deletingLastPathComponent()))?.beginRename(url)
     }
 
-    // MARK: Dialogs
-
-    @MainActor
-    private static func askForName(title: String, message: String, initial: String, directory: URL, current: String?) -> String? {
-        var text = initial
-        while true {
-            let alert = NSAlert()
-            alert.messageText = title
-            alert.informativeText = message
-            let field = NSTextField(string: text)
-            field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
-            alert.accessoryView = field
-            alert.addButton(withTitle: "OK")
-            alert.addButton(withTitle: "Cancel")
-            NSApp.activate()
-            alert.window.initialFirstResponder = field
-            // Select the base name, not the extension — Finder's habit.
-            let base = split(text).base
-            DispatchQueue.main.async {
-                field.currentEditor()?.selectedRange = NSRange(location: 0, length: (base as NSString).length)
+    /// No replacement, including when a competing writer wins after validation.
+    /// Rename the directory entry itself, never the target of a symlink.
+    static func renameItem(_ url: URL, to name: String) -> String? {
+        let directory = url.deletingLastPathComponent(), current = url.lastPathComponent
+        if let problem = renameProblem(name, in: directory, current: current) { return problem }
+        guard name != current else { return nil }
+        let destination = directory.appendingPathComponent(name)
+        if renamex_np(url.path, destination.path, UInt32(RENAME_EXCL)) == 0 { return nil }
+        let code = errno
+        // APFS can report EEXIST for a case-only move of the same entry.
+        // Stage exclusively, then move exclusively; no unrelated entry is overwritten.
+        if code == EEXIST, name.lowercased() == current.lowercased(),
+           (try? FileManager.default.contentsOfDirectory(atPath: directory.path).contains(name)) == false,
+           sameItem(url, destination) {
+            let staging = directory.appendingPathComponent(".agentpad-rename-" + UUID().uuidString)
+            if renamex_np(url.path, staging.path, UInt32(RENAME_EXCL)) == 0 {
+                if renamex_np(staging.path, destination.path, UInt32(RENAME_EXCL)) == 0 { return nil }
+                let message = String(cString: strerror(errno))
+                if renamex_np(staging.path, url.path, UInt32(RENAME_EXCL)) != 0 {
+                    return "Couldn't rename; the original remains at “\(staging.path)”: \(message)"
+                }
+                return message
             }
-            guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-            text = field.stringValue.trimmingCharacters(in: .whitespaces)
-            guard let problem = renameProblem(text, in: directory, current: current) else { return text }
-            report([problem])
         }
+        return "Couldn't rename “\(current)”: \(String(cString: strerror(code)))"
     }
 
     @MainActor
-    static func askAboutConflict(_ clash: URL, more: Bool) -> (ConflictChoice, Bool) {
-        let alert = NSAlert()
-        alert.messageText = "“\(clash.lastPathComponent)” already exists here."
-        alert.informativeText = "Replacing moves the existing item to the Trash."
-        alert.addButton(withTitle: "Keep Both")
-        alert.addButton(withTitle: "Replace")
-        alert.addButton(withTitle: "Skip")
-        if more {
-            alert.addButton(withTitle: "Stop")
-            alert.showsSuppressionButton = true
-            alert.suppressionButton?.title = "Apply to all"
-        }
-        NSApp.activate()
-        let attentionID = UUID()
-        PendingConfirmations.shared.register(attentionID, window: alert.window)
-        defer { PendingConfirmations.shared.end(attentionID) }
-        let choice: ConflictChoice
-        switch alert.runModal() {
-        case .alertFirstButtonReturn: choice = .keepBoth
-        case .alertSecondButtonReturn: choice = .replace
-        case .alertThirdButtonReturn: choice = .skip
-        default: choice = .stop
-        }
-        return (choice, alert.suppressionButton?.state == .on)
-    }
-
-    @MainActor
-    static func report(_ failures: [String]) {
+    static func report(_ failures: [Failure], editor: FileNameEdit? = nil) {
         guard !failures.isEmpty else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = failures.count == 1 ? "The operation didn't complete" : "Some items didn't complete"
-        alert.informativeText = failures.prefix(8).joined(separator: "\n")
-        NSApp.activate()
-        alert.runModal()
+        if let editor {
+            editor.record(failures)
+            if editor.isVisible { return }
+        }
+        for failure in failures {
+            LocalFormTabs.shared.files(failure.url.deletingLastPathComponent())?.record([failure])
+        }
     }
+}
+
+/// Captured again after each suspension and immediately before Trash. Directory
+/// entry identity is separate because staging changes its modification time.
+struct FileIdentity: Equatable, Sendable {
+    struct Entry: Equatable, Sendable {
+        let device: UInt64
+        let inode: UInt64
+        let path: String
+    }
+    let entry: Entry
+    let size: UInt64
+    let modified: Date?
+    let type: String
+    init?(_ url: URL) {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let inode = attrs[.systemFileNumber] as? NSNumber, let device = attrs[.systemNumber] as? NSNumber else { return nil }
+        entry = Entry(device: device.uint64Value, inode: inode.uint64Value, path: FileOperations.realPath(url))
+        size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        modified = attrs[.modificationDate] as? Date
+        type = (attrs[.type] as? FileAttributeType)?.rawValue ?? ""
+    }
+}
+
+/// Owns the file manager used by a serial transfer. The manager has no delegate;
+/// its copy/move/Trash methods run only inside that operation's async executor.
+struct TransferFileIO: @unchecked Sendable {
+    let manager: FileManager
+    init(_ manager: FileManager = FileManager()) { self.manager = manager }
 }

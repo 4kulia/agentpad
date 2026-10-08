@@ -84,7 +84,7 @@ final class ChannelTabEngine: TerminalEngine {
 
     var view: NSView { host }
     func renderNowIfNeeded() {}
-    func setOnScreen(_ onScreen: Bool) {}
+    func setOnScreen(_ onScreen: Bool) { if !onScreen { conversation.confirmation.invalidate() } }
     var backgroundColor: NSColor { .windowBackgroundColor }
     var onPwdChange: ((String) -> Void)?
     var onTitleChange: ((String) -> Void)?
@@ -105,6 +105,7 @@ final class ChannelTabEngine: TerminalEngine {
     func start(config: TerminalSessionConfig) { starts += 1 }
     func terminate() {
         terminations += 1
+        conversation.confirmation.invalidate()
         if terminations == 1 { ChatService.shared.channelTab(ref, open: false) }
     }
     var suspendsSizePropagation: Bool { false }

@@ -7,7 +7,6 @@ struct ChatSidebarAgentCard: View {
     let window: NSWindow?
     let store: WorkspaceStore
     let model: ChatOrgModel?
-    let close: () -> Void
     @State private var problem: String?
 
     var body: some View {
@@ -26,22 +25,22 @@ struct ChatSidebarAgentCard: View {
                 Divider()
                 ForEach(actions.channels, id: \.channelId) { channel in
                     Button("Open #\(channel.name)") {
-                        if ChatSidebarAgentActions.open(agentID: agentID, channel: channel.channelId, model: model, show: { store.showChannel($0) }) { close() }
-                        else { problem = "The agent's channel is no longer available." }
+                        if !ChatSidebarAgentActions.open(agentID: agentID, channel: channel.channelId, model: model, show: { store.showChannel($0) }) { problem = "The agent's channel is no longer available." }
                     }
                 }
                 if let channel = actions.mentionChannel {
                     Button("Mention in #\(channel.name)") {
                         let ref = ChannelRef(actions.key, channel: channel.channelId)
-                        if ChatSidebarMention.insert(agentID: agentID, ref: ref, window: window, model: model, store: store) { close() }
-                        else { problem = "The channel editor is not available. Finish composing text and try again." }
+                        let window = store.active?.activeSession?.engine.view.window ?? window
+                        _ = store.showChannel(ref)
+                        if !ChatSidebarMention.insert(agentID: agentID, ref: ref, window: window, model: model, store: store) { problem = "The channel editor is not available. Finish composing text and try again." }
                     }
                     if let member = model.agents(in: channel.channelId).first(where: { $0.agentId == agentID }) {
                         if model.canRemoveAgent(member) {
-                            Button("Remove from Channel…") { close(); ChatSidebarActions.removeAgent(member, from: channel, model) }
+                            Button("Remove from Channel…") { ChatSidebarActions.removeAgent(member, from: channel, model, from: store) }
                         }
                     } else if let own = model.addableAgents(channel).first(where: { $0.agentId == agentID }) {
-                        Button("Add to #\(channel.name)…") { close(); ChatSidebarActions.addAgent(own, to: channel, model) }
+                        Button("Add to #\(channel.name)…") { ChatSidebarActions.addAgent(own, to: channel, model, from: store) }
                     }
                 }
                 if agent.mine {
@@ -51,20 +50,19 @@ struct ChatSidebarAgentCard: View {
                                   currentKey: TeamService.shared.calls.serverKey, agents: TeamService.shared.calls.agents) else {
                             problem = "This publication cannot be edited here. Open it on the Mac that publishes this agent."; return
                         }
-                        close(); TeamWindows.showAgentEditor(editing)
+                        TeamTabs.shared.showPublication(editing)
                     }
                 } else {
-                    Button("Ask…") { close(); ChatSidebarActions.askAgent(actions, model) }
+                    Button("Ask…") { ChatSidebarActions.askAgent(actions, model, from: store) }
                         .disabled(actions.address == nil)
                 }
-                Button("Published Agents…") { close(); TeamUI.showAgents() }
+                Button("Published Agents…") { TeamUI.showAgents() }
                 if let problem { Text(problem).font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary) }
             } else {
                 Text("Agent unavailable").font(Theme.display(12))
             }
-            Button("Close", action: close).keyboardShortcut(.cancelAction)
         }
-        .padding(16).frame(width: 320, alignment: .leading)
+        .padding(24).frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
     }
@@ -167,7 +165,7 @@ enum ChatSidebarMention {
 }
 
 @MainActor
-final class ChatSidebarWindowReference { weak var window: NSWindow? }
+final class ChatSidebarWindowReference { weak var window: NSWindow?; weak var view: NSView? }
 
 struct ChatSidebarWindowReader: NSViewRepresentable {
     let reference: ChatSidebarWindowReference
@@ -177,7 +175,7 @@ struct ChatSidebarWindowReader: NSViewRepresentable {
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
     func makeNSView(context: Context) -> View {
-        let view = View(); view.reference = reference; return view
+        let view = View(); view.reference = reference; reference.view = view; return view
     }
     func updateNSView(_ view: View, context: Context) { reference.window = view.window }
 }

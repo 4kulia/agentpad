@@ -8,67 +8,26 @@ enum ExternalSessionActions {
     static func focus(_ session: ExternalAgentSession) {
         Task { @MainActor in
             if await TerminalFocuser.focus(session) == .noTerminalFound {
-                showAlert(
+                showFailure(
                     title: "Couldn't find this session's window",
-                    message: "It isn't running in a terminal app this Mac can bring forward (for example, it runs inside tmux or over SSH)."
+                    message: "It isn't running in a terminal app this Mac can bring forward (for example, it runs inside tmux or over SSH).", session: session
                 )
             }
         }
     }
 
     static func takeOver(_ session: ExternalAgentSession, into store: WorkspaceStore) {
-        let alert = NSAlert()
-        alert.messageText = "Move “\(session.displayTitle)” here?"
-        alert.informativeText = """
-        The session will be closed in its terminal and the same conversation resumed in a new tab here. \
-        The conversation is kept; anything else running in that terminal tab is not.
-        """
-        alert.addButton(withTitle: "Move Here")
-        alert.addButton(withTitle: "Cancel")
-        present(alert) { response in
-            guard response == .alertFirstButtonReturn else { return }
-            performTakeOver(session, into: store)
+        ProcessTabs.shared.importExternal(session, from: store)
+    }
+
+    static func showFailure(title: String, message: String, session: ExternalAgentSession? = nil, from store: WorkspaceStore? = nil) {
+        if let session, let model = ProcessTabs.shared.importExternal(session, from: store) {
+            model.message = title + "\n" + message
+        } else if let tab = TabRouter.shared.open(.importSession(agentID: "", conversationID: "", externalSourceID: UUID().uuidString), from: store) {
+            tab.tabState?.message = title + "\n" + message
         }
     }
 
-    private static func performTakeOver(_ session: ExternalAgentSession, into store: WorkspaceStore) {
-        Task { @MainActor in
-            switch await ExternalSessionMonitor.shared.takeOver(session, into: store) {
-            case .success:
-                break
-            case .failure(.notIdle):
-                showAlert(title: "Session is busy", message: "Only an idle session can be moved. Try again when it's done.")
-            case .failure(.stillRunning):
-                showAlert(title: "Session didn't close", message: "It is still running in its terminal. Nothing was changed here.")
-            case .failure(.changed):
-                showAlert(title: "Session changed", message: "That session ended or restarted since the list was shown. Nothing was changed.")
-            case .failure(.noTranscript):
-                showAlert(title: "Conversation not saved", message: "Claude Code hasn't saved this conversation to disk, so it couldn't be resumed here. The session was left running.")
-            case .failure(.resumeRefused(let reason)):
-                showAlert(title: "Couldn't resume the conversation", message: reason)
-            }
-        }
-    }
-
-    static func showAlert(title: String, message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        present(alert) { _ in }
-    }
-
-    /// As a sheet on our window, with the app active first. A free-floating
-    /// `runModal()` shown while another app is frontmost renders the default
-    /// button inactive — blank on macOS 26 — so the dialog looked like it had
-    /// only "Cancel".
-    static func present(_ alert: NSAlert, completion: @escaping (NSApplication.ModalResponse) -> Void) {
-        NSApp.activate()
-        if let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: \.isVisible) {
-            alert.beginSheetModal(for: window, completionHandler: completion)
-        } else {
-            completion(alert.runModal())
-        }
-    }
 }
 
 struct SessionSectionLabel: View {

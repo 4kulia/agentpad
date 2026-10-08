@@ -255,8 +255,10 @@ final class CLIControllerTests: XCTestCase {
             defer: true
         )
 
+        first.terminalConfirmation.canShow = { true }
         let opened = ConfirmCloseTab.request(first, in: workspace, store: store, anchorWindow: window)
-        XCTAssertEqual(opened, .confirming)
+        XCTAssertEqual(opened, .presenting)
+        first.terminalConfirmation.shown(true)
 
         // Asking again about the SAME tab is genuinely idempotent.
         XCTAssertEqual(
@@ -709,29 +711,136 @@ final class CLIControllerTests: XCTestCase {
         XCTAssertEqual(activations, 0)
     }
 
-    func testCloseWithNoAnchorableWindowClosesSilentlyAndSaysSo() async throws {
-        // The engine wants a confirmation, but the injected window() is nil
-        // and NSApp has no key window, so ConfirmCloseTab has nothing to
-        // anchor a sheet on and falls back to a plain close. Two things
-        // follow, and both are about reporting FACTS over the pre-read:
-        // the note says "closed" (not "confirmation shown"), and nothing is
-        // fronted or revealed — no confirmation reached the screen, so the
-        // call has no business stealing focus or pointing at a tab it just
-        // destroyed. ConfirmCloseTab reads NSApp.keyWindow (an IUO), so make
-        // sure the shared application exists when this test runs alone.
-        _ = NSApplication.shared
-        try XCTSkipIf(NSApp?.keyWindow != nil, "a key window would host a real confirm sheet")
+    func testCloseWithNoAnchorableWindowRefusesWithoutTerminating() async throws {
         let store = makeStore()
         let workspace = store.workspaces[0]
         let extra = store.addTab(in: workspace)
         engine(extra).needsConfirmQuit = true
         let controller = makeController(stores: [store])
         let response = await respond(controller, AgentPadCLIRequest(verb: .close, tab: extra.id.uuidString))
-        XCTAssertTrue(response.ok)
-        XCTAssertEqual(response.note, "closed")
-        XCTAssertFalse(workspace.root.allPanes.flatMap(\.tabs).contains { $0.id == extra.id })
-        XCTAssertTrue(revealed.isEmpty, "no confirmation was shown, so nothing should have been revealed")
-        XCTAssertEqual(activations, 0, "a silent background close must not front the app")
+        XCTAssertFalse(response.ok)
+        XCTAssertTrue(workspace.root.allPanes.flatMap(\.tabs).contains { $0.id == extra.id })
+        XCTAssertTrue(revealed.isEmpty)
+        XCTAssertEqual(activations, 0)
+    }
+
+    func testCLIReportsConfirmationOnlyAfterTheBlockActuallyAppears() async throws {
+        let store = makeStore(), workspace = store.workspaces[0]
+        let session = store.addTab(in: workspace)
+        engine(session).needsConfirmQuit = true
+        session.terminalConfirmation.canShow = { true }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered, defer: true)
+        let controller = makeController(stores: [store], anchorWindow: window)
+        let response = await respond(controller, AgentPadCLIRequest(verb: .close, tab: session.id.uuidString))
+        XCTAssertFalse(response.ok, "The host exists, but it never mounted an inline block")
+        XCTAssertEqual(session.terminalConfirmation.phase, .invalidated)
+        XCTAssertTrue(store.allSessions.contains { $0 === session })
+
+        XCTAssertEqual(ConfirmCloseTab.request(session, in: workspace, store: store, anchorWindow: window), .presenting)
+        let shown = Task { await ConfirmCloseTab.waitForPresentation(session, store: store) }
+        session.terminalConfirmation.shown(true)
+        let outcome = await shown.value
+        XCTAssertEqual(outcome, .confirming)
+        session.terminalConfirmation.cancel()
+    }
+
+    func testBackgroundTerminalCloseCreatesConsentBeforeItsViewBecomesVisible() async throws {
+        let store = makeStore(), workspace = store.workspaces[0]
+        defer { store.terminate() }
+        let session = try XCTUnwrap(workspace.activeSession)
+        _ = store.addTab(in: workspace)
+        engine(session).needsConfirmQuit = true
+        let window = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: true)
+        window.contentView = NSView()
+        window.contentView?.addSubview(session.engine.view)
+        session.engine.view.isHidden = true
+        let c = session.terminalConfirmation
+        c.canShow = { workspace.activeSession === session && !session.engine.view.isHiddenOrHasHiddenAncestor }
+
+        XCTAssertEqual(ConfirmCloseTab.request(session, in: workspace, store: store), .presenting)
+        XCTAssertTrue(workspace.activeSession === session)
+        XCTAssertTrue(session.engine.view.isHidden, "AppKit visibility updates after tab activation")
+        XCTAssertEqual(c.phase, .awaiting)
+        c.validate(); c.confirm()
+        XCTAssertEqual(c.phase, .awaiting)
+        XCTAssertEqual(engine(session).terminateCount, 0)
+
+        session.engine.view.isHidden = false
+        c.shown(true)
+        let outcome = await ConfirmCloseTab.waitForPresentation(session, store: store)
+        XCTAssertEqual(outcome, .confirming)
+        c.confirm()
+        for _ in 0..<100 where store.allSessions.contains(where: { $0 === session }) { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertFalse(store.allSessions.contains { $0 === session })
+        XCTAssertEqual(engine(session).terminateCount, 1)
+    }
+
+    func testCLIBackgroundTerminalCloseWaitsForDeferredVisibilityWithoutFalseBusy() async throws {
+        let store = makeStore(), workspace = store.workspaces[0]
+        defer { store.terminate() }
+        let session = try XCTUnwrap(workspace.activeSession)
+        _ = store.addTab(in: workspace)
+        engine(session).needsConfirmQuit = true
+        let window = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: true)
+        window.contentView = NSView()
+        window.contentView?.addSubview(session.engine.view)
+        session.engine.view.isHidden = true
+        let c = session.terminalConfirmation
+        c.canShow = { workspace.activeSession === session && !session.engine.view.isHiddenOrHasHiddenAncestor }
+        let controller = makeController(stores: [store], anchorWindow: window)
+        var response: AgentPadCLIResponse?
+        controller.handle(.init(verb: .close, tab: session.id.uuidString)) { response = $0 }
+        for _ in 0..<100 where !c.isAwaiting && response == nil { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(c.phase, .awaiting)
+        XCTAssertNil(response, "The CLI must wait for presentation instead of reporting busy")
+        XCTAssertFalse(c.isVisible)
+        XCTAssertEqual(engine(session).terminateCount, 0)
+
+        session.engine.view.isHidden = false
+        c.shown(true)
+        for _ in 0..<100 where response == nil { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(response?.ok, true)
+        XCTAssertEqual(response?.note, "confirmation shown in \(AppIdentity.appName)")
+        XCTAssertEqual(c.phase, .awaiting)
+        XCTAssertEqual(engine(session).terminateCount, 0)
+        c.cancel()
+    }
+
+    func testCloseConsentEndsWhenTheCallingClientGoesAway() async throws {
+        let store = makeStore(), workspace = store.workspaces[0]
+        let session = store.addTab(in: workspace)
+        engine(session).needsConfirmQuit = true
+        session.terminalConfirmation.canShow = { true }
+        let window = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: true)
+        var waiting = true
+        XCTAssertEqual(ConfirmCloseTab.request(session, in: workspace, store: store, anchorWindow: window, callerWaiting: { waiting }), .presenting)
+        session.terminalConfirmation.shown(true)
+        waiting = false
+        session.terminalConfirmation.confirm()
+        XCTAssertEqual(session.terminalConfirmation.phase, .invalidated)
+        XCTAssertTrue(store.allSessions.contains { $0 === session })
+    }
+
+    func testAcknowledgedCLICloseRemainsAvailableAfterTheClientReceivesItsReply() async throws {
+        let store = makeStore(), workspace = store.workspaces[0]
+        let session = store.addTab(in: workspace)
+        engine(session).needsConfirmQuit = true
+        session.terminalConfirmation.canShow = { true }
+        let window = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: true)
+        let controller = makeController(stores: [store], anchorWindow: window)
+        var waiting = true
+        var response: AgentPadCLIResponse?
+        controller.handle(.init(verb: .close, tab: session.id.uuidString), isCallerWaiting: { waiting }) {
+            response = $0; waiting = false
+        }
+        for _ in 0..<100 where !session.terminalConfirmation.isAwaiting { try await Task.sleep(for: .milliseconds(5)) }
+        session.terminalConfirmation.shown(true)
+        for _ in 0..<100 where response == nil { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(response?.ok, true)
+        XCTAssertFalse(waiting)
+        session.terminalConfirmation.confirm()
+        for _ in 0..<100 where store.allSessions.contains(where: { $0 === session }) { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertFalse(store.allSessions.contains { $0 === session })
     }
 
     /// A close refused because the window is already confirming ANOTHER tab
@@ -752,10 +861,11 @@ final class CLIControllerTests: XCTestCase {
             backing: .buffered,
             defer: true
         )
-        // Park a confirmation for `first` on that window.
+        first.terminalConfirmation.canShow = { true }
+        // Park an inline confirmation for `first` on that window.
         XCTAssertEqual(
             ConfirmCloseTab.request(first, in: workspace, store: store, anchorWindow: window),
-            .confirming
+            .presenting
         )
 
         let controller = makeController(stores: [store], anchorWindow: window)

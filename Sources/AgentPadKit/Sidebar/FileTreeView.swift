@@ -6,14 +6,13 @@ import SwiftUI
 /// fit a tree).
 struct FileTreeView: View {
     let store: WorkspaceStore
-    let model: FileTreeModel
+    @Bindable var model: FileTreeModel
+    var pinnedRoot: URL? = nil
 
     @State private var activationToken = 0
     /// AgentPad: the dotfile setting is shared by every window; each tree
     /// re-lists itself when it flips, not just the one whose button was hit.
     @AppStorage(FileTreePreferences.showHiddenKey) private var showHiddenFiles = true
-    /// AgentPad: find-a-file query; non-empty swaps the tree for results.
-    @State private var fileQuery = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,11 +23,11 @@ struct FileTreeView: View {
             content
                 // AgentPad: empty space anywhere in the tree — including an
                 // empty or still-loading root — takes drops into the root.
-                .fileTreeDropTarget(directory: model.rootURL, root: model.rootURL)
+                .fileTreeDropTarget(directory: model.rootURL, root: model.rootURL, editor: model.nameEdit)
         }
         .onAppear {
             activationToken = model.activate(root: effectiveRoot)
-            store.refreshFileTreeGitDiff()
+            if pinnedRoot == nil { store.refreshFileTreeGitDiff() }
         }
         // Tokened: an animated unmount's late onDisappear must not deactivate
         // the model a newer mount just activated (frozen-tree race).
@@ -37,6 +36,7 @@ struct FileTreeView: View {
         // `diskPath == workingDirectory` — OSC 7 cwd drift; worktrees stay
         // pinned via `worktreePath`.
         .onChange(of: store.fileTreeRoot?.path) { _, newPath in
+            guard pinnedRoot == nil else { return }
             // AgentPad: switching tabs/workspaces leaves an external session's folder.
             ExternalTreeRoot.for(store).clear()
             model.setRoot(newPath.map { URL(fileURLWithPath: $0) })
@@ -46,13 +46,14 @@ struct FileTreeView: View {
             if let root = model.rootURL { model.refresh(dirPath: root.path) }
         }
         .onChange(of: ExternalTreeRoot.for(store).url) { _, _ in
+            guard pinnedRoot == nil else { return }
             model.setRoot(effectiveRoot)
         }
     }
 
     /// AgentPad: an external session's folder when one is shown, else AgentPad's own root.
     private var effectiveRoot: URL? {
-        ExternalTreeRoot.for(store).url ?? store.fileTreeRoot
+        pinnedRoot ?? ExternalTreeRoot.for(store).url ?? store.fileTreeRoot
     }
 
     private func header(root: URL) -> some View {
@@ -75,7 +76,7 @@ struct FileTreeView: View {
                 .truncationMode(.head)
             // AgentPad: which external session this is, actions on the root
             // folder itself, and file search.
-            if let label = ExternalTreeRoot.for(store).label {
+            if pinnedRoot == nil, let label = ExternalTreeRoot.for(store).label {
                 HStack(spacing: 4) {
                     Text("Session in another terminal: \(label)")
                         .font(Theme.display(10.5))
@@ -87,8 +88,22 @@ struct FileTreeView: View {
                     }
                 }
             }
-            FileTreeRootActions(root: root)
-            FileSearchField(query: $fileQuery)
+            FileTreeRootActions(root: root, editor: model.nameEdit)
+            if pinnedRoot == nil {
+                Button("Open Files tab") { LocalFormTabs.shared.files(root, from: store) }
+                    .buttonStyle(.plain).font(.caption)
+            }
+            FileRowFeedback(url: root, edit: model.nameEdit)
+            if let draft = model.headerDraft {
+                // A cwd change, collapse or search must not strand a pinned edit.
+                Text(draft.path).font(.caption).textSelection(.enabled)
+                FileNameField(edit: model.nameEdit)
+            }
+            // A removed/filtered row must not swallow a late operation error.
+            ForEach(model.headerErrorPaths, id: \.self) { path in
+                Text(path + ": " + (model.nameEdit.errors[path] ?? "")).font(.caption).foregroundStyle(.red)
+            }
+            FileSearchField(query: $model.searchQuery)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.leading, Theme.sidebarContentLeadingX)
@@ -100,8 +115,8 @@ struct FileTreeView: View {
 
     @ViewBuilder
     private var content: some View {
-        if let root = model.rootURL, !fileQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-            FileSearchResults(root: root, query: fileQuery) { url in
+        if let root = model.rootURL, !model.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+            FileSearchResults(root: root, query: model.searchQuery) { url in
                 model.selectedId = url.standardizedFileURL.path
                 var isDir: ObjCBool = false
                 if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue {
@@ -249,7 +264,14 @@ private struct FileTreeRowView: View {
             // frame's layout is then a pure function of the row width. A
             // Spacer + two negotiating Texts re-split compression per frame,
             // which visibly judders the right-pinned badge.
-            Text(node.name)
+            VStack(alignment: .leading, spacing: 3) {
+                if model.nameEdit.draft?.kind == .rename, model.nameEdit.draft?.path == FileNameEdit.key(node.url) {
+                    FileNameField(edit: model.nameEdit)
+                } else {
+                    Text(node.name)
+                }
+                FileRowFeedback(url: node.url, edit: model.nameEdit)
+            }
                 .font(Theme.display(12.5))
                 .foregroundStyle(nameColor(selected: isSelected))
                 .lineLimit(1)
@@ -272,7 +294,7 @@ private struct FileTreeRowView: View {
         }
         // AgentPad: drop files onto a folder row (file rows aren't targets, so
         // the highlight never points somewhere the files won't go).
-        .fileTreeDropTarget(directory: node.isDirectory ? node.url : nil, root: model.rootURL)
+        .fileTreeDropTarget(directory: node.isDirectory ? node.url : nil, root: model.rootURL, editor: model.nameEdit)
         // count:2 must attach before count:1 or the double never recognizes.
         // A double-click on a file also fires the single handler on its
         // first click — select-then-open, same as Finder.
@@ -356,14 +378,14 @@ private struct FileTreeRowView: View {
             AgentPadMenuRow(
                 title: "Insert Path into Terminal",
                 // AgentPad: not into a channel tab (DESIGN-F2).
-                isDisabled: store.active?.activeSession == nil || store.active?.activeSession?.isChat == true
+                isDisabled: store.active?.activeSession == nil || store.active?.activeSession?.hasProcess == false
             ) {
                 isContextMenuOpen = false
                 store.active?.activeSession?.engine
                     .paste(AgentPadShellIntegration.backslashEscape(node.url.path))
             }
             // AgentPad: file operations.
-            FileTreeOperationRows(node: node, close: { isContextMenuOpen = false })
+            FileTreeOperationRows(node: node, close: { isContextMenuOpen = false }, editor: model.nameEdit)
         }
         .padding(Theme.space1)
         .frame(minWidth: 220)

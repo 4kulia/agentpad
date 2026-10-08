@@ -58,13 +58,14 @@ enum ChatCLI {
 
     // MARK: login
 
-    /// Tests: what opens the window.
-    static var openConnectWindow: @MainActor () -> Void = { ChatConnectWindow.show() }
+    /// Tests: what opens the Connection tab.
+    static var openConnection: @MainActor () -> Void = { ConnectionTabs.shared.show() }
+    static var connectionTabs: ConnectionTabs = .shared
 
-    /// Opens the window: the code from the mail is entered there only.
+    /// Opens Connection: the code from the mail is entered there only.
     static func login() -> Answer {
-        openConnectWindow()
-        return .done("opened", "finish signing in in the AgentPad window")
+        openConnection()
+        return .done("opened", "finish signing in in the Connection tab")
     }
 
     // MARK: logout
@@ -74,7 +75,7 @@ enum ChatCLI {
     static func logout(_ service: ChatService = .shared, isCallerWaiting: @escaping @MainActor () -> Bool,
                        now: Date = Date()) async -> Answer {
         guard let connection = service.connection else { return .refused("not_connected", "not connected to a server") }
-        let outcome = await ChatConnectWindow.confirmAndDisconnect(
+        let outcome = await connectionTabs.confirmAndDisconnect(
             expecting: connection, service: service, deadline: now.addingTimeInterval(45), isCallerWaiting: isCallerWaiting,
             answerBy: now.addingTimeInterval(110))
         switch outcome {

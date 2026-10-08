@@ -11,6 +11,8 @@ import XCTest
 @MainActor
 final class ChatCLITests: XCTestCase {
     private var root: URL!
+    private var tabs: ConnectionTabs!
+    private var workspace: WorkspaceStore!
     private let org = "0d6f1e1a-4b55-4c6a-8a2e-3b6c9d5e7f10"
     private let anna = "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40"
     private let boris = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
@@ -25,14 +27,22 @@ final class ChatCLITests: XCTestCase {
     override func setUp() async throws {
         teamScope = TeamServiceTestScope()
         root = FileManager.default.temporaryDirectory.appendingPathComponent("chat-cli-\(UUID().uuidString)")
+        workspace = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: {
+            XCTFail("Connection must not create a terminal"); return TestEngine()
+        })
+        let router = TabRouter(), store = workspace!
+        router.stores = { [store] }; router.ensureHost = { store }
+        let navigation = SupportTabNavigation(router: router); navigation.finishStartup()
+        tabs = ConnectionTabs(navigation: navigation)
+        ChatCLI.connectionTabs = tabs
     }
 
     override func tearDown() async throws {
         defer { teamScope.close(); teamScope = nil }
-        ChatConnectWindow.answerConfirmation = nil
-        ChatConnectWindow.disconnectCall = { await $0.disconnect(expecting: $1) }
-        ChatConnectWindow.now = { Date() }
-        ChatCLI.openConnectWindow = { ChatConnectWindow.show() }
+        workspace.terminate(); workspace = nil
+        ChatCLI.connectionTabs = .shared
+        ChatCLI.openConnection = { ConnectionTabs.shared.show() }
+        tabs = nil
         try? FileManager.default.removeItem(at: root)
     }
 
@@ -113,9 +123,9 @@ final class ChatCLITests: XCTestCase {
         XCTAssertTrue(info.problems?.contains { $0.hasPrefix("Changes cannot be saved on this Mac") } == true, "\(info.problems ?? [])")
     }
 
-    func testLoginOpensTheWindowInAnyState() {
+    func testLoginOpensTheConnectionTabInAnyState() {
         var opened = 0
-        ChatCLI.openConnectWindow = { opened += 1 }
+        ChatCLI.openConnection = { opened += 1 }
         let answer = ChatCLI.login()
         XCTAssertTrue(answer.ok)
         XCTAssertEqual(info(answer).outcome, "opened")
@@ -208,41 +218,39 @@ final class ChatCLITests: XCTestCase {
 
     // MARK: logout
 
-    /// C7 review p2-1: the key window may be another's open sheet: the
-    /// confirmation's host is its parent, which has that sheet — busy.
-    func testTheHostOfAnOpenSheetIsItsParent() async throws {
-        let parent = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
-        let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered, defer: false)
-        parent.isReleasedWhenClosed = false
-        sheet.isReleasedWhenClosed = false
-        parent.beginSheet(sheet, completionHandler: nil)
-        let deadline = Date().addingTimeInterval(2)
-        while sheet.sheetParent == nil, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
-        XCTAssertTrue(ChatConnectWindow.host(for: sheet) === parent)
-        XCTAssertNotNil(ChatConnectWindow.host(for: sheet).attachedSheet, "so the confirmation answers busy")
-        XCTAssertTrue(ChatConnectWindow.host(for: parent) === parent)
-        parent.endSheet(sheet)
+    private func decision(_ work: @escaping @MainActor () async -> ChatCLI.Answer,
+                          press: (ConfirmationCoordinator) -> Void) async throws -> ChatCLI.Answer {
+        var answer: ChatCLI.Answer?
+        let task = Task { @MainActor in answer = await work() }
+        let until = Date().addingTimeInterval(3)
+        while workspace.allSessions.first?.tabState?.confirmation.isAwaiting != true, Date() < until {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let coordinator = try XCTUnwrap(workspace.allSessions.first?.tabState?.confirmation)
+        XCTAssertTrue(coordinator.isAwaiting)
+        coordinator.canShow = { true }
+        coordinator.shown(true)
+        press(coordinator)
+        await task.value
+        return try XCTUnwrap(answer)
     }
 
     func testLogoutOutcomes() async throws {
         let (service, _) = try signedIn()
         var disconnected: [ChatConnection] = []
-        ChatConnectWindow.disconnectCall = { disconnected.append($1); return .done }
-
-        ChatConnectWindow.answerConfirmation = { .alertFirstButtonReturn }
-        let answer1 = await ChatCLI.logout(service, isCallerWaiting: { true })
+        tabs.disconnectCall = { disconnected.append($1); return .done }
+        let answer1 = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { true }) }) { $0.confirm() }
         XCTAssertEqual(info(answer1).outcome, "disconnected")
         XCTAssertEqual(disconnected, [connection])
 
-        ChatConnectWindow.answerConfirmation = { .alertSecondButtonReturn }
-        let answer2 = await ChatCLI.logout(service, isCallerWaiting: { true })
+        let answer2 = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { true }) }) { $0.cancel() }
         XCTAssertEqual(info(answer2).outcome, "cancelled")
 
-        ChatConnectWindow.disconnectCall = { _, _ in .notFinished("Disconnect could not finish: x. Try Disconnect again.") }
-        ChatConnectWindow.answerConfirmation = { .alertFirstButtonReturn }
-        let unfinished = await ChatCLI.logout(service, isCallerWaiting: { true })
+        tabs.disconnectCall = { _, _ in .notFinished("Disconnect could not finish: x. Try Disconnect again.") }
+        let unfinished = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { true }) }) { $0.confirm() }
         XCTAssertEqual(info(unfinished).outcome, "not_finished")
         XCTAssertEqual(unfinished.error, "Disconnect could not finish: x. Try Disconnect again.")
+        guard case .failed = workspace.allSessions.first?.tabState?.confirmation.phase else { return XCTFail("missing inline error") }
 
         let off = ChatService(files: ChatFiles(directory: root.appendingPathComponent("off")), tokens: FakeTokenStore())
         let answer3 = await ChatCLI.logout(off, isCallerWaiting: { true })
@@ -250,50 +258,76 @@ final class ChatCLITests: XCTestCase {
         XCTAssertEqual(disconnected.count, 1)
     }
 
-    /// The press decides: past the deadline, the caller gone or another
-    /// connection by then — no Disconnect, whatever the watchman did not
-    /// close yet (DESIGN-C7, amendment 1).
     func testThePressChecksDeadlineCallerAndConnection() async throws {
         let (service, _) = try signedIn()
-        var calls = 0
-        ChatConnectWindow.disconnectCall = { _, _ in calls += 1; return .done }
-        let start = Date()
-        // Pressed after the deadline.
-        ChatConnectWindow.now = { start.addingTimeInterval(46) }
-        ChatConnectWindow.answerConfirmation = { .alertFirstButtonReturn }
-        let answer4 = await ChatCLI.logout(service, isCallerWaiting: { true }, now: start)
-        XCTAssertEqual(info(answer4).outcome, "no_answer")
-        ChatConnectWindow.now = { Date() }
-        // Pressed once the caller left: nobody to answer, nothing done.
-        _ = await ChatCLI.logout(service, isCallerWaiting: { false })
-        // Pressed after another sign-in.
-        ChatConnectWindow.answerConfirmation = {
+        var calls = 0, clock = Date(), waiting = true
+        tabs.disconnectCall = { _, _ in calls += 1; return .done }
+        tabs.now = { clock }
+        let start = clock
+        let expired = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { true }, now: start) }) {
+            clock = start.addingTimeInterval(46); $0.confirm()
+        }
+        XCTAssertEqual(info(expired).outcome, "no_answer")
+        clock = Date()
+        let gone = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { waiting }) }) {
+            waiting = false; $0.confirm()
+        }
+        XCTAssertEqual(info(gone).outcome, "cancelled")
+        let changed = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { true }) }) {
             try? service.saveSignIn(ChatConnection(server: self.server, accountId: self.anna, sessionId: "s2", deviceName: "Mac",
                                                    orgId: self.org), token: "aps_u")
-            return .alertFirstButtonReturn
+            $0.confirm()
         }
-        let answer5 = await ChatCLI.logout(service, isCallerWaiting: { true })
-        XCTAssertEqual(info(answer5).outcome, "stale")
+        XCTAssertEqual(info(changed).outcome, "stale")
         XCTAssertEqual(calls, 0)
     }
 
-    /// One at a time, held until the core's call ends; an answer due before
-    /// the end says `started`, the Disconnect going on.
+    func testCallerDisappearingEndsAnUnansweredDecision() async throws {
+        let (service, _) = try signedIn()
+        var waiting = true
+        tabs.disconnectCall = { _, _ in XCTFail("caller gone"); return .done }
+        let gone = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { waiting }) }) { _ in waiting = false }
+        XCTAssertEqual(info(gone).outcome, "cancelled")
+        XCTAssertFalse(tabs.busy)
+    }
+
     func testOneLogoutAtATimeAndStarted() async throws {
         let (service, _) = try signedIn()
         let gate = AsyncGate()
         var ended = false
-        ChatConnectWindow.answerConfirmation = { .alertFirstButtonReturn }
-        ChatConnectWindow.disconnectCall = { _, _ in await gate.wait(); ended = true; return .done }
-        let first = await ChatConnectWindow.confirmAndDisconnect(expecting: connection, service: service, answerBy: Date().addingTimeInterval(0.2))
-        XCTAssertEqual(first, .started)
+        tabs.disconnectCall = { _, _ in await gate.wait(); ended = true; return .done }
+        let first = Task { await self.tabs.confirmAndDisconnect(expecting: self.connection, service: service, answerBy: Date().addingTimeInterval(0.1)) }
+        let until = Date().addingTimeInterval(3)
+        while workspace.allSessions.first?.tabState?.confirmation.isAwaiting != true, Date() < until {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let c = try XCTUnwrap(workspace.allSessions.first?.tabState?.confirmation)
+        c.canShow = { true }; c.shown(true); c.confirm(); c.confirm()
+        let started = await first.value
+        XCTAssertEqual(started, .started)
         XCTAssertFalse(ended)
-        let answer6 = await ChatCLI.logout(service, isCallerWaiting: { true })
-        XCTAssertEqual(info(answer6).outcome, "busy")
+        let answer = await ChatCLI.logout(service, isCallerWaiting: { true })
+        XCTAssertEqual(info(answer).outcome, "busy")
+        // Already sent work survives closing the tab; consent itself cannot be reused.
+        workspace.closeTab(workspace.allSessions[0], in: workspace.active!)
+        XCTAssertTrue(tabs.busy)
         await gate.open()
-        let deadline = Date().addingTimeInterval(5)
-        while ChatConnectWindow.busy, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
-        XCTAssertFalse(ChatConnectWindow.busy)
+        while tabs.busy, Date() < until { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertFalse(tabs.busy)
         XCTAssertTrue(ended)
+    }
+
+    func testNoHostAndCompetingDecisionAreBusyWithoutDisconnect() async throws {
+        let (service, _) = try signedIn()
+        tabs.disconnectCall = { _, _ in XCTFail("no consent"); return .done }
+        tabs.navigation.router.ensureHost = { nil }
+        let noHost = await ChatCLI.logout(service, isCallerWaiting: { true })
+        XCTAssertEqual(info(noHost).outcome, "busy")
+        tabs.navigation.router.ensureHost = { self.workspace }
+        let state = try XCTUnwrap(tabs.show()?.tabState)
+        state.confirmation.request(.init(tabID: UUID(), targetID: "other"), title: "Other", consequences: "", verb: "Apply", stillValid: { true }, operation: {})
+        let other = await ChatCLI.logout(service, isCallerWaiting: { true })
+        XCTAssertEqual(info(other).outcome, "busy")
+        state.confirmation.cancel()
     }
 }

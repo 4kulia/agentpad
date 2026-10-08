@@ -32,8 +32,6 @@ struct ChatMessageRow: View {
         guard model.editing?.messageId == message.messageId, model.editing?.root == editRoot else { return nil }
         return model.editing
     }
-    /// The revision the deletion's confirmation was opened on.
-    @State private var deleting: Int?
     @State private var showingReactions = false
 
     private var mine: Bool { message.authorAccountId == me }
@@ -72,6 +70,10 @@ struct ChatMessageRow: View {
                 }
                 if message.editedAt != nil && !message.deleted { Text("edited").font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary) }
                 marks
+                if let confirmation = model.confirmation, confirmation.context?.targetID == "message:\(message.id)",
+                   model.deletionRoot == editRoot {
+                    InlineConfirmation(coordinator: confirmation)
+                }
                 if !message.deleted, let b1 = model.b1 {
                     if b1.state.metadata[message.id] == nil, message.seq != nil,
                        b1.supports("chat.reactions") || b1.supports("chat.pins") || b1.supports("chat.thread_summary") {
@@ -137,17 +139,9 @@ struct ChatMessageRow: View {
                 ChatAccessibility.announce(announcement, in: window.view)
             }
         }
-        .confirmationDialog("Delete this message?", isPresented: Binding(get: { deleting != nil && !message.deleted },
-                                                                          set: { if !$0 { deleting = nil } })) {
-            Button("Delete", role: .destructive) {
-                if let revision = deleting { model.delete(message, revision: revision) }
-                deleting = nil
-            }
-        } message: { Text("Copies already in the context of a running agent stay.") }
         .onChange(of: message.deleted) { _, deleted in
             if deleted {
                 if editing != nil { model.cancelEditing() }
-                deleting = nil
             }
         }
     }
@@ -299,7 +293,7 @@ struct ChatMessageRow: View {
                 if model.canEdit(message) {
                     ChatIconButton(title: "Edit message", symbol: "pencil") { model.beginEditing(message, root: editRoot) }.disabled(model.editing != nil)
                 }
-                if canDelete { ChatIconButton(title: "Delete message…", symbol: "trash") { deleting = message.revision } }
+                if canDelete { ChatIconButton(title: "Delete message…", symbol: "trash") { model.requestDelete(message, root: editRoot) } }
                 Menu { menu } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("More message actions")
                     .accessibilityLabel("More message actions").chatFocusRing()
@@ -335,7 +329,7 @@ struct ChatMessageRow: View {
                 if !archived, model.canEdit(message) {
                     Button("Edit") { model.beginEditing(message, root: editRoot) }.disabled(model.editing != nil)
                 }
-                if canDelete { Button("Delete…", role: .destructive) { deleting = message.revision } }
+                if canDelete { Button("Delete…", role: .destructive) { model.requestDelete(message, root: editRoot) } }
             }
         }
     }

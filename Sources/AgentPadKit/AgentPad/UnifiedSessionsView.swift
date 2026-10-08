@@ -127,9 +127,9 @@ struct UnifiedSessionsView: View {
 
     private func resume(_ record: AgentSessionRecord) {
         if case .failure(let refusal) = store.resumeAgentSession(record) {
-            ExternalSessionActions.showAlert(
+            ExternalSessionActions.showFailure(
                 title: "Couldn't resume the conversation",
-                message: refusal.message(agentId: record.agentId, conversationId: record.conversationId)
+                message: refusal.message(agentId: record.agentId, conversationId: record.conversationId), from: store
             )
         }
     }

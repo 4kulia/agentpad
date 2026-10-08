@@ -583,8 +583,12 @@ final class TeamCalls {
 
     /// Adds or replaces several agents at once: every one is checked first,
     /// then all are written together — or none is.
-    func save(_ batch: [TeamPublishedAgent]) async throws {
-        try commit(try await prepared(batch))
+    func save(_ batch: [TeamPublishedAgent], validate: () throws -> Void = {}, didCommit: () -> Void = {}) async throws {
+        try validate()
+        let checked = try await prepared(batch)
+        try validate()
+        try commit(checked)
+        didCommit()
     }
 
     /// Server mode: colleagues' agents of the organization's catalog, as the
@@ -656,14 +660,18 @@ final class TeamCalls {
     /// `key`: the organization the form was opened for — the publication is
     /// refused if the connection is another one once the checks are done
     /// (review D3-9, D3-p1-3).
-    func saveAndPublish(_ batch: [TeamPublishedAgent], teams: [String], key: ChatOrgKey) async throws {
+    func saveAndPublish(_ batch: [TeamPublishedAgent], teams: [String], key: ChatOrgKey,
+                        validate: () throws -> Void = {}, didCommit: () -> Void = {}) async throws {
         guard serverMode, serverKey != nil, let publishing else { throw TeamError.notConnected }
+        try validate()
         let checked = try await prepared(batch)
         await afterPrepare()
         guard serverKey == key else { throw TeamError.notYet(TeamServerCore.changedMeanwhile) }
+        try validate()
         let published = checked.map(\.agent).filter(\.enabled)
         if !published.isEmpty, teams.isEmpty { throw TeamError.storage("choose one or more of your teams to publish to") }
         try commit(checked)
+        didCommit()
         if !published.isEmpty { try publishing.publish(published, teams: teams, key: key) }
     }
 
@@ -1272,14 +1280,14 @@ final class TeamCalls {
     /// `area`: the organization the asker began with (CLI, MCP); a call
     /// is not moved to another one that became current meanwhile.
     func ask(_ address: String, prompt: String, threadId: String?, origin: TeamCallOrigin?,
-             deliverBy: Date? = nil, area: ChatOrgKey?? = .none) throws -> Outgoing {
+             deliverBy: Date? = nil, area: ChatOrgKey?? = .none, requestID: String? = nil) throws -> Outgoing {
         if case .some(let began) = area, began != serverKey {
             throw TeamError.storage("the organization changed while the call was being made; nothing was sent")
         }
         if serverMode, serverCalls == nil { throw TeamError.notConnected }
         if let serverCalls, let serverKey {
             return try askServer(address, prompt: prompt, threadId: threadId, origin: origin, deliverBy: deliverBy,
-                                 calls: serverCalls, key: serverKey)
+                                 calls: serverCalls, key: serverKey, requestID: requestID)
         }
         guard let link else { throw TeamError.notConnected }
         let parts = address.split(separator: "@", maxSplits: 1).map(String.init)
@@ -1316,7 +1324,7 @@ final class TeamCalls {
     /// catalog and a member's handle — no contacts; the call is the request
     /// kept in the cache, the same checks as before. Sending it is D5's.
     private func askServer(_ address: String, prompt: String, threadId: String?, origin: TeamCallOrigin?, deliverBy: Date?,
-                           calls: ChatCallStore, key: ChatOrgKey) throws -> Outgoing {
+                           calls: ChatCallStore, key: ChatOrgKey, requestID: String? = nil) throws -> Outgoing {
         let parts = address.split(separator: "@", maxSplits: 1).map(String.init)
         guard parts.count == 2, TeamPublishedAgent.isValidName(parts[0]) else {
             throw TeamError.storage("an agent's address is name@colleague, e.g. backend@masha")
@@ -1334,7 +1342,7 @@ final class TeamCalls {
         if let thread, try !calls.queue.read({ try ChatCallStore.knowsThread($0, thread, agentId: agent.agentId, initiator: key.accountId) }) {
             throw TeamError.storage("unknown thread \(thread) for \(address): continue a thread of a call you made to this agent")
         }
-        let requestId = UUID().uuidString.lowercased()
+        let requestId = requestID ?? UUID().uuidString.lowercased()
         var args: [String: ChatJSON] = [
             "request_id": .string(requestId), "agent_id": .string(agent.agentId), "text": .string(prompt),
             "origin": origin.map { o in .object(["session": o.session.map(ChatJSON.string) ?? .null, "project": o.project.map(ChatJSON.string) ?? .null]) } ?? .null,

@@ -1,5 +1,6 @@
-import Foundation
+import AppKit
 import GRDB
+import SwiftUI
 import XCTest
 @testable import AgentPadKit
 
@@ -224,6 +225,171 @@ final class ChatChannelAgentsTests: XCTestCase {
         let doubting = model(doubt: true, there: [mineThere], mine: [catalogCard("a2")])
         XCTAssertTrue(doubting.addableAgents(card).isEmpty)
         XCTAssertFalse(doubting.canRemoveAgent(mineThere))
+    }
+
+    func testSidebarAgentMembershipUsesChannelAgentsInlineConfirmation() async throws {
+        let teamScope = TeamServiceTestScope()
+        defer { teamScope.close() }
+        for removing in [false, true] {
+            let catalog = catalogCard("a1"), member = inChannel("a1", owner: me)
+            let model = model(there: removing ? [member] : [], mine: [catalog])
+            let card = try XCTUnwrap(model.visibleChannel("c1"))
+            let host = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true,
+                engineFactory: { XCTFail("Agent membership must not create a terminal"); return TestEngine() })
+            defer { model.isCurrent = { false }; host.terminate() }
+            let sent = expectation(description: "Membership command queued")
+            var commands: [(String, ChatJSON)] = []
+            model.enqueue = { type, args in commands.append((type, args)); sent.fulfill(); return "command" }
+
+            if removing { ChatSidebarActions.removeAgent(member, from: card, model, from: host) }
+            else { ChatSidebarActions.addAgent(catalog, to: card, model, from: host) }
+            let session = try XCTUnwrap(host.active?.activeSession)
+            let engine = try XCTUnwrap(session.engine as? ChannelTabEngine)
+            let c = engine.conversation.confirmation
+            XCTAssertEqual(engine.ref, ChannelRef(key, channel: "c1"))
+            XCTAssertTrue(engine.conversation.showingAgents)
+            XCTAssertEqual(c.phase, .awaiting)
+            XCTAssertEqual(c.context?.tabID, session.id)
+            XCTAssertEqual(c.context?.scope, OrgKey(key))
+            XCTAssertEqual(c.context?.revision, "1")
+            XCTAssertEqual(c.verb, removing ? "Remove" : "Add")
+            XCTAssertEqual(c.destructive, removing)
+            XCTAssertTrue(c.consequences.contains(removing ? "requests in the channel end" : "future ones included"))
+            XCTAssertTrue(commands.isEmpty)
+            c.confirm()
+            XCTAssertTrue(commands.isEmpty, "An unseen block grants no consent")
+            c.canShow = { true }; c.shown(true); c.confirm(); c.confirm()
+            await fulfillment(of: [sent], timeout: 3)
+            XCTAssertEqual(c.phase, .completed)
+            XCTAssertEqual(commands.count, 1)
+            XCTAssertEqual(commands.first?.0, removing ? "agent.remove_from_channel" : "agent.add_to_channel")
+            XCTAssertEqual(commands.first?.1["agent_id"], .string("a1"))
+            XCTAssertEqual(commands.first?.1["channel_id"], .string("c1"))
+            XCTAssertEqual(host.allSessions.count, 1)
+        }
+    }
+
+    func testSidebarAgentMembershipRejectsStaleInlineConsent() throws {
+        let teamScope = TeamServiceTestScope()
+        defer { teamScope.close() }
+        for removing in [false, true] {
+            for change in ["channel", "agent", "rights", "connection", "organization", "cancel"] {
+                let catalog = catalogCard("a1"), member = inChannel("a1", owner: me)
+                let model = model(there: removing ? [member] : [], mine: [catalog])
+                let card = try XCTUnwrap(model.visibleChannel("c1"))
+                let host = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true,
+                    engineFactory: { TestEngine() })
+                defer { model.isCurrent = { false }; host.terminate() }
+                var commands = 0
+                model.enqueue = { _, _ in commands += 1; return "command" }
+                if removing { ChatSidebarActions.removeAgent(member, from: card, model, from: host) }
+                else { ChatSidebarActions.addAgent(catalog, to: card, model, from: host) }
+                let engine = try XCTUnwrap(host.active?.activeSession?.engine as? ChannelTabEngine)
+                let c = engine.conversation.confirmation
+                XCTAssertEqual(c.phase, .awaiting)
+                c.canShow = { true }; c.shown(true)
+                var view = model.view
+                switch change {
+                case "channel": view.channels[0].version += 1
+                case "agent":
+                    if removing { view.channelAgents[0].name = "changed" }
+                    else { view.myAgents[0].access = "edit" }
+                case "rights": view.rightsInDoubt = true
+                case "connection": model.isCurrent = { false }
+                case "organization": model.key = ChatOrgKey(server: server, accountId: me, orgId: "another-org")
+                default: c.cancel()
+                }
+                model.set(view)
+                c.confirm()
+                XCTAssertEqual(c.phase, change == "cancel" ? .cancelled : .invalidated, change)
+                XCTAssertEqual(commands, 0, change)
+            }
+        }
+    }
+
+    func testAgentMembershipConsentSurvivesRenderedPinnedAgentsAndChannelTransitions() async throws {
+        let teamScope = TeamServiceTestScope()
+        defer { teamScope.close() }
+        for (removing, initiallyPinned) in [(false, false), (false, true), (true, false), (true, true)] {
+            let catalog = catalogCard("a1"), member = inChannel("a1", owner: me)
+            let model = model(there: removing ? [member] : [], mine: [catalog])
+            let card = try XCTUnwrap(model.visibleChannel("c1"))
+            let chatStore = try store(channels: [card])
+            let service = ChatService(files: ChatFiles(directory: root.appendingPathComponent("service")), tokens: FakeTokenStore())
+            service.serverCapabilities[key.server] = ChatB1.capabilities
+            let workspaceStore = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true,
+                engineFactory: { TestEngine() })
+            defer { model.isCurrent = { false }; workspaceStore.terminate() }
+            let session = try XCTUnwrap(workspaceStore.showChannel(ChannelRef(key, channel: card.channelId)))
+            let engine = try XCTUnwrap(session.engine as? ChannelTabEngine)
+            let conversation = engine.conversation
+            conversation.update(.ready(card, team: "Billing", offline: true), key: key, store: chatStore, service: service)
+            if initiallyPinned { conversation.togglePins() }
+            XCTAssertEqual(conversation.pinsShown, initiallyPinned)
+            let c = conversation.confirmation
+            c.canShow = { true }
+            var renderedChanges = 0
+            let host = NSHostingView(rootView: MembershipChannelView(card: card, key: key, conversation: conversation,
+                didChangePanel: { renderedChanges += 1 })
+                .frame(width: 700, height: 700))
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false; window.contentView = host
+            defer { window.contentView = nil; window.close() }
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(120))
+            func renderTransition() async throws {
+                let previous = renderedChanges
+                for _ in 0..<100 where renderedChanges == previous {
+                    host.layoutSubtreeIfNeeded()
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                XCTAssertGreaterThan(renderedChanges, previous)
+                c.validate()
+                XCTAssertEqual(c.phase, .awaiting)
+                XCTAssertTrue(c.isVisible, "The same confirmation stays mounted across panel changes")
+            }
+            let sent = expectation(description: "Membership command queued after panel navigation")
+            var commands: [String] = []
+            model.enqueue = { type, _ in commands.append(type); sent.fulfill(); return "command" }
+
+            // The sidebar opens Agents and creates consent in the same turn.
+            // Start in either Messages or Pinned so each direction is exercised
+            // with a fresh pending confirmation.
+            if removing { ChatSidebarActions.removeAgent(member, from: card, model, from: workspaceStore) }
+            else { ChatSidebarActions.addAgent(catalog, to: card, model, from: workspaceStore) }
+            let actionID = try XCTUnwrap(c.context?.actionID)
+            try await renderTransition()
+            XCTAssertFalse(conversation.pinsShown)
+
+            conversation.togglePins()
+            try await renderTransition()
+            XCTAssertTrue(conversation.pinsShown)
+            XCTAssertEqual(c.context?.actionID, actionID)
+            XCTAssertTrue(commands.isEmpty)
+
+            conversation.showingAgents = true
+            try await renderTransition()
+            conversation.showChannelComposer()
+            try await renderTransition()
+            XCTAssertFalse(conversation.pinsShown)
+            XCTAssertEqual(c.context?.actionID, actionID)
+            XCTAssertTrue(commands.isEmpty)
+            c.confirm(); c.confirm()
+            await fulfillment(of: [sent], timeout: 3)
+            XCTAssertEqual(c.phase, .completed)
+            XCTAssertEqual(commands, [removing ? "agent.remove_from_channel" : "agent.add_to_channel"])
+        }
+    }
+
+    private struct MembershipChannelView: View {
+        let card: ChatChannelCard
+        let key: ChatOrgKey
+        let conversation: ChatChannelSession
+        let didChangePanel: () -> Void
+        var body: some View {
+            ChatChannelView(card: card, team: "Billing", offline: true, key: key, conversation: conversation)
+                .onChange(of: conversation.showingAgents) { _, _ in didChangePanel() }
+        }
     }
 
     /// The window says who sees the answers and the rights with their warnings.

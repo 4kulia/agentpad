@@ -4,21 +4,79 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 @MainActor enum ChatAttachmentPaste {
-    static func accepts(_ pasteboard: NSPasteboard) -> Bool {
-        pasteboard.availableType(from: [.fileURL, .png, .tiff]) != nil
+    // Prefer the GIF over a provider's still PNG/TIFF representation so an
+    // unsupported animation produces an error instead of silently losing frames.
+    static let imageTypes: [NSPasteboard.PasteboardType] = [.init(UTType.gif.identifier), .png, .init(UTType.jpeg.identifier), .tiff,
+        .init(UTType.heic.identifier), .init(UTType.heif.identifier)]
+    static let types: [NSPasteboard.PasteboardType] = [.fileURL] + imageTypes
+        + NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) }
+    static func accepts(_ pasteboard: NSPasteboard, fromDrop: Bool = false) -> Bool {
+        pasteboard.availableType(from: fromDrop ? types : [.fileURL] + imageTypes) != nil
     }
     /// Finder supplies image icons alongside file URLs. File URLs always win,
     /// and one handled paste never reaches NSTextView's ordinary text insertion.
-    static func take(_ pasteboard: NSPasteboard, manager: ChatAttachmentManager, channel: String, root: String?,
+    static func take(_ pasteboard: NSPasteboard, manager: ChatAttachmentManager, channel: String, root: String?, fromDrop: Bool = false,
                      completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws -> Bool {
         if pasteboard.availableType(from: [.fileURL]) != nil {
             guard let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty else { throw ChatAttachmentError.source }
             try manager.importFiles(urls.map(ChatAttachmentWorker.Input.file), channel: channel, root: root, completion: completion); return true
         }
-        guard let source = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) else { return false }
+        if fromDrop, let receivers = pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self]) as? [NSFilePromiseReceiver], !receivers.isEmpty {
+            try takePromises(receivers, manager: manager, channel: channel, root: root, completion: completion)
+            return true
+        }
+        guard let source = imageTypes.lazy.compactMap({ pasteboard.data(forType: $0) }).first else { return false }
         try manager.importFiles([.clipboard(source)], channel: channel, root: root, completion: completion)
         return true
     }
+    static func takePromises(_ receivers: [NSFilePromiseReceiver], manager: ChatAttachmentManager, channel: String, root: String?,
+                             completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws {
+        let promises = ChatAttachmentFilePromises(receivers)
+        try manager.importFiles(count: receivers.reduce(0) { $0 + max(1, $1.fileTypes.count) }, channel: channel, root: root,
+            start: { try promises.start() }, load: { try await promises.receive() }, cleanup: { promises.remove() }, completion: completion)
+    }
+}
+
+/// Dragging a screenshot thumbnail can promise a file instead of a file URL.
+/// Keep receipt inside the manager's import lifetime, so Send, revocation and
+/// quotas behave exactly like a file that already exists on disk.
+@MainActor private final class ChatAttachmentFilePromises {
+    let receivers: [NSFilePromiseReceiver]
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("agentpad-paste-" + UUID().uuidString, isDirectory: true)
+    private var remaining = 0
+    private var files: AsyncThrowingStream<URL, Error>?
+    init(_ receivers: [NSFilePromiseReceiver]) { self.receivers = receivers }
+    func start() throws {
+        try ChatAttachmentStorage.secureDirectory(directory)
+        // AppKit requires this call synchronously inside performDragOperation;
+        // neither a clipboard paste nor a later Task may call in a file promise.
+        files = AsyncThrowingStream<URL, Error> { continuation in
+            for receiver in receivers {
+                receiver.receivePromisedFiles(atDestination: directory, options: [:], operationQueue: .main) { [self] url, error in
+                    MainActor.assumeIsolated {
+                        if let error { continuation.finish(throwing: error); return }
+                        guard url.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL else {
+                            continuation.finish(throwing: ChatAttachmentError.source); return
+                        }
+                        continuation.yield(url)
+                        remaining -= 1
+                        if remaining == 0 { continuation.finish() }
+                    }
+                }
+                // AppKit resolves names synchronously when accepting the promise;
+                // legacy providers may promise several files in a single item.
+                remaining += max(1, receiver.fileNames.count)
+            }
+        }
+    }
+    func receive() async throws -> [ChatAttachmentWorker.Input] {
+        guard let files else { throw ChatAttachmentError.source }
+        var inputs: [ChatAttachmentWorker.Input] = []
+        for try await file in files { inputs.append(.file(file)) }
+        try Task.checkCancellation()
+        return inputs
+    }
+    func remove() { try? FileManager.default.removeItem(at: directory) }
 }
 
 struct ChatAttachmentDraftStrip: View {
@@ -91,6 +149,7 @@ struct ChatMessageAttachments: View {
 }
 
 struct ChatAttachmentCard: View {
+    @State private var host = ChatSidebarWindowReference()
     let manager: ChatAttachmentManager
     let message: ChatMessage
     let file: ChatAttachment
@@ -99,7 +158,6 @@ struct ChatAttachmentCard: View {
     @State private var problem: String?
     @State private var busy = false
     @State private var retry = 0
-    @State private var opening = false
     private struct PreviewTask: Hashable {
         var stamp: ChatAttachmentManager.Stamp?
         var retry: Int
@@ -113,12 +171,7 @@ struct ChatAttachmentCard: View {
         VStack(alignment: .leading, spacing: 4) {
             if file.isImage {
                 Button {
-                    busy = true; problem = nil
-                    Task {
-                        do { try await manager.open(message, file: file); opening = manager.viewer?.id == file.id }
-                        catch { problem = available ? ChatAttachments.reason(error) : "File unavailable." }
-                        busy = false
-                    }
+                    CompositionTabs.shared.viewer(key: manager.key, message: message, file: file)
                 } label: {
                     Group {
                         if let image = manager.image(message, file: file) { Image(decorative: image, scale: 1).resizable().scaledToFit() }
@@ -147,6 +200,7 @@ struct ChatAttachmentCard: View {
                     .font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
             }
         }
+        .background(ChatSidebarWindowReader(reference: host))
         .accessibilityElement(children: .contain).accessibilityLabel("\(file.mime), \(file.name), \(file.sizeText)")
         .task(id: PreviewTask(stamp: manager.stamp(channel: message.channelId, message: message, file: file), retry: retry)) {
             guard file.isImage, file.hasPreview, available, manager.image(message, file: file) == nil else { return }
@@ -154,40 +208,20 @@ struct ChatAttachmentCard: View {
             do { _ = try await manager.load(message, file: file, preview: true) }
             catch { if !Task.isCancelled { problem = available ? "Preview failed to load." : "File unavailable." } }
         }
-        .sheet(isPresented: Binding(get: { opening && manager.viewer?.id == file.id && available }, set: { opening = $0; if !$0 { manager.closeViewer() } })) {
-            ChatAttachmentViewer(manager: manager, message: message, file: file)
-        }
+
     }
     private func save() {
+        guard let window = host.window, let anchor = host.view,
+              let session = TabRouter.shared.stores().flatMap(\.allSessions).first(where: { anchor.isDescendant(of: $0.engine.view) }),
+              let owner = TabRouter.shared.owner(of: session.id) else { return }
         busy = true; problem = nil
-        Task { do { try await manager.save(message, file: file) } catch { problem = ChatAttachments.reason(error) }; busy = false }
-    }
-}
-
-struct ChatAttachmentViewer: View {
-    let manager: ChatAttachmentManager
-    let message: ChatMessage
-    let file: ChatAttachment
-    @State private var zoom: Double = 1
-    @State private var problem: String?
-    var body: some View {
-        if let viewer = manager.viewer, manager.current(viewer.stamp), let image = NSImage(data: viewer.data) {
-            VStack(spacing: 0) {
-                HStack {
-                    Text(file.name).font(.headline).lineLimit(1)
-                    Spacer()
-                    Slider(value: $zoom, in: 0.25...3).frame(width: 120).accessibilityLabel("Zoom")
-                    Text("\(Int(zoom * 100))%").monospacedDigit().frame(width: 45)
-                    Button("Save…") { Task { do { try await manager.save(message, file: file) } catch { problem = ChatAttachments.reason(error) } } }
-                    Button("Close") { manager.closeViewer() }.keyboardShortcut(.cancelAction)
-                }.padding(14)
-                Divider()
-                ScrollView([.horizontal, .vertical]) {
-                    Image(nsImage: image).resizable().scaledToFit().frame(width: min(680, image.size.width) * zoom)
-                        .padding(16).accessibilityLabel(file.name)
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                if let problem { Text(problem).font(.caption).padding(8) }
-            }.frame(width: 760, height: 570).background(ChatAppearance.surface)
+        Task {
+            do { try await manager.save(message, file: file, window: window, stillValid: {
+                host.window === window && TabRouter.shared.owner(of: session.id)?.store === owner.store
+                    && anchor.isDescendant(of: session.engine.view)
+            }) }
+            catch { problem = ChatAttachments.reason(error) }
+            busy = false
         }
     }
 }

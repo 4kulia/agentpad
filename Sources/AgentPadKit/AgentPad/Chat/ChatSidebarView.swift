@@ -76,8 +76,10 @@ struct ChatSidebarView: View {
     @Bindable var store: WorkspaceStore
     @Bindable var navigation: ChatSidebarNavigation
     let model: ChatOrgModel?
-    @State private var host = ChatSidebarWindowReference()
     @State private var organizationMenu = false
+    @State private var channelNameEdit = InlineNameEdit()
+    @State private var renamingChannel: ChatChannelCard?
+    @State private var renamingKey: ChatOrgKey?
     @FocusState private var focus: Focus?
     private enum Focus { case search, tree }
     @Environment(\.colorSchemeContrast) private var contrast
@@ -93,7 +95,7 @@ struct ChatSidebarView: View {
             switch snapshot.state {
             case .notConnected:
                 empty(ChatOrgSidebarSection.reason(ChatService.shared.state) ?? "Connect to an organization to see its channels.")
-                Button("Connect…") { ChatConnectWindow.show() }.padding(.bottom, 16)
+                Button("Connect…") { ConnectionTabs.shared.show() }.padding(.bottom, 16)
             case .checking:
                 ProgressView().controlSize(.small).padding(.top, 16)
                 empty(model?.notice ?? "Checking access…")
@@ -109,7 +111,6 @@ struct ChatSidebarView: View {
                 account(me)
             }
         }
-        .background(ChatSidebarWindowReader(reference: host))
         .task(id: ChatOrgCurrent.identity()) {
             ChatOrgCurrent.shared.refresh()
             navigation.adopt(ChatOrgCurrent.identity())
@@ -166,8 +167,8 @@ struct ChatSidebarView: View {
                     Text("\(me.name) · @\(me.handle)").font(Theme.display(12))
                     Divider()
                 }
-                Button("Organization…") { organizationMenu = false; ChatOrgWindow.show() }
-                Button("Change Connection…") { organizationMenu = false; ChatConnectWindow.show() }
+                Button("Organization…") { organizationMenu = false; OrganizationTabs.show() }
+                Button("Change Connection…") { organizationMenu = false; ConnectionTabs.shared.show() }
                 Button("Close") { organizationMenu = false }.keyboardShortcut(.cancelAction)
             }.padding(16).foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground)
                 .preferredColorScheme(Theme.chromeColorScheme)
@@ -281,7 +282,7 @@ struct ChatSidebarView: View {
                 if let model = model, model.canCreateChannel(in: team.card) {
                     Button {
                         setExpanded(.team(team.id), true)
-                        ChatSidebarActions.newChannel(in: team.card, model, navigation: navigation)
+                        ChatSidebarActions.newChannel(in: team.card, model, from: store)
                     } label: { Image(systemName: "plus").frame(width: 28, height: 28) }
                     .buttonStyle(.plain).foregroundStyle(ChatSidebarStyle.secondary).chatFocusRing()
                     .help("Create a channel in \(team.card.name)").accessibilityLabel("Create a channel in \(team.card.name)")
@@ -309,8 +310,28 @@ struct ChatSidebarView: View {
     }
 
     private func channelRow(_ channel: ChatSidebarSnapshot.Channel) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            channelButton(channel)
+            if renamingChannel?.channelId == channel.id, channelNameEdit.isEditing {
+                InlineNameField(edit: channelNameEdit, label: "Channel name") { value in
+                    guard let model, model.key == renamingKey, let original = renamingChannel,
+                          model.visibleChannel(channel.id) == original else { return "The channel changed. Start Rename again." }
+                    if let problem = ChatOrgModel.channelNameProblem(value) { return problem }
+                    do { try model.renameChannel(original, to: value); return nil } catch { return error.localizedDescription }
+                }.padding(.horizontal, 12)
+            }
+        }
+    }
+
+
+    private func channelButton(_ channel: ChatSidebarSnapshot.Channel) -> some View {
         let id = ChatSidebarRowID.channel(channel.id)
         let selected = model?.key.map { active == ChannelRef($0, channel: channel.id) } == true
+        let unreadStatus = channel.isUnread ? "Unread. " : ""
+        let archivedStatus = channel.card.archived ? "Archived. " : ""
+        let selectedStatus = selected ? "Selected. " : ""
+        let unreadMessages = channel.unreadLabel.map { "\($0) unread messages. " } ?? ""
+        let accessibilityValue = "\(unreadStatus)\(archivedStatus)\(selectedStatus)\(unreadMessages)\(channel.mentions) unread mentions"
         return Button { navigation.selection = id; open(channel.id) } label: {
             HStack(alignment: .top, spacing: 9) {
                 Text("#").font(Theme.display(19)).foregroundStyle(ChatSidebarStyle.secondary).frame(width: 17).accessibilityHidden(true)
@@ -328,8 +349,7 @@ struct ChatSidebarView: View {
             .overlay(focusBorder(id)).chatFocusRing().id(id)
             .help("#\(channel.card.name)" + (channel.card.archived ? " · Archived: read only" : ""))
             .accessibilityLabel("#\(channel.card.name)")
-            .accessibilityValue((channel.isUnread ? "Unread. " : "") + (channel.card.archived ? "Archived. " : "") + (selected ? "Selected. " : "")
-                + (channel.unreadLabel.map { "\($0) unread messages. " } ?? "") + "\(channel.mentions) unread mentions")
+            .accessibilityValue(accessibilityValue)
             .contextMenu { channelMenu(channel.id) }
     }
 
@@ -339,8 +359,8 @@ struct ChatSidebarView: View {
             if let unread = model.unread(id) {
                 Button(unread.muted ? "Unmute Thread Replies" : "Mute Thread Replies") { model.setMuted(id, !unread.muted) }
             }
-            if model.canRenameChannel(card) { Button("Rename…") { ChatSidebarActions.renameChannel(card, model) } }
-            if model.canArchiveChannel(card) { Button("Archive…") { ChatSidebarActions.archiveChannel(card, model) } }
+            if model.canRenameChannel(card) { Button("Rename…") { channelNameEdit.handle(.escape, save: { _ in nil }); renamingChannel = card; renamingKey = model.key; channelNameEdit.begin(card.name) } }
+            if model.canArchiveChannel(card) { Button("Archive…") { ChatSidebarActions.archiveChannel(card, model, from: store) } }
             let addable = model.addableAgents(card)
             if !addable.isEmpty {
                 Menu("Add Agent") {
@@ -362,7 +382,7 @@ struct ChatSidebarView: View {
 
     private func agentRow(_ agent: ChatSidebarSnapshot.Agent) -> some View {
         let id = ChatSidebarRowID.agent(agent.id)
-        return Button { navigation.selection = id; navigation.agentID = agent.id } label: {
+        return Button { navigation.selection = id; openAgent(agent.id) } label: {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "sparkles").font(.system(size: 15)).foregroundStyle(ChatSidebarStyle.accent)
                     .frame(width: 23, height: 23).background(ChatSidebarStyle.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
@@ -378,9 +398,12 @@ struct ChatSidebarView: View {
         }.buttonStyle(ChatSidebarRowStyle()).foregroundStyle(Theme.chromeForeground).overlay(focusBorder(id)).chatFocusRing().id(id)
             .help("\(agent.name) · Owner: \(agent.owner) · \(agentCaption(agent))")
             .accessibilityLabel("\(agent.name), BOT, owner \(agent.owner), \(agentCaption(agent))")
-            .popover(isPresented: Binding(get: { navigation.agentID == agent.id }, set: { if !$0 { navigation.agentID = nil } })) {
-                ChatSidebarAgentCard(agentID: agent.id, active: active, window: host.window, store: store, model: model, close: { navigation.agentID = nil })
-            }
+
+    }
+
+    private func openAgent(_ id: String) {
+        guard let key = model?.key else { return }
+        CompositionTabs.shared.agent(id, key: key, channel: active?.channel, from: store)
     }
 
     private func agentCaption(_ agent: ChatSidebarSnapshot.Agent) -> String {
@@ -398,7 +421,7 @@ struct ChatSidebarView: View {
                 Text("@\(me.handle)").font(Theme.display(10)).foregroundStyle(ChatSidebarStyle.secondary).lineLimit(1)
             }
             Spacer(minLength: 0)
-            Button { ChatOrgWindow.show() } label: { Image(systemName: "gearshape").frame(width: 28, height: 28) }
+            Button { OrganizationTabs.show() } label: { Image(systemName: "gearshape").frame(width: 28, height: 28) }
                 .buttonStyle(.plain).chatFocusRing().help("Account and organization").accessibilityLabel("Account and organization")
         }.foregroundStyle(Theme.chromeForeground).padding(.vertical, 12)
             .overlay(alignment: .top) { Rectangle().fill(Theme.chromeSeparator).frame(height: 1) }
@@ -458,7 +481,7 @@ struct ChatSidebarView: View {
         case .select(let id): navigation.selection = id
         case .expand(let id, let expanded): setExpanded(id, expanded)
         case .activate(.channel(let id)): open(id)
-        case .activate(.agent(let id)): navigation.agentID = id
+        case .activate(.agent(let id)): openAgent(id)
         default: break
         }
     }

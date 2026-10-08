@@ -20,8 +20,8 @@ enum AgentPadWindowLayout {
     static func minimumTerminalTreeWidth(for node: PaneNode?) -> CGFloat {
         guard let node else { return minimumTerminalWidth }
         switch node.content {
-        case .pane:
-            return minimumTerminalWidth
+        case .pane(let pane):
+            return pane.activeTab?.toolRoute == .settings ? 360 : minimumTerminalWidth
         case .split(let orientation, let first, let second, _):
             let firstWidth = minimumTerminalTreeWidth(for: first)
             let secondWidth = minimumTerminalTreeWidth(for: second)
@@ -275,6 +275,8 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
         alignTrafficLights()
         onDidBecomeKey?(self)
     }
+
+    func windowDidResignKey(_ notification: Notification) { store.invalidateTabConfirmations() }
 
     func windowDidChangeScreen(_ notification: Notification) {
         alignTrafficLights()

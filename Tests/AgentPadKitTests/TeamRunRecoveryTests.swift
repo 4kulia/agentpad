@@ -287,6 +287,11 @@ final class TeamRunRecoveryTests: XCTestCase {
 
     // (8)
     func testDisconnectStopsRunsBeforeClosingTheSession() async throws {
+        // A local terminal/agent outside the server executor must survive.
+        let local = Process()
+        local.executableURL = URL(fileURLWithPath: "/bin/sleep"); local.arguments = ["30"]
+        try local.run()
+        defer { if local.isRunning { local.terminate() }; local.waitUntilExit() }
         let files = ChatFiles(directory: root.appendingPathComponent("svc"))
         let service = ChatService(files: files, tokens: FakeTokenStore())
         service.executorRunner = ClaudeCodeRunner(fixturePath: script)
@@ -319,7 +324,20 @@ final class TeamRunRecoveryTests: XCTestCase {
         service.closeRemoteSession = { _, _ in
             factsAtClose = (try journal.commands(for: key)).map(\.type)
         }
-        await service.disconnect()
+        let workspace = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: {
+            XCTFail("Disconnect created a terminal"); return TestEngine()
+        })
+        defer { workspace.terminate() }
+        let router = TabRouter(); router.stores = { [workspace] }; router.ensureHost = { workspace }
+        let navigation = SupportTabNavigation(router: router); navigation.finishStartup()
+        let tabs = ConnectionTabs(navigation: navigation, service: service)
+        let confirmation = try XCTUnwrap(tabs.show()?.tabState?.confirmation)
+        let disconnect = Task { await tabs.confirmAndDisconnect(expecting: service.connection!) }
+        try await waitUntil { confirmation.isAwaiting }
+        confirmation.canShow = { true }; confirmation.shown(true); confirmation.confirm()
+        let outcome = await disconnect.value
+        XCTAssertEqual(outcome, .disconnected)
+        XCTAssertTrue(local.isRunning, "Disconnect must stop only server-request processes")
         _ = await run.value
         // Y5 confirms the stop before the session closes. The server still
         // has `starting`, so the chain owes run.started and run.failed.

@@ -32,7 +32,6 @@ final class ChatAttachmentManager {
     private(set) var drafts: [ChatAttachmentDraft] = []
     private(set) var queued: [ChatAttachmentDraft] = []
     private(set) var revision = 0
-    private(set) var viewer: Preview?
     @ObservationIgnored private var watch: AnyDatabaseCancellable?
     @ObservationIgnored private var transfers: [String: (UUID, Task<Void, Never>)] = [:]
     @ObservationIgnored private var previews: [Stamp: Data] = [:]
@@ -127,7 +126,7 @@ final class ChatAttachmentManager {
         thumbnails = [:]; thumbnailAttempts = [:]
         for (_, task) in transfers.values { task.cancel() }; transfers = [:]
         for (_, task, _) in reads.values { task.cancel() }; reads = [:]
-        previews = [:]; decodedPreviews = [:]; previewCosts = [:]; lru = []; viewer = nil; revision += 1
+        previews = [:]; decodedPreviews = [:]; previewCosts = [:]; lru = []; revision += 1
     }
     func revoke() {
         suspend()
@@ -157,7 +156,8 @@ final class ChatAttachmentManager {
             if draft.queued != true, draft.state != .failed {
                 do {
                     if let capture = uploadStamp(channel: draft.channel) {
-                        if draft.expiresAt <= Date() || draft.session != capture.session || draft.generation != capture.generation {
+                        if draft.expiresAt <= Date() || draft.session != capture.session || draft.generation != capture.generation
+                            || (draft.file.isImage && draft.sanitizedImageSHA256 != draft.sha256) {
                             let next = try renewed(draft, capture: capture)
                             try store.queue.write { try replace($0, draft: draft, with: next) }
                             storage.remove(key, id: draft.id)
@@ -179,7 +179,6 @@ final class ChatAttachmentManager {
         storage.prune(key, keeping: Set(kept.map(\.id)))
         for (id, read) in reads where !current(read.0, execution: read.2) { read.1.cancel(); reads[id] = nil }
         for capture in Array(previews.keys) where !current(capture) { previews[capture] = nil; decodedPreviews[capture] = nil; previewCosts[capture] = nil; lru.removeAll { $0 == capture }; revision += 1 }
-        if let viewer, !current(viewer.stamp) { self.viewer = nil }
         if limits == nil || !ChatNotifications.allowed(service, key, channel: nil) { suspend(); return }
         for (id, cached) in thumbnails where !kept.contains(where: { $0.id == id }) || !current(cached.0) {
             thumbnails[id] = nil; thumbnailAttempts[id] = nil
@@ -217,6 +216,7 @@ final class ChatAttachmentManager {
         guard let limits, let capture = stamp(channel: channel), let service,
               service.isServerKnown(service, key),
               (try? store.queue.read { try Bool.fetchOne($0, sql: "SELECT archived FROM channels WHERE channel_id = ?", arguments: [channel]) }) == false else { throw ChatAttachmentError.unavailable }
+        let (data, name) = try ChatAttachmentWorker.sanitizedFile(data, name: name, limits: limits)
         let file = try ChatAttachmentStorage.descriptor(data: data, name: name, limits: limits)
         try commit(data: data, file: file, digest: ChatAttachments.digest(data), thumbnail: nil, capture: capture, root: root)
     }
@@ -224,14 +224,26 @@ final class ChatAttachmentManager {
     /// before applying any bytes. Queued imports are bounded as well as decoding.
     func importFiles(_ inputs: [ChatAttachmentWorker.Input], channel: String, root: String?,
                      completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws {
+        try importFiles(count: inputs.count, channel: channel, root: root, load: { inputs }, completion: completion)
+    }
+    func importFiles(count: Int, channel: String, root: String?,
+                     start: @MainActor () throws -> Void = {},
+                     load: @escaping @MainActor () async throws -> [ChatAttachmentWorker.Input],
+                     cleanup: @escaping @MainActor () -> Void = {},
+                     completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws {
         guard let limits, let capture = stamp(channel: channel) else { throw ChatAttachmentError.unavailable }
-        guard !inputs.isEmpty, inputs.count <= limits.messageFiles, imports.count < min(8, limits.pendingFiles) else { throw ChatAttachmentError.size }
+        guard count > 0, count <= limits.messageFiles, imports.count < min(8, limits.pendingFiles) else { throw ChatAttachmentError.size }
+        do { try start() } catch { cleanup(); throw error }
         let id = UUID()
         importing[id] = (channel, root ?? "")
         imports[id] = Task { [weak self] in
+            defer { cleanup() }
             guard let self else { return }
             defer { self.imports[id] = nil; self.importing[id] = nil }
             do {
+                let inputs = try await load()
+                guard !inputs.isEmpty, inputs.count <= limits.messageFiles else { throw ChatAttachmentError.size }
+                guard !Task.isCancelled, self.current(capture), self.limits == limits else { throw ChatAttachmentError.unavailable }
                 for input in inputs {
                     let prepared = try await ChatAttachmentWorker.shared.prepare(input, limits: limits)
                     guard !Task.isCancelled, self.current(capture), self.limits == limits else { throw ChatAttachmentError.unavailable }
@@ -258,9 +270,10 @@ final class ChatAttachmentManager {
         let selected = all.filter { $0.queued != true && $0.channel == channel && $0.root == (root ?? "") }
         guard selected.count < limits.messageFiles, selected.reduce(data.count, { $0 + $1.file.size }) <= limits.messageBytes,
               all.count < limits.pendingFiles, all.reduce(data.count + limits.previewBytes, { $0 + $1.file.size + limits.previewBytes }) <= limits.pendingBytes else { throw ChatAttachmentError.size }
-        let draft = ChatAttachmentDraft(file: file, messageId: selected.first?.messageId ?? UUID().uuidString.lowercased(),
+        var draft = ChatAttachmentDraft(file: file, messageId: selected.first?.messageId ?? UUID().uuidString.lowercased(),
             channel: channel, root: root ?? "", session: capture.session, generation: capture.generation,
             sha256: digest, createdAt: Date(), expiresAt: Date().addingTimeInterval(Double(limits.draftTTLSeconds)))
+        if file.isImage { draft.sanitizedImageSHA256 = digest }
         try storage.save(data, key: key, id: file.id)
         do {
             try store.queue.write { db in
@@ -361,6 +374,9 @@ final class ChatAttachmentManager {
                     try update { $0.state = .uploading; $0.problem = nil }
                     let data = try ChatAttachmentStorage.read(self.storage.url(self.key, id: draft.id), limit: limits.fileBytes)
                     guard data.count == draft.file.size, ChatAttachments.digest(data) == draft.sha256 else { throw ChatAttachmentError.hash }
+                    // Composer drafts are sanitized into a fresh reservation by
+                    // reconcile. Never mutate an unanswered queued post's IDs.
+                    guard !draft.file.isImage || draft.sanitizedImageSHA256 == draft.sha256 else { throw ChatAttachmentError.changed }
                     try await api.attachmentCommand(org: self.key.orgId, id: draft.prepareCommand, type: "attachment.prepare", args: draft.prepareArgs, token: token)
                     try update { _ in }
                     var metadata = try await api.attachmentMetadata(org: self.key.orgId, id: draft.id, token: token)
@@ -430,7 +446,7 @@ final class ChatAttachmentManager {
             data = try await transfer(capture, path: "/v1/orgs/\(key.orgId)/attachments/\(file.id)/\(preview ? "preview" : "original")",
                 limit: preview ? limits.previewBytes : min(file.size, limits.fileBytes), preview: preview)
         } catch {
-            previews[capture] = nil; decodedPreviews[capture] = nil; previewCosts[capture] = nil; if viewer?.stamp == capture { viewer = nil }; revision += 1
+            previews[capture] = nil; decodedPreviews[capture] = nil; previewCosts[capture] = nil; revision += 1
             throw error
         }
         if preview {
@@ -473,18 +489,12 @@ final class ChatAttachmentManager {
         guard !Task.isCancelled, current(capture, execution: execution) else { throw ChatAttachmentError.unavailable }
         return data
     }
-    func open(_ message: ChatMessage, file: ChatAttachment) async throws {
-        let data = try await load(message, file: file, preview: false)
-        guard file.isImage, let capture = stamp(channel: message.channelId, message: message, file: file), NSImage(data: data) != nil else { throw ChatAttachmentError.unavailable }
-        viewer = Preview(stamp: capture, data: data)
-    }
-    func closeViewer() { viewer = nil }
-    func save(_ message: ChatMessage, file: ChatAttachment) async throws {
+    func save(_ message: ChatMessage, file: ChatAttachment, window: NSWindow, stillValid: @MainActor () -> Bool) async throws {
         guard let capture = stamp(channel: message.channelId, message: message, file: file) else { throw ChatAttachmentError.unavailable }
         let panel = NSSavePanel(); panel.nameFieldStringValue = file.name
-        guard await panel.begin() == .OK, let url = panel.url, current(capture) else { return }
+        guard await panel.beginSheetModal(for: window) == .OK, let url = panel.url, current(capture), stillValid() else { return }
         let data = try await load(message, file: file, preview: false)
-        guard current(capture) else { throw ChatAttachmentError.unavailable }
+        guard current(capture), stillValid() else { throw ChatAttachmentError.unavailable }
         try data.write(to: url, options: .atomic)
     }
 }

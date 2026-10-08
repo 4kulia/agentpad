@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Team menu actions and the Team window: the server connection, what
+/// Team menu actions and activity tabs: the server connection, what
 /// stopped on it, and runs that need the owner (C0, C1, D11).
 @MainActor
 enum TeamUI {
@@ -74,18 +74,7 @@ enum TeamUI {
 
     /// A damaged run journal blocks server runs until the user resets it (C4).
     static func resetRunJournal() {
-        Task {
-            let alert = NSAlert()
-            alert.messageText = "Reset the run journal?"
-            alert.informativeText = """
-            The damaged journal is kept beside as journal.sqlite.corrupt. Results not yet delivered \
-            and runs it recorded are forgotten; server runs on this Mac work again.
-            """
-            alert.addButton(withTitle: "Reset")
-            alert.addButton(withTitle: "Cancel")
-            guard await present(alert) == .alertFirstButtonReturn else { return }
-            do { try ChatService.shared.resetJournal() } catch { await showError("The run journal could not be reset", error) }
-        }
+        ProcessTabs.shared.resetJournal()
     }
 
     /// At launch, before windows come back: the team tools of the Claude
@@ -101,7 +90,7 @@ enum TeamUI {
     }
 
     static func showTeam() {
-        TeamWindows.showTeam()
+        TeamTabs.shared.showActivity()
     }
 
     static func chooseClaudeExecutable() {
@@ -124,20 +113,6 @@ enum TeamUI {
             openTab(NSHomeDirectory(), shellQuoted(executable.file.resolvedPath), "Claude Code · sign in")
         } catch {
             Task { await showError("Claude Code could not be opened", error) }
-        }
-    }
-
-    static func stopPublishing(_ agents: [TeamPublishedAgent]) async {
-        let alert = NSAlert()
-        alert.messageText = agents.count == 1 ? "Stop publishing \(agents[0].name)?" : "Stop publishing this session?"
-        alert.informativeText = "Colleagues can no longer call it. Calls already allowed finish."
-        alert.addButton(withTitle: "Stop Publishing")
-        alert.addButton(withTitle: "Cancel")
-        guard await present(alert) == .alertFirstButtonReturn else { return }
-        do {
-            for agent in agents { try service.calls.unpublish(agent.id) }
-        } catch {
-            await showError("Not all was unpublished", error)
         }
     }
 
@@ -208,139 +183,43 @@ enum TeamUI {
     }
 
     static func showAgents() {
-        Task {
-            await loading?.value
-            TeamWindows.showAgents()
-        }
+        TeamTabs.shared.showAgents()
     }
 
     // MARK: Helpers
 
-    /// Shows an alert as a sheet on the front window and waits without a
-    /// nested modal loop — `runModal` inside an async task would hold every
-    /// other main-actor continuation (incoming requests, CLI answers) until
-    /// the alert closes. With no window to attach to, falls back to modal.
-    @discardableResult
-    static func present(_ alert: NSAlert) async -> NSApplication.ModalResponse {
-        NSApp.activate(ignoringOtherApps: true)
-        var window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first { $0.isVisible && $0.canBecomeMain }
-        if window == nil {
-            // No window to attach to: the Team window serves as one.
-            TeamWindows.showTeam()
-            window = TeamWindows.teamWindow
-        }
-        guard let host = window else { return .cancel }
-        // One sheet at a time: wait for the current one instead of a modal loop.
-        while host.attachedSheet != nil { try? await Task.sleep(for: .milliseconds(200)) }
-        let attentionID = UUID()
-        defer { PendingConfirmations.shared.end(attentionID) }
-        return await withCheckedContinuation { continuation in
-            alert.beginSheetModal(for: host) { continuation.resume(returning: $0) }
-            if alert.buttons.count > 1 { PendingConfirmations.shared.register(attentionID, window: alert.window) }
-        }
-    }
-
+    /// Errors live in the Delivery section.
     static func showError(_ title: String, _ error: Error?) async {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = title
-        if let error { alert.informativeText = (error as? LocalizedError)?.errorDescription ?? String(describing: error) }
-        await present(alert)
+        TeamTabs.shared.report(title, error)
     }
+
+
 }
 
-// MARK: - Windows
-
-@MainActor
-enum TeamWindows {
-    private static var team: NSWindow?
-    static var teamWindow: NSWindow? { team }
-    private static var agents: NSWindow?
-    private static var publishSession: NSWindow?
-    private static var publicationEditor: NSWindow?
-    /// The Team tab of the front window's left sidebar.
-    static var showCallsTab: @MainActor () -> Void = {}
-
-    static func showCalls() { showCallsTab() }
-
-    static func showAgentEditor(_ editing: TeamAgentEditing) {
-        publicationEditor?.close()
-        final class Handle { weak var window: NSWindow? }
-        let handle = Handle()
-        let made = window(title: "Edit publication", content: TeamPublicationEditor(open: editing, service: .shared) { handle.window?.close() })
-        handle.window = made
-        publicationEditor = made
-        present(made)
-    }
-
-    static func showPublishSession(sessionId: String, title: String, surfaceId: UUID? = nil) {
-        publishSession?.close()
-        // Closing is bound to this window: a save that ends after it was
-        // replaced must not close the next one.
-        final class Handle { weak var window: NSWindow? }
-        let handle = Handle()
-        let made = window(title: "Publish to Team", content: TeamPublishSessionView(
-            sessionId: sessionId, title: title, service: .shared, surfaceId: surfaceId
-        ) { handle.window?.close() })
-        handle.window = made
-        publishSession = made
-        present(made)
-    }
-
-    static func showAgents() {
-        if agents == nil {
-            agents = window(title: "Published Agents", content: TeamAgentsView(service: .shared))
-        }
-        present(agents)
-    }
-
-    static func showTeam() {
-        if team == nil {
-            team = window(title: "Team", content: TeamStatusView(service: .shared))
-        }
-        present(team)
-    }
-
-    private static func window(title: String, content: some View) -> NSWindow {
-        let host = NSHostingController(rootView: content)
-        host.sizingOptions = .preferredContentSize
-        let window = NSWindow(contentViewController: host)
-        window.title = title
-        window.styleMask = [.titled, .closable]
-        window.isReleasedWhenClosed = false
-        window.appearance = Theme.windowAppearance
-        window.center()
-        return window
-    }
-
-    private static func present(_ window: NSWindow?) {
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-}
-
-/// The Team window: the server connection, what stopped on it, and runs
+/// Team activity: the server connection, what stopped on it, and runs
 /// that need the owner.
 struct TeamStatusView: View {
     let service: TeamService
+    var delivery = false
+    var scope: TeamScope = .local
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
-            HStack {
-                Button("Claude Code…") { TeamUI.chooseClaudeExecutable() }
-                if ClaudeVersionApprovals.shared.selectedPath != nil {
-                    Button("Автовыбор") { ClaudeVersionApprovals.shared.selectExecutable(nil) }
+            if !delivery {
+                HStack {
+                    Button("Claude Code…") { TeamUI.chooseClaudeExecutable() }
+                    if ClaudeVersionApprovals.shared.selectedPath != nil {
+                        Button("Automatic") { ClaudeVersionApprovals.shared.selectExecutable(nil) }
+                    }
+                }
+                if let path = ClaudeVersionApprovals.shared.selectedPath {
+                    Text(path).font(Theme.mono(10.5)).textSelection(.enabled)
                 }
             }
-            if let path = ClaudeVersionApprovals.shared.selectedPath {
-                Text(path).font(Theme.mono(10.5)).textSelection(.enabled)
-            }
-            // Folder requests of running calls are answered here too.
-            TeamPanelSection(service: service)
-            // Results of runs here no server has taken: from the journal, also
-            // after Disconnect and with no connection (D4, review D4b-4).
-            let undelivered = ChatService.shared.undeliveredResults()
+            // Request decisions remain in the Requests section.
+            // Results are read from the journal only for this verified scope.
+            let undelivered = delivery ? deliveryResults : []
             if !undelivered.isEmpty {
                 Text("Results not delivered").font(Theme.display(12, weight: .semibold))
                 ForEach(undelivered) { result in
@@ -351,7 +230,7 @@ struct TeamStatusView: View {
                     }
                 }
             }
-            if service.mode == .server {
+            if !delivery, service.mode == .server {
                 if let problem = ChatService.shared.publishProblem {
                     Text(problem).font(Theme.display(11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
                 }
@@ -362,15 +241,20 @@ struct TeamStatusView: View {
                 Button("Published Agents…") { TeamUI.showAgents() }
                 Spacer()
                 if service.mode == .server {
-                    Button("Disconnect…") { ChatConnectWindow.disconnect() }
+                    Button("Disconnect…") { ConnectionTabs.shared.disconnect() }
                 } else {
-                    Button("Connect to a Server…") { ChatConnectWindow.show() }
+                    Button("Connect to a Server…") { ConnectionTabs.shared.show() }
                 }
             }
         }
         .padding(18)
-        .frame(width: 440)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .attentionPlace([.recovery(nil)])
+    }
+
+    private var deliveryResults: [ChatService.UndeliveredResult] {
+        guard case .server(let key) = scope else { return [] }
+        return ChatService.shared.undeliveredResults(key: key.chatKey)
     }
 
     /// Colleagues' agents the member may call (D3, answer (а)).
@@ -394,7 +278,7 @@ struct TeamStatusView: View {
     @ViewBuilder
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Team work").font(Theme.display(14, weight: .semibold))
+            Text(delivery ? "Delivery" : "Connection").font(Theme.display(14, weight: .semibold))
             if service.mode == .server, let connection = ChatService.shared.connection {
                 Text("Through \(connection.server.description)").font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
             } else {
@@ -417,7 +301,7 @@ struct TeamStatusView: View {
                 HStack {
                     Button("Try Again") { ChatService.shared.retryStopped() }
                     if ChatService.shared.hasRefused { Button("Dismiss") { ChatService.shared.dismissRefused() } }
-                    if case .needsSignIn = ChatService.shared.state { Button("Connect to a Server…") { ChatConnectWindow.show() } }
+                    if case .needsSignIn = ChatService.shared.state { Button("Connect to a Server…") { ConnectionTabs.shared.show() } }
                 }
             }
             if let problem = ChatService.shared.recovery?.problem {

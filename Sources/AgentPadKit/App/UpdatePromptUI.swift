@@ -36,7 +36,7 @@ struct UpdatePromptView: View {
         .padding(.horizontal, 28)
         .padding(.top, 22)
         .padding(.bottom, 22)
-        .frame(width: 460, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .attentionPlace([.update(UpdateAttention.shared.version ?? "")])
         .glassWindowBackground(fallback: Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
@@ -135,63 +135,6 @@ struct UpdatePromptView: View {
             )
         case .upToDate: return String(localized: "you're on the latest release.", bundle: .agentPadResources)
         case .failed(let reason): return reason
-        }
-    }
-}
-
-@MainActor
-final class UpdatePromptWindowController: NSWindowController, NSWindowDelegate {
-    static let shared = UpdatePromptWindowController()
-
-    private init() { super.init(window: nil) }
-    required init?(coder: NSCoder) { fatalError() }
-    private var hasAvailableUpdate = false
-
-    func windowWillClose(_ notification: Notification) {
-        if hasAvailableUpdate { UpdateAttention.shared.chose(.later) }
-    }
-
-    static func present(outcome: UpdateChecker.Outcome, currentVersion: String) {
-        switch outcome {
-        case .newer(let version, _, _): UpdateAttention.shared.available(version, manual: true)
-        case .failed: UpdateAttention.shared.failed(shown: true)
-        case .upToDate: break
-        }
-        let controller = shared
-        controller.build(outcome: outcome, currentVersion: currentVersion)
-        if controller.window?.isVisible != true {
-            controller.window?.center()
-        }
-        controller.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func build(outcome: UpdateChecker.Outcome, currentVersion: String) {
-        if case .newer = outcome { hasAvailableUpdate = true } else { hasAvailableUpdate = false }
-        let view = UpdatePromptView(
-            outcome: outcome,
-            currentVersion: currentVersion,
-            onClose: { [weak self] in UpdateAttention.shared.chose(.later); self?.window?.close() },
-            onDownload: { url in NSWorkspace.shared.open(url) }
-        )
-        let host = NSHostingController(rootView: view)
-        // NSHostingController computes its preferred size from the SwiftUI
-        // root; the .frame(width:) on UpdatePromptView fixes the width and
-        // lets height self-size around the content (with or without release
-        // notes). Without this, the window opens at NSWindow default size.
-        host.sizingOptions = .preferredContentSize
-
-        if let window {
-            window.contentViewController = host
-        } else {
-            let new = NSWindow(contentViewController: host)
-            new.title = String(localized: "Update", bundle: .agentPadResources)
-            new.styleMask = [.titled, .closable]
-            new.isReleasedWhenClosed = false
-            new.delegate = self
-            new.appearance = Theme.windowAppearance
-            new.configureGlassChrome()
-            self.window = new
         }
     }
 }

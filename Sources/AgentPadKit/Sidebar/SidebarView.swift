@@ -1,26 +1,7 @@
 import SwiftUI
 import AgentPadHookKit
 
-/// Bundles every modal sheet the sidebar can show so they share one
-/// `.sheet(item:)` modifier. `.sheet(isPresented:)` per state would race
-/// when switching directly between modes (create → confirm-remove).
-private enum SidebarSheet: Identifiable {
-    case createSSHWorkspace
-    case createWorktree(Workspace)
-    case confirmRemoveWorktree(Workspace)
-    case confirmCloseOthers(WorkspaceStore.BulkRemovalRequest)
-    case confirmCloseSource(WorkspaceStore.CloseSourceRequest)
 
-    var id: String {
-        switch self {
-        case .createSSHWorkspace: return "create-ssh-workspace"
-        case .createWorktree(let ws): return "create-\(ws.id.uuidString)"
-        case .confirmRemoveWorktree(let ws): return "remove-\(ws.id.uuidString)"
-        case .confirmCloseOthers(let req): return "close-others-\(req.keeping.id.uuidString)"
-        case .confirmCloseSource(let req): return "close-source-\(req.source.id.uuidString)"
-        }
-    }
-}
 
 /// Places a full wordmark so the measured centre of its first glyph lands on
 /// a caller-provided horizontal axis. The second subview is an invisible copy
@@ -104,10 +85,7 @@ struct SidebarView: View {
     /// land here. Ephemeral by design: a AgentPad relaunch always shows every
     /// worktree on first paint so nothing is hidden by stale state.
     @State private var collapsedParents: Set<UUID> = []
-    /// Active modal sheet (create worktree / confirm-delete worktree).
-    /// Nil = no sheet. Set by row callbacks and an onChange observer that
-    /// watches `store.pendingRemovalRequest` for ⌘⇧W routed via AppDelegate.
-    @State private var sheet: SidebarSheet?
+
 
     /// Invisible trailing-edge strip that widens the sidebar by drag —
     /// full mode only (compact is fixed, hidden is hidden). A width drag
@@ -224,145 +202,6 @@ struct SidebarView: View {
             }
             return true
         } isTargeted: { isFolderDropTargeted = $0 && !fileTreeIsMounted }
-        .sheet(item: $sheet) { current in
-            switch current {
-            case .createSSHWorkspace:
-                CreateSSHWorkspaceSheet(
-                    create: { host in
-                        store.addWorkspace(sshRemoteHost: host)
-                        dismissCurrentSheet()
-                    },
-                    dismiss: dismissCurrentSheet
-                )
-            case .createWorktree(let source):
-                CreateWorktreeSheet(
-                    source: source,
-                    launchTemplates: AgentTemplate.visibleOrdered(model: AgentPadSettingsModel.shared),
-                    defaultLaunchTemplate: AgentTemplate.defaultLaunchTemplate(model: AgentPadSettingsModel.shared)
-                        ?? .terminal,
-                    // Include every workspace's diskPath, not just worktree
-                    // children — if the user opened a worktree directory as
-                    // a top-level workspace (Finder drop / ⌘O), adopting it
-                    // again would spawn a duplicate row pointing at the same
-                    // dir. Source workspaces (the repo root) also belong in
-                    // the exclusion set because the adopt picker already
-                    // drops them via `sourceRootKey`; including them here is
-                    // belt-and-suspenders against multi-source ⌘O scenarios.
-                    alreadyAdoptedPaths: Set(
-                        store.workspaces.map { $0.diskPath.standardizedFileURL.path }
-                    ),
-                    create: { request in
-                        await store.createWorktree(source: source, request: request)
-                    },
-                    dismiss: dismissCurrentSheet
-                )
-            case .confirmRemoveWorktree(let workspace):
-                ConfirmRemoveWorktreeSheet(
-                    workspace: workspace,
-                    confirm: { alsoDelete in
-                        if alsoDelete {
-                            if let message = await store.removeWorktreeDirectory(workspace) {
-                                return .failure(message)
-                            }
-                        }
-                        store.closeWorkspace(workspace)
-                        return .success
-                    },
-                    dismiss: dismissCurrentSheet
-                )
-            case .confirmCloseOthers(let request):
-                ConfirmBulkCloseSheet(
-                    statusLabel: String(localized: "CLOSE-OTHERS", bundle: .agentPadResources),
-                    headlineText: String.localizedStringWithFormat(
-                        String(localized: "keeping %@", bundle: .agentPadResources),
-                        request.keeping.title
-                    ),
-                    subtitleText: bulkSubtitle(
-                        closingCount: request.others.count,
-                        worktreeCount: request.worktreeOthers.count
-                    ),
-                    worktreesAmong: request.worktreeOthers,
-                    confirm: { alsoDelete in
-                        if let message = await store.performCloseOthers(request, alsoDelete: alsoDelete) {
-                            return .failure(message)
-                        }
-                        return .success
-                    },
-                    dismiss: dismissCurrentSheet
-                )
-            case .confirmCloseSource(let request):
-                ConfirmBulkCloseSheet(
-                    statusLabel: String(localized: "CLOSE-WORKSPACE", bundle: .agentPadResources),
-                    headlineText: String.localizedStringWithFormat(
-                        String(localized: "closing %@", bundle: .agentPadResources),
-                        request.source.title
-                    ),
-                    subtitleText: bulkSubtitle(
-                        closingCount: request.worktrees.count + 1,
-                        worktreeCount: request.worktrees.count
-                    ),
-                    worktreesAmong: request.worktrees,
-                    confirm: { alsoDelete in
-                        if let message = await store.performCloseSource(request, alsoDelete: alsoDelete) {
-                            return .failure(message)
-                        }
-                        return .success
-                    },
-                    dismiss: dismissCurrentSheet
-                )
-            }
-        }
-        // ⌘⇧W routes through AppDelegate → store.requestCloseWorkspace,
-        // which parks worktree workspaces in `pendingRemovalRequest` for
-        // the sidebar to pop the confirm sheet on. Identity-keyed so the
-        // observer only fires on a fresh request, not internal renames.
-        .onChange(of: store.pendingRemovalRequest?.id) { _, _ in
-            if let workspace = store.pendingRemovalRequest {
-                sheet = .confirmRemoveWorktree(workspace)
-            }
-        }
-        // Global create requests (currently the command palette). When the
-        // sidebar was hidden, `onAppear` below catches the already-parked
-        // request after AppDelegate makes the sidebar visible.
-        .onChange(of: store.pendingCreateWorktreeRequest?.id) { _, _ in
-            if let workspace = store.pendingCreateWorktreeRequest {
-                sheet = .createWorktree(workspace)
-            }
-        }
-        // SSH-workspace create request (File menu / command palette). Same
-        // parked-while-hidden contract as worktree-create above.
-        .onChange(of: store.pendingCreateSSHWorkspaceRequest) { _, pending in
-            if pending { sheet = .createSSHWorkspace }
-        }
-        // ⌘W while a sheet is key (AppDelegate can't reach the sheet's
-        // `@State` directly) — cancel it exactly like its cancel button.
-        .onChange(of: store.sheetDismissRequest) { _, _ in
-            dismissCurrentSheet()
-        }
-        .onAppear {
-            if let workspace = store.pendingCreateWorktreeRequest {
-                sheet = .createWorktree(workspace)
-            }
-            if store.pendingCreateSSHWorkspaceRequest {
-                sheet = .createSSHWorkspace
-            }
-        }
-        // Bulk close-others request — keyed off keeping.id since the
-        // others list can vary in length but each request is anchored
-        // on its keeping workspace.
-        .onChange(of: store.pendingCloseOthersRequest?.keeping.id) { _, _ in
-            if let request = store.pendingCloseOthersRequest {
-                sheet = .confirmCloseOthers(request)
-            }
-        }
-        // Close-source-with-worktrees request — keyed off source.id; the
-        // store parks it when ⌘⇧W / × on a top-level workspace would
-        // strand its worktrees.
-        .onChange(of: store.pendingCloseSourceRequest?.source.id) { _, _ in
-            if let request = store.pendingCloseSourceRequest {
-                sheet = .confirmCloseSource(request)
-            }
-        }
     }
 
     @ViewBuilder
@@ -386,40 +225,9 @@ struct SidebarView: View {
         }
     }
 
-    /// Cancel whichever sheet is up, clearing its parked store request —
-    /// the single dismissal path shared by every sheet's cancel button and
-    /// the ⌘W `sheetDismissRequest` signal, so the two can't drift.
-    private func dismissCurrentSheet() {
-        switch sheet {
-        case .createSSHWorkspace:
-            store.pendingCreateSSHWorkspaceRequest = false
-        case .createWorktree:
-            store.pendingCreateWorktreeRequest = nil
-        case .confirmRemoveWorktree:
-            store.pendingRemovalRequest = nil
-        case .confirmCloseOthers:
-            store.pendingCloseOthersRequest = nil
-        case .confirmCloseSource:
-            store.pendingCloseSourceRequest = nil
-        case nil:
-            return
-        }
-        sheet = nil
-    }
 
-    /// Shared subtitle string between the two bulk-close flows — folds
-    /// pluralisation into one place so the count never reads as
-    /// "1 workspaces" or "1 worktrees".
-    private func bulkSubtitle(closingCount: Int, worktreeCount: Int) -> String {
-        String.localizedStringWithFormat(
-            String(
-                localized: "%d workspace(s) will close · %d worktree(s)",
-                bundle: .agentPadResources
-            ),
-            closingCount,
-            worktreeCount
-        )
-    }
+
+
 
     /// True when `workspace` is a top-level source workspace *and* its
     /// cwd is inside a git repo. Worktree rows are excluded (worktree
@@ -531,9 +339,7 @@ struct SidebarView: View {
             .padding(.bottom, Theme.space2)
         }
         // ⌘⇧R parks the active workspace on the store; reveal its row so the
-        // row's own rename popover can open. onChange catches a request made
-        // while the sidebar is up; onAppear catches one parked while the
-        // sidebar was hidden (SidebarView mounts only after the reveal).
+        // row's inline editor is visible, including a virtualized row.
         .onChange(of: store.pendingRenameWorkspace?.id) { _, _ in
             revealWorkspaceForRename(using: proxy)
         }
@@ -577,6 +383,7 @@ struct SidebarView: View {
                     onDuplicate: { store.duplicateWorkspace(worktree) },
                     onRename: { store.renameWorkspace(worktree, to: $0) },
                     onSetTag: { store.setTag($0, for: worktree) },
+                    onDetails: { LocalFormTabs.shared.details(worktree, from: store) },
                     onGoToSource: { store.activateWorkspace(parent) }
                 )
                 // Source-list hierarchy should be visible without decoding a
@@ -599,18 +406,14 @@ struct SidebarView: View {
     }
 
     /// Bring the active workspace's row into the view hierarchy so its rename
-    /// popover can anchor, then hand off to the row via `renameRequested`. The
-    /// row may be unmounted — nested under a collapsed worktree parent, or
-    /// scrolled out of the LazyVStack's realized window. Without this the ⌘⇧R
-    /// flag would sit unconsumed and then fire stale when the user later
-    /// scrolled to / expanded that row.
+    /// editor is visible even under a collapsed worktree parent or outside
+    /// the LazyVStack's realized window.
     private func revealWorkspaceForRename(using proxy: ScrollViewProxy) {
         guard let workspace = store.pendingRenameWorkspace else { return }
         store.pendingRenameWorkspace = nil
         if let parentId = workspace.worktreeParentId, collapsedParents.contains(parentId) {
             collapsedParents.remove(parentId)
         }
-        workspace.renameRequested = true
         // Defer so a just-expanded subtree is laid out before scrolling to a
         // row that may have only now been inserted.
         DispatchQueue.main.async {
@@ -619,11 +422,7 @@ struct SidebarView: View {
     }
 
     private func presentCreateWorktree(_ workspace: Workspace) {
-        // Single channel: parking on the store triggers the `.onChange`
-        // observer that sets `sheet`. Direct row clicks and command-palette
-        // / AppDelegate routes all go through here, so this stays the one
-        // mechanism that opens the create sheet.
-        store.pendingCreateWorktreeRequest = workspace
+        store.requestCreateWorktree(workspace)
     }
 }
 
@@ -665,6 +464,7 @@ private struct DraggableWorkspaceRow: View {
             onDuplicate: { store.duplicateWorkspace(workspace) },
             onRename: { store.renameWorkspace(workspace, to: $0) },
             onSetTag: { store.setTag($0, for: workspace) },
+            onDetails: { LocalFormTabs.shared.details(workspace, from: store) },
             disclosure: disclosure,
             onCreateWorktree: onCreateWorktree,
             onGoToSource: onGoToSource

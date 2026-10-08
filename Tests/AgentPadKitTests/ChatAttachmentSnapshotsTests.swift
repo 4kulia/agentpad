@@ -68,8 +68,10 @@ import XCTest
             try await capture(view, output: output, name: dark ? "r116-att-dark" : "r116-att-light", dark: dark)
         }
         settings.appearanceMode = .light
-        try await manager.open(message, file: picture)
-        try await capture(ChatAttachmentViewer(manager: manager, message: message, file: picture), output: output, name: "r116-att-viewer", dark: false)
+        let viewerState = TabState(route: .viewer(OrgKey(f.key), channelID: message.channelId, messageID: message.id, attachmentID: picture.id))
+        let viewer = AttachmentViewerModel(state: viewerState, tabs: CompositionTabs(router: TabRouter(), chat: f.service, team: f.teamService))
+        await viewer.load()
+        try await capture(AttachmentViewerTab(model: viewer).frame(width: 760, height: 570), output: output, name: "r116-att-viewer", dark: false)
         await f.service.disconnect()
     }
     private func capture(_ view: some View, output: String, name: String, dark: Bool) async throws {

@@ -430,6 +430,7 @@ final class ChatService {
     /// The account is no longer in the organization: its cache goes, the
     /// connection and the account's stream stay.
     func membershipLost(_ key: ChatOrgKey) {
+        if self === ChatService.shared { CompositionTabs.shared.revoke(key) }
         attachmentManagers.removeValue(forKey: key)?.revoke()
         // Out of the organization: its runs stop here, with no fact — the
         // account may not tell them any more (DESIGN-D3b-D4b-D5b §10.3).
@@ -679,9 +680,11 @@ final class ChatService {
     /// выключенной командной работы"). Serving it — the feed, the queue moved
     /// to the new session (6.4) — starts with `start(mode:)` (review C-18).
     @discardableResult
-    func completeSignIn(_ answer: ChatSignIn, server: ChatServerAddress, deviceName: String, orgId: String?) async throws -> ChatConnection {
+    func completeSignIn(_ answer: ChatSignIn, server: ChatServerAddress, deviceName: String, orgId: String?,
+                        stillValid: @escaping @MainActor () -> Bool = { true }) async throws -> ChatConnection {
         try await exclusively {
-            try await self.completeSignInNow(answer, server: server, deviceName: deviceName, orgId: orgId)
+            guard stillValid() else { throw CancellationError() }
+            return try await self.completeSignInNow(answer, server: server, deviceName: deviceName, orgId: orgId)
         }
     }
 
@@ -704,8 +707,9 @@ final class ChatService {
     /// A sign-in team work did not move to (a call began meanwhile): its
     /// session closes and its token goes; the record, if any, still names
     /// the connection before it, whose token stays.
-    func discardSignIn() async {
+    func discardSignIn(expecting expected: ChatConnection? = nil) async {
         await exclusively {
+            guard expected == nil || self.connection == expected else { return }
             self.stopFeed()
             self.replaced = nil
             guard let connection = self.connection else { return }
@@ -920,6 +924,7 @@ final class ChatService {
     /// The user chose to reset a damaged run journal. The organizations'
     /// queues take the new journal's table (review C3-14).
     func resetJournal() throws {
+        try journal?.queue.close()
         let fresh = try ChatJournal.reset(files: files)
         journal = fresh
         journalProblem = nil

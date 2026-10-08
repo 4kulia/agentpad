@@ -44,11 +44,13 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(app.state(for: w2.id), w2.state)
     }
 
-    func testMissingOrCorruptFileLoadsEmpty() throws {
+    func testMissingFileLoadsEmptyAndCorruptFileShowsRecovery() throws {
         XCTAssertTrue(AppPersistence(fileURL: tempURL()).windowIds.isEmpty)
         let url = tempURL()
         try "not json".write(to: url, atomically: true, encoding: .utf8)
-        XCTAssertTrue(AppPersistence(fileURL: url).windowIds.isEmpty)
+        let corrupt = AppPersistence(fileURL: url)
+        XCTAssertEqual(corrupt.windowIds.count, 1)
+        XCTAssertNotNil(corrupt.lastError)
     }
 
     // MARK: - Window slots

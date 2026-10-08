@@ -39,6 +39,7 @@ struct PersistedState: Codable, Equatable {
 /// AgentPad window's `WorkspaceStore`; array order is window restore order.
 struct PersistedApp: Codable, Equatable {
     var windows: [PersistedWindow]
+    var formatVersion: Int? = 2
 }
 
 /// A window's frame in AppKit screen points (origin bottom-left). Restored
@@ -56,6 +57,30 @@ struct PersistedWindow: Codable, Equatable {
     /// Absent in files written before v0.51.9 (nil → the window is placed
     /// the old way: centered / cascaded at the default size).
     var frame: PersistedFrame?
+
+    init(id: UUID, state: PersistedState, frame: PersistedFrame? = nil) {
+        self.id = id; self.state = state; self.frame = frame
+    }
+    private enum CodingKeys: String, CodingKey { case id, state, frame }
+    init(from decoder: Decoder) throws {
+        do {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(UUID.self, forKey: .id)
+            state = try c.decode(PersistedState.self, forKey: .state)
+            frame = try c.decodeIfPresent(PersistedFrame.self, forKey: .frame)
+        } catch {
+            id = UUID(); state = Self.recoveryState(); frame = nil
+        }
+    }
+    static func recoveryState() -> PersistedState {
+        let id = UUID()
+        var tab = PersistedTab(id: id, agentId: "terminal", currentDirectoryPath: homeDirectoryPath)
+        tab.content = .tool(.unavailable(id))
+        let pane = PersistedPane(id: UUID(), tabs: [tab], activeTabId: id)
+        let workspace = PersistedWorkspace(id: UUID(), workingDirectoryPath: homeDirectoryPath,
+            root: PersistedPaneNode(id: pane.id, kind: .pane(pane)))
+        return PersistedState(workspaces: [workspace], activeWorkspaceId: workspace.id)
+    }
 }
 
 struct PersistedWorkspace: Codable, Equatable {
@@ -275,6 +300,37 @@ struct PersistedTab: Codable, Equatable {
     var channel: ChannelRef?
     // AgentPad: a saved list persists its organization address and kind only.
     var inbox: ChatInboxRef?
+    var content: TabContent?
+    var navigation: TabNavigation?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, agentId, currentDirectoryPath, customTitle, conversationId, sshWorkspaceHost, channel, inbox, content, navigation
+    }
+
+    init(from decoder: Decoder) throws {
+        // A malformed or newer tab is isolated; never reinterpret it as shell.
+        do {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(UUID.self, forKey: .id)
+            if c.contains(.content) {
+                content = try c.decode(TabContent.self, forKey: .content)
+            } else {
+                channel = try c.decodeIfPresent(ChannelRef.self, forKey: .channel)
+                inbox = try c.decodeIfPresent(ChatInboxRef.self, forKey: .inbox)
+            }
+            agentId = try c.decode(String.self, forKey: .agentId)
+            currentDirectoryPath = try c.decode(String.self, forKey: .currentDirectoryPath)
+            customTitle = try c.decodeIfPresent(String.self, forKey: .customTitle)
+            conversationId = try c.decodeIfPresent(String.self, forKey: .conversationId)
+            sshWorkspaceHost = try c.decodeIfPresent(String.self, forKey: .sshWorkspaceHost)
+            navigation = try c.decodeIfPresent(TabNavigation.self, forKey: .navigation)
+            if case .channel(let ref) = content { channel = ref }
+            if case .chatInbox(let ref) = content { inbox = ref }
+        } catch {
+            id = UUID(); agentId = "terminal"; currentDirectoryPath = homeDirectoryPath
+            content = .tool(.unavailable(id))
+        }
+    }
 
     @MainActor
     init(_ session: Session) {
@@ -282,11 +338,13 @@ struct PersistedTab: Codable, Equatable {
         self.agentId = session.agent.id
         self.currentDirectoryPath = session.currentDirectory.path
         // AgentPad: a channel tab keeps no title — its name is its card's (DESIGN-F2).
-        self.customTitle = !session.isChat ? session.customTitle : nil
+        self.customTitle = session.hasProcess ? session.customTitle : nil
         self.conversationId = session.conversationId
         self.sshWorkspaceHost = session.sshWorkspaceHost ?? ""
         self.channel = session.channel
         self.inbox = session.inbox
+        self.content = session.content
+        self.navigation = session.tabState?.navigation
     }
 
     init(id: UUID, agentId: String, currentDirectoryPath: String, customTitle: String? = nil, conversationId: String? = nil) {
@@ -302,6 +360,11 @@ struct PersistedTab: Codable, Equatable {
 protocol Persistence {
     func load() -> PersistedState?
     func save(_ state: PersistedState)
+    func saveChecked(_ state: PersistedState) throws
+}
+
+extension Persistence {
+    func saveChecked(_ state: PersistedState) throws { save(state) }
 }
 
 /// Owns the single `state.json` for the whole app. Holds every window's
@@ -310,83 +373,98 @@ protocol Persistence {
 /// a `WindowPersistence` scoped to its own `windowId`.
 @MainActor
 final class AppPersistence {
-    /// The real `state.json`. Tests inject a temp path via `init(fileURL:)`.
     static var defaultFileURL: URL {
-        // AgentPad: a debug build may keep its state elsewhere — to run beside
-        // the working app, e.g. to check a channel tab starts no process
-        // (DESIGN-F2). A release build never reads it.
         #if DEBUG
         if let path = ProcessInfo.processInfo.environment["AGENTPAD_DEBUG_STATE_PATH"], !path.isEmpty {
             return URL(fileURLWithPath: path)
         }
         #endif
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = support.appendingPathComponent(AppIdentity.supportDirectoryName, isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("state.json")
+        return support.appendingPathComponent(AppIdentity.supportDirectoryName, isDirectory: true).appendingPathComponent("state-v2.json")
     }
-
     private let fileURL: URL
     private var windows: [PersistedWindow]
+    private let writer: (Data, URL) throws -> Void
+    private(set) var lastError: Error?
+    private var unreadable = false
+    let drafts: DraftRepository
 
-    init(fileURL: URL = AppPersistence.defaultFileURL) {
-        self.fileURL = fileURL
-        windows = Self.loadFromDisk(from: fileURL)
-    }
-
-    /// Window ids in restore order — `AppDelegate` rebuilds one window each.
-    var windowIds: [UUID] { windows.map(\.id) }
-
-    func state(for id: UUID) -> PersistedState? {
-        windows.first { $0.id == id }?.state
-    }
-
-    func frame(for id: UUID) -> PersistedFrame? {
-        windows.first { $0.id == id }?.frame
-    }
-
-    /// Upserts a window's state — a new id appends (so a `⌘⇧N` window
-    /// restores last) — and writes the file. The write is synchronous:
-    /// `WorkspaceStore.scheduleSave` already debounces upstream, and a
-    /// closing window must reach disk before the process can exit. A nil
-    /// `frame` means "unknown" and keeps whatever was saved before — a
-    /// provider with no window to read must never erase a frame an earlier
-    /// save wrote.
-    func setWindow(_ id: UUID, state: PersistedState, frame: PersistedFrame? = nil) {
-        if let idx = windows.firstIndex(where: { $0.id == id }) {
-            windows[idx].state = state
-            if let frame { windows[idx].frame = frame }
-        } else {
-            windows.append(PersistedWindow(id: id, state: state, frame: frame))
+    init(fileURL: URL = AppPersistence.defaultFileURL, legacyURL: URL? = nil,
+         writer: @escaping (Data, URL) throws -> Void = { data, url in
+             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+             try data.write(to: url, options: .atomic)
+         }) {
+        self.fileURL = fileURL; self.writer = writer
+        self.drafts = DraftRepository(fileURL: fileURL.deletingLastPathComponent().appendingPathComponent("tab-drafts-v1.json"), write: writer)
+        windows = []
+        let legacy = legacyURL ?? (fileURL.lastPathComponent == "state-v2.json" ? fileURL.deletingLastPathComponent().appendingPathComponent("state.json") : nil)
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            do { windows = try Self.read(fileURL) }
+            catch { lastError = error; unreadable = true; windows = [Self.unavailableWindow()] }
+        } else if let legacy, FileManager.default.fileExists(atPath: legacy.path) {
+            do {
+                windows = try Self.read(legacy)
+                try write(windows) // Original is retained for a 1.1.8 rollback.
+            } catch { lastError = error; unreadable = true; windows = [Self.unavailableWindow()] }
         }
-        writeToDisk()
+        do { try backUpUnreadableFile() }
+        catch { lastError = error }
     }
+    var windowIds: [UUID] { windows.map(\.id) }
+    func state(for id: UUID) -> PersistedState? { windows.first { $0.id == id }?.state }
+    func frame(for id: UUID) -> PersistedFrame? { windows.first { $0.id == id }?.frame }
 
-    func removeWindow(_ id: UUID) {
-        windows.removeAll { $0.id == id }
-        writeToDisk()
+    @discardableResult
+    func setWindow(_ id: UUID, state: PersistedState, frame: PersistedFrame? = nil) -> Result<Void, Error> {
+        setWindows([PersistedWindow(id: id, state: state, frame: frame)])
     }
-
-    private func writeToDisk() {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(PersistedApp(windows: windows)) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+    /// One atomic write for both ends of a transfer; memory commits only on success.
+    @discardableResult
+    func setWindows(_ updates: [PersistedWindow]) -> Result<Void, Error> {
+        var next = windows
+        for update in updates {
+            if let i = next.firstIndex(where: { $0.id == update.id }) {
+                let frame = update.frame ?? next[i].frame
+                next[i] = update; next[i].frame = frame
+            } else { next.append(update) }
+        }
+        return commit(next)
     }
-
-    /// Reads `state.json`, accepting both the current `{windows:[…]}` shape
-    /// and the legacy bare `PersistedState` (pre-multi-window) — a legacy
-    /// file migrates to one window. Returns `[]` for a missing / corrupt file.
-    static func loadFromDisk(from url: URL) -> [PersistedWindow] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
+    @discardableResult
+    func removeWindow(_ id: UUID) -> Result<Void, Error> { commit(windows.filter { $0.id != id }) }
+    private func commit(_ next: [PersistedWindow]) -> Result<Void, Error> {
+        do {
+            try backUpUnreadableFile()
+            try write(next); windows = next; lastError = nil
+            return .success(())
+        } catch { lastError = error; return .failure(error) }
+    }
+    private func write(_ next: [PersistedWindow]) throws {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try writer(encoder.encode(PersistedApp(windows: next)), fileURL)
+    }
+    private func backUpUnreadableFile() throws {
+        guard unreadable else { return }
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            let backup = fileURL.appendingPathExtension("corrupt-\(Date().timeIntervalSince1970)")
+            try FileManager.default.copyItem(at: fileURL, to: backup)
+        }
+        // If backup failed, the next save retries it instead of blocking forever.
+        // A failed legacy import already has its original in state.json.
+        unreadable = false
+    }
+    private static func read(_ url: URL) throws -> [PersistedWindow] {
+        let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
         if let app = try? decoder.decode(PersistedApp.self, from: data) {
+            guard app.formatVersion == nil || app.formatVersion == 2 else { throw CocoaError(.fileReadCorruptFile) }
             return app.windows
         }
-        if let legacy = try? decoder.decode(PersistedState.self, from: data) {
-            return [PersistedWindow(id: UUID(), state: legacy)]
-        }
-        return []
+        return [PersistedWindow(id: UUID(), state: try decoder.decode(PersistedState.self, from: data))]
+    }
+    static func loadFromDisk(from url: URL) -> [PersistedWindow] { (try? read(url)) ?? [] }
+    private static func unavailableWindow() -> PersistedWindow {
+        PersistedWindow(id: UUID(), state: PersistedWindow.recoveryState())
     }
 }
 
@@ -410,7 +488,8 @@ final class WindowPersistence: Persistence {
     }
 
     func load() -> PersistedState? { app.state(for: windowId) }
-    func save(_ state: PersistedState) {
-        app.setWindow(windowId, state: state, frame: frameProvider?())
+    func save(_ state: PersistedState) { app.setWindow(windowId, state: state, frame: frameProvider?()) }
+    func saveChecked(_ state: PersistedState) throws {
+        try app.setWindow(windowId, state: state, frame: frameProvider?()).get()
     }
 }

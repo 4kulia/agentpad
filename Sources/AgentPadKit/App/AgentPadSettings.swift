@@ -15,8 +15,14 @@ import GhosttyKit
 enum AgentPadSettings {
     static let pairedThemeSchemaVersion = 2
 
-    static let directory: URL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(AppIdentity.configDirectoryName, isDirectory: true)
+    static let directory: URL = {
+        #if DEBUG
+        if let path = ProcessInfo.processInfo.environment["AGENTPAD_DEBUG_CONFIG_DIRECTORY"], !path.isEmpty {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        #endif
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(AppIdentity.configDirectoryName, isDirectory: true)
+    }()
 
     static let url: URL = directory.appendingPathComponent("settings.json")
 
@@ -353,12 +359,13 @@ enum AgentPadSettings {
     /// `settings.json`. Drops the write on serialization failure rather than
     /// surfacing — same behavior as `loadParsed` on the read side.
     static func write(_ object: [String: Any]) {
-        ensureDirectory()
-        guard let data = try? JSONSerialization.data(
-            withJSONObject: object,
-            options: [.prettyPrinted, .sortedKeys]
-        ) else { return }
-        try? data.write(to: url, options: .atomic)
+        try? writeChecked(object)
+    }
+
+    static func writeChecked(_ object: [String: Any]) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
     }
 }
 
@@ -368,16 +375,13 @@ enum AgentPadSettings {
 /// so subsequent launches skip this branch.
 @MainActor
 enum AgentPadOnboarding {
-    static func runIfNeeded() {
+    static func runIfNeeded(ghosttyConfig: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/ghostty/config")) {
         // Gate on the settings.json file existing rather than the directory —
         // a previous run could have created `~/.agentpad/` but failed to write
         // the file (disk full, perms), and skipping onboarding forever in
         // that state leaves the user with no settings at all.
         let fm = FileManager.default
         guard !fm.fileExists(atPath: AgentPadSettings.url.path) else { return }
-
-        let ghosttyConfig = fm.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/ghostty/config")
 
         if fm.fileExists(atPath: ghosttyConfig.path) {
             promptGhosttyImport(from: ghosttyConfig)

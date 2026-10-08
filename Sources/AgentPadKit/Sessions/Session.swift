@@ -43,11 +43,22 @@ struct ToolCallEvent: Identifiable, Equatable {
 @Observable
 final class Session: Identifiable {
     let id: UUID
-    let engine: any TerminalEngine
+    let terminalConfirmation = ConfirmationCoordinator()
+    var clipboardPreview: String?
+    var engine: any TerminalEngine
     // AgentPad: a channel tab (probe V1) — its engine is a ChannelTabEngine.
-    var channel: ChannelRef?
-    // AgentPad: saved chat lists use a native host too, never a terminal.
-    var inbox: ChatInboxRef?
+    var content: TabContent = .terminal
+    var channel: ChannelRef? {
+        get { if case .channel(let ref) = content { ref } else { nil } }
+        set { content = newValue.map(TabContent.channel) ?? .terminal }
+    }
+    var inbox: ChatInboxRef? {
+        get { if case .chatInbox(let ref) = content { ref } else { nil } }
+        set { content = newValue.map(TabContent.chatInbox) ?? .terminal }
+    }
+    var toolRoute: ToolRoute? { if case .tool(let route) = content { route } else { nil } }
+    var tabState: TabState? { (engine as? NativeTabEngine)?.state }
+    var hasProcess: Bool { content.hasProcess }
     var isChat: Bool { channel != nil || inbox != nil }
     /// Initial template the tab was opened with. Promoted at runtime when an
     /// agent's hooks fire from a plain `terminal` session — e.g. user types
@@ -183,7 +194,7 @@ final class Session: Identifiable {
     @ObservationIgnored private var pendingShellCommand: (command: String, deadline: ContinuousClock.Instant)?
 
     var canRunShellCommand: Bool {
-        guard let shellControlPID, effectiveRemoteHost == nil, !shellCommandRunning,
+        guard hasProcess, let shellControlPID, effectiveRemoteHost == nil, !shellCommandRunning,
               pendingShellCommand.map({ ContinuousClock.now >= $0.deadline }) ?? true else { return false }
         return engine.foregroundPid == shellControlPID
     }
@@ -264,10 +275,7 @@ final class Session: Identifiable {
     /// the pane's bottom-left corner. Runtime-only, not persisted.
     var hoveredLinkURL: String?
 
-    /// Set true to open the rename popover on this tab from outside the view
-    /// (the ⌘R menu command). The active tab's `TabBarItem` observes this,
-    /// opens its rename popover, and resets the flag. Runtime-only.
-    var renameRequested = false
+    let nameEdit = InlineNameEdit()
 
     /// CLI `open --no-focus` (issue #59): this tab's shell must spawn while
     /// hidden — "background" means the command runs. Two topologies consume
@@ -486,6 +494,7 @@ final class Session: Identifiable {
     /// render as blank.
     var title: String {
         // AgentPad: a channel tab shows its channel's name while it may be seen (DESIGN-F2).
+        if let toolRoute { return toolRoute.title }
         if let channel { return ChannelTabs.title(channel) }
         if let inbox { return inbox.kind.title }
         if let custom = customTitle, !custom.isEmpty { return custom }

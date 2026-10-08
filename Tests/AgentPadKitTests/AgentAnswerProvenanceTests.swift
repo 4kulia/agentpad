@@ -124,7 +124,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
             XCTAssertEqual(failure, .ambiguousClaude)
             store.applyHookConversationId(conversationId: journal, sessionId: surface, provenance: proof, failure: failure)
             XCTAssertEqual(AgentAnswerSource.problem(tab), .ambiguousClaude)
-            XCTAssertFalse(AgentAnswerWindow.available(tab))
+            XCTAssertFalse(CompositionTabs.available(tab))
             received.fulfill()
         }
         server.originOf = { _ in .localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100) }
@@ -380,7 +380,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
             AgentAnswerSource.recordHook(conversation: second, session: tab, provenance: fixture.capture(), inspector: fixture.inspector)
             XCTAssertNil(tab.answerBinding, "tmux/shell or another pane's Claude cannot match the hook parent")
             XCTAssertNotNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector)?.errorDescription)
-            XCTAssertFalse(AgentAnswerWindow.available(tab))
+            XCTAssertFalse(CompositionTabs.available(tab))
         }
         try fixture.bind(tab, conversation: first)
         store.applyHookConversationId(conversationId: second, sessionId: tab.id)
@@ -429,7 +429,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         XCTAssertTrue(sent)
         await fulfillment(of: [received], timeout: 3)
         XCTAssertNil(tab.answerBinding)
-        XCTAssertFalse(AgentAnswerWindow.available(tab))
+        XCTAssertFalse(CompositionTabs.available(tab))
     }
 
     func testSocketPreservesVerifiedParentWithJournalAndChecksSignaturesOffMain() async throws {

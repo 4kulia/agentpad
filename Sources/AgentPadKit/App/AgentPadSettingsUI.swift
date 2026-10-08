@@ -120,7 +120,13 @@ enum AgentPadAppLanguage: String, CaseIterable, Identifiable, Sendable {
 final class AgentPadSettingsModel {
     /// Singleton so non-Settings UI surfaces (TabBarView's `+` menu, etc.)
     /// observe the same instance and react to user edits without a reload.
-    static let shared = AgentPadSettingsModel()
+    private static let applicationModel = AgentPadSettingsModel()
+    #if DEBUG
+    static var testModel: AgentPadSettingsModel?
+    static var shared: AgentPadSettingsModel { testModel ?? applicationModel }
+    #else
+    static var shared: AgentPadSettingsModel { applicationModel }
+    #endif
 
     /// Narrow app-boundary callbacks. Tests and standalone model instances
     /// keep the no-op defaults; AppDelegate wires the shared instance once at
@@ -373,7 +379,18 @@ final class AgentPadSettingsModel {
         }
     }
 
-    init() {
+    @ObservationIgnored private let settingsReader: () -> [String: Any]?
+    @ObservationIgnored private let settingsWriter: ([String: Any]) throws -> Void
+    @ObservationIgnored private let appliesRuntimeEffects: Bool
+    @ObservationIgnored private var savedSettings: NSDictionary?
+    private var isDirty = false
+    private(set) var saveError: String?
+    private(set) var isSaving = false
+
+    init(read: @escaping () -> [String: Any]? = { AgentPadSettings.loadParsed() },
+         write: @escaping ([String: Any]) throws -> Void = { try AgentPadSettings.writeChecked($0) },
+         appliesRuntimeEffects: Bool = true) {
+        self.settingsReader = read; self.settingsWriter = write; self.appliesRuntimeEffects = appliesRuntimeEffects
         let language = AgentPadAppLanguage.current()
         launchedAppLanguage = language
         appLanguage = language
@@ -381,7 +398,10 @@ final class AgentPadSettingsModel {
     }
 
     func load() {
-        let parsed = AgentPadSettings.loadParsed() ?? [:]
+        let settings = settingsReader()
+        savedSettings = settings.map { NSDictionary(dictionary: $0) }
+        isDirty = false
+        let parsed = settings ?? [:]
         appLanguage = .current()
         terminalThemeChoices = AgentPadTerminalTheme.availableThemes()
         let terminal = parsed["terminal"] as? [String: Any] ?? [:]
@@ -575,6 +595,8 @@ final class AgentPadSettingsModel {
     /// the 300ms timer collapses a burst of edits (Stepper, typing, etc.)
     /// into one write.
     func scheduleSave() {
+        isDirty = true
+        isSaving = true
         saveWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.save() }
         saveWork = work
@@ -594,11 +616,35 @@ final class AgentPadSettingsModel {
     /// Default users. Font, cursor, agent, and other saves must not cross it.
     func activatePairedThemeSchemaAndSave() {
         pairedThemeSchemaEnabled = true
+        isDirty = true
         flushSave()
     }
 
+    func flushSaveChecked() throws {
+        flushSave()
+        if let saveError { throw NSError(domain: "AgentPad.Settings", code: 1, userInfo: [NSLocalizedDescriptionKey: saveError]) }
+    }
+
+    func reloadIfClean() {
+        guard !isDirty, saveError == nil else { return }
+        load()
+    }
+
+    func discardUnsavedChanges() {
+        saveWork?.cancel(); saveWork = nil
+        isSaving = false; saveError = nil
+        load()
+    }
+
     private func save() {
-        var parsed = AgentPadSettings.loadParsed() ?? [:]
+        defer { isSaving = false }
+        guard isDirty else { return }
+        let settings = settingsReader()
+        guard settings.map({ NSDictionary(dictionary: $0) }) == savedSettings else {
+            saveError = "settings.json changed outside Settings. Discard local changes to reload it before saving."
+            return
+        }
+        var parsed = settings ?? [:]
         var terminal = parsed["terminal"] as? [String: Any] ?? [:]
         let previousTerminal = terminal
         let previousAppearance = parsed["appearance"] as? [String: Any] ?? [:]
@@ -754,7 +800,13 @@ final class AgentPadSettingsModel {
             parsed["statusbar"] = statusbar
         }
 
-        AgentPadSettings.write(parsed)
+        do {
+            try settingsWriter(parsed)
+            savedSettings = NSDictionary(dictionary: parsed)
+            isDirty = false; saveError = nil
+        }
+        catch { saveError = error.localizedDescription; return }
+        guard appliesRuntimeEffects else { return }
         AgentPadShellIntegration.refreshClaudeCustomSettings(customAgents: customAgents)
         // Same live-set sweep as the line above, for imported agent icons —
         // covers deletion, reset-to-defaults, a cleared icon, the file a
@@ -1091,50 +1143,56 @@ final class AgentPadSettingsModel {
     }
 }
 
-enum SettingsCategory: String, CaseIterable, Identifiable {
-    case general, appearance, codingAgents, terminalPresets, openIn, statusBar, notifications, advanced
-
-    var id: String { rawValue }
-
-    @MainActor
-    var title: String {
-        switch self {
-        case .general: return String(localized: "General", bundle: .agentPadResources)
-        case .appearance: return String(localized: "Appearance", bundle: .agentPadResources)
-        case .codingAgents: return String(localized: "Agents", bundle: .agentPadResources)
-        case .terminalPresets: return String(localized: "Terminals", bundle: .agentPadResources)
-        case .openIn: return String(localized: "Open in", bundle: .agentPadResources)
-        case .statusBar: return String(localized: "Status Bar", bundle: .agentPadResources)
-        case .notifications: return String(localized: "Notifications", bundle: .agentPadResources)
-        case .advanced: return String(localized: "Advanced", bundle: .agentPadResources)
-        }
-    }
-}
-
-/// Settings panel. Brutalist-minimal:
-///   - sidebar list reads like a config-key index: mono font, `▸` prefix on
-///     the selected row, no pill highlights, no icons
-///   - detail surface is unboxed — rows are hairline-separated, labels are
-///     kebab-case config keys in mono, headers use Onest display for the
-///     single human-readable hook
-///   - all separators are 1pt hairlines, all corners are sharp
-/// The goal is to feel like polishing a `.toml` in a clean GUI, not a SaaS
-/// settings panel.
+/// Settings content is hosted by the same native tab in every pane/window.
 struct AgentPadSettingsView: View {
     @Bindable var model: AgentPadSettingsModel
+    @Bindable var state: TabState
+    @Bindable var screen: SettingsScreenState
+    let updates: UpdatesTabModel
     let onOpenInTab: () -> Void
-    @State private var selected: SettingsCategory = .general
+    @FocusState private var focusedSection: SettingsTabSection?
+    private var selected: SettingsTabSection { state.navigation.settingsSection }
+    private var sectionBinding: Binding<SettingsTabSection> {
+        Binding(get: { selected }, set: { state.select($0) })
+    }
 
     var body: some View {
         // The autosave `.onChange` observers are split across two statements
         // via an intermediate `let`: a single chain this long (16 modifiers)
         // overruns the Swift type-checker's budget ("unable to type-check in
         // reasonable time"). Each half stays comfortably under the limit.
-        let core = HStack(spacing: 0) {
-            sidebar
-            Rectangle().fill(Theme.chromeHairline).frame(width: 1)
-            ScrollView { detail }
-                .frame(maxWidth: .infinity)
+        let core = GeometryReader { geometry in
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Label("Settings", systemImage: "gearshape").font(Theme.display(20, weight: .semibold))
+                    Spacer(minLength: 8)
+                    Text(model.saveError != nil ? "Changes could not be saved" : model.isSaving ? "Saving…" : "Changes applied")
+                        .font(Theme.display(11)).foregroundStyle(.secondary)
+                }.padding(20)
+                Divider()
+                if geometry.size.width >= 620 {
+                    HStack(spacing: 0) {
+                        sidebar
+                        Rectangle().fill(Theme.chromeHairline).frame(width: 1)
+                        detailScroll
+                    }
+                } else {
+                    Picker("Settings section", selection: sectionBinding) {
+                        ForEach(SettingsTabSection.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }.padding(12).accessibilityIdentifier("settings-section-picker")
+                    Divider()
+                    detailScroll
+                }
+                if let error = model.saveError {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(error).foregroundStyle(.red).accessibilityIdentifier("settings-write-error")
+                        Button("Retry saving") {
+                            do { try model.flushSaveChecked(); state.saveError = nil }
+                            catch { state.saveError = error.localizedDescription }
+                        }
+                    }.padding(12)
+                }
+            }
         }
         .glassWindowBackground(fallback: Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
@@ -1144,7 +1202,7 @@ struct AgentPadSettingsView: View {
         .onChange(of: model.appearanceMode) { _, _ in model.activatePairedThemeSchemaAndSave() }
         .onChange(of: model.lightTerminalThemeSelection) { _, _ in model.activatePairedThemeSchemaAndSave() }
         .onChange(of: model.darkTerminalThemeSelection) { _, _ in model.activatePairedThemeSchemaAndSave() }
-        .onChange(of: model.backgroundBlur) { _, _ in model.flushSave() }
+        .onChange(of: model.backgroundBlur) { _, _ in model.scheduleSave(); model.flushSave() }
         .onChange(of: model.backgroundOpacity) { _, _ in model.scheduleSave() }
         .onChange(of: model.agentOrder) { _, _ in model.scheduleSave() }
         .onChange(of: model.hiddenAgents) { _, _ in model.scheduleSave() }
@@ -1174,40 +1232,38 @@ struct AgentPadSettingsView: View {
             .onChange(of: model.notifyOnFailure) { _, _ in model.scheduleSave() }
     }
 
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(String(localized: "SETTINGS", bundle: .agentPadResources))
-                .font(Theme.mono(10, weight: .medium))
-                .tracking(1.6)
-                .foregroundStyle(Theme.chromeMuted.opacity(0.85))
-                .padding(.horizontal, 18)
-                .padding(.top, 22)
-                .padding(.bottom, 18)
-            ForEach(SettingsCategory.allCases) { category in
-                sidebarRow(category)
-            }
-            Spacer()
-        }
-        .frame(width: 168, alignment: .topLeading)
-        .background(Theme.chromeFaint.opacity(0.08))
+    private var detailScroll: some View {
+        ScrollView {
+            detail.background(TabScrollPosition(state: state, section: selected.rawValue).frame(width: 0, height: 0))
+        }.frame(maxWidth: .infinity)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("settings-detail-" + selected.rawValue)
     }
 
-    private func sidebarRow(_ category: SettingsCategory) -> some View {
-        let isSelected = selected == category
-        return HStack(spacing: 0) {
-            Text(isSelected ? "▸" : " ")
-                .font(Theme.mono(11, weight: .medium))
-                .foregroundStyle(isSelected ? Theme.chromeForeground : Color.clear)
-                .frame(width: 14, alignment: .leading)
-            Text(category.title)
-                .font(Theme.mono(12, weight: isSelected ? .medium : .regular))
-                .foregroundStyle(isSelected ? Theme.chromeForeground : Theme.chromeMuted)
-            Spacer()
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 7)
-        .contentShape(Rectangle())
-        .onTapGesture { selected = category }
+    private var sidebar: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(SettingsTabSection.allCases, id: \.self) { category in
+                    Button { state.select(category) } label: {
+                        Label(category.title, systemImage: category == .about ? "info.circle" : category == .updates ? "arrow.down.circle" : "gearshape")
+                            .font(Theme.display(12)).frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                            .background(selected == category ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 6))
+                            .contentShape(Rectangle())
+                    }.buttonStyle(.plain).focused($focusedSection, equals: category)
+                        .accessibilityLabel(category.title)
+                        .accessibilityIdentifier("settings-section-" + category.rawValue)
+                        .accessibilityAddTraits(selected == category ? .isSelected : [])
+                        .onKeyPress(.downArrow) { stepSection(category, by: 1); return .handled }
+                        .onKeyPress(.upArrow) { stepSection(category, by: -1); return .handled }
+                }
+            }.padding(10)
+        }.frame(width: 168).accessibilityLabel("Settings sections")
+    }
+    private func stepSection(_ current: SettingsTabSection, by step: Int) {
+        let values = SettingsTabSection.allCases
+        guard let index = values.firstIndex(of: current) else { return }
+        let next = values[(index + step + values.count) % values.count]
+        state.select(next); focusedSection = next
     }
 
     @ViewBuilder
@@ -1215,8 +1271,8 @@ struct AgentPadSettingsView: View {
         VStack(alignment: .leading, spacing: 0) {
             if selected == .general
                 || selected == .appearance
-                || selected == .codingAgents
-                || selected == .terminalPresets
+                || selected == .agents
+                || selected == .terminals
             {
                 Color.clear.frame(height: 26)
             } else {
@@ -1245,12 +1301,16 @@ struct AgentPadSettingsView: View {
             switch selected {
             case .general: generalDetail
             case .appearance: appearanceDetail
-            case .codingAgents: codingAgentsDetail
-            case .terminalPresets: terminalPresetsDetail
+            case .agents: codingAgentsDetail
+            case .terminals: terminalPresetsDetail
             case .openIn: openInDetail
             case .statusBar: statusBarDetail
             case .notifications: notificationsDetail
             case .advanced: advancedDetail
+            case .about:
+                AboutView()
+                Button("Check for Updates") { state.select(.updates); updates.check() }.padding(28)
+            case .updates: SettingsUpdatesView(model: updates)
             }
             Spacer(minLength: 28)
         }
@@ -1499,7 +1559,7 @@ struct AgentPadSettingsView: View {
 
     private var terminalPresetsDetail: some View {
         SettingsSection(title: "Presets") {
-            TerminalPresetsList(model: model)
+            TerminalPresetsList(model: model, state: state, expandedId: $screen.expandedPresetID)
         }
     }
 
@@ -1514,7 +1574,7 @@ struct AgentPadSettingsView: View {
     private var codingAgentsDetail: some View {
         SettingsSection(title: "Presets") {
             VStack(alignment: .leading, spacing: 0) {
-                AgentReorderList(model: model)
+                AgentReorderList(model: model, state: state, screen: screen, expandedId: $screen.expandedAgentID)
                 SettingsHairline()
                 SettingsRow(label: "resume-conversation-when-reopen") {
                     Toggle("", isOn: $model.resumeConversations)
@@ -1542,6 +1602,7 @@ struct AgentPadSettingsView: View {
                     TextField("Add to the AgentPad context…", text: $model.agentPadPromptAdditionalInstruction, axis: .vertical)
                         .textFieldStyle(.roundedBorder)
                         .lineLimit(3...8)
+                        .frame(minHeight: 60)
                         .disabled(!model.agentPadPrompt)
                         .onChange(of: model.agentPadPromptAdditionalInstruction) { _, _ in model.scheduleSave() }
                 }
@@ -1590,6 +1651,9 @@ struct AgentPadSettingsView: View {
                 .foregroundStyle(Theme.chromeMuted)
                 .padding(.horizontal, 28)
                 .padding(.top, 16)
+            #if DEBUG
+            SettingsDiagnosticsView(model: screen.diagnostics)
+            #endif
         }
     }
 
@@ -1759,22 +1823,24 @@ private struct SettingsRow<Trailing: View>: View {
         self.trailing = trailing
     }
 
+    private var labelView: some View {
+        Group {
+            if localizesLabel { Text(LocalizedStringKey(label), bundle: .agentPadResources) }
+            else { Text(verbatim: label) }
+        }.font(Theme.mono(12.5)).foregroundStyle(Theme.chromeForeground)
+    }
     var body: some View {
-        HStack(spacing: 14) {
-            Group {
-                if localizesLabel {
-                    Text(LocalizedStringKey(label), bundle: .agentPadResources)
-                } else {
-                    Text(verbatim: label)
-                }
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 14) {
+                labelView.fixedSize()
+                Spacer(minLength: 14)
+                trailing().fixedSize(horizontal: true, vertical: false)
             }
-                .font(Theme.mono(12.5))
-                .foregroundStyle(Theme.chromeForeground)
-            Spacer(minLength: 14)
-            trailing()
-        }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 11)
+            VStack(alignment: .leading, spacing: 10) {
+                labelView.fixedSize(horizontal: false, vertical: true)
+                trailing().frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }.padding(.horizontal, 28).padding(.vertical, 11)
     }
 }
 
@@ -1856,9 +1922,11 @@ private struct SettingsSection<Content: View>: View {
 /// appended in their default `AgentTemplate.all` position.
 private struct AgentReorderList: View {
     @Bindable var model: AgentPadSettingsModel
+    let state: TabState
+    @Bindable var screen: SettingsScreenState
     @State private var draggingId: String?
     @State private var endTargeted: Bool = false
-    @State private var expandedId: String?
+    @Binding var expandedId: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1879,6 +1947,7 @@ private struct AgentReorderList: View {
                     baseAgentId: customBinding(id: template.id, \.baseAgentId),
                     env: customBinding(id: template.id, \.env),
                     iconAsset: customBinding(id: template.id, \.iconAsset),
+                    iconError: screen.iconErrors[template.id],
                     onToggleVisible: { toggle(template.id) },
                     onToggleExpanded: {
                         expandedId = expandedId == template.id ? nil : template.id
@@ -1943,31 +2012,14 @@ private struct AgentReorderList: View {
     /// resolving the agent by id in the completion handler is race-free
     /// (same reasoning as `chooseFolder(forPresetId:)`).
     private func chooseIcon(forAgentId id: String) {
+        guard let expected = model.customAgents.first(where: { $0.id == id }) else { return }
         let panel = NSOpenPanel()
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false; panel.canChooseFiles = true; panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.png, .jpeg, .svg]
         panel.message = String(localized: "Choose an icon for this agent.", bundle: .agentPadResources)
-        let assign: (URL) -> Void = { url in
-            guard let idx = model.customAgents.firstIndex(where: { $0.id == id }) else { return }
-            do {
-                model.customAgents[idx].iconAsset = try AgentIconStore.importIcon(from: url, agentId: id)
-            } catch {
-                // Deferred a runloop turn: the panel sheet is still attached
-                // when its completion handler runs, and an app-modal alert
-                // raised under it can land behind the sheet.
-                let message = error.localizedDescription
-                DispatchQueue.main.async {
-                    let alert = NSAlert()
-                    alert.messageText = String(localized: "Couldn't use that icon", bundle: .agentPadResources)
-                    alert.informativeText = message
-                    alert.alertStyle = .warning
-                    alert.runModal()
-                }
-            }
+        TabFilePicker.present(panel, state: state, stillValid: { model.customAgents.first { $0.id == id } == expected }) { url in
+            SettingsIconImport.apply(url, agentID: id, model: model, screen: screen)
         }
-        AgentPadSettingsWindowController.shared.present(panel, onAccept: assign)
     }
 
     /// Binding into a specific custom agent's field. Returns a no-op binding
@@ -2055,6 +2107,7 @@ private struct AgentRow: View {
     /// `onChooseIcon` (via `AgentIconStore`), cleared to fall back to the
     /// "based on" agent's mark.
     @Binding var iconAsset: String
+    var iconError: String?
     let onToggleVisible: () -> Void
     let onToggleExpanded: () -> Void
     let onChooseIcon: () -> Void
@@ -2109,6 +2162,11 @@ private struct AgentRow: View {
             if isCustom {
                 basedOnRow
                 iconRow
+                if let iconError {
+                    Text(iconError).font(Theme.display(12)).foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 22).accessibilityIdentifier("agent-icon-error-" + template.id)
+                }
                 editRow(label: "title", placeholder: "My Agent", text: $title)
                 if baseAgentId.isEmpty {
                     editRow(label: "command", placeholder: "aichat --model gpt-4", text: $command)
@@ -2273,105 +2331,14 @@ private struct AgentRow: View {
 
 }
 
-/// Singleton NSWindowController so reopening Settings reuses the same window
-/// (preserves position, doesn't stack). `show(storeProvider:)` is the only
-/// entry point; the provider resolves the *current* active window's store
-/// each time "Open in New Tab" runs — a captured store would dangle once
-/// its window closed.
-@MainActor
-final class AgentPadSettingsWindowController: NSWindowController {
-    static let shared = AgentPadSettingsWindowController()
-    private let model = AgentPadSettingsModel.shared
-    private var storeProvider: (() -> WorkspaceStore?)?
-    private var host: NSHostingController<AgentPadSettingsView>?
-
-    private init() {
-        super.init(window: nil)
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    static func show(storeProvider: @escaping () -> WorkspaceStore?) {
-        let controller = shared
-        controller.storeProvider = storeProvider
-        controller.buildWindowIfNeeded()
-        controller.model.load()
-        if controller.window?.isVisible != true {
-            controller.window?.center()
-        }
-        controller.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func buildWindowIfNeeded() {
-        guard window == nil else { return }
-        let view = AgentPadSettingsView(model: model) { [weak self] in
-            self?.openSettingsInNewTab()
-        }
-        let host = NSHostingController(rootView: view)
-        self.host = host
-        let window = NSWindow(contentViewController: host)
-        window.title = String(localized: "Settings", bundle: .agentPadResources)
-        // Keep the title set (Window menu / accessibility) but hide the text in
-        // the bar, matching the main window + About + the floating panels.
-        window.titleVisibility = .hidden
-        window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 680, height: 460))
-        window.isReleasedWhenClosed = false
-        window.appearance = Theme.windowAppearance
-        // Glass runs edge to edge under a transparent full-size titlebar;
-        // content keeps its safe-area inset, so rows still sit below the bar.
-        window.configureGlassChrome()
-        self.window = window
-    }
-
-    /// Settings-owned open panels always attach to the Settings window, not
-    /// whichever unrelated auxiliary window happens to be globally key when
-    /// the action runs. The modal fallback only covers tests or a future
-    /// programmatic call before the Settings window has been built.
-    func present(_ panel: NSOpenPanel, onAccept: @escaping (URL) -> Void) {
-        if let window {
-            panel.beginSheetModal(for: window) { response in
-                if response == .OK, let url = panel.url { onAccept(url) }
-            }
-        } else if panel.runModal() == .OK, let url = panel.url {
-            onAccept(url)
-        }
-    }
-
-    /// Opens `~/.agentpad/settings.json` in a new AgentPad tab via `$EDITOR`
-    /// (defaulting to `vi`). Falls back to the system default editor (via
-    /// NSWorkspace) when no active workspace exists.
-    private func openSettingsInNewTab() {
-        // Ensure the file exists so the editor lands in a real document.
-        if !FileManager.default.fileExists(atPath: AgentPadSettings.url.path) {
-            AgentPadSettings.writeDefaultTemplate()
-        }
-        guard let store = storeProvider?(), let workspace = store.active else {
-            NSWorkspace.shared.open(AgentPadSettings.url)
-            return
-        }
-        // AGENTPAD_AGENT is auto-evaluated by the wrapper rcfile; shell expands
-        // `${EDITOR:-vi}` at runtime, so the user's chosen editor wins.
-        let template = AgentTemplate(
-            id: "agentpad-settings-editor",
-            title: "settings.json",
-            symbol: "doc.text",
-            iconAsset: nil,
-            tintHex: nil,
-            initialCommand: "${EDITOR:-vi} \(AgentPadShellIntegration.quote(AgentPadSettings.url.path))"
-        )
-        let session = store.addTab(in: workspace, template: template)
-        session.customTitle = "settings.json"
-        window?.orderOut(nil)
-    }
-}
+// MARK: - Terminal presets
 
 private struct TerminalPresetsList: View {
     @Bindable var model: AgentPadSettingsModel
+    let state: TabState
     @State private var draggingId: String?
     @State private var endTargeted: Bool = false
-    @State private var expandedId: String?
+    @Binding var expandedId: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -2470,6 +2437,7 @@ private struct TerminalPresetsList: View {
     /// blocks edits to the underlying view, so resolving the preset by id
     /// in the completion handler is race-free.
     private func chooseFolder(forPresetId id: String) {
+        guard let expected = model.terminalPresets.first(where: { $0.id == id }) else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -2483,7 +2451,8 @@ private struct TerminalPresetsList: View {
             guard let idx = model.terminalPresets.firstIndex(where: { $0.id == id }) else { return }
             model.terminalPresets[idx].path = (url.path as NSString).abbreviatingWithTildeInPath
         }
-        AgentPadSettingsWindowController.shared.present(panel, onAccept: assign)
+        TabFilePicker.present(panel, state: state,
+            stillValid: { model.terminalPresets.first { $0.id == id } == expected }, onAccept: assign)
     }
 
     private func toggleVisible(_ id: String) {

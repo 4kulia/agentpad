@@ -27,6 +27,7 @@ struct TerminalTabHost: NSViewRepresentable {
 @MainActor
 final class TerminalTabHostView: NSView {
     private var mountedViews: [UUID: NSView] = [:]
+    private var focusedTabID: UUID?
 
     override func layout() {
         super.layout()
@@ -40,6 +41,11 @@ final class TerminalTabHostView: NSView {
 
     func update(tabs: [Session], activeTabId: UUID?, grabsFocusOnMount: Bool) {
         let tabIds = Set(tabs.map(\.id))
+        let focusChanged = focusedTabID != activeTabId
+        if focusChanged, let old = tabs.first(where: { $0.id == focusedTabID }) {
+            (old.engine as? NativeTabEngine)?.rememberFocus()
+        }
+        focusedTabID = activeTabId
         for session in tabs where session.id == activeTabId || session.spawnsInBackground {
             let view = session.engine.view
             let isActive = session.id == activeTabId
@@ -65,6 +71,9 @@ final class TerminalTabHostView: NSView {
            let active = tabs.first(where: { $0.id == activeTabId }),
            active.engine.view.superview === self {
             active.engine.renderNowIfNeeded()
+            if focusChanged, grabsFocusOnMount, let engine = active.engine as? NativeTabEngine {
+                DispatchQueue.main.async { [weak engine] in engine?.focus() }
+            }
         }
 
         let removedIds = mountedViews.keys.filter { !tabIds.contains($0) }

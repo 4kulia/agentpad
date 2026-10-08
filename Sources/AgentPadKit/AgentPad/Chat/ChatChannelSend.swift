@@ -73,7 +73,15 @@ extension ChatService {
             if !context.contains(where: { $0.messageId == root }) { context.append(ChatMessage(row: row)) }
         }
         // The source and root are mandatory and budgeted before optional context.
-        let sorted = context.sorted { a, b in a.messageId == root && b.messageId != root || (a.messageId != root && b.messageId != root && (a.seq ?? 0) < (b.seq ?? 0)) }
+        let sorted = context.sorted { a, b in
+            let aIsRoot = a.messageId == root
+            let bIsRoot = b.messageId == root
+            if aIsRoot { return !bIsRoot }
+            if bIsRoot { return false }
+            let aSequence = a.seq ?? 0
+            let bSequence = b.seq ?? 0
+            return aSequence < bSequence
+        }
         var snapshots = [ChatChannelContent.Message](), bytes = text.utf8.count, seen = Set<String>()
         for m in sorted where seen.insert(m.messageId).inserted {
             guard snapshots.count < ChatChannelAsk.maxContext - 1, bytes + m.text.utf8.count <= ChatChannelAsk.maxContextBytes else {
@@ -188,7 +196,7 @@ extension ChatService {
     /// A refused create is retried only by this explicit review action. It
     /// creates a new request and consent, retaining the already posted question.
     @discardableResult
-    func retryChannelCall(_ key: ChatOrgKey, source: ChatMessage, agent: ChatChannelAgent, context: [ChatMessage]) throws -> String {
+    func retryChannelCall(_ key: ChatOrgKey, source: ChatMessage, agent: ChatChannelAgent, context: [ChatMessage], requestID: String? = nil) throws -> String {
         guard supports("chat.channel_ux1", key: key), let store = orgSessions[key]?.store, let connection, connection.orgKey == key,
               channelAgentAllowed(key, channel: source.channelId), ChatChannelAsk.eligible(source),
               source.authorAccountId == key.accountId, source.authorAgentId == nil, source.authorSessionName == nil,
@@ -224,7 +232,7 @@ extension ChatService {
             guard let message = chosen.first(where: { $0.id == item.messageId }), message.revision == item.revision,
                   message.attachments.contains(where: { var normalized = $0; normalized.position = item.file.position; return normalized == item.file }) else { throw ChatAttachmentError.changed }
         }
-        let request = UUID().uuidString.lowercased(), deadline = ChatCallStore.timestamp(Date().addingTimeInterval(7 * 24 * 60 * 60))
+        let request = requestID ?? UUID().uuidString.lowercased(), deadline = ChatCallStore.timestamp(Date().addingTimeInterval(7 * 24 * 60 * 60))
         let snapshots = fit.taken.map { ChatChannelContent.Message(messageId: $0.messageId, revision: $0.revision,
             authorAccountId: $0.authorAccountId, authorAgentId: $0.authorAgentId, text: $0.text) }
         var args: [String: ChatJSON] = ["request_id": .string(request), "agent_id": .string(agent.agentId), "channel_id": .string(source.channelId),

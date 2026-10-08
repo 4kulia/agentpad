@@ -201,6 +201,11 @@ extension ChatService {
     func setChannelTrust(_ key: ChatOrgKey, channel: String, agent: ChatChannelAgent, enabled: Bool) throws {
         guard supports("chat.channel_ux1", key: key), let journal, agent.ownerAccountId == key.accountId,
               let connection, connection.orgKey == key else { throw ChatError.notConnected }
+        if enabled {
+            guard let current = trustReview(key, channel: channel, agent: agent.agentId), current.agent == agent else {
+                throw ChatError.storage("The channel, agent or trust policy changed. Review it again.")
+            }
+        }
         let old = agent.trust?.policyId
         // Revocation is durable before its network command; no offline promise.
         if let old { try journal.revokeAuthority(old) }

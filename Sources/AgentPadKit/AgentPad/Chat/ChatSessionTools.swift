@@ -2,6 +2,17 @@ import AgentPadHookKit
 import Foundation
 import GRDB
 
+enum ChatSessionAuthor: Codable, Equatable {
+    case agent(String), session(String)
+
+    var field: String {
+        switch self { case .agent: "author_agent_id"; case .session: "author_session_name" }
+    }
+    var value: String {
+        switch self { case .agent(let id): id; case .session(let name): name }
+    }
+}
+
 @MainActor
 enum ChatSessionTools {
     struct Failure: Error { var code: String; var retryAfter: Int? = nil }
@@ -42,6 +53,7 @@ enum ChatSessionTools {
 
     static func call(_ json: ChatJSON, caller: ChatLocalCaller, service: ChatService,
                      isCallerWaiting: @escaping @MainActor () -> Bool = { true },
+                     preparePost: @MainActor (String) throws -> ChatSessionAuthor? = { _ in nil },
                      revalidate: @escaping @MainActor () throws -> Bool) async throws -> ChatJSON {
         guard case .object(let args) = json, let tool = args["tool"]?.string else { throw Failure(code: "invalid_args") }
         let allowed: Set<String>
@@ -124,10 +136,14 @@ enum ChatSessionTools {
             let id = try uuid("message_id", optional: true) ?? UUID().uuidString.lowercased()
             // A fresh authenticated read makes access current even on an exact
             // repeat; the post command itself validates the root/author atomically.
-            _ = try await api.messagesPage(org, channel: channel, root: root, before: nil, token: token)
+            let page = try await api.messagesPage(org, channel: channel, root: root, before: nil, token: token)
+            if let root, !page.messages.contains(where: { $0.messageId == root && $0.threadRootId == nil && $0.deletedAt == nil }) {
+                throw Failure(code: "not_found")
+            }
             guard try current() else { throw Failure(code: "not_found") }
+            let author = try preparePost(generation)
             let command = try service.queueSessionPost(key, caller: caller, generation: generation, message: id,
-                                                       channel: channel, root: root, text: text)
+                                                       channel: channel, root: root, text: text, author: author)
             let until = Date().addingTimeInterval(2)
             repeat {
                 guard try current() else { throw Failure(code: "not_found") }
@@ -170,7 +186,7 @@ extension ChatService {
         }
     }
 
-    func sessionAuthor(_ key: ChatOrgKey, caller: ChatLocalCaller, generation: String) throws -> (field: String, value: String) {
+    func sessionAuthor(_ key: ChatOrgKey, caller: ChatLocalCaller, generation: String) throws -> ChatSessionAuthor {
         guard let journal, let connection else { throw ChatError.notConnected }
         let ids = try journal.queue.read { db in
             try String.fetchAll(db, sql: """
@@ -181,11 +197,11 @@ extension ChatService {
                 """, arguments: [key.server.description, key.accountId, key.orgId, caller.surface, connection.sessionId, generation])
         }.filter { localAgent($0)?.enabled == true && localAgent($0)?.isSession == true }
         guard ids.count <= 1 else { throw ChatSessionTools.Failure(code: "ambiguous_author") }
-        return ids.first.map { ("author_agent_id", $0) } ?? ("author_session_name", caller.signature)
+        return ids.first.map(ChatSessionAuthor.agent) ?? .session(caller.signature)
     }
 
     func queueSessionPost(_ key: ChatOrgKey, caller: ChatLocalCaller, generation: String, message: String,
-                          channel: String, root: String?, text: String) throws -> String {
+                          channel: String, root: String?, text: String, author savedAuthor: ChatSessionAuthor? = nil) throws -> String {
         guard let connection, connection.orgKey == key, let store = orgSessions[key]?.store else { throw ChatError.notConnected }
         if let held = try store.queue.read({ try Row.fetchOne($0, sql: "SELECT p.*, o.body_bytes, o.state, o.error FROM session_posts p JOIN outbox o ON o.command_id = p.command_id WHERE p.message_id = ?", arguments: [message]) }) {
             guard (held["provenance"] as String) == caller.provenance, (held["generation"] as String) == generation,
@@ -193,6 +209,9 @@ extension ChatService {
                   let envelope = try? JSONDecoder().decode(ChatCommandEnvelope.self, from: held["body_bytes"]),
                   envelope.args["channel_id"]?.string == channel, envelope.args["thread_root_id"]?.string == root,
                   envelope.args["text"]?.string == text else { throw ChatSessionTools.Failure(code: "message_conflict") }
+            if let savedAuthor, envelope.args[savedAuthor.field]?.string != savedAuthor.value {
+                throw ChatSessionTools.Failure(code: "message_conflict")
+            }
             let command: String = held["command_id"], state: String = held["state"]
             let quota = state == "failed" && (held["error"] as String?) == "rate_limited"
             if quota, let until: Int = held["retry_after"], until > Int(Date().timeIntervalSince1970) {
@@ -210,7 +229,7 @@ extension ChatService {
             // A repeat is this exact attempt, never a recalculated author.
             return command
         }
-        let author = try sessionAuthor(key, caller: caller, generation: generation)
+        let author = try savedAuthor ?? sessionAuthor(key, caller: caller, generation: generation)
         guard case .object(var args) = Self.postArgs(message, channel, root, text, []) else { throw ChatSessionTools.Failure(code: "invalid_args") }
         args[author.field] = .string(author.value)
         let prepared = try prepareCommand(key, type: "message.post_from_session", args: .object(args))

@@ -17,26 +17,30 @@ struct TabBarItem: View {
 
     @State private var isHovered = false
     @State private var isContextMenuOpen = false
-    @State private var isRenameOpen = false
-    @State private var pendingRename = ""
 
     var body: some View {
         HStack(spacing: 7) {
             HStack(spacing: 7) {
                 commandStatusDot
                 // AgentPad: saved chat lists have their own navigation symbols.
-                AgentIconView(asset: tab.inbox == nil ? tab.displayAgent.iconAsset : nil,
-                              fallbackSymbol: tab.inbox?.kind.symbol ?? tab.displayAgent.symbol, size: 15)
-                Text(tab.title)
+                AgentIconView(asset: tab.hasProcess ? tab.displayAgent.iconAsset : nil,
+                              fallbackSymbol: tab.toolRoute?.symbol ?? tab.inbox?.kind.symbol ?? tab.displayAgent.symbol, size: 15)
+                if tab.nameEdit.isEditing {
+                    InlineNameField(edit: tab.nameEdit, label: "Tab title") { text in
+                        onRename(text); return nil
+                    }.frame(minWidth: 100)
+                } else {
+                    Text(tab.title)
                     .font(Theme.display(12, weight: isActive ? .medium : .regular))
                     .lineLimit(1)
+                }
             }
-            .overlay(TabDragSource(session: tab, store: store, onActivate: onActivate))
+            .overlay { if !tab.nameEdit.isEditing { TabDragSource(session: tab, store: store, onActivate: onActivate) } }
             // AgentPad: show why an export is unavailable instead of hiding it.
             if AgentAnswerSource.supports(tab), isActive {
                 HoverableIconButton(systemName: "arrowshape.turn.up.right", fontSize: 11, size: 18,
                                     help: AgentAnswerSource.problem(tab)?.rawValue ?? "Forward last agent answer…") { onLastAnswer(false) }
-                    .disabled(!AgentAnswerWindow.available(tab))
+                    .disabled(!CompositionTabs.available(tab))
             }
             HoverableIconButton(
                 systemName: "xmark",
@@ -54,6 +58,8 @@ struct TabBarItem: View {
         .background(rowBackground)
         .clipShape(RoundedRectangle(cornerRadius: Theme.chromeSelectionCornerRadius, style: .continuous))
         .contentShape(Rectangle())
+        .accessibilityLabel(tab.title)
+        .accessibilityIdentifier("workspace-tab-" + tab.id.uuidString)
         .onTapGesture(perform: onActivate)
         .onHover { isHovered = $0 }
         // Selection is a discrete navigation state, not a layout transition.
@@ -70,37 +76,11 @@ struct TabBarItem: View {
             AgentPadTabMenu(tab: tab, canCloseToRight: canCloseToRight,
                 dismiss: { isContextMenuOpen = false }, onClose: onClose,
                 onCloseOthers: onCloseOthers, onCloseToRight: onCloseToRight,
-                onDuplicate: onDuplicate, onRename: { beginRename(deferred: true) },
+                onDuplicate: onDuplicate, onRename: {
+                    onActivate()
+                    if tab.hasProcess { tab.nameEdit.begin(tab.customTitle ?? tab.title) }
+                },
                 onSplit: onSplit, onMoveToNewWindow: onMoveToNewWindow, onLastAnswer: onLastAnswer)
-        }
-        .popover(isPresented: $isRenameOpen, arrowEdge: .bottom) {
-            AgentPadRenameField(placeholder: "Tab title", text: $pendingRename) {
-                onRename(pendingRename)
-                isRenameOpen = false
-            }
-        }
-        .onChange(of: tab.renameRequested) { _, requested in
-            // ⌘R routes here via `Session.renameRequested`. Consume the flag
-            // so the next ⌘R re-fires.
-            guard requested else { return }
-            tab.renameRequested = false
-            beginRename(deferred: false)
-        }
-    }
-
-    /// Seed the edit field from the current title and open the rename popover.
-    /// `deferred` waits one runloop tick — needed from the context menu, where
-    /// that popover is mid-dismiss and back-to-back popovers off the same
-    /// anchor glitch; the ⌘R path opens synchronously. Skips when already open
-    /// so a re-trigger mid-edit can't wipe what the user is typing.
-    private func beginRename(deferred: Bool) {
-        // AgentPad: never for a channel tab — its title is its card's (review F2-p1-3).
-        guard !isRenameOpen, !tab.isChat else { return }
-        pendingRename = tab.customTitle ?? tab.title
-        if deferred {
-            DispatchQueue.main.async { isRenameOpen = true }
-        } else {
-            isRenameOpen = true
         }
     }
 

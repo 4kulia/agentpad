@@ -246,7 +246,7 @@ private struct DraggableTabRow: View {
             onRename: { store.renameTab(tab, to: $0) },
             onSplit: { store.splitPane(pane, orientation: $0, in: workspace) },
             onMoveToNewWindow: { store.moveTabToNewWindow(tab.id) },
-            onLastAnswer: { AgentAnswerWindow.open(session: tab, store: store, copyOnly: $0) }
+            onLastAnswer: { CompositionTabs.shared.forward(session: tab, store: store, copyOnly: $0) }
         )
         .dropIndicator(active: isTargeted && !isSelfDrag, on: edge)
         .dropDestination(for: String.self) { dropped, _ in

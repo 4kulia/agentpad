@@ -2,8 +2,8 @@ import Foundation
 import GRDB
 import SwiftUI
 
-/// Decisions and local previews have no entry through Team. They live with
-/// the channel, and are re-read after every change relevant to its gate.
+/// Channel review data is shared by its summary and the Request tab. Every
+/// read still goes through the channel gate, including local previews.
 @MainActor @Observable
 final class ChatChannelOwnerModel {
     let service: ChatService
@@ -136,151 +136,25 @@ final class ChatChannelOwnerModel {
 
 struct ChatChannelOwnerPanel: View {
     let model: ChatChannelOwnerModel
-    @State private var selected: String?
-    @State private var problem: String?
     private var calls: TeamCalls { TeamService.shared.calls }
-
     var body: some View {
         if model.visible {
             let requests = model.requests.filter { !model.isAutomatic($0) || !calls.channelPendingAccess($0.requestId).isEmpty }
             if !requests.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(requests, id: \.requestId) { request in
-                        HStack {
-                            Text("\(request.agentName ?? "Agent") · \(request.state.rawValue.replacingOccurrences(of: "_", with: " "))").font(.callout)
-                            Spacer()
-                            if request.ownerAccountId == model.key.accountId {
-                                if !model.isAutomatic(request), request.state == .awaitingDecision { Button("Review request…") { selected = request.requestId } }
-                                if !model.isAutomatic(request), request.publication != nil { Button("Preview result…") { selected = request.requestId } }
-                                if !calls.channelPendingAccess(request.requestId).isEmpty { Button("Review folders…") { selected = request.requestId } }
-                                if [.starting, .running].contains(request.state) {
-                                    Button("Stop") { problem = model.service.askToEnd(model.key, request.requestId, type: "request.stop", states: [.starting, .running]) }
-                                }
-                            }
-                            if model.canCancel(request) {
-                                Button("Cancel request") { problem = model.cancel(request) }
-                            }
-                        }
-                    }
-                    if let problem { Text(problem).font(.caption).foregroundStyle(.red) }
-                }
-                .padding(8)
-            }
-        }
-        Color.clear.frame(height: 0).sheet(isPresented: Binding(get: { selected != nil && model.visible }, set: { if !$0 { selected = nil } })) {
-            if let id = selected {
-                ChatChannelDecisionSheet(model: model, requestId: id) { selected = nil }
-            }
-        }
-        .onChange(of: model.visible) { _, visible in if !visible { selected = nil; problem = nil } }
-        .onChange(of: AttentionSelection.shared.revision, initial: true) { _, _ in
-            if case .channel(let channel, let request) = AttentionSelection.shared.destination,
-               channel == model.channel, model.visible { selected = request }
-        }
-    }
-}
-
-struct ChatChannelDecisionSheet: View {
-    let model: ChatChannelOwnerModel
-    let requestId: String
-    let close: () -> Void
-    @State private var problem: String?
-    @State private var reason = ""
-    @State private var deciding = false
-    private var calls: TeamCalls { TeamService.shared.calls }
-
-    var body: some View {
-        Group {
-            if model.visible, let request = model.requests.first(where: { $0.requestId == requestId }) {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 10) {
-                        if request.state.isFinal {
-                            Text(request.state.rawValue.replacingOccurrences(of: "_", with: " ")).font(.headline)
-                            if let reason = request.failureReason ?? request.declineReason { Text(reason).font(.callout).textSelection(.enabled) }
-                        }
-                        ClaudeLaunchHelpView(key: model.key, request: requestId, service: model.service)
-                        if let terms = model.decisionText(request) { Text(terms).font(.callout).textSelection(.enabled) }
-                        if request.state == .awaitingDecision, !model.isAutomatic(request) {
-                            Text("Review channel request").font(.headline)
-                            Text(ChatMarkdownText.attributed(request.text ?? "")).textSelection(.enabled)
-                            if let content = model.content(request) {
-                                ForEach(content.attachments ?? []) { item in
-                                    Label("\(item.file.name) · \(item.file.sizeText) · \(item.file.mime)", systemImage: item.file.isImage ? "photo" : "doc")
-                                        .font(.callout)
-                                }
-                                ForEach(content.context ?? [], id: \.messageId) { message in
-                                    Text("\(model.name(message.authorAccountId)) · revision \(message.revision)").font(.caption).foregroundStyle(.secondary)
-                                    Text(ChatMarkdownText.attributed(message.text ?? "[Message deleted]")).textSelection(.enabled)
-                                }
-                            } else { Text("Waiting for the verified context…").foregroundStyle(.secondary) }
-                            if request.onThisDevice {
-                                TextField("Reason for declining (optional)", text: $reason)
-                                HStack {
-                                    Button("Decline") { decide(false) }
-                                    Button("Allow") { decide(true) }
-                                }
-                                .disabled(deciding)
-                            } else { Text("The decision is made on \(request.executorDeviceName ?? "the executor Mac").") }
-                        }
-                        if !model.isAutomatic(request), let run = model.service.channelPreview(model.key, requestId: requestId) {
-                            Text("Preview · only on this Mac").font(.headline)
-                            if model.canOpenSession(requestId) {
-                                Button("Continue…") { problem = model.openSession(requestId) }
-                            }
-                            Text(verbatim: run.resultErased ? "The result is no longer kept on this Mac." : (model.publicationText(requestId) ?? "No result text.")).textSelection(.enabled)
-                            if let issue = model.service.channelPublicationIssue(model.key, requestId: requestId) {
-                                Text(issue).font(.caption).foregroundStyle(.secondary)
-                            }
-                            if request.publication == "awaiting_publish" {
-                                let refusal = model.service.channelPublishProblem(model.key, requestId: requestId)
-                                if let refusal { Text(refusal).font(.caption).foregroundStyle(.orange) }
-                                HStack {
-                                    Button("Don't Publish") { publish(false) }
-                                    Button("Publish") { publish(true) }.disabled(refusal != nil)
-                                }
-                                .disabled(model.service.channelPublicationInFlight(model.key, requestId: requestId) != nil)
-                            } else if request.publication == "publish_failed" {
-                                Text("Not published: \(ChatChannelRequests.reason(request.publishReason))").foregroundStyle(.orange)
-                            }
-                        }
-                        ForEach(calls.channelPendingAccess(requestId), id: \.id) { folder in
-                            Text("Folder requested: \(folder.path)").textSelection(.enabled)
-                            Text(folder.reason).font(.callout)
+                        Button {
+                            RequestTabs.shared.open(request.requestId, scope: .server(OrgKey(model.key)))
+                        } label: {
                             HStack {
-                                Button("Deny folder") { grant(folder.id, .denied) }
-                                Button("Allow folder once") { grant(folder.id, .once) }
+                                Text("\(request.agentName ?? "Agent") · \(request.state.rawValue.replacingOccurrences(of: "_", with: " "))")
+                                Spacer()
+                                Text("Open Request…")
                             }
-                        }
-                        if let problem { Text(problem).foregroundStyle(.red).font(.caption) }
-                        HStack { Spacer(); Button("Close") { close() } }
-                    }.padding(16)
-                }
-            } else { Color.clear.onAppear { close() } }
+                        }.buttonStyle(.plain).font(.callout)
+                    }
+                }.padding(8)
+            }
         }
-        .frame(width: 560, height: 540)
-        .attentionPlace([.channel(model.channel, request: requestId)])
-        .task(id: requestId) {
-            guard let request = model.requests.first(where: { $0.requestId == requestId }), request.state == .awaitingDecision else { return }
-            do { _ = try await model.service.loadChannelContent(model.key, request: request) }
-            catch ChatAttachmentError.contextLost { problem = ChatAttachmentError.contextLost.localizedDescription }
-            catch { problem = "The context could not be loaded. Close and try again." }
-        }
-        .onChange(of: model.visible) { _, visible in if !visible { close() } }
-    }
-
-    private func decide(_ allow: Bool) {
-        deciding = true
-        Task {
-            problem = await model.service.owner?.decideChannel(model.key, requestId: requestId, allow: allow, reason: reason)
-            deciding = false
-            if problem == nil { close() }
-        }
-    }
-    private func publish(_ publish: Bool) {
-        do { try model.service.publishChannelResult(model.key, requestId: requestId, publish: publish); close() }
-        catch { problem = error.localizedDescription }
-    }
-    private func grant(_ id: String, _ state: TeamCalls.AccessRequest.State) {
-        Task { problem = await calls.decideAccess(id, state) }
     }
 }

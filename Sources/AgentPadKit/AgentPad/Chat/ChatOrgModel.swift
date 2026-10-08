@@ -466,10 +466,10 @@ final class ChatOrgModel {
 
     /// Queues `channel.create`; the new channel's id.
     @discardableResult
-    func createChannel(_ name: String, in team: ChatOrgView.Team) throws -> String {
+    func createChannel(_ name: String, in team: ChatOrgView.Team, channelID: String? = nil) throws -> String {
         let team = try self.team(team)
         try require(canCreateChannel(in: team) && Self.channelNameProblem(name) == nil)
-        let id = newTeamId()
+        let id = channelID ?? newTeamId()
         try send("channel.create", ["channel_id": .string(id), "team_id": .string(team.teamId),
                                     "name": .string(name.trimmingCharacters(in: .whitespacesAndNewlines))])
         return id
@@ -877,7 +877,7 @@ extension ChatDevicesModel {
             let token = try token()
             try await ChatService.endingOn401(service, session: session, server: server) { try await api.closeSession(id, token: token) }
         }
-        model.disconnect = { ChatConnectWindow.disconnect() }
+        model.disconnect = { ConnectionTabs.shared.disconnect() }
         return model
     }
 }

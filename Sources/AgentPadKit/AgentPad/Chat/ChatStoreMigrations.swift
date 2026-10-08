@@ -526,6 +526,22 @@ enum ChatStoreMigrations {
         migrator.registerMigration("release-21-attachments") { db in try ChatAttachments.migrate(db) }
         migrator.registerMigration("release-22-attachment-access") { db in try ChatAttachments.migrateExecutionAccess(db) }
         migrator.registerMigration("release-23-attachment-retention") { db in try ChatAttachments.migrateRetention(db) }
+        migrator.registerMigration("release-24-composition-drafts") { db in
+            try db.create(table: "composition_drafts") { t in
+                t.primaryKey("id", .text)
+                t.column("channel_id", .text)
+                t.column("body", .text).notNull()
+            }
+            try db.execute(sql: """
+                CREATE TRIGGER composition_channel_deleted AFTER DELETE ON channels
+                WHEN (SELECT pending_generation FROM meta WHERE id = 1) IS NULL BEGIN
+                    DELETE FROM composition_drafts WHERE channel_id = OLD.channel_id;
+                END;
+                CREATE TRIGGER composition_team_revoked AFTER UPDATE OF mine ON teams WHEN NEW.mine = 0 BEGIN
+                    DELETE FROM composition_drafts WHERE channel_id IN (SELECT channel_id FROM channels WHERE team_id = NEW.team_id);
+                END;
+                """)
+        }
         return migrator
     }
 

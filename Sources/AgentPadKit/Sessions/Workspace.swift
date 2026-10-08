@@ -32,13 +32,7 @@ final class Workspace: Identifiable {
     /// `nil` so the sidebar label resumes tracking the cwd.
     var customTitle: String? = nil
 
-    /// Set by `SidebarView` once it has brought this workspace's row into the
-    /// view hierarchy (the ⌘⇧R flow, parked on
-    /// `WorkspaceStore.pendingRenameWorkspace`). The row's `SidebarWorkspaceRow`
-    /// observes it — onChange while already mounted, onAppear for a row that
-    /// just mounted after the sidebar expanded/scrolled to it — opens its
-    /// rename popover, and resets the flag. Runtime-only.
-    var renameRequested = false
+    let nameEdit = InlineNameEdit()
 
     /// When non-nil, this workspace is a git worktree whose source workspace
     /// has this id. Sidebar groups worktrees under their source via a

@@ -1,6 +1,29 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// The file panel belongs to the composer that opened it. Navigating a thread
+/// does not change its destination; access and draft changes still invalidate it.
+@MainActor
+struct ChatComposerFileSelection {
+    private let model: ChatChannelModel
+    private let attachments: ChatAttachmentManager
+    private let root: String?
+    private let capture: ChatAttachmentManager.Stamp
+    private let version: String?
+
+    init?(model: ChatChannelModel, root: String?, attachments: ChatAttachmentManager) {
+        guard let capture = attachments.stamp(channel: model.channel) else { return nil }
+        self.model = model; self.attachments = attachments; self.root = root; self.capture = capture
+        version = model.draftVersion(root: root)
+    }
+    @discardableResult
+    func importFiles(_ urls: [URL], completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws -> Bool {
+        guard attachments.current(capture), model.draftVersion(root: root) == version else { return false }
+        try attachments.importFiles(urls.map(ChatAttachmentWorker.Input.file), channel: model.channel, root: root, completion: completion)
+        return true
+    }
+}
+
 struct ChatUX1Composer: View {
     let model: ChatChannelModel
     let root: String?
@@ -32,10 +55,10 @@ struct ChatUX1Composer: View {
             ? "Attachment context is paused on this server. Your selection is saved." : nil
     }
     private var uploads: [ChatAttachmentDraft] { attachments?.files(channel: model.channel, root: root) ?? [] }
-    private func attach(_ pasteboard: NSPasteboard) -> Bool {
-        guard fileUI, let attachments, ChatAttachmentPaste.accepts(pasteboard) else { return false }
+    private func attach(_ pasteboard: NSPasteboard, fromDrop: Bool = false) -> Bool {
+        guard fileUI, let attachments, ChatAttachmentPaste.accepts(pasteboard, fromDrop: fromDrop) else { return false }
         do {
-            _ = try ChatAttachmentPaste.take(pasteboard, manager: attachments, channel: model.channel, root: root) { error in
+            return try ChatAttachmentPaste.take(pasteboard, manager: attachments, channel: model.channel, root: root, fromDrop: fromDrop) { error in
                 if let error { model.attachmentProblem(error) }
                 version = model.draftVersion(root: root)
             }
@@ -44,17 +67,18 @@ struct ChatUX1Composer: View {
         return true
     }
     private func chooseFiles() {
-        guard let attachments, let limits = attachments.limits else { return }
+        guard let attachments, let limits = attachments.limits, let tabID = model.tabID,
+              let owner = TabRouter.shared.owner(of: tabID), let window = owner.session.engine.view.window else { return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
         panel.allowedContentTypes = limits.extensions.compactMap { UTType(filenameExtension: $0) }
-        let destination = root
-        let capture = attachments.stamp(channel: model.channel)
-        panel.begin { result in
-            guard result == .OK, let capture, attachments.current(capture) else { return }
+        let selection = ChatComposerFileSelection(model: model, root: root, attachments: attachments)
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let selection,
+                  TabRouter.shared.owner(of: tabID)?.store === owner.store else { return }
             do {
-                try attachments.importFiles(panel.urls.map(ChatAttachmentWorker.Input.file), channel: model.channel, root: destination) { error in
+                try selection.importFiles(panel.urls) { error in
                     if let error { model.attachmentProblem(error) }
-                    version = model.draftVersion(root: root)
+                    self.version = model.draftVersion(root: root)
                 }
             }
             catch { model.attachmentProblem(error) }
@@ -150,6 +174,7 @@ struct ChatUX1Composer: View {
                     .font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
             }
             agentContext
+            if choosingContext { contextPicker }
             if let contextPause { Text(contextPause).font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary) }
             if let problem = model.problem { Text(problem).foregroundStyle(ChatAppearance.failure).font(Theme.display(11)).textSelection(.enabled) }
             HStack {
@@ -187,11 +212,13 @@ struct ChatUX1Composer: View {
             selected = 0; dismissedQuery = nil
             draftLoaded = true
         }
-        .sheet(isPresented: $choosingContext) { contextPicker }
     }
 
     private var pasteHandler: ((NSPasteboard) -> Bool)? {
         guard fileUI else { return nil }; return { board in attach(board) }
+    }
+    private var dropHandler: ((NSPasteboard) -> Bool)? {
+        guard fileUI else { return nil }; return { board in attach(board, fromDrop: true) }
     }
 
     private var inputBox: some View {
@@ -205,7 +232,7 @@ struct ChatUX1Composer: View {
                                   accessibilityName: recipient,
                                   suggestions: .init(sections: sections, selected: min(selected, max(0, matches.count - 1)),
                                                      title: "Mention in \(root == nil ? "channel" : "thread")", choose: choose),
-                                  attachments: pasteHandler, dropTarget: { dropping = $0 },
+                                  attachments: pasteHandler, dropAttachments: dropHandler, dropTarget: { dropping = $0 },
                                   key: { key($0, $1) })
                     .frame(height: editorHeight)
                     .accessibilityLabel(recipient)
@@ -263,7 +290,7 @@ struct ChatUX1Composer: View {
                 Text("\(contextCount) / 20 messages · \(contextBytes) / 49152 bytes\(tooMuchContext ? " — reduce the selection before sending" : "")")
                     .font(.caption).foregroundStyle(tooMuchContext ? .red : .secondary)
                 Button("Done") { choosingContext = false }
-            }.padding(16).frame(width: 480, height: 340)
+            }.padding(16).frame(maxWidth: .infinity).frame(height: 340)
     }
 
     private func select(_ file: ChatAttachment, message: ChatMessage, on: Bool) {

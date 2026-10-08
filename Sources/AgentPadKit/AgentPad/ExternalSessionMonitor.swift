@@ -179,10 +179,18 @@ final class ExternalSessionMonitor {
         case resumeRefused(String)
     }
 
+    enum TakeOverStep: String { case checking, signalSent, sourceStopped, resumed }
+    var sendSignal: (pid_t, Int32) -> Int32 = { Darwin.kill($0, $1) }
+    var awaitExit: (pid_t, TimeInterval) async -> Bool = { await ExternalSessionMonitor.waitForExit($0, startTime: $1, timeout: .seconds(6)) }
+    var resume: (ExternalAgentSession, WorkspaceStore) -> Result<Session, WorkspaceStore.ResumeRefusal> = {
+        $1.resumeAgentSession(agentId: AgentTemplate.claudeCodeID, conversationId: $0.sessionId, cwd: $0.cwd)
+    }
+
     /// Ends the session in its terminal and resumes the same conversation in a
     /// new tab here. The conversation is on disk, so nothing is lost; whatever
     /// that terminal tab was running in the background is.
-    func takeOver(_ session: ExternalAgentSession, into store: WorkspaceStore) async -> Result<Void, TakeOverError> {
+    func takeOver(_ session: ExternalAgentSession, into store: WorkspaceStore, destination: (() -> WorkspaceStore?)? = nil, progress: (TakeOverStep) -> Void = { _ in }) async -> Result<Void, TakeOverError> {
+        progress(.checking)
         guard session.canTakeOver, let expectedStart = session.processStart else { return .failure(.notIdle) }
         guard !takingOver.contains(session.id) else { return .failure(.stillRunning) }
         takingOver.insert(session.id)
@@ -218,6 +226,7 @@ final class ExternalSessionMonitor {
         guard let fresh = snapshot.first(where: { $0.pid == session.pid && $0.sessionId == session.sessionId }) else {
             return .failure(.changed)
         }
+        guard fresh.cwd == session.cwd, fresh.kind == session.kind, fresh.startedAt == session.startedAt else { return .failure(.changed) }
         guard fresh.status == .idle else { return .failure(.notIdle) }
         // Same process instance as the one we listed, checked right before
         // the signal so a recycled PID is never hit.
@@ -228,16 +237,17 @@ final class ExternalSessionMonitor {
             return .failure(.changed)
         }
 
-        kill(session.pid, SIGTERM)
-        let exited = await Self.waitForExit(session.pid, startTime: expectedStart, timeout: .seconds(6))
+        guard sendSignal(session.pid, SIGTERM) == 0 else { return .failure(.stillRunning) }
+        progress(.signalSent)
+        let exited = await awaitExit(session.pid, expectedStart)
         guard exited else { return .failure(.stillRunning) }
 
-        switch store.resumeAgentSession(
-            agentId: AgentTemplate.claudeCodeID,
-            conversationId: session.sessionId,
-            cwd: session.cwd
-        ) {
+        progress(.sourceStopped)
+        let currentStore = destination?() ?? store
+        guard !currentStore.isTerminated else { return .failure(.resumeRefused("The destination window closed.")) }
+        switch resume(session, currentStore) {
         case .success:
+            progress(.resumed)
             sessions.removeAll { $0.pid == session.pid }
             return .success(())
         case .failure(let refusal):

@@ -37,26 +37,39 @@ struct ChatMentionEditor: NSViewRepresentable {
     var accessibilityName = "Message"
     var suggestions: ChatMentionPopup.Content? = nil
     var attachments: ((NSPasteboard) -> Bool)? = nil
+    var dropAttachments: ((NSPasteboard) -> Bool)? = nil
     var dropTarget: ((Bool) -> Void)? = nil
     var key: (UInt16, NSEvent.ModifierFlags) -> Bool
 
     final class Editor: NSTextView {
         let mentionPopup = ChatMentionPopup()
         var attachments: ((NSPasteboard) -> Bool)?
+        var dropAttachments: ((NSPasteboard) -> Bool)?
         var dropTarget: ((Bool) -> Void)?
+        private var canPasteAttachment: Bool {
+            isEditable && attachments != nil && ChatAttachmentPaste.accepts(.general)
+        }
+        override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+            if menuItem.action == #selector(paste(_:)), canPasteAttachment { return true }
+            return super.validateMenuItem(menuItem)
+        }
+        override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+            if item.action == #selector(paste(_:)), canPasteAttachment { return true }
+            return super.validateUserInterfaceItem(item)
+        }
         override func paste(_ sender: Any?) {
-            if attachments?(NSPasteboard.general) == true { return }
+            if isEditable, attachments?(NSPasteboard.general) == true { return }
             super.paste(sender)
         }
         override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-            if attachments != nil, ChatAttachmentPaste.accepts(sender.draggingPasteboard) { dropTarget?(true); return .copy }
+            if isEditable, attachments != nil, ChatAttachmentPaste.accepts(sender.draggingPasteboard, fromDrop: dropAttachments != nil) { dropTarget?(true); return .copy }
             return super.draggingEntered(sender)
         }
         override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation { draggingEntered(sender) }
         override func draggingExited(_ sender: (any NSDraggingInfo)?) { dropTarget?(false); super.draggingExited(sender) }
         override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
             dropTarget?(false)
-            if attachments?(sender.draggingPasteboard) == true { return true }
+            if isEditable, (dropAttachments ?? attachments)?(sender.draggingPasteboard) == true { return true }
             return super.performDragOperation(sender)
         }
         var navigationTarget: ChannelRef?
@@ -172,8 +185,8 @@ struct ChatMentionEditor: NSViewRepresentable {
         defer { context.coordinator.updating = false }
         control?.view = view
         view.consume = key
-        view.attachments = attachments; view.dropTarget = dropTarget
-        if attachments != nil { view.registerForDraggedTypes([.fileURL, .png, .tiff]) }
+        view.attachments = attachments; view.dropAttachments = dropAttachments; view.dropTarget = dropTarget
+        if attachments != nil { view.registerForDraggedTypes(ChatAttachmentPaste.types) }
         view.navigationTarget = navigationTarget
         view.placeholder = placeholder
         view.setAccessibilityLabel(accessibilityName)

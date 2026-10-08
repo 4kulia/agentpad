@@ -184,6 +184,7 @@ final class PaneTreeHostView: FlippedLayoutView {
         // for the terminal here would put the caret in the shell UNDER a
         // visible editor, where Return executes a command (Codex P1).
         if session.composerActive || session.searchActive { return }
+        if let native = session.engine as? NativeTabEngine { native.focus(); return }
         let target = session.engine.view
         // The freshly-activated tab's view may not be mounted yet (SwiftUI
         // applies the swap on its own schedule) — its mount-time grab owns

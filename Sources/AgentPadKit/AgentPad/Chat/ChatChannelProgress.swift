@@ -175,7 +175,6 @@ struct ChatSourceProgress: View {
     let source: String
     @State private var problem: String?
     @State private var expanded = false
-    @State private var details: ChatSourceStatus?
     @State private var window = WindowBox()
     private var connected: Bool { model.service.isServerKnown(model.service, model.key) }
     private var statuses: [ChatSourceStatus] { model.sourceStatuses.filter { $0.source == source } }
@@ -198,14 +197,7 @@ struct ChatSourceProgress: View {
                         }
                     }
                 }
-                .popover(item: $details) { status in
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack { Text(status.agent).font(Theme.display(13, weight: .semibold)); ChatBotBadge() }
-                        Text(model.sourceStatusWord(status)).textSelection(.enabled)
-                        if let activity = model.service.activity(model.key, request: status.id) { Text(activity).textSelection(.enabled) }
-                        if !connected { Text("Offline · status may have changed") }
-                    }.font(Theme.display(11)).padding(16).frame(width: 300)
-                }
+
         }
     }
 
@@ -245,7 +237,7 @@ struct ChatSourceProgress: View {
             if presentation.answered, let answer = status.answer, let message = model.message(answer) {
                 ChatIconButton(title: "Go to answer", symbol: "arrow.turn.down.right") { model.navigate(to: message) }
             }
-            ChatIconButton(title: "Request details", symbol: "ellipsis") { details = status }
+            ChatIconButton(title: "Request details", symbol: "ellipsis") { RequestTabs.shared.open(status.id, scope: .server(OrgKey(model.key))) }
         }
         .padding(.horizontal, 12).padding(.vertical, presentation.answered ? 6 : 10)
         .frame(minHeight: presentation.answered ? 32 : 64)

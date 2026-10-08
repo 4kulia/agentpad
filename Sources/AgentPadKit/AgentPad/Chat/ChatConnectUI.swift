@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 /// The steps of Team → Connect to a Server… (docs/agentpad/CHAT-PLAN.md C5),
-/// apart from the window so they can be tested.
+/// kept in the tab state, independently of SwiftUI mounts.
 @MainActor
 @Observable
 final class ChatConnectModel {
@@ -40,17 +40,25 @@ final class ChatConnectModel {
     /// Nothing of team work runs here (no call, no run not confirmed gone):
     /// only then may this Mac move to a server. Replaced in tests.
     var teamWorkIdle: @MainActor () -> Bool = { TeamService.shared.canMoveToServer }
-    /// The window says a call still runs here and shows the Team window.
+    /// The tab says a call still runs here and offers Team activity.
     private(set) var teamWorkInTheWay = false
     /// `TeamMode.switchToServer`, with the server service started.
     private let switchToServer: @MainActor () async throws -> Void
     var now: () -> Date = Date.init
     private var server: ChatServerAddress?
     private var answer: ChatSignIn?
+    private var representedConnection: ChatConnection?
+    private(set) var isClosed = false
 
     init(service: ChatService = .shared, switchToServer: @escaping @MainActor () async throws -> Void = ChatConnectModel.switchApp) {
         self.service = service
         self.switchToServer = switchToServer
+        representedConnection = service.connection
+        if service.connection != nil, service.state == .signedIn { step = .done }
+    }
+
+    var connectionChanged: Bool {
+        !busy && (representedConnection != service.connection || (step == .done && service.state != .signedIn))
     }
 
     /// The app's step after a sign-in: `TeamMode.switchToServer`, whose step
@@ -87,7 +95,9 @@ final class ChatConnectModel {
             guard email.contains("@") else { throw Problem.text("Enter your email address.") }
             // Everything a connection needs, before anything is kept (review C-20).
             _ = try await self.service.makeAPI(server).serverInfo(requiring: ChatAPI.requiredCapabilities)
+            guard !self.isClosed else { return }
             try await self.service.requestCode(server: server, email: email)
+            guard !self.isClosed else { return }
             self.server = server
             self.email = email
             self.codeSentAt = self.now()
@@ -100,13 +110,15 @@ final class ChatConnectModel {
         guard canResend, let server else { return }
         await run {
             try await self.service.requestCode(server: server, email: self.email)
+            guard !self.isClosed else { return }
+            self.code = ""
             self.codeSentAt = self.now()
         }
     }
 
-    /// A wrong code and a lost answer both keep the window on this step.
+    /// A wrong code and a lost answer both keep the tab on this step.
     func submitCode() async {
-        guard let server else { return }
+        guard step == .code, let server else { return }
         await run {
             let code = self.code.trimmingCharacters(in: .whitespaces)
             let answer: ChatSignIn
@@ -116,12 +128,17 @@ final class ChatConnectModel {
                 // The code may be used up already: only a new one helps.
                 throw Problem.text("The answer to the sign-in was lost. Ask for a new code and try again.")
             }
+            self.code = ""
+            guard !self.isClosed else {
+                await self.service.discard(answer, server: server)
+                return
+            }
             self.answer = answer
             switch answer.orgs.count {
             case 0:
                 await self.service.discard(answer, server: server)
                 self.answer = nil
-                self.step = .noOrganization
+                if !self.isClosed { self.step = .noOrganization }
             case 1:
                 try await self.finish(answer.orgs[0])
             default:
@@ -137,8 +154,27 @@ final class ChatConnectModel {
 
     private func finish(_ org: ChatOrgMembership) async throws {
         guard let server, let answer else { return }
-        let connection = try await service.completeSignIn(answer, server: server, deviceName: deviceName, orgId: org.orgId)
+        let connection: ChatConnection
+        do {
+            connection = try await service.completeSignIn(answer, server: server, deviceName: deviceName, orgId: org.orgId,
+                                                          stillValid: { !self.isClosed })
+        } catch {
+            if isClosed {
+                self.answer = nil
+                await service.discard(answer, server: server)
+            } else {
+                // A Keychain failure has not committed the sign-in. Keep the
+                // temporary authorization for Retry, Back or tab cleanup.
+                step = .chooseOrg(answer.orgs)
+            }
+            throw error
+        }
         self.answer = nil
+        representedConnection = connection
+        guard !isClosed else {
+            await service.discardSignIn(expecting: connection)
+            return
+        }
         do {
             try await switchToServer()
         } catch TeamError.teamWorkOn {
@@ -154,6 +190,7 @@ final class ChatConnectModel {
             step = .address
             throw error
         }
+        guard !isClosed else { return }
         if org.name == org.handle, let key = connection.orgKey {
             displayName = ""
             step = .name(key)
@@ -176,8 +213,32 @@ final class ChatConnectModel {
     func skipName() { if case .name = step { step = .done } }
 
     func back() {
+        guard !busy, !isClosed else { return }
+        discardPendingSignIn()
         step = .address
         error = nil
+        code = ""
+        codeSentAt = nil
+    }
+
+    /// Closing forgets all input synchronously. A late authentication answer
+    /// is revoked by submitCode; a chosen, committed sign-in belongs to the core.
+    func close() {
+        isClosed = true
+        code = ""
+        email = ""
+        displayName = ""
+        error = nil
+        codeSentAt = nil
+        step = .address
+        // finish owns the answer while it is committing, including cleanup.
+        if !busy { discardPendingSignIn() } else { answer = nil }
+    }
+
+    private func discardPendingSignIn() {
+        if let answer, let server {
+            Task { [service] in await service.discard(answer, server: server) }
+        }
         answer = nil
     }
 
@@ -185,7 +246,7 @@ final class ChatConnectModel {
 
     private enum Problem: Error { case text(String) }
 
-    /// True (with the window saying so) while something of team work runs.
+    /// True (with the tab saying so) while something of team work runs.
     private func blockedByTeamWork() -> Bool {
         teamWorkInTheWay = !teamWorkIdle()
         if teamWorkInTheWay { error = TeamError.teamWorkOn.localizedDescription }
@@ -193,10 +254,11 @@ final class ChatConnectModel {
     }
 
     private func run(_ work: @MainActor () async throws -> Void) async {
+        guard !busy, !isClosed else { return }
         busy = true
         error = nil
         defer { busy = false }
-        do { try await work() } catch { self.error = Self.text(for: error) }
+        do { try await work() } catch { if !isClosed { self.error = Self.text(for: error) } }
     }
 
     static func text(for error: Error) -> String {
@@ -213,162 +275,10 @@ final class ChatConnectModel {
     }
 }
 
-// MARK: Window
-
-@MainActor
-enum ChatConnectWindow {
-    private static var window: NSWindow?
-
-    static func show() {
-        if window == nil || !(window?.isVisible ?? false) {
-            let model = ChatConnectModel()
-            let host = NSHostingController(rootView: ChatConnectView(model: model) { window?.close() })
-            host.sizingOptions = .preferredContentSize
-            let made = NSWindow(contentViewController: host)
-            made.title = "Connect to a Server"
-            made.styleMask = [.titled, .closable]
-            made.isReleasedWhenClosed = false
-            made.appearance = Theme.windowAppearance
-            made.center()
-            window = made
-        }
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    /// Team → Disconnect…, after a confirmation.
-    static func disconnect() {
-        Task {
-            guard let connection = ChatService.shared.connection else {
-                return await TeamUI.showError("Not connected to a server", nil)
-            }
-            switch await confirmAndDisconnect(expecting: connection) {
-            case .notFinished(let text):
-                // Not done until it is on disk; what failed is said (review C5-12).
-                await TeamUI.showError("Disconnect did not finish", ChatError.storage(text))
-            case .busy:
-                await TeamUI.showError("A Disconnect is already waiting for an answer or under way", nil)
-            default:
-                break
-            }
-        }
-    }
-
-    /// What one confirmed Disconnect came to (DESIGN-C7).
-    enum LogoutOutcome: Equatable {
-        case disconnected, cancelled, noAnswer, stale, busy, started
-        case notFinished(String)
-    }
-
-    /// A confirmation shown, or a Disconnect under way, from the menu, the
-    /// Devices tab or the CLI: one at a time; held until the core's call ends,
-    /// not until someone was answered.
-    private(set) static var busy = false
-    /// Tests: how the confirmation is answered instead of a sheet; nil when shown.
-    static var answerConfirmation: (@MainActor () async -> NSApplication.ModalResponse)?
-    /// Tests: the Disconnect itself.
-    static var disconnectCall: @MainActor (ChatService, ChatConnection) async -> ChatService.DisconnectOutcome = {
-        await $0.disconnect(expecting: $1)
-    }
-    /// Tests: the moment of the button's press, for the checks made then.
-    static var now: () -> Date = { Date() }
-
-    /// Asks to disconnect `expected` and does it — the core's Disconnect for
-    /// that connection only. With a `deadline` (the CLI's) and a caller who
-    /// may go, a watchman closes the confirmation as cancelled when either
-    /// ends or the connection changes; the press itself checks all three
-    /// again — the watchman only closes the sheet, the decision is made at
-    /// the press. `answerBy`: the CLI is answered then at the latest
-    /// (`started`), the Disconnect going on.
-    static func confirmAndDisconnect(expecting expected: ChatConnection, service: ChatService = .shared, deadline: Date? = nil,
-                                     isCallerWaiting: @escaping @MainActor () -> Bool = { true },
-                                     answerBy: Date? = nil) async -> LogoutOutcome {
-        guard !busy else { return .busy }
-        busy = true
-        func stillValid() -> Bool { service.connection == expected && isCallerWaiting() && (deadline.map { now() < $0 } ?? true) }
-        func whyNot() -> LogoutOutcome {
-            if service.connection != expected { return .stale }
-            if let deadline, now() >= deadline { return .noAnswer }
-            return .cancelled
-        }
-        let answer: NSApplication.ModalResponse
-        if let answerConfirmation {
-            answer = await answerConfirmation()
-        } else {
-            let alert = NSAlert()
-            alert.messageText = "Disconnect from the server?"
-            alert.informativeText = "Agents started by requests will be stopped. This Mac stops receiving the organization's updates until you connect again."
-            alert.addButton(withTitle: "Disconnect")
-            alert.addButton(withTitle: "Cancel")
-            guard let host = hostWindow(), host.attachedSheet == nil else {
-                busy = false
-                return .busy
-            }
-            let attentionID = UUID()
-            PendingConfirmations.shared.register(attentionID, window: host)
-            defer { PendingConfirmations.shared.end(attentionID) }
-            // Time and the caller leaving tell no observer: looked at each second.
-            let watchman = Task { @MainActor in
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(1))
-                    if !Task.isCancelled, !stillValid() { host.endSheet(alert.window, returnCode: .abort) }
-                }
-            }
-            answer = await withCheckedContinuation { continuation in
-                alert.beginSheetModal(for: host) { continuation.resume(returning: $0) }
-            }
-            watchman.cancel()
-        }
-        guard answer == .alertFirstButtonReturn, stillValid() else {
-            busy = false
-            return answer == .alertFirstButtonReturn ? whyNot() : (stillValid() ? .cancelled : whyNot())
-        }
-        let work = Task { @MainActor () -> LogoutOutcome in
-            defer { busy = false }
-            switch await disconnectCall(service, expected) {
-            case .done: return .disconnected
-            case .stale: return .stale
-            case .notFinished(let text): return .notFinished(text)
-            }
-        }
-        guard let answerBy else { return await work.value }
-        return await first(of: work, orAt: answerBy)
-    }
-
-    /// The window a confirmation goes on: the key window may be another's
-    /// sheet — then its parent, which has that sheet attached (busy).
-    static func host(for window: NSWindow) -> NSWindow {
-        window.sheetParent ?? window
-    }
-
-    /// The work's outcome, or `started` once `time` comes first.
-    private static func first(of work: Task<LogoutOutcome, Never>, orAt time: Date) async -> LogoutOutcome {
-        await withCheckedContinuation { continuation in
-            var done = false
-            Task { @MainActor in
-                let outcome = await work.value
-                if !done { done = true; continuation.resume(returning: outcome) }
-            }
-            Task { @MainActor in
-                try? await Task.sleep(for: .seconds(max(0, time.timeIntervalSince(now()))))
-                if !done { done = true; continuation.resume(returning: .started) }
-            }
-        }
-    }
-
-    private static func hostWindow() -> NSWindow? {
-        NSApp.activate(ignoringOtherApps: true)
-        if let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }) {
-            return host(for: window)
-        }
-        TeamWindows.showTeam()
-        return TeamWindows.teamWindow
-    }
-}
-
-private struct ChatConnectView: View {
+struct ChatConnectView: View {
     @Bindable var model: ChatConnectModel
     let onClose: () -> Void
+    let onDisconnect: () -> Void
     @State private var tick = Date()
 
     var body: some View {
@@ -382,7 +292,7 @@ private struct ChatConnectView: View {
             }
         }
         .padding(18)
-        .frame(width: 400)
+        .frame(maxWidth: 520, alignment: .leading)
         .attentionPlace([.connect])
         .disabled(model.busy)
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { tick = $0 }
@@ -419,6 +329,7 @@ private struct ChatConnectView: View {
             ForEach(orgs, id: \.orgId) { org in
                 Button("\(org.orgName) — \(org.role)") { Task { await model.choose(org.orgId) } }
             }
+            Button("Back") { model.back() }
         case .name:
             Text("Your name in the organization").font(Theme.display(14, weight: .semibold))
             Text("Colleagues see it next to your messages and agents.")
@@ -438,7 +349,11 @@ private struct ChatConnectView: View {
             // A Claude session reads the team tools once, at its start (DESIGN-D6 §7.2).
             Text(ChatConnectModel.restartClaudeHint)
                 .font(Theme.display(12)).foregroundStyle(Theme.chromeMuted).fixedSize(horizontal: false, vertical: true)
-            HStack { Spacer(); Button("Close", action: onClose).keyboardShortcut(.defaultAction) }
+            HStack {
+                Button("Disconnect…", action: onDisconnect)
+                Spacer()
+                Button("Close", action: onClose)
+            }
         }
     }
 }

@@ -69,59 +69,47 @@ private struct AttentionPlaceProbe: NSViewRepresentable {
     static func dismantleNSView(_ view: Probe, coordinator: ()) { AttentionFocus.places[view.id] = nil }
 }
 
-/// No positive decision is exported. The live sheet owns its single-shot callback.
+/// No positive decision is exported. The live tab owns its single-shot callback.
 @MainActor
 final class PendingConfirmations {
     static let shared = PendingConfirmations()
     private let ledger: AttentionLedger
-    private var windows: [UUID: WeakWindow] = [:]
-    private final class WeakWindow { weak var window: NSWindow?; init(_ value: NSWindow) { window = value } }
+    private var tabs: [UUID: WeakConfirmation] = [:]
+    private final class WeakConfirmation {
+        weak var coordinator: ConfirmationCoordinator?
+        let tabID: TabID
+        init(_ coordinator: ConfirmationCoordinator, tabID: TabID) { self.coordinator = coordinator; self.tabID = tabID }
+    }
+    func register(_ id: UUID, tabID: TabID, coordinator: ConfirmationCoordinator) {
+        guard coordinator.isAwaiting, coordinator.isVisible else { return }
+        tabs[id] = WeakConfirmation(coordinator, tabID: tabID)
+        ledger.upsert(AttentionEvent(source: "tab-confirmation", object: id.uuidString, kind: .confirmation,
+                                    destination: .tabAction(tabID: tabID, actionID: id)))
+    }
     init(ledger: AttentionLedger = .shared) { self.ledger = ledger }
-    func register(_ id: UUID, window: NSWindow, busy: Bool = false) {
-        windows[id] = WeakWindow(window)
-        var event = AttentionEvent(source: "sheet", object: id.uuidString, kind: .confirmation, destination: .sheet(id))
-        event.actionInFlight = busy
-        ledger.upsert(event)
-    }
     func end(_ id: UUID) {
-        windows[id] = nil
-        ledger.resolve(AttentionEvent(source: "sheet", object: id.uuidString, kind: .confirmation, destination: .sheet(id)).id)
-    }
-    func valid(_ id: UUID) -> Bool { windows[id]?.window != nil }
-    func open(_ id: UUID) -> Bool {
-        guard let window = windows[id]?.window else { end(id); return false }
-        let parent = window.sheetParent ?? window
-        parent.deminiaturize(nil); parent.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        return true
-    }
-}
-
-private struct AttentionConfirmationProbe: NSViewRepresentable {
-    var busy: Bool
-    final class Probe: NSView {
-        let id = UUID()
-        var busy = false
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if let window { PendingConfirmations.shared.register(id, window: window, busy: busy) }
-            else { PendingConfirmations.shared.end(id) }
+        if let tab = tabs.removeValue(forKey: id) {
+            ledger.resolve(AttentionEvent(source: "tab-confirmation", object: id.uuidString, kind: .confirmation,
+                destination: .tabAction(tabID: tab.tabID, actionID: id)).id)
         }
     }
-    func makeNSView(context: Context) -> Probe { Probe() }
-    func updateNSView(_ view: Probe, context: Context) {
-        view.busy = busy
-        if let window = view.window { PendingConfirmations.shared.register(view.id, window: window, busy: busy) }
+    func valid(_ id: UUID) -> Bool {
+        if let coordinator = tabs[id]?.coordinator { coordinator.validate(); return coordinator.isAwaiting && coordinator.isVisible }
+        return false
     }
-    static func dismantleNSView(_ view: Probe, coordinator: ()) { PendingConfirmations.shared.end(view.id) }
+    func open(_ id: UUID) -> Bool {
+        if let coordinator = tabs[id]?.coordinator {
+            coordinator.validate()
+            guard coordinator.isAwaiting else { end(id); return false }
+            return coordinator.reveal()
+        }
+        end(id); return false
+    }
 }
 
 extension View {
     func attentionPlace(_ destinations: Set<AttentionDestination>) -> some View {
         background(AttentionPlaceProbe(destinations: destinations).allowsHitTesting(false))
-    }
-    func attentionConfirmation(busy: Bool = false) -> some View {
-        background(AttentionConfirmationProbe(busy: busy).allowsHitTesting(false))
     }
 }
 

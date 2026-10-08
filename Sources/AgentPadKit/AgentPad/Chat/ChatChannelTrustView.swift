@@ -5,6 +5,7 @@ struct ChatChannelTrustView: View {
     let key: ChatOrgKey
     let channel: String
     let agents: [ChatChannelAgent]
+    let conversation: ChatChannelSession
     var service = ChatService.shared
     @State private var problem: String?
 
@@ -30,7 +31,10 @@ struct ChatChannelTrustView: View {
                 }
             }
             if let problem { Text(problem).font(.caption).foregroundStyle(.red) }
-        }.padding(16).frame(width: 430)
+            if conversation.confirmation.context?.targetID.hasPrefix("trust:") == true {
+                InlineConfirmation(coordinator: conversation.confirmation)
+            }
+        }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func pendingDisable(_ agent: ChatChannelAgent) -> Bool {
@@ -46,19 +50,7 @@ struct ChatChannelTrustView: View {
             catch { problem = error.localizedDescription }
             return
         }
-        guard let local = service.localChannelExecutor(key, channel: channel, agent: agent) else { return }
-        let settings = ChatExecutionSettings(local)
-        let text = "Every current and future member of this channel's team can call this agent; its answers publish automatically.\n\n"
-            + "Profile: \(local.access.title)\nFolders: \(([local.folder] + (local.extraFolders ?? [])).joined(separator: ", "))\n"
-            + "Memory: \(local.isSession ? "a copy of your personal session, whose knowledge may appear in answers" : "this channel's conversations")\n"
-            + "Limits: \(local.maxTurns) turns, \(local.timeoutMinutes) minutes\(local.maxBudgetUSD.map { ", $\($0)" } ?? "")\n"
-            + "Changing execution settings or the executor requires enabling trust again."
-        Task { @MainActor in
-            guard await ChatOrgWindow.confirm("Enable automatic answers?", text, "Enable", while: {
-                service.localChannelExecutor(key, channel: channel, agent: agent).map(ChatExecutionSettings.init) == settings
-            }) else { return }
-            do { try service.setChannelTrust(key, channel: channel, agent: agent, enabled: true) }
-            catch { problem = error.localizedDescription }
-        }
+        guard let tabID = conversation.tabID else { return }
+        service.confirmTrust(key, channel: channel, agent: agent.agentId, tabID: tabID, coordinator: conversation.confirmation)
     }
 }

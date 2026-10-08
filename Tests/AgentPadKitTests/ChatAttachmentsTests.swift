@@ -77,6 +77,7 @@ private final class AttachmentTestServer: @unchecked Sendable {
 @MainActor final class ChatAttachmentsTests: XCTestCase {
     private var root: URL!
     private var fixtures: [ChatChannelExecutionTests.Fixture] = []
+    private var viewerStates: [TabState] = []
     private let channel = "f5000000-0000-4000-8000-000000000001"
     private let messageID = "f5000000-0000-4000-8000-000000000002"
     private let requestID = "f5000000-0000-4000-8000-000000000003"
@@ -92,7 +93,7 @@ private final class AttachmentTestServer: @unchecked Sendable {
     }
     override func tearDown() async throws {
         for f in fixtures { f.service.attachmentManagers.values.forEach { $0.revoke() }; f.sender?.hold(); await f.service.disconnect() }
-        fixtures = []
+        fixtures = []; viewerStates = []
         try await Task.sleep(for: .milliseconds(30))
         ChatStubProtocol.reset()
         try? FileManager.default.removeItem(at: root)
@@ -107,6 +108,11 @@ private final class AttachmentTestServer: @unchecked Sendable {
     }
     private func manager(_ f: ChatChannelExecutionTests.Fixture) throws -> ChatAttachmentManager {
         let manager = try XCTUnwrap(f.service.attachments(f.key)); manager.pollDelay = { _ in .milliseconds(15) }; return manager
+    }
+    private func viewer(_ f: ChatChannelExecutionTests.Fixture, message: ChatMessage, file: ChatAttachment) -> AttachmentViewerModel {
+        let state = TabState(route: .viewer(OrgKey(f.key), channelID: message.channelId, messageID: message.id, attachmentID: file.id))
+        viewerStates.append(state)
+        return AttachmentViewerModel(state: state, tabs: CompositionTabs(router: TabRouter(), chat: f.service, team: f.teamService))
     }
     private func model(_ f: ChatChannelExecutionTests.Fixture) -> ChatChannelModel {
         let model = ChatChannelModel(key: f.key, channel: channel); model.service = f.service; model.follow(f.store); return model
@@ -157,6 +163,35 @@ private final class AttachmentTestServer: @unchecked Sendable {
         XCTAssertEqual(manager.queued.map(\.id), [draft.id], "A stale composer action cannot take a post's ownership")
         XCTAssertTrue(FileManager.default.fileExists(atPath: try manager.storage.url(f.key, id: draft.id).path))
         return (manager, draft, id)
+    }
+
+    func testFilePanelKeepsOriginatingChannelOrThreadComposerAndRejectsStaleDraft() async throws {
+        let f = try await fixture(), manager = try manager(f), model = model(f)
+        let thread = UUID().uuidString.lowercased(), otherThread = UUID().uuidString.lowercased()
+        let channelFile = root.appendingPathComponent("channel.txt"), threadFile = root.appendingPathComponent("thread.txt")
+        try Data("channel file".utf8).write(to: channelFile); try Data("thread file".utf8).write(to: threadFile)
+        model.saveDraft("Channel draft", root: nil); model.saveDraft("Thread draft", root: thread)
+        model.openThread(thread)
+        let channelSelection = try XCTUnwrap(ChatComposerFileSelection(model: model, root: nil, attachments: manager))
+        let threadSelection = try XCTUnwrap(ChatComposerFileSelection(model: model, root: thread, attachments: manager))
+        let channelImported = expectation(description: "Channel files imported"), threadImported = expectation(description: "Thread files imported")
+        XCTAssertTrue(try channelSelection.importFiles([channelFile]) { error in XCTAssertNil(error); channelImported.fulfill() })
+        // A navigation change must never retarget the captured thread's files.
+        model.openThread(otherThread)
+        XCTAssertTrue(try threadSelection.importFiles([threadFile]) { error in XCTAssertNil(error); threadImported.fulfill() })
+        await fulfillment(of: [channelImported, threadImported], timeout: 5)
+        try await wait { manager.files(channel: self.channel, root: nil).count == 1 && manager.files(channel: self.channel, root: thread).count == 1 }
+        XCTAssertEqual(manager.files(channel: channel, root: nil).map { $0.file.name }, ["channel.txt"])
+        XCTAssertEqual(manager.files(channel: channel, root: thread).map { $0.file.name }, ["thread.txt"])
+        XCTAssertTrue(manager.files(channel: channel, root: otherThread).isEmpty)
+        XCTAssertEqual(model.draft(root: nil), "Channel draft"); XCTAssertEqual(model.draft(root: thread), "Thread draft")
+
+        let stale = try XCTUnwrap(ChatComposerFileSelection(model: model, root: nil, attachments: manager))
+        model.saveDraft("A newer edit", root: nil)
+        XCTAssertFalse(try stale.importFiles([channelFile]))
+        let revoked = try XCTUnwrap(ChatComposerFileSelection(model: model, root: nil, attachments: manager))
+        try f.store.putRightsInDoubt()
+        XCTAssertFalse(try revoked.importFiles([channelFile]))
     }
 
     private func otherChannel(_ f: ChatChannelExecutionTests.Fixture) throws -> String {
@@ -836,12 +871,12 @@ private final class AttachmentTestServer: @unchecked Sendable {
         XCTAssertEqual(message.displayText, "")
         server.change { $0.downloads = image }
         _ = try await manager.load(message, file: file, preview: true)
-        try await manager.open(message, file: file)
-        XCTAssertNotNil(manager.image(message, file: file)); XCTAssertNotNil(manager.viewer)
+        let viewer = viewer(f, message: message, file: file); await viewer.load()
+        XCTAssertNotNil(manager.image(message, file: file)); XCTAssertNotNil(viewer.preview)
         let capture = try XCTUnwrap(manager.stamp(channel: channel, message: message, file: file))
         _ = try self.message(f, file: file, revision: 2, deleted: true)
         manager.reconcile()
-        XCTAssertFalse(manager.current(capture)); XCTAssertNil(manager.image(message, file: file)); XCTAssertNil(manager.viewer)
+        XCTAssertFalse(manager.current(capture)); XCTAssertNil(manager.image(message, file: file)); XCTAssertNil(viewer.preview)
         _ = try self.message(f, file: file, revision: 1)
         let tombstone = try read(f.store.queue) { try XCTUnwrap(Row.fetchOne($0, sql: "SELECT * FROM messages WHERE message_id = ?", arguments: [messageID])).mapMessage() }
         XCTAssertTrue(tombstone.attachments.isEmpty)
@@ -851,6 +886,31 @@ private final class AttachmentTestServer: @unchecked Sendable {
         XCTAssertNil(manager.stamp(channel: channel))
         try f.write("UPDATE teams SET mine = 1")
         XCTAssertFalse(manager.current(capture))
+    }
+
+    func testViewerTabsHaveIndependentBytesAndRejectLateDownloadsAfterRevisionOrRevocation() async throws {
+        let f = try await fixture(), manager = try manager(f)
+        let firstBytes = Self.png(), secondBytes = try metadataImage("public.jpeg")
+        let firstFile = try file(firstBytes, name: "one.png"), secondFile = try file(secondBytes, name: "two.jpg")
+        let firstMessage = try message(f, file: firstFile)
+        let secondMessage = try message(f, file: secondFile, id: UUID().uuidString.lowercased())
+        let first = viewer(f, message: firstMessage, file: firstFile), second = viewer(f, message: secondMessage, file: secondFile)
+        server.change { $0.downloads = firstBytes }; await first.load()
+        server.change { $0.downloads = secondBytes }; await second.load()
+        XCTAssertEqual(first.preview?.data, firstBytes); XCTAssertEqual(second.preview?.data, secondBytes)
+        first.zoom = 2; XCTAssertEqual(second.zoom, 1)
+        _ = try message(f, file: firstFile, revision: 2)
+        XCTAssertNil(first.preview)
+        let before = ChatStubProtocol.seen.filter { $0.request.url?.path.hasSuffix("/original") == true }.count
+        ChatStubProtocol.delay = 0.1
+        server.change { $0.downloads = firstBytes }
+        let loading = Task { await first.load() }
+        try await wait { ChatStubProtocol.seen.filter { $0.request.url?.path.hasSuffix("/original") == true }.count > before }
+        _ = try message(f, file: firstFile, revision: 3)
+        await loading.value
+        XCTAssertNil(first.preview, "A late download cannot fill the new revision")
+        try f.write("UPDATE teams SET mine = 0"); manager.reconcile()
+        XCTAssertNil(first.preview); XCTAssertNil(second.preview)
     }
     func testClipboardFileURLWinsOverIconAndPlainTextIsNative() async throws {
         let f = try await fixture(), manager = try manager(f), pasteboard = NSPasteboard.withUniqueName()
@@ -867,6 +927,417 @@ private final class AttachmentTestServer: @unchecked Sendable {
         XCTAssertTrue(try ChatAttachmentPaste.take(pasteboard, manager: manager, channel: channel, root: messageID))
         try await wait { manager.files(channel: self.channel, root: self.messageID).count == 1 }
         XCTAssertEqual(manager.files(channel: channel, root: messageID).first?.file.mime, "image/png")
+    }
+
+    private func pasteEditor(in view: NSView) -> ChatMentionEditor.Editor? {
+        (view as? ChatMentionEditor.Editor) ?? view.subviews.lazy.compactMap { self.pasteEditor(in: $0) }.first
+    }
+    private func composer(_ model: ChatChannelModel, root: String?) -> NSHostingView<some View> {
+        NSHostingView(rootView: ChatUX1Composer(model: model, root: root, members: [], mentionable: [], agents: [])
+            .frame(width: 700, height: 400))
+    }
+    private func clipboardImage(_ type: String, frames: Int = 1) throws -> Data {
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(Self.png() as CFData, nil))
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil)), data = NSMutableData()
+        let output = try XCTUnwrap(CGImageDestinationCreateWithData(data, type as CFString, frames, nil))
+        for _ in 0..<frames { CGImageDestinationAddImage(output, image, nil) }
+        XCTAssertTrue(CGImageDestinationFinalize(output))
+        return data as Data
+    }
+
+    private func metadataImage(_ type: String, orientation: Int = 6) throws -> Data {
+        let context = try XCTUnwrap(CGContext(data: nil, width: 80, height: 40, bitsPerComponent: 8, bytesPerRow: 320,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        for (index, color) in [CGColor(red: 1, green: 0, blue: 0, alpha: 1), CGColor(red: 0, green: 1, blue: 0, alpha: 1),
+                               CGColor(red: 0, green: 0, blue: 1, alpha: 1), CGColor(red: 1, green: 1, blue: 0, alpha: 1)].enumerated() {
+            context.setFillColor(color)
+            context.fill(CGRect(x: (index % 2) * 40, y: (1 - index / 2) * 20, width: 40, height: 20))
+        }
+        let data = NSMutableData(), metadata = CGImageMetadataCreateMutable()
+        XCTAssertTrue(CGImageMetadataRegisterNamespaceForPrefix(metadata, "https://example.test/private/" as CFString, "private" as CFString, nil))
+        XCTAssertTrue(CGImageMetadataSetValueWithPath(metadata, nil, "private:Location" as CFString, "PRIVATE-XMP-LOCATION" as CFString))
+        let properties: [CFString: Any] = [
+            kCGImagePropertyOrientation: orientation,
+            kCGImagePropertyGPSDictionary: [kCGImagePropertyGPSLatitude: 52.37, kCGImagePropertyGPSLatitudeRef: "N",
+                kCGImagePropertyGPSLongitude: 4.90, kCGImagePropertyGPSLongitudeRef: "E"],
+            kCGImagePropertyExifDictionary: [kCGImagePropertyExifUserComment: "PRIVATE-EXIF-COMMENT"],
+            kCGImagePropertyIPTCDictionary: [kCGImagePropertyIPTCByline: "PRIVATE-IPTC-AUTHOR"],
+            kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFArtist: "PRIVATE-TIFF-ARTIST"],
+        ]
+        let output = try XCTUnwrap(CGImageDestinationCreateWithData(data, type as CFString, 1, nil))
+        CGImageDestinationAddImageAndMetadata(output, try XCTUnwrap(context.makeImage()), metadata, properties as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(output))
+        // Verify the fixture really carries location and all three metadata families.
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data, nil))
+        let props = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
+        XCTAssertNotNil(props[kCGImagePropertyGPSDictionary], type)
+        XCTAssertNotNil(props[kCGImagePropertyExifDictionary], type)
+        XCTAssertNotNil(props[kCGImagePropertyIPTCDictionary], type)
+        XCTAssertEqual(props[kCGImagePropertyOrientation] as? Int, orientation, type)
+        let tags = try XCTUnwrap(CGImageSourceCopyMetadataAtIndex(source, 0, nil))
+        XCTAssertEqual(CGImageMetadataCopyStringValueWithPath(tags, nil, "private:Location" as CFString) as String?, "PRIVATE-XMP-LOCATION", type)
+        return data as Data
+    }
+
+    private func imageCorners(_ data: Data) throws -> [String] {
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil))
+        // Decode the pixels without applying EXIF: the upload must already be oriented.
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil)), w = image.width, h = image.height
+        let context = try XCTUnwrap(CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let pixels = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
+        return [(w / 4, h / 4), (3 * w / 4, h / 4), (w / 4, 3 * h / 4), (3 * w / 4, 3 * h / 4)].map { x, y in
+            let offset = (y * w + x) * 4
+            return (0..<3).map { pixels[offset + $0] > 127 ? "1" : "0" }.joined()
+        }
+    }
+
+    private func assertNoImageMetadata(_ data: Data, file: StaticString = #filePath, line: UInt = #line) throws {
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil), file: file, line: line)
+        let props = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any], file: file, line: line)
+        for key in [kCGImagePropertyGPSDictionary, kCGImagePropertyExifDictionary, kCGImagePropertyExifAuxDictionary, kCGImagePropertyIPTCDictionary] {
+            XCTAssertNil(props[key], "Leaked \(key)", file: file, line: line)
+        }
+        XCTAssertTrue(props[kCGImagePropertyOrientation] == nil || props[kCGImagePropertyOrientation] as? Int == 1, file: file, line: line)
+        for marker in ["PRIVATE-", "Exif\0\0", "http://ns.adobe.com/xap/1.0/", "<x:xmpmeta", "<rdf:RDF"] {
+            XCTAssertNil(data.range(of: Data(marker.utf8)), "Leaked metadata bytes: \(marker.debugDescription)", file: file, line: line)
+        }
+        if let metadata = CGImageSourceCopyMetadataAtIndex(source, 0, nil) {
+            XCTAssertNil(CGImageMetadataCopyStringValueWithPath(metadata, nil, "private:Location" as CFString), file: file, line: line)
+        }
+    }
+
+    private func checkMetadataUpload(type: String, ext: String, route: String) async throws {
+        let f = try await fixture(), manager = try manager(f), original = try metadataImage(type)
+        let url = root.appendingPathComponent(UUID().uuidString + "." + ext), board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        try original.write(to: url)
+        let completion: @MainActor (Error?) -> Void = { XCTAssertNil($0, route) }
+        switch route {
+        case "clipboard":
+            board.setData(original, forType: .init(type))
+            XCTAssertTrue(try ChatAttachmentPaste.take(board, manager: manager, channel: channel, root: nil, completion: completion))
+        case "file":
+            try manager.importFiles([.file(url)], channel: channel, root: nil, completion: completion)
+        case "legacy":
+            try manager.add(urls: [url], channel: channel, root: nil)
+        default:
+            board.writeObjects([url as NSURL]); board.setData(Self.png(), forType: .png)
+            XCTAssertTrue(try ChatAttachmentPaste.take(board, manager: manager, channel: channel, root: nil,
+                fromDrop: route == "drop", completion: completion))
+        }
+        try await wait { manager.drafts.first?.state == .ready }
+        let draft = try XCTUnwrap(manager.drafts.first)
+        var uploaded: Data?
+        server.change { uploaded = $0.bytes[draft.id] }
+        let bytes = try XCTUnwrap(uploaded)
+        try assertNoImageMetadata(bytes)
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(bytes as CFData, nil))
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        XCTAssertEqual(image.width, 40); XCTAssertEqual(image.height, 80)
+        XCTAssertEqual(try imageCorners(bytes), ["001", "100", "110", "010"], "Orientation 6 must be baked into the pixels: \(route)")
+        XCTAssertEqual(bytes.count, draft.file.size)
+        XCTAssertEqual(ChatAttachments.digest(bytes), draft.sha256)
+        XCTAssertEqual(try Data(contentsOf: manager.storage.url(f.key, id: draft.id)), bytes)
+        XCTAssertEqual(try Data(contentsOf: url), original, "The source file must remain unchanged")
+    }
+
+    func testImageMetadataIsStrippedFromUploadedJPEGAcrossImportPaths() async throws {
+        for route in ["clipboard", "file", "finder", "drop", "legacy"] {
+            try await checkMetadataUpload(type: "public.jpeg", ext: "jpg", route: route)
+        }
+    }
+
+    func testLegacyJPEGWithGPSIsSanitizedOnRetryAndRetryKeepsBytesAndHash() async throws {
+        let f = try await fixture(), original = try metadataImage("public.jpeg")
+        var old = ChatAttachmentDraft(file: try file(original, name: "old.jpg"), messageId: messageID,
+            channel: channel, root: "", session: "s-anna", generation: "g1",
+            sha256: ChatAttachments.digest(original), createdAt: Date(), expiresAt: .distantFuture)
+        old.state = .failed
+        // Write the pre-update shape and original bytes, bypassing all import paths.
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(old)) as? [String: Any])
+        json.removeValue(forKey: "sanitizedImageSHA256")
+        old = try JSONDecoder().decode(ChatAttachmentDraft.self, from: JSONSerialization.data(withJSONObject: json))
+        try f.service.files.attachmentStorage.save(original, key: f.key, id: old.id)
+        try write(f.store.queue) { try ChatAttachments.put($0, old) }
+        // The old prepare might have succeeded before the network failure.
+        server.change { $0.rows[old.id] = ["attachment_id": old.id, "state": "reserved", "size": original.count]; $0.failUpload = true }
+        let manager = try manager(f)
+        manager.retry(old)
+        try await wait { manager.drafts.first?.id != old.id && manager.drafts.first?.state == .failed }
+        let cleaned = try XCTUnwrap(manager.drafts.first)
+        let saved = try Data(contentsOf: manager.storage.url(f.key, id: cleaned.id))
+        try assertNoImageMetadata(saved)
+        XCTAssertEqual(cleaned.file.size, saved.count)
+        XCTAssertEqual(cleaned.sha256, ChatAttachments.digest(saved))
+        XCTAssertEqual(cleaned.sanitizedImageSHA256, cleaned.sha256)
+        server.change { $0.failUpload = false }
+        manager.retry(cleaned)
+        try await wait { manager.drafts.first?.state == .ready }
+        var uploaded: Data?
+        server.change { uploaded = $0.bytes[cleaned.id] }
+        XCTAssertEqual(uploaded, saved)
+        try assertNoImageMetadata(XCTUnwrap(uploaded))
+        XCTAssertEqual(manager.drafts.first?.id, cleaned.id)
+        XCTAssertEqual(manager.drafts.first?.sha256, cleaned.sha256)
+        XCTAssertFalse(ChatStubProtocol.seen.contains { $0.request.httpMethod == "PUT" && $0.body == original })
+    }
+
+    func testRenewingLegacyJPEGRecomputesFileAndSelectedManifest() async throws {
+        let f = try await fixture(), manager = try manager(f), original = try metadataImage("public.jpeg")
+        var old = ChatAttachmentDraft(file: try file(original, name: "expired.jpg"), messageId: messageID,
+            channel: channel, root: "", session: "s-anna", generation: "g1",
+            sha256: ChatAttachments.digest(original), createdAt: Date(), expiresAt: .distantPast)
+        old.state = .failed
+        try manager.storage.save(original, key: f.key, id: old.id)
+        try write(f.store.queue) { try ChatAttachments.put($0, old) }
+        let model = model(f)
+        model.saveDraft("saved caption", root: nil, attachmentSelection: [.init(file: old.file, messageId: messageID, revision: 1, sha256: old.sha256)])
+        let next = try manager.renewed(old, capture: XCTUnwrap(manager.uploadStamp(channel: channel)))
+        let saved = try Data(contentsOf: manager.storage.url(f.key, id: next.id))
+        try assertNoImageMetadata(saved)
+        XCTAssertEqual(next.file.size, saved.count)
+        XCTAssertEqual(next.sha256, ChatAttachments.digest(saved))
+        XCTAssertNotEqual(next.prepareCommand, old.prepareCommand)
+        try write(f.store.queue) { try manager.replace($0, draft: old, with: next) }
+        manager.reconcile()
+        try await wait { manager.drafts.first?.state == .ready }
+        XCTAssertEqual(model.composerDraft(root: nil).attachmentSelection.first?.sha256, next.sha256)
+        XCTAssertEqual(model.composerDraft(root: nil).attachmentSelection.first?.file.size, saved.count)
+        var uploaded: Data?
+        server.change { uploaded = $0.bytes[next.id] }
+        XCTAssertEqual(uploaded, saved)
+    }
+
+    func testImageMetadataIsStrippedFromUploadedPNGHEICAndTIFF() async throws {
+        for (type, ext) in [("public.png", "png"), ("public.heic", "heic"), ("public.tiff", "tiff")] {
+            for route in ["clipboard", "file"] { try await checkMetadataUpload(type: type, ext: ext, route: route) }
+        }
+    }
+
+    func testImageMetadataStrippingBakesAllEXIFOrientationsIntoPixels() async throws {
+        let expected = [
+            ["100", "010", "001", "110"], ["010", "100", "110", "001"],
+            ["110", "001", "010", "100"], ["001", "110", "100", "010"],
+            ["100", "001", "010", "110"], ["001", "100", "110", "010"],
+            ["110", "010", "001", "100"], ["010", "110", "100", "001"],
+        ]
+        for orientation in 1...8 {
+            let original = try metadataImage("public.jpeg", orientation: orientation)
+            XCTAssertEqual(try imageCorners(original), expected[0])
+            let prepared = try await ChatAttachmentWorker.shared.prepare(.clipboard(original), limits: limits)
+            try assertNoImageMetadata(prepared.data)
+            XCTAssertEqual(prepared.file.width, orientation < 5 ? 80 : 40)
+            XCTAssertEqual(prepared.file.height, orientation < 5 ? 40 : 80)
+            XCTAssertEqual(try imageCorners(prepared.data), expected[orientation - 1], "EXIF orientation \(orientation)")
+        }
+    }
+
+    func testAnimatedGIFReportsComposerErrorWithoutUploading() async throws {
+        let gif = try clipboardImage("com.compuserve.gif", frames: 2)
+        XCTAssertEqual(CGImageSourceGetCount(try XCTUnwrap(CGImageSourceCreateWithData(gif as CFData, nil))), 2)
+        let url = root.appendingPathComponent("Animation.gif"); try gif.write(to: url)
+        for (route, destination) in [("clipboard", nil), ("clipboardAndPNG", messageID), ("finder", nil), ("drop", messageID)] as [(String, String?)] {
+            let f = try await fixture(), manager = try manager(f), model = model(f)
+            let host = composer(model, root: destination), ui = ComposerPasteTestWindow(content: host)
+            defer { ui.close() }
+            try await wait { self.pasteEditor(in: host)?.attachments != nil }
+            let editor = try XCTUnwrap(pasteEditor(in: host)); ui.focus(editor)
+            let board = NSPasteboard.general; board.clearContents()
+            if route == "finder" || route == "drop" { board.writeObjects([url as NSURL]) }
+            else { board.setData(gif, forType: .init("com.compuserve.gif")) }
+            if route != "clipboard" { board.setData(Self.png(), forType: .png) }
+            if route == "drop" { XCTAssertTrue(try XCTUnwrap(editor.dropAttachments)(board)) }
+            else { try ui.commandV() }
+            try await wait { !manager.isImporting(channel: self.channel, root: destination) }
+            XCTAssertEqual(model.problem, "Animated GIF attachments are not supported by this server. Choose another file.", route)
+            XCTAssertTrue(manager.drafts.isEmpty, route)
+            XCTAssertEqual(editor.string, "")
+            let visible = try await renderedOwnershipText(host).map(\.0).joined(separator: " ")
+            XCTAssertTrue(visible.contains("Animated GIF"), visible)
+        }
+        XCTAssertFalse(ChatStubProtocol.seen.contains { $0.request.httpMethod == "PUT" })
+        XCTAssertFalse(ChatStubProtocol.seen.contains { (try? JSONDecoder().decode(ChatCommandEnvelope.self, from: $0.body).type) == "attachment.prepare" })
+        XCTAssertEqual(try Data(contentsOf: url), gif)
+    }
+
+    func testNativeChatImagePasteViaEditMenuInChannelAndThread() async throws {
+        let f = try await fixture(), manager = try manager(f), model = model(f)
+        for destination in [nil, messageID] as [String?] {
+            model.openThread(destination)
+            let host = composer(model, root: destination), ui = ComposerPasteTestWindow(content: host)
+            defer { ui.close() }
+            try await wait { self.pasteEditor(in: host)?.attachments != nil }
+            let editor = try XCTUnwrap(pasteEditor(in: host))
+            ui.focus(editor)
+            for type in ["public.png", "public.jpeg", "public.heic", "com.compuserve.gif"] {
+                let board = NSPasteboard.general
+                board.clearContents(); board.setData(try clipboardImage(type), forType: .init(type))
+                XCTAssertNil(board.string(forType: .string))
+                // These assertions must fail if either validator is reverted.
+                XCTAssertTrue(editor.validateMenuItem(ui.paste), type)
+                XCTAssertTrue(editor.validateUserInterfaceItem(ui.paste), type)
+                let count = manager.files(channel: channel, root: destination).count
+                try ui.commandV()
+                try await wait { !manager.isImporting(channel: self.channel, root: destination) }
+                XCTAssertNil(model.problem)
+                XCTAssertEqual(manager.files(channel: channel, root: destination).count, count + 1, "Exactly one attachment per Command-V: \(type)")
+                let draft = try XCTUnwrap(manager.files(channel: channel, root: destination).last)
+                XCTAssertEqual(draft.file.mime, type == "public.jpeg" ? "image/jpeg" : "image/png")
+                XCTAssertEqual(draft.file.name, type == "public.jpeg" ? "Clipboard.jpg" : "Clipboard.png")
+                XCTAssertEqual(editor.string, "", "The image must not also insert text")
+            }
+        }
+        XCTAssertEqual(manager.files(channel: channel, root: nil).count, 4)
+        XCTAssertEqual(manager.files(channel: channel, root: messageID).count, 4)
+    }
+
+    func testNativeChatPasteKeepsTextFallbackAndCapabilityGate() async throws {
+        for support in ["enabled", "no capability", "no limits"] {
+            let f = try await fixture(), manager = try manager(f), model = model(f)
+            if support == "no capability" { f.service.serverCapabilities[f.key.server] = [] }
+            if support == "no limits" { f.service.serverAttachmentLimits[f.key.server] = nil }
+            let host = composer(model, root: nil), ui = ComposerPasteTestWindow(content: host)
+            defer { ui.close() }
+            try await wait { self.pasteEditor(in: host) != nil }
+            let editor = try XCTUnwrap(pasteEditor(in: host))
+            ui.focus(editor)
+            XCTAssertEqual(editor.attachments != nil, support == "enabled")
+            let board = NSPasteboard.general
+            board.clearContents(); board.setString("ordinary text", forType: .string)
+            try ui.commandV()
+            XCTAssertEqual(editor.string, "ordinary text")
+            XCTAssertEqual(model.draft(root: nil), "ordinary text")
+            if support != "enabled" {
+                board.clearContents(); board.setData(Self.png(), forType: .png)
+                ui.editMenu.update(); XCTAssertFalse(ui.paste.isEnabled)
+                XCTAssertFalse(editor.validateUserInterfaceItem(ui.paste))
+                board.setString(" fallback", forType: .string)
+                try ui.commandV()
+                XCTAssertEqual(editor.string, "ordinary text fallback")
+            } else {
+                // Advertised image data can disappear (e.g. a clipboard owner
+                // exits). Exercise the production composer's Boolean result.
+                let provider = MissingClipboardImage()
+                let item = NSPasteboardItem()
+                item.setDataProvider(provider, forTypes: [.png])
+                item.setString(" fallback", forType: .string)
+                board.clearContents(); board.writeObjects([item])
+                XCTAssertTrue(ChatAttachmentPaste.accepts(board))
+                XCTAssertNil(board.data(forType: .png))
+                try ui.commandV()
+                XCTAssertEqual(editor.string, "ordinary text fallback")
+                withExtendedLifetime(provider) {}
+            }
+            XCTAssertTrue(manager.drafts.isEmpty)
+            board.clearContents(); board.setData(Self.png(), forType: .png)
+            editor.isEditable = false
+            ui.editMenu.update(); XCTAssertFalse(ui.paste.isEnabled)
+            XCTAssertFalse(editor.validateUserInterfaceItem(ui.paste))
+        }
+    }
+
+    func testClipboardFileImagesConvertWithoutAttachingFinderIcons() async throws {
+        let f = try await fixture(), manager = try manager(f), board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        for (ext, type) in [("png", "public.png"), ("heic", "public.heic"), ("tiff", "public.tiff"), ("gif", "com.compuserve.gif")] {
+            let url = root.appendingPathComponent("Screenshot." + ext)
+            try clipboardImage(type).write(to: url)
+            board.clearContents(); board.writeObjects([url as NSURL]); board.setData(Data("Finder icon".utf8), forType: .tiff)
+            let count = manager.drafts.count
+            var finished = false
+            XCTAssertTrue(try ChatAttachmentPaste.take(board, manager: manager, channel: channel, root: nil) { error in
+                XCTAssertNil(error); finished = true
+            })
+            try await wait { finished }
+            XCTAssertEqual(manager.drafts.count, count + 1)
+            let draft = try XCTUnwrap(manager.drafts.last)
+            XCTAssertEqual(draft.file.name, "Screenshot.png"); XCTAssertEqual(draft.file.mime, "image/png")
+        }
+    }
+
+    func testConvertedClipboardImagesKeepNegotiatedLimits() async throws {
+        let heic = try clipboardImage("public.heic")
+        var narrow = limits
+        narrow.imageSide = 1
+        do { _ = try await ChatAttachmentWorker.shared.prepare(.clipboard(heic), limits: narrow); XCTFail("oversized pixels accepted") }
+        catch { XCTAssertEqual(error as? ChatAttachmentError, .type) }
+        narrow = limits; narrow.fileBytes = 1
+        do { _ = try await ChatAttachmentWorker.shared.prepare(.clipboard(heic), limits: narrow); XCTFail("oversized encoded bytes accepted") }
+        catch { XCTAssertEqual(error as? ChatAttachmentError, .size) }
+        narrow = limits; narrow.extensions = ["jpeg"]; narrow.mimeTypes = ["image/jpeg"]
+        let jpeg = try await ChatAttachmentWorker.shared.prepare(.clipboard(heic), limits: narrow)
+        XCTAssertEqual(jpeg.file.name, "Clipboard.jpeg"); XCTAssertEqual(jpeg.file.mime, "image/jpeg")
+        narrow.extensions = ["txt"]; narrow.mimeTypes = ["text/plain"]
+        do { _ = try await ChatAttachmentWorker.shared.prepare(.clipboard(heic), limits: narrow); XCTFail("unsupported server type accepted") }
+        catch { XCTAssertEqual(error as? ChatAttachmentError, .type) }
+    }
+
+    func testNativeScreenshotLazyImagePromisePastesOnce() async throws {
+        let f = try await fixture(), manager = try manager(f), model = model(f)
+        let host = composer(model, root: nil), ui = ComposerPasteTestWindow(content: host)
+        defer { ui.close() }
+        try await wait { self.pasteEditor(in: host)?.attachments != nil }
+        ui.focus(try XCTUnwrap(pasteEditor(in: host)))
+        let provider = LazyClipboardImage(data: Self.png())
+        let item = NSPasteboardItem(); item.setDataProvider(provider, forTypes: [.png])
+        let board = NSPasteboard.general
+        board.clearContents(); XCTAssertTrue(board.writeObjects([item]))
+        XCTAssertTrue(ChatAttachmentPaste.accepts(board))
+        XCTAssertEqual(provider.requests, 0, "Validation must not request the promised bytes")
+        try ui.commandV()
+        XCTAssertTrue(manager.isImporting(channel: channel, root: nil))
+        XCTAssertThrowsError(try manager.prepared(channel: channel, root: nil))
+        try await wait { !manager.isImporting(channel: self.channel, root: nil) }
+        XCTAssertNil(model.problem)
+        XCTAssertEqual(manager.drafts.count, 1)
+        XCTAssertEqual(manager.drafts.first?.file.name, "Clipboard.png")
+        XCTAssertEqual(provider.requests, 1)
+        withExtendedLifetime(provider) {}
+    }
+
+    func testDragOnlyFilePromiseDoesNotSuppressClipboardText() async throws {
+        let f = try await fixture(), manager = try manager(f), board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let delegate = PromisedClipboardImage(data: Self.png())
+        let provider = NSFilePromiseProvider(fileType: "public.png", delegate: delegate)
+        board.writeObjects([provider])
+        board.setString("ordinary text", forType: .string)
+        XCTAssertTrue(ChatAttachmentPaste.accepts(board, fromDrop: true))
+        XCTAssertFalse(ChatAttachmentPaste.accepts(board))
+        XCTAssertFalse(try ChatAttachmentPaste.take(board, manager: manager, channel: channel, root: nil))
+        XCTAssertTrue(manager.drafts.isEmpty)
+        XCTAssertNil(delegate.destination)
+        withExtendedLifetime(provider) {}
+    }
+
+    func testDroppedFilePromisesStartSynchronouslyAndKeepAuthorization() async throws {
+        for outcome in ["success", "revoked", "failed"] {
+            let f = try await fixture(), manager = try manager(f)
+            // A legacy promise can advertise one type but deliver two files.
+            let receiver = ControlledFilePromise(data: Self.png())
+            var finished = false
+            try ChatAttachmentPaste.takePromises([receiver], manager: manager, channel: channel, root: messageID) { error in
+                XCTAssertEqual(error == nil, outcome == "success"); finished = true
+            }
+            let directory = try XCTUnwrap(receiver.destination, "The promise must start before the drop handler returns")
+            XCTAssertTrue(manager.isImporting(channel: channel, root: messageID))
+            XCTAssertThrowsError(try manager.prepared(channel: channel, root: messageID))
+            if outcome == "revoked" {
+                try f.write("UPDATE teams SET mine = 0")
+                try f.write("UPDATE teams SET mine = 1")
+            }
+            receiver.fulfill(error: outcome == "failed" ? ChatAttachmentError.source : nil)
+            try await wait { finished }
+            XCTAssertEqual(manager.files(channel: channel, root: messageID).count, outcome == "success" ? 2 : 0)
+            XCTAssertTrue(manager.files(channel: channel, root: nil).isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        }
+        let f = try await fixture(), manager = try manager(f), receiver = ControlledFilePromise(data: Self.png())
+        XCTAssertThrowsError(try ChatAttachmentPaste.takePromises(Array(repeating: receiver, count: limits.messageFiles + 1),
+            manager: manager, channel: channel, root: nil))
+        XCTAssertNil(receiver.destination, "Reject over-quota promises before asking the source to write files")
     }
 
     func testReview1ClipboardDefersProcessingAndRejectsResultAfterRevokeRejoin() async throws {
@@ -1106,7 +1577,6 @@ private final class AttachmentTestServer: @unchecked Sendable {
         XCTAssertTrue(manager.drafts.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: try manager.storage.url(f.key, id: draft.id).path))
         do { _ = try await loading.value; XCTFail("late bytes escaped the epoch") } catch { }
-        XCTAssertNil(manager.viewer)
         try await Task.sleep(for: .milliseconds(130))
     }
 
@@ -1118,9 +1588,10 @@ private final class AttachmentTestServer: @unchecked Sendable {
         _ = try await manager.load(message, file: file, preview: true)
         XCTAssertNotNil(manager.image(message, file: file))
         server.change { $0.deny = true }
-        do { try await manager.open(message, file: file); XCTFail("hidden file opened") } catch { }
+        let viewer = viewer(f, message: message, file: file); await viewer.load()
+        XCTAssertNil(viewer.preview); XCTAssertNotNil(viewer.problem)
         XCTAssertNil(manager.image(message, file: file))
-        XCTAssertNil(manager.stamp(channel: channel)); XCTAssertNil(manager.viewer)
+        XCTAssertNil(manager.stamp(channel: channel)); XCTAssertNil(viewer.preview)
     }
 
     func testReview2ManifestAccessRefusalsCloseAllSurfaces() async throws {
@@ -1134,8 +1605,8 @@ private final class AttachmentTestServer: @unchecked Sendable {
                 let message = try message(f, file: file, id: UUID().uuidString.lowercased())
                 server.change { $0.downloads = bytes }
                 _ = try await manager.load(message, file: file, preview: true)
-                try await manager.open(message, file: file)
-                XCTAssertNotNil(manager.viewer); XCTAssertNotNil(manager.image(message, file: file))
+                let viewer = viewer(f, message: message, file: file); await viewer.load()
+                XCTAssertNotNil(viewer.preview); XCTAssertNotNil(manager.image(message, file: file))
                 let socket = ChatSocket(server: f.key.server, token: "test-only")
                 let sync = ChatSync(key: f.key, store: f.store, api: f.service.makeAPI(f.key.server), socket: socket, outbox: nil, token: "test-only")
                 f.service.orgSessions[f.key]?.sync = sync
@@ -1150,7 +1621,7 @@ private final class AttachmentTestServer: @unchecked Sendable {
                 } catch {
                     XCTAssertEqual(error as? ChatAPIError, .server(status: status, code: "opaque_access_error", retryAfter: nil))
                 }
-                XCTAssertNil(manager.viewer, "status \(status), final \(finalVerification)")
+                XCTAssertNil(viewer.preview, "status \(status), final \(finalVerification)")
                 XCTAssertNil(manager.image(message, file: file)); XCTAssertNil(manager.stamp(channel: channel))
                 XCTAssertFalse(FileManager.default.fileExists(atPath: copied.directory.path))
                 XCTAssertTrue(f.service.attachmentCalls.isEmpty)
@@ -1175,10 +1646,10 @@ private final class AttachmentTestServer: @unchecked Sendable {
             let message = try message(f, file: file)
             server.change { $0.downloads = bytes }
             _ = try await manager.load(message, file: file, preview: true)
-            try await manager.open(message, file: file)
+            let viewer = viewer(f, message: message, file: file); await viewer.load()
             server.change { $0.refusedPath = "/v1/orgs/\(f.key.orgId)/attachments/\(file.id)/original"; $0.refusedStatus = status }
             do { _ = try await manager.load(message, file: file, preview: false); XCTFail("Access refusal was accepted") } catch { }
-            XCTAssertNil(manager.viewer); XCTAssertNil(manager.image(message, file: file)); XCTAssertNil(manager.stamp(channel: channel))
+            XCTAssertNil(viewer.preview); XCTAssertNil(manager.image(message, file: file)); XCTAssertNil(manager.stamp(channel: channel))
         }
     }
 
@@ -1190,12 +1661,12 @@ private final class AttachmentTestServer: @unchecked Sendable {
             let message = try message(f, file: file)
             server.change { $0.downloads = bytes }
             _ = try await manager.load(message, file: file, preview: true)
-            try await manager.open(message, file: file)
+            let viewer = viewer(f, message: message, file: file); await viewer.load()
             try manager.add(data: Data("upload".utf8), name: "notes.txt", channel: channel, root: nil)
             let draft = try XCTUnwrap(manager.drafts.first)
             server.change { $0.refusedPath = "/v1/orgs/\(f.key.orgId)/attachments/\(draft.id)"; $0.refusedStatus = status }
             try await wait { manager.stamp(channel: self.channel) == nil }
-            XCTAssertNil(manager.viewer); XCTAssertNil(manager.image(message, file: file))
+            XCTAssertNil(viewer.preview); XCTAssertNil(manager.image(message, file: file))
             XCTAssertFalse(ChatStubProtocol.seen.contains { $0.request.httpMethod == "PUT" && $0.request.url?.path.contains(draft.id) == true })
         }
     }
@@ -1310,3 +1781,62 @@ private final class AttachmentTestServer: @unchecked Sendable {
 }
 
 private extension Row { func mapMessage() -> ChatMessage { ChatMessage(row: self) } }
+
+private final class MissingClipboardImage: NSObject, NSPasteboardItemDataProvider {
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {}
+}
+
+private final class LazyClipboardImage: NSObject, NSPasteboardItemDataProvider, @unchecked Sendable {
+    let data: Data
+    private let lock = NSLock()
+    private var requestCount = 0
+    var requests: Int { lock.lock(); defer { lock.unlock() }; return requestCount }
+    init(data: Data) { self.data = data }
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+        lock.lock(); requestCount += 1; lock.unlock()
+        item.setData(data, forType: type)
+    }
+}
+
+private final class PromisedClipboardImage: NSObject, NSFilePromiseProviderDelegate, @unchecked Sendable {
+    let data: Data
+    private let lock = NSLock()
+    private var writtenURL: URL?
+    var destination: URL? { lock.lock(); defer { lock.unlock() }; return writtenURL }
+    init(data: Data) { self.data = data }
+    func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String { "Screenshot.png" }
+    func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler: @escaping ((any Error)?) -> Void) {
+        lock.lock(); writtenURL = url; lock.unlock()
+        do { try data.write(to: url); completionHandler(nil) } catch { completionHandler(error) }
+    }
+}
+
+/// Only the external file producer is controlled. Receipt, async preparation,
+/// authorization, quotas and temporary-file cleanup use the production path.
+private final class ControlledFilePromise: NSFilePromiseReceiver, @unchecked Sendable {
+    private let data: Data
+    private let lock = NSLock()
+    private var directory: URL?
+    private var pending: (OperationQueue, (URL, Error?) -> Void)?
+    var destination: URL? { lock.lock(); defer { lock.unlock() }; return directory }
+    override var fileTypes: [String] { ["public.png"] }
+    override var fileNames: [String] { destination == nil ? [] : ["Screenshot.png", "Screenshot 2.png"] }
+    init(data: Data) { self.data = data; super.init() }
+    required init?(pasteboardPropertyList propertyList: Any, ofType type: NSPasteboard.PasteboardType) { return nil }
+    override func receivePromisedFiles(atDestination destination: URL, options: [AnyHashable: Any] = [:],
+                                      operationQueue: OperationQueue, reader: @escaping (URL, Error?) -> Void) {
+        lock.lock(); directory = destination; pending = (operationQueue, reader); lock.unlock()
+    }
+    func fulfill(error: Error?) {
+        lock.lock(); let queue = pending?.0; lock.unlock()
+        queue?.addOperation { [self] in
+            lock.lock(); let callback = pending?.1, directory = directory; pending = nil; lock.unlock()
+            guard let callback, let directory else { return }
+            if let error { callback(directory, error); return }
+            for name in fileNames {
+                let url = directory.appendingPathComponent(name)
+                do { try data.write(to: url); callback(url, nil) } catch { callback(url, error) }
+            }
+        }
+    }
+}

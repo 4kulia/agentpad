@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 struct FileTreeOperationRows: View {
     let node: FileNode
     let close: () -> Void
+    var editor: FileNameEdit? = nil
 
     /// Where "New…" and "Paste" land: the folder itself, or a file's folder.
     private var targetDirectory: URL {
@@ -17,24 +18,24 @@ struct FileTreeOperationRows: View {
             row("Quick Look") { QuickLookPanel.show(node.url) }
         }
         AgentPadMenuDivider()
-        row("New File…") { FileOperations.newFile(in: targetDirectory) }
-        row("New Folder") { FileOperations.newFolder(in: targetDirectory) }
+        row("New File…") { FileOperations.newFile(in: targetDirectory, editor: editor) }
+        row("New Folder") { FileOperations.newFolder(in: targetDirectory, editor: editor) }
         AgentPadMenuDivider()
         row("Copy", shortcut: nil) { FileOperations.copy([node.url]) }
         row("Cut") { FileOperations.copy([node.url], cut: true) }
         row(FileOperations.pasteMode() == .move ? "Move Here" : "Paste", disabled: !FileOperations.canPaste()) {
-            FileOperations.paste(into: targetDirectory)
+            FileOperations.paste(into: targetDirectory, editor: editor)
         }
         AgentPadMenuDivider()
-        row("Rename…") { FileOperations.rename(node.url) }
-        row("Duplicate") { FileOperations.duplicate(node.url) }
-        row("Move to Trash", color: Theme.activityFailure) { FileOperations.trash([node.url]) }
+        row("Rename…") { FileOperations.rename(node.url, editor: editor) }
+        row("Duplicate") { FileOperations.duplicate(node.url, editor: editor) }
+        row("Move to Trash", color: Theme.activityFailure) { FileOperations.trash([node.url], editor: editor) }
     }
 
     private func row(_ title: String, shortcut: String? = nil, disabled: Bool = false, color: Color? = nil, _ action: @escaping () -> Void) -> some View {
         AgentPadMenuRow(title: title, localizesTitle: false, shortcut: shortcut, isDisabled: disabled, titleColor: color) {
             close()
-            // Let the popover finish closing before a modal dialog opens.
+            // Let the menu close before focusing the inline field.
             DispatchQueue.main.async(execute: action)
         }
     }
@@ -43,13 +44,14 @@ struct FileTreeOperationRows: View {
 /// Compact buttons under the tree header, acting on the root folder.
 struct FileTreeRootActions: View {
     let root: URL
+    var editor: FileNameEdit? = nil
     @AppStorage(FileTreePreferences.showHiddenKey) private var showHidden = true
 
     var body: some View {
         HStack(spacing: 2) {
-            button("doc.badge.plus", "New file") { FileOperations.newFile(in: root) }
-            button("folder.badge.plus", "New folder") { FileOperations.newFolder(in: root) }
-            button("doc.on.clipboard", "Paste into this folder") { FileOperations.paste(into: root) }
+            button("doc.badge.plus", "New file") { FileOperations.newFile(in: root, editor: editor) }
+            button("folder.badge.plus", "New folder") { FileOperations.newFolder(in: root, editor: editor) }
+            button("doc.on.clipboard", "Paste into this folder") { FileOperations.paste(into: root, editor: editor) }
             Spacer(minLength: 0)
             button(showHidden ? "eye" : "eye.slash", showHidden ? "Hide hidden files" : "Show hidden files") {
                 showHidden.toggle()
@@ -66,14 +68,15 @@ struct FileTreeRootActions: View {
 extension View {
     /// Accepts files dragged from Finder (copied) or from the tree itself
     /// (moved, when the source is inside the same root — like Finder on one volume).
-    func fileTreeDropTarget(directory: URL?, root: URL?) -> some View {
-        modifier(FileTreeDropModifier(directory: directory, root: root))
+    func fileTreeDropTarget(directory: URL?, root: URL?, editor: FileNameEdit? = nil) -> some View {
+        modifier(FileTreeDropModifier(directory: directory, root: root, editor: editor))
     }
 }
 
 private struct FileTreeDropModifier: ViewModifier {
     let directory: URL?
     let root: URL?
+    let editor: FileNameEdit?
     @State private var isTargeted = false
 
     @ViewBuilder
@@ -98,7 +101,7 @@ private struct FileTreeDropModifier: ViewModifier {
                 Task { @MainActor in
                     let urls = await Self.loadURLs(providers)
                     guard !urls.isEmpty else { return }
-                    FileTreeDrop.perform(urls, into: directory, root: root)
+                    FileTreeDrop.perform(urls, into: directory, root: root, editor: editor)
                 }
                 return true
             }
@@ -126,7 +129,7 @@ enum FileTreeDrop {
     }
 
     @MainActor
-    static func perform(_ sources: [URL], into directory: URL, root: URL?) {
+    static func perform(_ sources: [URL], into directory: URL, root: URL?, editor: FileNameEdit? = nil) {
         let mode = mode(for: sources, root: root)
         // Dropping an item onto its own folder is a no-op, not a duplicate.
         let real = FileOperations.realPath(directory)
@@ -134,7 +137,7 @@ enum FileTreeDrop {
         guard !moving.isEmpty else { return }
         Task { @MainActor in
             let result = await FileOperations.transferInBackground(moving, into: directory, mode: mode)
-            FileOperations.report(result.failures)
+            FileOperations.report(result.issues, editor: editor)
         }
     }
 }

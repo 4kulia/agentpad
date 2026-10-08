@@ -2913,10 +2913,10 @@ final class ChatTeamCallsTests: XCTestCase {
         let sessionId = UUID().uuidString.lowercased()
         let plain = agent("plain", folder)
         try await team.calls.saveAndPublish([plain], teams: [ops], key: anna)
-        let edited = TeamPublishSessionView.edited(mode: .folder, sessionId: sessionId, folderName: "plain", folder: folder.path, calls: team.calls)
+        let edited = TeamSessionPublication.edited(mode: .folder, sessionId: sessionId, folderName: "plain", folder: folder.path, calls: team.calls)
         XCTAssertEqual(edited.map(\.id), [plain.id])
         XCTAssertEqual(edited.compactMap { service.chosenTeams($0.id, key: anna) }.first, [ops])
-        XCTAssertEqual(TeamPublishSessionView.edited(mode: .session, sessionId: sessionId, folderName: "plain", folder: folder.path,
+        XCTAssertEqual(TeamSessionPublication.edited(mode: .session, sessionId: sessionId, folderName: "plain", folder: folder.path,
                                                       calls: team.calls), [], "the session mode has no agent yet")
     }
 
@@ -2926,10 +2926,10 @@ final class ChatTeamCallsTests: XCTestCase {
     func testTheSessionWindowRestoresTeamsWhenTheAgentChanges() {
         let a = TeamPublishedAgent(name: "billing", description: "d", folder: "/tmp"), b = TeamPublishedAgent(name: "other", description: "d", folder: "/tmp")
         let earlier: (UUID) -> [String]? = { $0 == a.id ? [self.ops] : nil }
-        XCTAssertEqual(TeamPublishSessionView.restored(edited: [], previous: nil, general: [general], earlier: earlier), [general])
-        XCTAssertEqual(TeamPublishSessionView.restored(edited: [a], previous: [], general: [general], earlier: earlier), [ops], "typed its name")
-        XCTAssertNil(TeamPublishSessionView.restored(edited: [a], previous: [a.id], general: [general], earlier: earlier), "the same agent: the owner's choice stays")
-        XCTAssertEqual(TeamPublishSessionView.restored(edited: [b], previous: [a.id], general: [general], earlier: earlier), [general])
+        XCTAssertEqual(TeamSessionPublication.restored(edited: [], previous: nil, general: [general], earlier: earlier), [general])
+        XCTAssertEqual(TeamSessionPublication.restored(edited: [a], previous: [], general: [general], earlier: earlier), [ops], "typed its name")
+        XCTAssertNil(TeamSessionPublication.restored(edited: [a], previous: [a.id], general: [general], earlier: earlier), "the same agent: the owner's choice stays")
+        XCTAssertEqual(TeamSessionPublication.restored(edited: [b], previous: [a.id], general: [general], earlier: earlier), [general])
     }
 
     /// Publishing again asks the server when its card differs from what
@@ -4845,6 +4845,10 @@ final class ChatTeamCallsTests: XCTestCase {
         try server(store, service, "run.start", move("starting", 4, runId: approval.runId))
         try await waitUntil { try XCTUnwrap(service.journal).run(approval.runId)?.outcome == .finished }
         XCTAssertEqual(service.undeliveredResults().map(\.text), ["Refunded twice by a retry."])
+        XCTAssertEqual(service.undeliveredResults(key: anna).map(\.requestId), [req])
+        XCTAssertTrue(service.undeliveredResults(key: boris).isEmpty, "Delivery tabs are isolated by account")
+        let otherOrg = ChatOrgKey(server: anna.server, accountId: anna.accountId, orgId: UUID().uuidString)
+        XCTAssertTrue(service.undeliveredResults(key: otherOrg).isEmpty, "Delivery tabs are isolated by organization")
         await service.disconnect()
         XCTAssertEqual(service.undeliveredResults().map(\.text), ["Refunded twice by a retry."], "after Disconnect, from the journal")
         let again = ChatService(files: files, tokens: FakeTokenStore())

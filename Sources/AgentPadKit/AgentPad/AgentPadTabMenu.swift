@@ -61,7 +61,7 @@ struct AgentPadTabMenu: View {
             }
             AgentPadMenuDivider()
             // AgentPad: a chat tab takes its destination’s name (DESIGN-F2).
-            if !tab.isChat {
+            if tab.hasProcess {
                 AgentPadMenuRow(title: "Rename Tab…", shortcut: "⌘R") {
                     dismiss()
                     onRename()

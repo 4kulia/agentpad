@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 /// The models of the connection's organization and session, shared by the
-/// left panel and the Organization window. Each counts only while it stands
+/// left panel and Organization tabs. Each counts only while it stands
 /// for the connection now — checked on every read, not by a view's task
 /// (review C6 p1-4) — and is made anew for a new one.
 @MainActor
@@ -75,125 +75,26 @@ enum ChatOrgSidebarSection {
         case .needsSignIn(let text), .notMember(_, let text): text
         default: nil
         }
-    }}
-
-@MainActor
-enum ChatOrgWindow {
-    private static var window: NSWindow?
-
-    static func show() {
-        if window == nil {
-            let host = NSHostingController(rootView: ChatOrgWindowView())
-            host.sizingOptions = .preferredContentSize
-            let made = NSWindow(contentViewController: host)
-            made.title = "Organization"
-            made.styleMask = [.titled, .closable, .resizable]
-            made.isReleasedWhenClosed = false
-            made.appearance = Theme.windowAppearance
-            made.center()
-            window = made
-        }
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    /// Asks before a change that cannot be taken back or that others see,
-    /// as a sheet of the Organization window, for as long as `valid` holds:
-    /// once the object or the right is gone — another Mac, a lower role,
-    /// another connection — the sheet closes as cancelled and keeps nothing
-    /// it showed (review C6b p1-4). `field`: a line to edit; its text is the
-    /// answer. Nil when cancelled.
-    static func ask(_ title: String, _ text: String, _ button: String, field initial: String? = nil,
-                    while valid: @escaping @MainActor () -> Bool) async -> String? {
-        guard valid() else { return nil }
-        show()
-        guard let host = window else { return nil }
-        // One sheet at a time.
-        while host.attachedSheet != nil { try? await Task.sleep(for: .milliseconds(200)) }
-        guard valid() else { return nil }
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = text
-        let field = initial.map { value in
-            let made = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-            made.stringValue = value
-            return made
-        }
-        alert.accessoryView = field
-        alert.addButton(withTitle: button)
-        alert.addButton(withTitle: "Cancel")
-        let watcher = SheetWatcher(valid: valid) { host.endSheet(alert.window, returnCode: .abort) }
-        watcher.watch()
-        let answer = await withCheckedContinuation { continuation in
-            alert.beginSheetModal(for: host) { continuation.resume(returning: $0) }
-        }
-        watcher.open = false
-        let text = field?.stringValue ?? ""
-        field?.stringValue = ""
-        alert.messageText = ""
-        alert.informativeText = ""
-        guard answer == .alertFirstButtonReturn, valid() else { return nil }
-        return text
-    }
-
-    static func confirm(_ title: String, _ text: String, _ button: String,
-                        while valid: @escaping @MainActor () -> Bool) async -> Bool {
-        await ask(title, text, button, while: valid) != nil
     }
 }
 
-/// Closes a sheet once what it asks about is no longer valid: looked at
-/// again on every change of what `valid` reads.
-@MainActor
-private final class SheetWatcher {
-    var open = true
-    let valid: @MainActor () -> Bool
-    let close: @MainActor () -> Void
-
-    init(valid: @escaping @MainActor () -> Bool, close: @escaping @MainActor () -> Void) {
-        self.valid = valid
-        self.close = close
-    }
-
-    func watch() {
-        withObservationTracking { _ = valid() } onChange: { [weak self] in
-            Task { @MainActor in
-                guard let self, self.open else { return }
-                if self.valid() { self.watch() } else { self.close() }
-            }
-        }
-    }
-}
-
-/// The Organization window. Its forms belong to one organization and
-/// session: another one starts them empty (review C6 p1-5).
-private struct ChatOrgWindowView: View {
-    private var current = ChatOrgCurrent.shared
-
-    var body: some View {
-        Group {
-            if current.model != nil || current.devices != nil {
-                ChatOrgWindowContent(model: current.model, devices: current.devices)
-                    .id(ChatOrgCurrent.identity())
-                    .attentionPlace(ChatService.shared.connection?.orgKey.map { [.organization($0.orgId)] } ?? [])
-            } else {
-                VStack(spacing: 10) {
-                    Text(ChatOrgSidebarSection.reason(ChatService.shared.state) ?? "Not connected to a server.")
-                    Button("Connect to a Server…") { ChatConnectWindow.show() }
-                }
-                .padding(30)
-            }
-        }
-        .frame(minWidth: 560, minHeight: 420)
-        .task(id: ChatOrgCurrent.identity()) { current.refresh() }
-    }
-}
-
-private struct ChatOrgWindowContent: View {
+struct ChatOrgTabContent: View {
+    @Bindable var state: TabState
+    @Bindable var form: OrganizationFormState
     let model: ChatOrgModel?
     let devices: ChatDevicesModel?
-    @State private var answer: String?
-    @State private var selected: AttentionOrganizationSection = .members
+    private var selected: Binding<AttentionOrganizationSection> {
+        Binding(get: { AttentionOrganizationSection(rawValue: state.navigation.selection ?? "") ?? .members }, set: {
+            state.confirmation.invalidate(); state.navigation.selection = $0.rawValue; state.changed()
+        })
+    }
+    private var sections: [AttentionOrganizationSection] {
+        var sections: [AttentionOrganizationSection] = model == nil ? [] : [.members, .teams]
+        if model?.actions.contains(.invite) == true { sections.append(.invitations) }
+        if devices != nil { sections.append(.devices) }
+        if model?.actions.contains(.seeAudit) == true { sections.append(.audit) }
+        return sections
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -203,17 +104,17 @@ private struct ChatOrgWindowContent: View {
             if let notice = model?.notice {
                 Text(notice).font(Theme.display(11)).foregroundStyle(.orange)
             }
-            TabView(selection: $selected) {
+            TabView(selection: selected) {
                 if let model {
-                    ChatOrgMembersTab(model: model, act: act).tabItem { Text("Members") }.tag(AttentionOrganizationSection.members)
-                    ChatOrgTeamsTab(model: model, act: act).tabItem { Text("Teams") }.tag(AttentionOrganizationSection.teams)
+                    ChatOrgMembersTab(model: model, state: state, form: form, act: act).tabItem { Text("Members") }.tag(AttentionOrganizationSection.members)
+                    ChatOrgTeamsTab(model: model, state: state, form: form, act: act).tabItem { Text("Teams") }.tag(AttentionOrganizationSection.teams)
                     if model.actions.contains(.invite) {
-                        ChatOrgInvitationsTab(model: model, act: act).tabItem { Text("Invitations") }.tag(AttentionOrganizationSection.invitations)
+                        ChatOrgInvitationsTab(model: model, state: state, form: form, act: act).tabItem { Text("Invitations") }.tag(AttentionOrganizationSection.invitations)
                     }
                 }
                 // The account's devices, in an organization or not (review C6 p1-9).
                 if let devices {
-                    ChatOrgDevicesTab(model: devices).tabItem { Text("Devices") }.tag(AttentionOrganizationSection.devices)
+                    ChatOrgDevicesTab(model: devices, state: state).tabItem { Text("Devices") }.tag(AttentionOrganizationSection.devices)
                 }
                 if let model, model.actions.contains(.seeAudit) {
                     ChatOrgAuditTab(model: model).tabItem { Text("Security Log") }.tag(AttentionOrganizationSection.audit)
@@ -225,20 +126,13 @@ private struct ChatOrgWindowContent: View {
                 }
                 Button("Dismiss") { model.dismissRefusals(Set(model.refused.map(\.id))) }
             }
-            if let answer { Text(answer).font(Theme.display(11)).foregroundStyle(.orange) }
+            if let answer = form.error { Text(answer).font(Theme.display(11)).foregroundStyle(.orange) }
             if let problem = model?.problem { Text(problem).font(Theme.display(11)).foregroundStyle(.orange) }
         }
         .padding(12)
-        .attentionPlace(ChatService.shared.connection?.orgKey.map { [.organization($0.orgId, section: selected)] } ?? [])
-        .onChange(of: AttentionSelection.shared.revision, initial: true) { _, _ in
-            if model == nil { selected = .devices }
-            guard case .organization(let org, let section?) = AttentionSelection.shared.destination,
-                  ChatService.shared.connection?.orgKey?.orgId == org else { return }
-            if section == .invitations && model?.actions.contains(.invite) != true { return }
-            if section == .audit && model?.actions.contains(.seeAudit) != true { return }
-            if section == .devices && devices == nil { return }
-            if section != .devices && model == nil { return }
-            selected = section
+        .attentionPlace(ChatService.shared.connection?.orgKey.map { [.organization($0.orgId, section: selected.wrappedValue)] } ?? [])
+        .onChange(of: sections, initial: true) { _, sections in
+            if !sections.contains(selected.wrappedValue), let first = sections.first { selected.wrappedValue = first }
         }
     }
 
@@ -247,9 +141,9 @@ private struct ChatOrgWindowContent: View {
         Task {
             do {
                 try await change()
-                answer = nil
+                form.error = nil
             } catch {
-                answer = error.localizedDescription
+                form.error = error.localizedDescription
             }
         }
     }
@@ -259,18 +153,19 @@ typealias ChatOrgAct = (@escaping @MainActor () async throws -> Void) -> Void
 
 private struct ChatOrgMembersTab: View {
     let model: ChatOrgModel
+    let state: TabState
+    @Bindable var form: OrganizationFormState
     let act: ChatOrgAct
-    @State private var name = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                TextField("Your name", text: $name)
+                TextField("Your name", text: $form.fields.name)
                 Button("Change Name") {
-                    let text = name
+                    let text = form.fields.name
                     act { try model.setName(text) }
                 }
-                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || !model.actions.contains(.setOwnName))
+                .disabled(form.fields.name.trimmingCharacters(in: .whitespaces).isEmpty || !model.actions.contains(.setOwnName))
             }
             List(model.members) { member in
                 HStack {
@@ -283,48 +178,52 @@ private struct ChatOrgMembersTab: View {
                     if !roles.isEmpty {
                         Menu("Role") {
                             ForEach(roles, id: \.self) { role in
-                                Button("Make \(role.capitalized)") { act { try model.setRole(member, to: role) } }
+                                Button("Make \(role.capitalized)") {
+                                    OrganizationTabs.confirm(state, target: member.id, title: "Make \(member.name) \(role)?",
+                                        text: "Their organization permissions will change.", verb: "Change Role",
+                                        valid: { model.member(member.id) == member && model.roles(for: member).contains(role) }) {
+                                            try model.setRole(member, to: role)
+                                        }
+                                }
                             }
                         }
                         .fixedSize()
                     }
                     if model.canRemove(member) {
                         Button("Remove…") {
-                            act {
-                                guard await ChatOrgWindow.confirm("Remove \(member.name) from the organization?",
-                                                                  "Their devices lose access to the organization; they leave every team.",
-                                                                  "Remove", while: { model.member(member.accountId).map(model.canRemove) ?? false })
-                                else { return }
-                                try model.remove(member)
-                            }
+                            OrganizationTabs.confirm(state, target: member.id, title: "Remove \(member.name) from the organization?",
+                                text: "Their devices lose access to the organization; they leave every team.", verb: "Remove", destructive: true,
+                                valid: { model.member(member.id) == member && model.canRemove(member) }) { try model.remove(member) }
                         }
                     }
                 }
             }
         }
         .padding(8)
-        .onAppear { name = model.member(model.me)?.name ?? "" }
+
     }
 }
 
 private struct ChatOrgTeamsTab: View {
     let model: ChatOrgModel
+    let state: TabState
+    @Bindable var form: OrganizationFormState
     let act: ChatOrgAct
-    @State private var newTeam = ""
+    @FocusState private var renameFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if model.actions.contains(.createTeam) {
                 HStack {
-                    TextField("New team name", text: $newTeam)
+                    TextField("New team name", text: $form.fields.newTeam)
                     Button("Create Team") {
-                        let text = newTeam
+                        let text = form.fields.newTeam
                         act {
                             try model.createTeam(text)
-                            newTeam = ""
+                            form.fields.newTeam = ""
                         }
                     }
-                    .disabled(newTeam.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(form.fields.newTeam.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
             List(model.teams) { team in
@@ -337,47 +236,41 @@ private struct ChatOrgTeamsTab: View {
     private func teamRow(_ team: ChatOrgView.Team) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(team.name).font(.headline)
+                if form.fields.renameTeamID == team.id {
+                    VStack(alignment: .leading) {
+                        TextField("Team name", text: $form.fields.renameText)
+                            .focused($renameFocused).accessibilityIdentifier("rename-team-" + team.id)
+                            .onSubmit { form.rename(team, model: model) }
+                            .onExitCommand { form.fields.renameTeamID = nil; form.renameError = nil }
+                            .onAppear { renameFocused = true }
+                        if let error = form.renameError { Text(error).font(.caption).foregroundStyle(.red) }
+                    }
+                } else { Text(team.name).font(.headline) }
                 if team.archived { Text("archived").font(.caption).foregroundStyle(.secondary) }
                 if team.mine { Text("you are in it").font(.caption).foregroundStyle(.secondary) }
                 Spacer()
                 if model.canChange(team) {
                     Button("Rename…") {
-                        act {
-                            guard let name = await ChatOrgWindow.ask("Rename \(team.name)", "", "Rename", field: team.name,
-                                                                     while: { current(team).map(model.canChange) ?? false })
-                            else { return }
-                            try model.renameTeam(team, to: name)
-                        }
+                        form.fields.renameTeamID = team.id; form.fields.renameText = team.name; form.renameError = nil
                     }
                     Button("Archive…") {
-                        act {
-                            guard await ChatOrgWindow.confirm("Archive \(team.name)?", "An archived team cannot be changed.", "Archive",
-                                                              while: { current(team).map(model.canChange) ?? false })
-                            else { return }
-                            try model.archiveTeam(team)
-                        }
+                        OrganizationTabs.confirm(state, target: team.id, title: "Archive \(team.name)?",
+                            text: "An archived team cannot be changed.", verb: "Archive", destructive: true,
+                            valid: { current(team) == team && model.canChange(team) }) { try model.archiveTeam(team) }
                     }
                 }
                 if model.canJoin(team) {
                     Button("Join…") {
-                        act {
-                            guard await ChatOrgWindow.confirm("Join \(team.name)?",
-                                                              "This is written to the security log and seen by the team's members.",
-                                                              "Join", while: { current(team).map(model.canJoin) ?? false })
-                            else { return }
-                            try model.join(team)
-                        }
+                        OrganizationTabs.confirm(state, target: team.id, title: "Join \(team.name)?",
+                            text: "This is written to the security log and seen by the team's members.", verb: "Join",
+                            valid: { current(team) == team && model.canJoin(team) }) { try model.join(team) }
                     }
                 }
                 if model.canLeave(team) {
                     Button("Leave…") {
-                        act {
-                            guard await ChatOrgWindow.confirm("Leave \(team.name)?", "You stop seeing this team.", "Leave",
-                                                              while: { current(team).map(model.canLeave) ?? false })
-                            else { return }
-                            try model.leave(team)
-                        }
+                        OrganizationTabs.confirm(state, target: team.id, title: "Leave \(team.name)?",
+                            text: "You stop seeing this team.", verb: "Leave", destructive: true,
+                            valid: { current(team) == team && model.canLeave(team) }) { try model.leave(team) }
                     }
                 }
             }
@@ -385,7 +278,13 @@ private struct ChatOrgTeamsTab: View {
                 ForEach(team.members, id: \.self) { account in
                     let name = model.member(account)?.name ?? "unknown"
                     if model.canRemoveMember(account, from: team) {
-                        Button("\(name) ✕") { act { try model.removeMember(account, from: team) } }
+                        Button("\(name) ✕") {
+                            OrganizationTabs.confirm(state, target: team.id + ":" + account, title: "Remove \(name) from \(team.name)?",
+                                text: "They lose access to this team.", verb: "Remove", destructive: true,
+                                valid: { current(team) == team && model.canRemoveMember(account, from: team) }) {
+                                    try model.removeMember(account, from: team)
+                                }
+                        }
                             .buttonStyle(.borderless)
                             .help("Remove \(name) from \(team.name)")
                     } else {
@@ -396,7 +295,13 @@ private struct ChatOrgTeamsTab: View {
                 if !others.isEmpty {
                     Menu("Add") {
                         ForEach(others) { member in
-                            Button(member.name) { act { try model.addMember(member.accountId, to: team) } }
+                            Button(member.name) {
+                                OrganizationTabs.confirm(state, target: team.id + ":" + member.id, title: "Add \(member.name) to \(team.name)?",
+                                    text: "They will be able to read the team's channels and call its agents.", verb: "Add",
+                                    valid: { current(team) == team && model.candidates(for: team).contains(member) }) {
+                                        try model.addMember(member.accountId, to: team)
+                                    }
+                            }
                         }
                     }
                     .fixedSize()
@@ -414,47 +319,44 @@ private struct ChatOrgTeamsTab: View {
 
 private struct ChatOrgInvitationsTab: View {
     let model: ChatOrgModel
+    let state: TabState
+    @Bindable var form: OrganizationFormState
     let act: ChatOrgAct
-    @State private var email = ""
-    @State private var role = "member"
-    @State private var teams: Set<String> = []
-    /// Chosen teams that stopped being choosable (archived, gone) were taken
-    /// off the form: said once, so the invitation is not refused unexplained
-    /// (review C6b p2-6).
-    @State private var takenOff = false
 
     private var choosable: [ChatOrgView.Team] { model.invitable }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                TextField("Email", text: $email)
-                Picker("", selection: $role) {
+                TextField("Email", text: $form.fields.email)
+                Picker("", selection: $form.fields.role) {
                     Text("Member").tag("member")
                     Text("Admin").tag("admin")
                 }
                 .labelsHidden()
                 .fixedSize()
                 Button("Invite") {
-                    let (address, chosen, ids) = (email, role, Array(teams))
-                    act {
+                    let (address, chosen, ids) = (form.fields.email, form.fields.role, Array(form.fields.teams))
+                    OrganizationTabs.confirm(state, target: address, title: "Invite \(address)?",
+                        text: "They will join as \(chosen), with access to General and the selected teams.", verb: "Invite",
+                        valid: { model.manages && Set(ids).isSubset(of: Set(model.invitable.map(\.teamId))) }) {
                         try model.invite(email: address, role: chosen, teams: ids)
-                        email = ""
-                        teams = []
-                        takenOff = false
+                        form.fields.email = ""
+                        form.fields.teams = []
                     }
                 }
-                .disabled(!email.contains("@"))
+                 .disabled(!form.fields.email.contains("@"))
             }
-            if takenOff {
-                Text("A chosen team is no longer available and was taken off.").font(.caption).foregroundStyle(.orange)
+            if !form.fields.teams.isSubset(of: Set(choosable.map(\.teamId))) {
+                Text("A chosen team is no longer available. Update the invitation before sending.").font(.caption).foregroundStyle(.orange)
+                Button("Remove unavailable teams") { form.fields.teams.formIntersection(choosable.map(\.teamId)) }
             }
             if !choosable.isEmpty {
                 HStack {
                     Text("Teams:").font(.caption)
                     ForEach(choosable) { team in
-                        Toggle(team.name, isOn: Binding(get: { teams.contains(team.teamId) },
-                                                        set: { if $0 { teams.insert(team.teamId) } else { teams.remove(team.teamId) } }))
+                        Toggle(team.name, isOn: Binding(get: { form.fields.teams.contains(team.teamId) },
+                                                        set: { if $0 { form.fields.teams.insert(team.teamId) } else { form.fields.teams.remove(team.teamId) } }))
                     }
                 }
             }
@@ -465,23 +367,21 @@ private struct ChatOrgInvitationsTab: View {
                         Text("\(invitation.role) · until \(invitation.expiresAt ?? "—")").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Revoke") { act { try model.revoke(invitation) } }
+                    Button("Revoke") {
+                        OrganizationTabs.confirm(state, target: invitation.invitationId, title: "Revoke invitation for \(invitation.email)?",
+                            text: "This invitation can no longer be accepted.", verb: "Revoke", destructive: true,
+                            valid: { model.invitations.contains(invitation) }) { try model.revoke(invitation) }
+                    }
                 }
             }
         }
         .padding(8)
-        .onChange(of: choosable.map(\.teamId)) { _, ids in
-            let kept = teams.intersection(ids)
-            if kept != teams {
-                teams = kept
-                takenOff = true
-            }
-        }
     }
 }
 
-private struct ChatOrgDevicesTab: View {
+struct ChatOrgDevicesTab: View {
     let model: ChatDevicesModel
+    let state: TabState
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -505,21 +405,20 @@ private struct ChatOrgDevicesTab: View {
                         Button("Disconnect…") { Task { await model.close(device) } }
                     } else {
                         Button("Close Session…") {
-                            Task {
-                                guard await ChatOrgWindow.confirm("Close the session of \(device.deviceName)?",
-                                                                  "Closes that device's access to the whole server, every organization on it included.",
-                                                                  "Close Session",
-                                                                  while: { model.isCurrent() && model.devices?.contains { $0.id == device.id } == true })
-                                else { return }
-                                await model.close(device)
-                            }
+                            OrganizationTabs.confirm(state, target: device.id, title: "Close the session of \(device.deviceName)?",
+                                text: "Closes that device's access to the whole server, every organization on it included.",
+                                verb: "Close Session", destructive: true, requiresOrganization: false,
+                                valid: { model.isCurrent() && model.devices?.contains(device) == true }) {
+                                    await model.close(device)
+                                    if let problem = model.problem { throw ChatError.storage(problem) }
+                                }
                         }
                     }
                 }
             }
         }
         .padding(8)
-        .task { await model.load() }
+        .task { if model.devices == nil { await model.load() } }
     }
 }
 
@@ -544,19 +443,6 @@ private struct ChatOrgAuditTab: View {
             }
         }
         .padding(8)
-        .task { await model.loadAudit() }
-    }
-}
-
-/// Problems of a channel action, said without naming anything (the
-/// names are the dialogs', which close with their object).
-@MainActor
-enum ChannelPrompt {
-    static func fail(_ error: Error) { fail(error.localizedDescription) }
-
-    static func fail(_ text: String) {
-        let alert = NSAlert()
-        alert.messageText = text
-        alert.runModal()
+        .task { if model.audit == nil { await model.loadAudit() } }
     }
 }

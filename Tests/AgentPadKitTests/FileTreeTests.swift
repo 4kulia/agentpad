@@ -180,6 +180,61 @@ final class FileTreeModelTests: XCTestCase {
         XCTAssertEqual(model.rows.map(\.depth), [0, 0])
     }
 
+    func testRenameDraftRemainsInHeaderWhenItsDirectoryBecomesRoot() throws {
+        let (root, src, model) = try makeFixture()
+        model.activate(root: root)
+        model.nameEdit.beginRename(src)
+        model.nameEdit.draft?.name = "renamed"
+        XCTAssertNil(model.headerDraft, "the directory row contains the editor")
+
+        model.setRoot(src)
+        XCTAssertFalse(model.rows.contains { $0.id == FileNameEdit.key(src) })
+        XCTAssertEqual(model.headerDraft?.name, "renamed", "the header must expose the editor for Enter/Esc")
+        model.nameEdit.cancel()
+        XCTAssertNil(model.headerDraft)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: src.path))
+
+        model.setRoot(root)
+        model.nameEdit.beginRename(src)
+        model.nameEdit.draft?.name = "renamed"
+        model.setRoot(src)
+        XCTAssertEqual(model.headerDraft, model.nameEdit.draft)
+        model.nameEdit.commit()
+        XCTAssertNil(model.nameEdit.draft)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("renamed").path))
+
+        model.nameEdit.beginNew(in: root)
+        model.setRoot(root)
+        XCTAssertEqual(model.nameEdit.draft?.path, FileNameEdit.key(root))
+        XCTAssertNil(model.headerDraft, "root new-file edits already appear in FileRowFeedback")
+        model.nameEdit.draft?.name = "created.txt"
+        model.nameEdit.commit()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("created.txt").path))
+    }
+
+    func testRenameCollisionAppearsInHeaderDuringSearchEvenForLoadedRow() throws {
+        let (root, _, model) = try makeFixture()
+        let source = root.appendingPathComponent("a.txt"), taken = root.appendingPathComponent("b.txt")
+        try Data("source".utf8).write(to: source)
+        try Data("keep".utf8).write(to: taken)
+        model.activate(root: root)
+        XCTAssertTrue(model.rows.contains { $0.id == FileNameEdit.key(source) })
+        model.searchQuery = "a"
+        model.nameEdit.beginRename(source)
+        model.nameEdit.draft?.name = "b.txt"
+        model.nameEdit.commit()
+
+        XCTAssertNotNil(model.nameEdit.error(for: source))
+        XCTAssertEqual(model.headerErrorPaths, [FileNameEdit.key(source)])
+        XCTAssertEqual(model.headerDraft?.name, "b.txt")
+        XCTAssertEqual(try String(contentsOf: taken, encoding: .utf8), "keep")
+        model.searchQuery = ""
+        XCTAssertTrue(model.headerErrorPaths.isEmpty, "normal tree rows display their own errors")
+        model.searchQuery = "a"
+        model.nameEdit.cancel()
+        XCTAssertTrue(model.headerErrorPaths.isEmpty)
+    }
+
     func testActivateSchedulesRootListingThroughRunner() throws {
         let (root, src, model) = try makeFixture()
         var pending: (() -> Void)?

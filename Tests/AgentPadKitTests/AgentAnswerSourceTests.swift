@@ -28,7 +28,7 @@ final class AgentAnswerSourceTests: XCTestCase {
     private func assertRefused(_ session: Session, _ problem: AgentAnswerTranscript.Problem,
                                inspector: AgentAnswerProvenance.Inspector = .init(),
                                file: StaticString = #filePath, line: UInt = #line) async {
-        XCTAssertFalse(AgentAnswerWindow.available(session), file: file, line: line)
+        XCTAssertFalse(CompositionTabs.available(session), file: file, line: line)
         XCTAssertEqual(AgentAnswerSource.problem(session, inspector: inspector), problem, file: file, line: line)
         do {
             _ = try await AgentAnswerSource.read(session: session, store: store, inspector: inspector) { _, _, _ in

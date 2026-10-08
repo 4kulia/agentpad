@@ -7,7 +7,6 @@ import SwiftUI
 struct ChatAskStrip: View {
     let model: ChatChannelModel
     let agents: [ChatChannelAgent]
-    @State private var asking: ChatChannelAsk.Offer?
 
     private func name(_ agentId: String) -> String {
         agents.first { $0.agentId == agentId }.map { $0.address ?? $0.name } ?? "the agent"
@@ -15,13 +14,14 @@ struct ChatAskStrip: View {
 
     var body: some View {
         let offers = model.offers.filter { offer in agents.contains { $0.agentId == offer.agentId } }
-        if !offers.isEmpty || !model.asks.isEmpty {
+        VStack(alignment: .leading, spacing: 0) {
+        if !offers.isEmpty || !model.asks.isEmpty || model.channelAsk != nil {
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(offers) { offer in
                     HStack {
                         Text("You named \(offer.address).").font(.callout)
                         Spacer()
-                        Button("Ask \(offer.address)…") { asking = offer }
+                        Button("Ask \(offer.address)…") { model.beginAsk(offer) }
                         Button("Dismiss") { model.dismissOffer(offer) }.buttonStyle(.link)
                     }
                 }
@@ -32,8 +32,8 @@ struct ChatAskStrip: View {
                             Spacer()
                             if let root = asked.root, agents.contains(where: { $0.agentId == asked.agentId }) {
                                 Button("Ask Again…") {
-                                    asking = .init(messageId: asked.source ?? root, agentId: asked.agentId, address: name(asked.agentId),
-                                                   text: asked.source.flatMap(model.message)?.text ?? asked.text, root: root, ux1: asked.source != nil)
+                                    model.beginAsk(.init(messageId: asked.source ?? root, agentId: asked.agentId, address: name(asked.agentId),
+                                                   text: asked.source.flatMap(model.message)?.text ?? asked.text, root: root, ux1: asked.source != nil))
                                 }
                             }
                             Button("Dismiss") { model.dismissAsk(asked) }.buttonStyle(.link)
@@ -45,77 +45,50 @@ struct ChatAskStrip: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .sheet(item: $asking) { offer in
-                ChatAskSheet(model: model, offer: offer, agents: agents) { asking = nil }
+            if let form = model.channelAsk, !form.alreadySent {
+                if form.expanded { ChatAskInline(form: form, agents: agents) }
+                else { Button("Edit saved channel question") { form.expanded = true } }
             }
         }
+        }.task { model.restoreAsk() }
     }
 }
 
-/// "Ask <agent>": the request's text, and the messages given as context —
-/// the thread's root first; what the limits cut shows before it is sent.
-struct ChatAskSheet: View {
-    let model: ChatChannelModel
-    let offer: ChatChannelAsk.Offer
+/// The channel owns this draft and context independently of SwiftUI mounts.
+struct ChatAskInline: View {
+    @Bindable var form: ChannelAskModel
     let agents: [ChatChannelAgent]
-    let close: () -> Void
-    @State private var text = ""
-    @State private var candidates: [ChatMessage] = []
-    @State private var chosen: Set<String> = []
-    @State private var problem: String?
-
-    private var fit: (taken: [ChatMessage], cut: [ChatMessage]) {
-        ChatChannelAsk.fit(candidates.filter { chosen.contains($0.messageId) }, root: offer.root)
-    }
-
     var body: some View {
-        let fit = fit
+        let fit = form.fit
         let cut = Set(fit.cut.map(\.messageId))
         VStack(alignment: .leading, spacing: 10) {
-            Text("Ask \(offer.address)").font(.headline)
-            Text(offer.ux1 ? "Review the current question and context. Your own agent on this Mac or a trusted agent runs and publishes automatically. Other calls wait for the owner."
-                 : "The agent's owner decides on their Mac whether it runs, and whether its answer is published here.")
-                .foregroundStyle(.secondary).font(.callout)
-            TextEditor(text: $text)
-                .font(.body)
-                .frame(minHeight: 60, maxHeight: 120)
-                .disabled(offer.ux1)
-            Text("Context: \(fit.taken.count) of at most \(ChatChannelAsk.maxContext) messages, "
-                 + "\(fit.taken.reduce(0) { $0 + $1.text.utf8.count } / 1024) of \(ChatChannelAsk.maxContextBytes / 1024) KiB")
-                .font(.caption).foregroundStyle(.secondary)
-            List(candidates) { m in
-                Toggle(isOn: Binding(get: { chosen.contains(m.messageId) },
-                                     set: { if $0 { chosen.insert(m.messageId) } else { chosen.remove(m.messageId) } })) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(m.text).lineLimit(2)
-                        if cut.contains(m.messageId) { Text("does not fit: left out").font(.caption).foregroundStyle(.orange) }
+            if form.replacement.context?.targetID.hasPrefix("channel-ask:") == true {
+                InlineConfirmation(coordinator: form.replacement)
+            }
+            Text("Ask \(form.fields.offer.address)").font(.headline)
+            Text("This question and the selected context go to the agent. The answer is shared with this channel.").font(.callout).foregroundStyle(.secondary)
+            TextEditor(text: $form.fields.text).frame(minHeight: 70, maxHeight: 120)
+                .disabled(form.fields.offer.ux1).accessibilityLabel("Channel question")
+            Text("Context: \(fit.taken.count) / \(ChatChannelAsk.maxContext) messages").font(.caption)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(form.candidates) { message in
+                        Toggle(isOn: Binding(get: { form.fields.chosen.contains(message.id) }, set: { on in
+                            if on { form.fields.chosen.insert(message.id) } else { form.fields.chosen.remove(message.id) }
+                        })) {
+                            Text(message.text).lineLimit(2)
+                            if cut.contains(message.id) { Text("Does not fit: left out").font(.caption).foregroundStyle(.orange) }
+                        }.disabled(form.fields.offer.ux1 && [form.fields.offer.root, form.fields.offer.messageId].contains(message.id))
                     }
                 }
-                .disabled(offer.ux1 && (m.messageId == offer.root || m.messageId == offer.messageId))
-            }
-            .frame(minHeight: 160)
-            if let problem { Text(problem).foregroundStyle(.red).font(.caption) }
+            }.frame(maxHeight: 180)
+            if let problem = form.problem { Text(problem).foregroundStyle(.red) }
             HStack {
-                Spacer()
-                Button("Cancel") { close() }.keyboardShortcut(.cancelAction)
-                Button("Ask") {
-                    // Read again: the root may be the server's only now, and each revision is the current one.
-                    if !offer.ux1 { candidates = model.contextCandidates(root: offer.root) }
-                    problem = model.ask(offer, text: text, context: candidates.filter { chosen.contains($0.messageId) }, agents: agents)
-                    if problem == nil { close() }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(ChatChannelAsk.textProblem(text) != nil)
+                Button("Keep draft") { form.expanded = false }
+                Button("Ask") { form.send(agents: agents) }
+                    .disabled(form.alreadySent || ChatChannelAsk.textProblem(form.fields.text) != nil || !agents.contains { $0.agentId == form.fields.offer.agentId })
             }
-        }
-        .padding(16)
-        .frame(width: 480)
-        .onAppear {
-            text = offer.text
-            candidates = model.contextCandidates(root: offer.root)
-            chosen = offer.ux1 ? [offer.root, offer.messageId] : [offer.root]
-        }
-        // The agent gone from the channel: the sheet closes, keeping nothing.
-        .onChange(of: agents.contains { $0.agentId == offer.agentId }) { _, there in if !there { close() } }
+        }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
+            .onExitCommand { form.expanded = false }
     }
 }

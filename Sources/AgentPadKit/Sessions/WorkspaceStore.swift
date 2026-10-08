@@ -349,26 +349,17 @@ final class WorkspaceStore {
         scheduleSave()
     }
 
-    /// Open the rename popover on the active tab (⌘R). Sets a runtime flag the
-    /// active `TabBarItem` observes; the active tab is always present in its
-    /// pane's tab bar, so the popover can anchor.
     func requestRenameActiveTab() {
-        active?.activeSession?.renameRequested = true
+        guard let session = active?.activeSession, session.hasProcess else { return }
+        session.nameEdit.begin(session.customTitle ?? session.title)
     }
 
-    /// Open the rename popover on the active workspace's sidebar row (⌘⇧R).
-    /// Parks the request for `SidebarView` to handle — the active row may be
-    /// unmounted (collapsed worktree parent, or scrolled out of the
-    /// `LazyVStack`), so the sidebar expands/scrolls it into view before
-    /// handing off to the row via `Workspace.renameRequested`. Reveal a hidden
-    /// sidebar first so `SidebarView` exists to observe the parked request.
+    var workspaceRenameInHeader: Bool { sidebarMode != .full || sidebarContent != .workspaces }
+
     func requestRenameActiveWorkspace() {
-        if sidebarMode == .hidden { setSidebarMode(.full) }
-        // The rename popover anchors to a workspace row — flip the sidebar
-        // back to the list, or the parked request sits unconsumed in files
-        // mode and fires stale on the next toggle.
-        if sidebarContent != .workspaces { setSidebarContent(.workspaces) }
-        pendingRenameWorkspace = active
+        guard let workspace = active else { return }
+        workspace.nameEdit.begin(workspace.customTitle ?? workspace.title)
+        if !workspaceRenameInHeader { pendingRenameWorkspace = workspace }
     }
 
     /// Diff pill popover's "Show in File Tree": switch the sidebar to files
@@ -421,6 +412,10 @@ final class WorkspaceStore {
     /// default a test construction silently inherits; `AppDelegate.addWindow`
     /// wires the real `RecentFolders` sink.
     private let noteRecentFolder: @MainActor (URL) -> Void
+    let windowID: UUID
+    let drafts: DraftRepository
+    let tabCloseCoordinator: TabCloseCoordinator
+    private(set) var persistenceError: String?
     private let persistence: any Persistence
     private let gitStatusFetcher = GitStatusFetcher()
     /// One watcher per session — refreshes git status when `.git/HEAD` or
@@ -484,6 +479,8 @@ final class WorkspaceStore {
         // AgentPad: a closed channel tab comes back a channel tab; no title kept.
         var channel: ChannelRef? = nil
         var inbox: ChatInboxRef? = nil
+        var tool: ToolRoute? = nil
+        var navigation: TabNavigation? = nil
     }
 
     /// LIFO stack of recently-closed tabs for ⌘⇧T (reopen). Capped at
@@ -513,6 +510,7 @@ final class WorkspaceStore {
     func setOnScreen(_ onScreen: Bool) {
         guard onScreen != isOnScreen, !isTerminated else { return }
         isOnScreen = onScreen
+        if !onScreen { invalidateTabConfirmations() }
         let sessions = workspaces.flatMap { $0.root.allPanes }.flatMap(\.tabs)
         for session in sessions { session.engine.setOnScreen(onScreen) }
         if onScreen {
@@ -532,6 +530,8 @@ final class WorkspaceStore {
 
     init(
         persistence: any Persistence,
+        initiallyEmpty: Bool = false,
+        drafts: DraftRepository? = nil,
         engineFactory: @escaping @MainActor () -> any TerminalEngine = { LibghosttyEngine() },
         optionsProvider: @escaping @MainActor (String) -> String? = { AgentPadSettingsModel.shared.agentOptions[$0] },
         resumeProvider: @escaping @MainActor () -> Bool = { AgentPadSettingsModel.shared.resumeConversations },
@@ -543,6 +543,10 @@ final class WorkspaceStore {
         claudeProjectsRoot: URL = TeamSessionFiles.root
     ) {
         self.persistence = persistence
+        self.windowID = (persistence as? WindowPersistence)?.windowId ?? UUID()
+        let repository = drafts ?? (persistence as? WindowPersistence)?.app.drafts ?? DraftRepository()
+        self.drafts = repository
+        self.tabCloseCoordinator = TabCloseCoordinator(drafts: repository)
         self.engineFactory = engineFactory
         self.optionsProvider = optionsProvider
         self.resumeProvider = resumeProvider
@@ -554,9 +558,80 @@ final class WorkspaceStore {
         self.claudeProjectsRoot = claudeProjectsRoot
         if let saved = persistence.load(), !saved.workspaces.isEmpty {
             restore(from: saved)
+        } else if initiallyEmpty {
+            addEmptyWorkspace()
         } else {
             addWorkspace()
         }
+    }
+
+    @discardableResult
+    func addEmptyWorkspace() -> Workspace {
+        invalidateTabConfirmations()
+        let workspace = Workspace(workingDirectory: URL(fileURLWithPath: homeDirectoryPath), root: PaneNode(pane: Pane()))
+        workspaces.append(workspace); activeWorkspaceId = workspace.id
+        scheduleSave()
+        return workspace
+    }
+
+    var allSessions: [Session] { workspaces.flatMap { $0.root.allPanes.flatMap(\.tabs) } }
+    func invalidateTabConfirmations() {
+        for session in allSessions {
+            session.terminalConfirmation.invalidate()
+            session.tabState?.confirmation.invalidate()
+            session.tabState?.fileOperation?.stopIfWaiting()
+            (session.engine as? ChannelTabEngine)?.conversation.confirmation.invalidate()
+        }
+    }
+
+    @discardableResult
+    func openToolTab(_ route: ToolRoute, navigation: TabNavigation = TabNavigation()) -> Session {
+        // Reopen/duplicate enter here without the router. Connection still
+        // has one login flow across every window, including hidden windows.
+        let owners = route == .connection ? [self] + peerStores().filter { $0 !== self } : [self]
+        for owner in owners where !owner.isTerminated {
+            if let existing = owner.allSessions.first(where: { $0.toolRoute?.key(windowID: owner.windowID) == route.key(windowID: windowID) }),
+               let location = owner.location(ofSessionId: existing.id) {
+                location.workspace.zoomedPaneId = nil
+                owner.activateWorkspace(location.workspace); owner.activateTab(existing, in: location.workspace)
+                if owner !== self { TabRouter.shared.revealWindow(owner) }
+                return existing
+            }
+        }
+        let workspace = active ?? addEmptyWorkspace()
+        let pane = workspace.activePane ?? workspace.root.firstPane!
+        let session = makeToolSession(route, navigation: navigation, cwd: workspace.workingDirectory)
+        attachSession(session, to: pane, at: pane.tabs.count, in: workspace)
+        return session
+    }
+
+    /// A successful create-channel keeps the tab instance and replaces only
+    /// its native content. The old state's late callbacks are now invalid.
+    func replaceToolWithChannel(_ session: Session, ref: ChannelRef) {
+        guard session.toolRoute != nil, location(ofSessionId: session.id) != nil else { return }
+        session.engine.view.removeFromSuperview()
+        session.engine.terminate()
+        session.engine = ChannelTabEngine(ref: ref)
+        session.content = .channel(ref)
+        holdChannelClose(session)
+        scheduleSave()
+    }
+
+    private func makeToolSession(_ route: ToolRoute, id: UUID = UUID(), navigation: TabNavigation = TabNavigation(), cwd: URL) -> Session {
+        var navigation = navigation
+        let recovered = navigation.draftID.flatMap(drafts.draft) ?? drafts.drafts
+            .filter { $0.route.key(windowID: windowID) == route.key(windowID: windowID) }
+            .max { $0.revision < $1.revision }
+        if let recovered { navigation.draftID = recovered.id }
+        let state = TabState(route: route, navigation: navigation)
+        state.draft = recovered
+        if case .unavailable = route { state.message = "This saved tab is damaged or belongs to a newer version. Other tabs are still available." }
+        if navigation.draftID != nil, recovered == nil { state.saveError = "The saved draft could not be loaded." }
+        let engine = NativeTabEngine(state: state, tabID: id)
+        let session = Session(id: id, engine: engine, currentDirectory: cwd, agent: .terminal)
+        session.content = .tool(route)
+        holdChannelClose(session)
+        return session
     }
 
     // MARK: - Workspaces
@@ -631,6 +706,7 @@ final class WorkspaceStore {
             workspaces.append(workspace)
         }
         if activate {
+            invalidateTabConfirmations()
             activeWorkspaceId = workspace.id
         }
         // Remember the project folder for Open Recent / ⌘P (issue #28) —
@@ -651,107 +727,19 @@ final class WorkspaceStore {
         return workspace
     }
 
-    /// Creates a git worktree of `source` and adds the resulting directory
-    /// as a child workspace under it. `git worktree add` runs on a detached
-    /// task so the SwiftUI sheet stays responsive; on failure the stderr
-    /// goes back via the outcome so the sheet shows it inline.
-    func createWorktree(
-        source: Workspace,
-        request: CreateWorktreeSheet.Request
-    ) async -> CreateWorktreeSheet.CreateOutcome {
-        switch request.kind {
-        case .create(let mode, let path, let branchForDisplay):
-            // repoRoot runs inside the detached task too — it is a git
-            // subprocess with a 2s timeout, and on the main actor it froze
-            // the UI for that long on slow/network filesystems.
-            let sourceDir = source.workingDirectory
-            let failureMessage: String? = await Task.detached(priority: .userInitiated) {
-                guard let repoPath = WorktreeManager.repoRoot(near: sourceDir) else {
-                    return "not inside a git repository"
-                }
-                if case .failure(let err) = WorktreeManager.add(repoPath: repoPath, path: path, mode: mode) {
-                    return err.description
-                }
-                return nil
-            }.value
-            if let failureMessage {
-                return .failure(failureMessage)
-            }
-            addWorkspace(
-                workingDirectory: path,
-                worktreeParent: source,
-                worktreeBranch: branchForDisplay,
-                template: request.template
-            )
-            return .success
-        case .adopt(let worktrees):
-            // Pure sidebar materialization — no git command, the
-            // directories already exist on disk. One workspace per
-            // picked worktree, inserted after the source in array
-            // order so sidebar grouping stays correct.
-            for info in worktrees {
-                addWorkspace(
-                    workingDirectory: info.path,
-                    worktreeParent: source,
-                    worktreeBranch: info.branch,
-                    template: request.template
-                )
-            }
-            return .success
-        }
+    func requestCreateSSHWorkspace(tabs: LocalFormTabs = .shared) {
+        tabs.newSSH(from: self)
     }
 
-    /// Worktree workspaces close through this request first so the
-    /// sidebar can pop the brutalist confirm sheet before anything
-    /// destructive runs. Plain workspaces skip the prompt and go
-    /// straight to `closeWorkspace`. Set non-nil to mean "user asked to
-    /// close this worktree, sidebar please ask them about the dir";
-    /// cleared by the sheet on dismiss / confirm.
-    var pendingRemovalRequest: Workspace?
-
-    /// Cross-view create request. Sidebar rows open the sheet directly, but
-    /// global entry points such as the command palette need to ask the
-    /// sidebar to host the sheet, especially when the sidebar was hidden and
-    /// has to be shown first.
-    var pendingCreateWorktreeRequest: Workspace?
-
-    /// Cross-view SSH-workspace create request — File menu and command
-    /// palette park it here for `SidebarView` to open the destination sheet
-    /// (same seam as `pendingCreateWorktreeRequest`; Bool because the sheet
-    /// needs no payload).
-    var pendingCreateSSHWorkspaceRequest = false
-
-    /// Park the SSH-workspace create request and reveal a hidden sidebar so
-    /// `SidebarView` exists to consume it (mirrors
-    /// `requestRenameActiveWorkspace`). Callers that want the reveal animated
-    /// wrap the call in `withAnimation` — the store stays SwiftUI-free.
-    func requestCreateSSHWorkspace() {
-        pendingCreateSSHWorkspaceRequest = true
-        if sidebarMode == .hidden {
-            setSidebarMode(.full)
-        }
+    func requestCreateWorktree(_ source: Workspace, tabs: LocalFormTabs = .shared) {
+        tabs.newWorktree(source: source, from: self)
     }
 
-    /// ⌘W-on-a-sheet request, parked for `SidebarView` to cancel whichever
-    /// of its sheets is up (the sheet's `@State` lives in the view, so the
-    /// store can only signal). Identity-keyed so repeat requests re-fire.
-    /// Runtime-only.
-    var sheetDismissRequest: UUID?
-
-    func requestDismissActiveSheet() {
-        sheetDismissRequest = UUID()
-    }
-
-    /// ⌘⇧R rename request, parked for `SidebarView` to act on. The active
-    /// workspace's row may be unmounted — nested under a collapsed worktree
-    /// parent, or scrolled out of the sidebar's `LazyVStack` — so the sidebar
-    /// (not the store) has to expand/scroll it into view before the row's
-    /// rename popover can anchor. Identity-keyed; cleared by the sidebar once
-    /// handled.
+    /// Scroll a full sidebar to the inline editor when its row is virtualized.
     var pendingRenameWorkspace: Workspace?
 
     /// Payload for the "close source workspace, take its worktrees with
-    /// it" confirm sheet. A source can't simply close on its own — its
+    /// it" close review. A source can't simply close on its own — its
     /// worktrees would either show as orphan rows (the sidebar fallback)
     /// or vanish silently. Either way the user's mental model breaks.
     struct CloseSourceRequest {
@@ -759,17 +747,12 @@ final class WorkspaceStore {
         let worktrees: [Workspace]
     }
 
-    /// Set when a top-level workspace with worktrees is being closed and
-    /// the sidebar should pop the bulk confirm sheet. Plain top-level
-    /// workspaces (no worktrees) close inline and never park here.
-    var pendingCloseSourceRequest: CloseSourceRequest?
-
     /// UI-level close request. Callers from the sidebar (× button, right-
     /// click menu) and the ⌘⇧W menu item both funnel here so the
     /// confirm prompt only lives in one place.
     func requestCloseWorkspace(_ workspace: Workspace) {
         if workspace.worktreeParentId != nil {
-            pendingRemovalRequest = workspace
+            ProcessTabs.shared.close([workspace], from: self, details: true)
             return
         }
         let worktrees = workspaces.filter { $0.worktreeParentId == workspace.id }
@@ -777,27 +760,18 @@ final class WorkspaceStore {
             closeWorkspace(workspace)
             return
         }
-        pendingCloseSourceRequest = CloseSourceRequest(source: workspace, worktrees: worktrees)
+        ProcessTabs.shared.close(worktrees + [workspace], from: self)
     }
 
-    /// Performs the deferred source-with-worktrees close from the sheet.
+    /// Closes a fixed source/worktree set through the same batch service.
     /// `alsoDelete = true` runs `git worktree remove --force` + branch-d
     /// for each child before closing the source (the v0.18.x default
-    /// behaviour, now opt-in via the sheet's checkbox). First failing
-    /// git remove aborts and surfaces stderr. `alsoDelete = false` just
+    /// behaviour, now opt-in). A failed row stays open for review. `alsoDelete = false` just
     /// drops the workspaces from the sidebar — disk untouched.
     func performCloseSource(_ request: CloseSourceRequest, alsoDelete: Bool) async -> String? {
-        if alsoDelete {
-            for worktree in request.worktrees {
-                if let message = await removeWorktreeDirectory(worktree) {
-                    return message
-                }
-            }
-        }
-        for worktree in request.worktrees { closeWorkspace(worktree) }
-        closeWorkspace(request.source)
-        pendingCloseSourceRequest = nil
-        return nil
+        let batch = CloseWorkspaceBatch(targets: request.worktrees + [request.source], store: self)
+        batch.alsoDelete = alsoDelete
+        return await batch.execute()
     }
 
     /// Zombie-clean sidebar worktree workspaces against `git worktree list`.
@@ -885,10 +859,10 @@ final class WorkspaceStore {
 
     /// Runs `git worktree remove --force <path>` on a detached task. The
     /// caller closes the workspace separately — this method only touches
-    /// disk. `--force` because the close-confirm sheet already gathered
+    /// disk. `--force` because the close review already gathered
     /// the user's intent; refusing on dirty state here would just bounce
     /// them back to terminal commands. Returns nil on success, otherwise
-    /// the error message to surface inline in the sheet.
+    /// the error message to surface in the close review.
     func removeWorktreeDirectory(_ workspace: Workspace) async -> String? {
         guard workspace.worktreeParentId != nil else {
             return "workspace is not a worktree"
@@ -960,6 +934,7 @@ final class WorkspaceStore {
     }
 
     func closeWorkspace(_ workspace: Workspace) {
+        guard tabCloseCoordinator.prepare(workspace.root.allPanes.flatMap(\.tabs)) else { return }
         for pane in workspace.root.allPanes {
             for tab in pane.tabs {
                 teardownSessionMonitors(tab)
@@ -979,6 +954,7 @@ final class WorkspaceStore {
 
     func activateWorkspace(_ workspace: Workspace) {
         guard activeWorkspaceId != workspace.id else { return }
+        invalidateTabConfirmations()
         fileTreeRootOverride = nil
         activeWorkspaceId = workspace.id
         scheduleSave()
@@ -1047,12 +1023,6 @@ final class WorkspaceStore {
         }
     }
 
-    /// Set when `closeOtherWorkspaces` detects a worktree among the
-    /// workspaces about to close; sidebar's onChange listener pops the
-    /// summary sheet from here. Plain bulk closes skip this and run
-    /// inline.
-    var pendingCloseOthersRequest: BulkRemovalRequest?
-
     func closeOtherWorkspaces(keeping workspace: Workspace) {
         // Keep the workspace's worktree family intact so we never strand
         // a worktree without its source (and vice versa):
@@ -1068,29 +1038,22 @@ final class WorkspaceStore {
         }
         let others = workspaces.filter { !keepIds.contains($0.id) }
         if others.contains(where: { $0.worktreeParentId != nil }) {
-            pendingCloseOthersRequest = BulkRemovalRequest(keeping: workspace, others: others)
+            ProcessTabs.shared.close(others, from: self)
             return
         }
         for ws in others { closeWorkspace(ws) }
     }
 
-    /// Performs the deferred bulk close from the confirm sheet.
+    /// Executes the fixed bulk-close targets through the batch service.
     /// `alsoDelete = true` runs `git worktree remove --force` + branch-d
     /// on each worktree in the others list before closing; `alsoDelete
     /// = false` just drops them from the sidebar with disk untouched
     /// (v0.19.0 default — destructive removal is the checkbox path).
-    /// First failing git remove aborts.
+    /// Failed rows remain open; successful rows close.
     func performCloseOthers(_ request: BulkRemovalRequest, alsoDelete: Bool) async -> String? {
-        if alsoDelete {
-            for worktree in request.worktreeOthers {
-                if let message = await removeWorktreeDirectory(worktree) {
-                    return message
-                }
-            }
-        }
-        for ws in request.others { closeWorkspace(ws) }
-        pendingCloseOthersRequest = nil
-        return nil
+        let batch = CloseWorkspaceBatch(targets: request.others, store: self)
+        batch.alsoDelete = alsoDelete
+        return await batch.execute()
     }
 
     // MARK: - Tabs
@@ -1154,6 +1117,7 @@ final class WorkspaceStore {
         // file-tree override invalidation is identity-coupled, so it stays
         // inside the gate too (nothing active changed).
         if activate {
+            invalidateTabConfirmations()
             target.activeTabId = session.id
             if workspace.activePaneId != target.id {
                 workspace.activePaneId = target.id
@@ -1166,6 +1130,7 @@ final class WorkspaceStore {
 
     @discardableResult
     func duplicateTab(_ session: Session, in workspace: Workspace) -> Session? {
+        if let route = session.toolRoute { return openToolTab(route) }
         guard let pane = pane(containing: session, in: workspace) else { return nil }
         // AgentPad: duplicating a channel tab opens the same channel.
         if let channel = session.channel { return openChannelTab(channel, in: workspace, pane: pane) }
@@ -1403,7 +1368,7 @@ final class WorkspaceStore {
     /// the override so the title resumes tracking the working directory.
     func renameTab(_ session: Session, to newTitle: String) {
         // AgentPad: a chat tab takes its destination’s name (DESIGN-F2).
-        guard !session.isChat else { return }
+        guard session.hasProcess else { return }
         let next = normalizedTitle(newTitle)
         guard session.customTitle != next else { return }
         session.customTitle = next
@@ -1415,6 +1380,8 @@ final class WorkspaceStore {
               (0..<pane.tabs.count).contains(sourceIndex),
               (0..<pane.tabs.count).contains(destIndex) else { return }
         let tab = pane.tabs.remove(at: sourceIndex)
+        tab.terminalConfirmation.invalidate()
+        tab.tabState?.leave(moving: true)
         pane.tabs.insert(tab, at: destIndex)
         scheduleSave()
     }
@@ -1437,6 +1404,9 @@ final class WorkspaceStore {
     /// this serves both `closeTab` (which terminates first) and a tab move
     /// (which re-homes the live session elsewhere).
     private func detachSession(_ session: Session, from pane: Pane, at idx: Int, in workspace: Workspace, keepingEmptyPane: Bool = false) {
+        session.terminalConfirmation.invalidate()
+        session.tabState?.leave(moving: true)
+        (session.engine as? ChannelTabEngine)?.conversation.confirmation.invalidate()
         pane.tabs.remove(at: idx)
         if pane.tabs.isEmpty {
             pane.activeTabId = nil
@@ -1447,7 +1417,7 @@ final class WorkspaceStore {
         } else if pane.activeTabId == session.id {
             let next = pane.tabs[min(idx, pane.tabs.count - 1)]
             pane.activeTabId = next.id
-            if workspace.activePane?.id == pane.id, workspace.workingDirectory != next.currentDirectory {
+            if next.hasProcess, workspace.activePane?.id == pane.id, workspace.workingDirectory != next.currentDirectory {
                 workspace.workingDirectory = next.currentDirectory
             }
         }
@@ -1458,6 +1428,7 @@ final class WorkspaceStore {
     /// Inserts an existing `session` into `destPane` at `destIndex` and
     /// promotes it to the active tab + active pane.
     private func attachSession(_ session: Session, to destPane: Pane, at destIndex: Int, in workspace: Workspace) {
+        invalidateTabConfirmations()
         let insertIndex = min(max(destIndex, 0), destPane.tabs.count)
         destPane.tabs.insert(session, at: insertIndex)
         // AgentPad: a channel tab's Close now goes to this store.
@@ -1468,7 +1439,7 @@ final class WorkspaceStore {
         // Promoting to active mirrors `activateTab` so the sidebar title and
         // the next tab's spawn cwd follow the new focus without waiting for
         // the next OSC 7.
-        if workspace.workingDirectory != session.currentDirectory {
+        if session.hasProcess, workspace.workingDirectory != session.currentDirectory {
             workspace.workingDirectory = session.currentDirectory
         }
         invalidateStaleFileTreeRootOverride()
@@ -1513,11 +1484,46 @@ final class WorkspaceStore {
         // store that owns it, slot it in here, and re-point its engine
         // callbacks at this store so focus / title / activity events follow.
         for source in peerStores() where source !== self {
-            if let session = source.surrenderSession(id: droppedId) {
-                attachSession(session, to: destPane, at: destIndex, in: workspace)
-                configureSession(session, in: workspace, codexRolloutId: session.conversationId)
-                return true
+            guard let original = source.location(ofSessionId: droppedId),
+                  let index = original.pane.tabs.firstIndex(where: { $0.id == droppedId }) else { continue }
+            let candidate = original.pane.tabs[index]
+            if let route = candidate.toolRoute, let existing = allSessions.first(where: {
+                $0.toolRoute?.key(windowID: windowID) == route.key(windowID: windowID)
+            }), let target = location(ofSessionId: existing.id) {
+                activateWorkspace(target.workspace); activateTab(existing, in: target.workspace)
+                return false // Window singleton collision: keep the source edit intact.
             }
+            guard source.tabCloseCoordinator.prepare([candidate], moving: true) else { return false }
+            let sourceActive = original.pane.activeTabId
+            let sourcePaneID = original.workspace.activePaneId
+            let destinationActive = destPane.activeTabId
+            let destinationPaneID = workspace.activePaneId
+            let destinationCwd = workspace.workingDirectory
+            let destinationZoom = workspace.zoomedPaneId
+            guard let session = source.surrenderSession(id: droppedId) else { return false }
+            attachSession(session, to: destPane, at: destIndex, in: workspace)
+            configureSession(session, in: workspace, codexRolloutId: session.conversationId)
+            if let left = source.persistence as? WindowPersistence,
+               let right = persistence as? WindowPersistence, left.app === right.app {
+                do {
+                    try left.app.setWindows([
+                        PersistedWindow(id: left.windowId, state: source.snapshot(), frame: left.frameProvider?()),
+                        PersistedWindow(id: right.windowId, state: snapshot(), frame: right.frameProvider?())
+                    ]).get()
+                } catch {
+                    // Roll back structure and callbacks; the same live editor survives.
+                    destPane.tabs.removeAll { $0 === session }
+                    source.attachSession(session, to: original.pane, at: index, in: original.workspace)
+                    source.configureSession(session, in: original.workspace, codexRolloutId: session.conversationId)
+                    original.pane.activeTabId = sourceActive; original.workspace.activePaneId = sourcePaneID
+                    destPane.activeTabId = destinationActive; workspace.activePaneId = destinationPaneID
+                    workspace.workingDirectory = destinationCwd; workspace.zoomedPaneId = destinationZoom
+                    session.tabState?.saveError = "The tab could not be moved. Its original location and edits were kept."
+                    persistenceError = error.localizedDescription
+                    return false
+                }
+            }
+            return true
         }
         return false
     }
@@ -1546,7 +1552,7 @@ final class WorkspaceStore {
         let workspace = Workspace(workingDirectory: session.currentDirectory, root: PaneNode(pane: Pane()))
         // Workspace titles are persisted without a channel access check.
         // Never copy the channel's currently visible name into that state.
-        workspace.customTitle = session.channel == nil ? normalizedTitle(session.title) : "Channel"
+        workspace.customTitle = session.hasProcess ? normalizedTitle(session.title) : (session.toolRoute?.title ?? "Channel")
         workspace.sshRemoteHost = session.sshWorkspaceHost
         workspaces.append(workspace)
         guard handleTabDrop(droppedId: id, in: workspace) else {
@@ -1595,7 +1601,11 @@ final class WorkspaceStore {
     }
 
     func closeTab(_ session: Session, in workspace: Workspace) {
-        closeTab(session, in: workspace, recordHistory: true)
+        tabCloseCoordinator.request(session) { [weak self, weak session, weak workspace] in
+            guard let self, let session, let workspace else { return }
+            self.closeTab(session, in: workspace, recordHistory: true)
+        }
+        if session.tabState?.saveError != nil { activateWorkspace(workspace); activateTab(session, in: workspace) }
     }
 
     /// Like `closeTab` but skips the reopen-closed-tab history — for
@@ -1634,8 +1644,8 @@ final class WorkspaceStore {
               let idx = pane.tabs.firstIndex(where: { $0.id == session.id }) else { return }
         // Closing the last tab of a worktree workspace cascades through
         // detachSession → closePane → closeWorkspace, which would bypass
-        // the confirm sheet. Reroute here before any state mutates so
-        // the sheet's cancel path can keep the tab open.
+        // the close review. Reroute here before any state mutates so
+        // cancelling the review keeps the tab open.
         if workspace.closingLastTabCascadesIntoWorktreeRemoval {
             requestCloseWorkspace(workspace)
             return
@@ -1651,13 +1661,15 @@ final class WorkspaceStore {
         recentlyClosed.append(ClosedTabState(
             agent: session.agent,
             cwd: session.currentDirectory,
-            customTitle: !session.isChat ? session.customTitle : nil,
+            customTitle: session.hasProcess ? session.customTitle : nil,
             workspaceId: workspace.id,
             paneId: pane.id,
             conversationId: session.conversationId,
             sshWorkspaceHost: session.sshWorkspaceHost,
             channel: session.channel,
-            inbox: session.inbox
+            inbox: session.inbox,
+            tool: session.toolRoute,
+            navigation: session.tabState?.navigation
         ))
         if recentlyClosed.count > Self.closedTabHistoryLimit {
             recentlyClosed.removeFirst(recentlyClosed.count - Self.closedTabHistoryLimit)
@@ -1675,6 +1687,7 @@ final class WorkspaceStore {
     @discardableResult
     func reopenLastClosedTab() -> Session? {
         guard let state = recentlyClosed.popLast() else { return nil }
+        if let tool = state.tool { return openToolTab(tool, navigation: state.navigation ?? TabNavigation()) }
         guard let workspace = workspaces.first(where: { $0.id == state.workspaceId }) ?? active else {
             return nil
         }
@@ -1736,11 +1749,13 @@ final class WorkspaceStore {
         // consumer gate, so the structure closes the race with no timing.
         guard let pane = pane(containing: session, in: workspace) else { return }
         var changed = false
+        if pane.activeTabId != session.id || workspace.activePaneId != pane.id { invalidateTabConfirmations() }
         if pane.activeTabId != session.id {
             pane.activeTabId = session.id
             changed = true
         }
         if workspace.activePaneId != pane.id {
+            invalidateTabConfirmations()
             workspace.activePaneId = pane.id
             // Focusing a different pane while zoomed would route ⌘D /
             // ⌘T / cwd-sync at the now-hidden active pane. Auto-exit so
@@ -1750,7 +1765,7 @@ final class WorkspaceStore {
             }
             changed = true
         }
-        if workspace.workingDirectory != session.currentDirectory {
+        if session.hasProcess, workspace.workingDirectory != session.currentDirectory {
             workspace.workingDirectory = session.currentDirectory
             changed = true
         }
@@ -1775,6 +1790,7 @@ final class WorkspaceStore {
         guard workspace.canZoom else { return }
         // Suspend per-frame `set_size` across the workspace for the zoom animation
         // (see suspendSizePropagationForLayoutAnimation).
+        invalidateTabConfirmations()
         suspendSizePropagationForLayoutAnimation(workspace.root.allEngines)
         workspace.activePaneId = paneId
         workspace.zoomedPaneId = workspace.isZoomed(paneId) ? nil : paneId
@@ -1812,6 +1828,7 @@ final class WorkspaceStore {
     func splitPane(_ pane: Pane, orientation: SplitOrientation, in workspace: Workspace) -> Pane? {
         guard let leafNode = workspace.root.paneNode(paneId: pane.id) else { return nil }
         guard case .pane(let existing) = leafNode.content else { return nil }
+        invalidateTabConfirmations()
         let newPane = Pane()
         let firstChild = PaneNode(pane: existing)
         let secondChild = PaneNode(pane: newPane)
@@ -1836,6 +1853,7 @@ final class WorkspaceStore {
     /// whole workspace closes. Otherwise the sibling pane collapses up to
     /// take the parent split's place.
     func closePane(_ pane: Pane, in workspace: Workspace) {
+        guard tabCloseCoordinator.prepare(pane.tabs) else { return }
         guard let leafNode = workspace.root.paneNode(paneId: pane.id) else { return }
         // Worktree last-pane cascade — route through the confirm sheet
         // before any engines get terminated, so a sheet cancel leaves
@@ -1867,7 +1885,7 @@ final class WorkspaceStore {
         // After collapse, focus whichever pane is now nearest.
         if workspace.activePaneId == pane.id {
             workspace.activePaneId = info.sibling.firstPane?.id
-            if let session = workspace.activeSession,
+            if let session = workspace.activeSession, session.hasProcess,
                workspace.workingDirectory != session.currentDirectory {
                 workspace.workingDirectory = session.currentDirectory
             }
@@ -1880,6 +1898,7 @@ final class WorkspaceStore {
         guard workspace.root.pane(id: pane.id) != nil else { return }
         var changed = false
         if workspace.activePaneId != pane.id {
+            invalidateTabConfirmations()
             workspace.activePaneId = pane.id
             // Same "visible-pane = active-pane" invariant as activateTab —
             // cycling focus via ⌘[ / ⌘] off the zoomed pane drops zoom.
@@ -1888,7 +1907,7 @@ final class WorkspaceStore {
             }
             changed = true
         }
-        if let session = pane.activeTab, workspace.workingDirectory != session.currentDirectory {
+        if let session = pane.activeTab, session.hasProcess, workspace.workingDirectory != session.currentDirectory {
             workspace.workingDirectory = session.currentDirectory
             changed = true
         }
@@ -2135,7 +2154,7 @@ final class WorkspaceStore {
 
     /// The workspace + pane holding the session with `id`, or nil. One DFS
     /// per workspace, stopping at the first hit.
-    private func location(ofSessionId id: UUID) -> (workspace: Workspace, pane: Pane)? {
+    func location(ofSessionId id: UUID) -> (workspace: Workspace, pane: Pane)? {
         for workspace in workspaces {
             if let pane = workspace.root.pane(containingSessionId: id) {
                 return (workspace, pane)
@@ -2162,7 +2181,8 @@ final class WorkspaceStore {
     /// marker path needs no twin: `releaseSurface` seals the byte stream
     /// before the drain starts.
     private func hookSession(id: UUID) -> Session? {
-        isTerminated ? nil : findSession(id: id)
+        guard !isTerminated, let session = findSession(id: id), session.hasProcess else { return nil }
+        return session
     }
 
     /// Re-resolves every live session's `agent` against the current templates.
@@ -2189,10 +2209,19 @@ final class WorkspaceStore {
         }
     }
 
-    func flushPersistence() {
-        pendingSave?.cancel()
-        pendingSave = nil
-        persistence.save(snapshot())
+    @discardableResult
+    func flushPersistence() -> Bool {
+        pendingSave?.cancel(); pendingSave = nil
+        do {
+            for session in allSessions { if let state = session.tabState { try tabCloseCoordinator.save(state) } }
+            try persistence.saveChecked(snapshot())
+            persistenceError = nil
+            return true
+        } catch {
+            persistenceError = error.localizedDescription
+            for session in allSessions where session.tabState?.draft != nil { session.tabState?.saveError = error.localizedDescription }
+            return false
+        }
     }
 
     /// Tears the store down when its window closes — releases every
@@ -2294,6 +2323,10 @@ final class WorkspaceStore {
         case .pane(let p):
             let pane = Pane(id: p.id)
             for tab in p.tabs {
+                if case .tool(let route) = tab.content {
+                    pane.tabs.append(makeToolSession(route, id: tab.id, navigation: tab.navigation ?? TabNavigation(), cwd: resolvedSpawnCwd(tab.currentDirectoryPath)))
+                    continue
+                }
                 // AgentPad: a channel tab comes back without a terminal process.
                 if let channel = tab.channel {
                     pane.tabs.append(makeChannelSession(channel, id: tab.id, cwd: resolvedSpawnCwd(tab.currentDirectoryPath)))
@@ -2345,13 +2378,49 @@ final class WorkspaceStore {
     /// A channel tab's own Close goes to the store that holds it now: set
     /// when it is made here and again when it moves here (review F2b-p2-3).
     private func holdChannelClose(_ session: Session) {
+        if let engine = session.engine as? NativeTabEngine {
+            engine.owner = self
+            engine.state.confirmation.canShow = { [weak engine] in
+                guard let engine, let owner = engine.owner else { return false }
+                return owner.isOnScreen && owner.active?.activeSession?.id == engine.tabID && engine.view.window?.isKeyWindow == true
+            }
+            engine.state.confirmation.restoreFocus = { [weak engine] in engine?.focus() }
+            engine.state.changed = { [weak engine] in engine?.owner?.scheduleSave() }
+            engine.state.confirmation.reveal = { [weak engine] in
+                guard let engine, let owner = engine.owner,
+                      let location = owner.location(ofSessionId: engine.tabID),
+                      let session = location.pane.tabs.first(where: { $0.id == engine.tabID }) else { return false }
+                location.workspace.zoomedPaneId = nil
+                owner.activateWorkspace(location.workspace); owner.activateTab(session, in: location.workspace)
+                TabRouter.shared.revealWindow(owner)
+                return true
+            }
+        }
         let close: () -> Void = { [weak self, weak session] in
             guard let self, let session,
                   let workspace = self.workspaces.first(where: { ws in ws.root.allPanes.contains { $0.tabs.contains { $0 === session } } })
             else { return }
             self.closeTab(session, in: workspace)
         }
-        (session.engine as? ChannelTabEngine)?.onClose = close
+        if let engine = session.engine as? ChannelTabEngine {
+            engine.conversation.tabID = session.id
+            engine.onClose = close
+            engine.conversation.confirmation.canShow = { [weak self, weak session, weak engine] in
+                guard let self, let session, let engine else { return false }
+                return self.isOnScreen && self.active?.activeSession === session && engine.view.window?.isKeyWindow == true
+            }
+            engine.conversation.confirmation.restoreFocus = { [weak engine] in
+                guard let engine, engine.conversation.confirmation.canShow() else { return }
+                engine.conversation.model?.focusRequest = ChatFocusRequest(area: .feed)
+            }
+            engine.conversation.confirmation.reveal = { [weak self, weak session] in
+                guard let self, let session, let location = self.location(ofSessionId: session.id) else { return false }
+                location.workspace.zoomedPaneId = nil
+                self.activateWorkspace(location.workspace); self.activateTab(session, in: location.workspace)
+                TabRouter.shared.revealWindow(self)
+                return true
+            }
+        }
         if let engine = session.engine as? ChatInboxTabEngine {
             engine.onClose = close
             let ref = engine.ref
@@ -2389,6 +2458,7 @@ final class WorkspaceStore {
 
     @discardableResult
     func openInboxTab(_ ref: ChatInboxRef, in workspace: Workspace, pane: Pane? = nil) -> Session {
+        invalidateTabConfirmations()
         guard let target = pane ?? workspace.activePane ?? workspace.root.firstPane else { preconditionFailure("workspace has no panes") }
         let session = makeInboxSession(ref, cwd: workspace.workingDirectory)
         configureSession(session, in: workspace, codexRolloutId: nil)
@@ -2421,6 +2491,7 @@ final class WorkspaceStore {
 
     @discardableResult
     func openChannelTab(_ ref: ChannelRef, in workspace: Workspace, pane: Pane? = nil) -> Session {
+        invalidateTabConfirmations()
         guard let target = pane ?? workspace.activePane ?? workspace.root.firstPane else {
             preconditionFailure("workspace has no panes")
         }
@@ -2549,6 +2620,7 @@ final class WorkspaceStore {
     /// file. AgentPad: this preserves the source monitor's heuristic; it is not
     /// a verified journal binding for answer export.
     private func configureSession(_ session: Session, in workspace: Workspace, codexRolloutId: String?) {
+        guard session.hasProcess else { holdChannelClose(session); return }
         // Initial refresh — without these, the status bar stays empty until
         // the user `cd`s or runs a command. Both fetchers silently hide
         // results for non-applicable cwds, so the calls are harmless.
@@ -2565,6 +2637,19 @@ final class WorkspaceStore {
 
     /// Retarget engine events without restarting session-owned monitors.
     private func wireSessionCallbacks(engine: any TerminalEngine, session: Session, workspace: Workspace) {
+        guard session.hasProcess else { holdChannelClose(session); return }
+        session.terminalConfirmation.canShow = { [weak self, weak session] in
+            guard let self, let session, self.active?.activeSession === session,
+                  let window = session.engine.view.window else { return false }
+            return window.isVisible && window.isKeyWindow && !session.engine.view.isHiddenOrHasHiddenAncestor
+        }
+        session.terminalConfirmation.reveal = { [weak self, weak session] in
+            guard let self, let session, let location = self.location(ofSessionId: session.id) else { return false }
+            self.activateWorkspace(location.workspace); self.activateTab(session, in: location.workspace)
+            TabRouter.shared.revealWindow(self)
+            return true
+        }
+        (engine.view as? GhosttySurfaceView)?.confirmationSession = session
         // Paste-time upload routing. Deliberately `sshWorkspaceHost` (spawn
         // pinned), NOT `remoteHost`: the latter is the status-bar display
         // signal with a marker→command-finished lifecycle that a remote
@@ -2832,7 +2917,7 @@ final class WorkspaceStore {
 
     private func refreshGitStatus(for session: Session) {
         // Off screen nothing paints the result; `setOnScreen(true)` refetches.
-        guard isOnScreen else { return }
+        guard isOnScreen, session.hasProcess else { return }
         if let gitDir = sessionGitWatch[session.id]?.gitDir,
            gitWatches[gitDir]?.subscribers.contains(session.id) == true {
             scheduleGitStatusRefresh(for: gitDir)
@@ -3040,6 +3125,7 @@ final class WorkspaceStore {
     /// surrender variant: the destination store re-wires the session, so
     /// the engine stays alive and agent records survive.
     private func teardownSessionMonitors(_ session: Session, keepForTransfer: Bool = false) {
+        session.terminalConfirmation.invalidate()
         if !keepForTransfer { onSessionWaitingEnded(session.id) }
         removeGitWatch(sessionId: session.id)
         codexUsageMonitor.stop(sessionId: session.id)
@@ -3139,7 +3225,7 @@ final class WorkspaceStore {
         pendingSave = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.saveDebounce)
             guard let self, !Task.isCancelled else { return }
-            self.persistence.save(self.snapshot())
+            self.flushPersistence()
         }
     }
 

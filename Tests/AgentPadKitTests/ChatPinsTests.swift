@@ -63,6 +63,40 @@ final class ChatPinsTests: XCTestCase {
         XCTAssertEqual(ChatPins.ordered([pin("old", seq: 1), pin("new", seq: 2)]).map(\.id), ["new", "old"])
     }
 
+    func testPinnedAndAgentsNavigationPreservesConsentUntilExplicitCancellation() throws {
+        let s = try store(), service = service()
+        let conversation = ChatChannelSession()
+        conversation.update(.ready(.init(channelId: "c", teamId: "t", name: "planning", archived: false, version: 1), team: "Team", offline: false),
+                            key: key, store: s, service: service)
+        let model = try XCTUnwrap(conversation.model)
+        for verb in ["Add", "Remove"] {
+            conversation.showingAgents = true
+            var decisions: [Bool] = []
+            XCTAssertTrue(conversation.confirmation.request(.init(tabID: UUID(), targetID: "agent"),
+                title: verb, consequences: "Membership changes", verb: verb, stillValid: { true },
+                completion: { decisions.append($0) }, operation: { XCTFail("Navigation must not grant consent") }))
+            // A hidden presentation flag alone is not navigation.
+            model.pins.open()
+            XCTAssertFalse(conversation.pinsShown)
+            XCTAssertEqual(conversation.confirmation.phase, .awaiting)
+            service.serverCapabilities[key.server] = []
+            conversation.togglePins()
+            XCTAssertTrue(conversation.showingAgents)
+            XCTAssertEqual(conversation.confirmation.phase, .awaiting)
+            service.serverCapabilities[key.server] = ChatB1.capabilities
+            conversation.togglePins()
+            XCTAssertFalse(conversation.showingAgents)
+            XCTAssertTrue(conversation.pinsShown)
+            XCTAssertEqual(conversation.confirmation.phase, .awaiting)
+            XCTAssertTrue(decisions.isEmpty)
+            conversation.togglePins()
+            XCTAssertFalse(conversation.pinsShown)
+            XCTAssertEqual(conversation.confirmation.phase, .awaiting)
+            conversation.confirmation.cancel()
+            XCTAssertEqual(decisions, [false])
+        }
+    }
+
     func testBannerCyclesWithValidSelection() {
         let old = pin("old", seq: 1), new = pin("new", seq: 2)
         let pins = [new, old]
@@ -363,7 +397,7 @@ final class ChatPinsTests: XCTestCase {
         let workspace = WorkspaceStore(persistence: InMemoryPersistence(), engineFactory: { TestEngine() }, optionsProvider: { _ in nil }, resumeProvider: { true })
         defer { workspace.terminate() }
         for id in ["writer", "reviewer"] {
-            let card = ChatSidebarAgentCard(agentID: id, active: ChannelRef(key, channel: "c"), window: nil, store: workspace, model: org, close: {})
+            let card = ChatSidebarAgentCard(agentID: id, active: ChannelRef(key, channel: "c"), window: nil, store: workspace, model: org)
             try await capture(card, output: output, name: "agent-\(id)", size: NSSize(width: 352, height: 410), dark: true)
         }
     }

@@ -29,16 +29,31 @@ enum WorktreeManager {
     /// Caller is responsible for picking `path` — typically sibling of the
     /// source repo so the worktree shows up next to it in Finder.
     static func add(repoPath: URL, path: URL, mode: BranchMode) -> Result<Void, GitError> {
+        let branch: String
+        switch mode { case .existing(let name), .newBranch(let name, _): branch = name }
+        guard !branch.isEmpty, !branch.hasPrefix("-"), branch != "HEAD",
+              case .success = runGit(["check-ref-format", "refs/heads/" + branch], timeout: 2) else {
+            return .failure(GitError(stderr: "Enter a valid branch name.", exitCode: -1))
+        }
         var args = ["-C", repoPath.path, "worktree", "add"]
         switch mode {
         case .existing(let branch):
+            args.append("--")
             args.append(path.path)
             args.append(branch)
         case .newBranch(let name, let base):
             args.append("-b")
             args.append(name)
+            args.append("--")
             args.append(path.path)
-            if let base, !base.isEmpty { args.append(base) }
+            if let base, !base.isEmpty {
+                // Resolve explicitly so neither options nor reflog shorthand can
+                // change the branch being created while the form is open.
+                switch runGit(["-C", repoPath.path, "rev-parse", "--verify", "--end-of-options", base + "^{commit}"], timeout: 2) {
+                case .success(let sha): args.append(sha.trimmingCharacters(in: .whitespacesAndNewlines))
+                case .failure(let error): return .failure(error)
+                }
+            }
         }
         return runGit(args, timeout: 30).map { _ in () }
     }

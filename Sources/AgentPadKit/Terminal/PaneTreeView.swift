@@ -61,7 +61,7 @@ private struct PaneView: View {
         }
         let view = active.engine.view
         store.activateTab(active, in: workspace)
-        guard let window = view.window else { return }
+        guard active.hasProcess, let window = view.window else { return }
         // TabBarItem activates the selected tab in its own tap handler. The
         // pane-wide simultaneous gesture also receives that click; if the
         // current terminal is already first responder, do not focus it again.
@@ -81,6 +81,9 @@ private struct PaneView: View {
             TabBarView(pane: pane, workspace: workspace, store: store)
             Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
             if let active = pane.activeTab {
+                if active.hasProcess, active.terminalConfirmation.context?.targetID.hasPrefix("process:") != true {
+                    TerminalConfirmation(session: active)
+                }
                 TerminalTabHost(
                     tabs: pane.tabs,
                     activeTabId: pane.activeTabId,
@@ -104,18 +107,17 @@ private struct PaneView: View {
                         }
                     }
                     // AgentPad: a channel tab has no terminal menu (DESIGN-F2).
-                    .overlay(RightClickCatcher { unit in
-                        guard !active.isChat else { return }
-                        // Promote this pane to the workspace's active one —
-                        // RightClickCatcher swallows rightMouseDown before
-                        // libghostty sees it, so `engine.onFocus` never
-                        // fires. Without this, the menu would dismiss but
-                        // keystrokes + new-agent-tab spawns would still go
-                        // to whichever pane had focus before.
-                        store.activateTab(active, in: workspace)
-                        contextMenuAnchor = unit
-                        contextMenuOpen = true
-                    })
+                    .overlay {
+                        if active.hasProcess {
+                            // Only a process surface needs this interceptor.
+                            // Native editors keep their own contextual actions.
+                            RightClickCatcher { unit in
+                                store.activateTab(active, in: workspace)
+                                contextMenuAnchor = unit
+                                contextMenuOpen = true
+                            }
+                        }
+                    }
                     .popover(
                         isPresented: $contextMenuOpen,
                         attachmentAnchor: .point(contextMenuAnchor),
@@ -132,7 +134,7 @@ private struct PaneView: View {
                     .overlay(alignment: .topTrailing) {
                         // Per-pane: multiple panes can search simultaneously,
                         // each with their own needle and result count.
-                        if active.searchActive, !active.isChat {
+                        if active.searchActive, active.hasProcess {
                             PaneSearchBar(
                                 session: active,
                                 isWorkspaceActive: store.activeWorkspaceId == workspace.id,
@@ -145,7 +147,7 @@ private struct PaneView: View {
                     .overlay(alignment: .bottom) {
                         // ⌘L composer rises from the bottom like a chat box.
                         // Per-pane / per-session, same as search.
-                        if active.composerActive, !active.isChat {
+                        if active.composerActive, active.hasProcess {
                             PaneComposerBar(
                                 session: active,
                                 pane: pane,
@@ -165,8 +167,10 @@ private struct PaneView: View {
                     }
                 // Always present now that it hosts the compose button — a
                 // stable bottom affordance, not gated on git / env / zoom data.
-                Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
-                PaneStatusBar(session: active, paneId: pane.id, workspace: workspace, store: store)
+                if active.hasProcess {
+                    Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
+                    PaneStatusBar(session: active, paneId: pane.id, workspace: workspace, store: store)
+                }
             } else {
                 EmptyPaneView(pane: pane, workspace: workspace, store: store)
             }
@@ -510,7 +514,7 @@ private struct PaneStatusBar: View {
                 }
             }
             // AgentPad: no composer in a channel tab (DESIGN-F2).
-            if !session.isChat {
+            if session.hasProcess {
                 StatusBarIconButton(
                     systemName: "long.text.page.and.pencil",
                     isActive: session.composerActive,
@@ -1657,8 +1661,20 @@ private struct PaneComposerBar: View {
 /// that both terminal paste entry points use, so the composer can't drift from
 /// them. Plain text falls through to NSTextView's native paste, keeping undo
 /// coalescing + smart behaviors.
-private final class ComposerNSTextView: NSTextView {
+final class ComposerNSTextView: NSTextView {
     var onFocusGained: (() -> Void)?
+
+    private var canPasteContent: Bool {
+        isEditable && AgentPadShellIntegration.pasteboardHasTerminalPasteContent(.general)
+    }
+    override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(paste(_:)), canPasteContent { return true }
+        return super.validateMenuItem(menuItem)
+    }
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(paste(_:)), canPasteContent { return true }
+        return super.validateUserInterfaceItem(item)
+    }
 
     /// Session's spawn-pinned SSH host — same paste routing signal the
     /// surface's ⌘V uses (see `TerminalEngine.pasteUploadHostProvider`).

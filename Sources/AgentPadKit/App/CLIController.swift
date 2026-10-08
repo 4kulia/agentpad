@@ -199,7 +199,7 @@ final class AgentPadCLIController {
         case .focus:
             completion(handleFocus(request))
         case .close:
-            completion(handleClose(request))
+            Task { completion(await handleClose(request, isCallerWaiting: isCallerWaiting)) }
         case .rename:
             completion(handleRename(request))
         case .open:
@@ -229,53 +229,40 @@ final class AgentPadCLIController {
         return ok(note: "focused")
     }
 
-    private func handleClose(_ request: AgentPadCLIRequest) -> AgentPadCLIResponse {
+    private func handleClose(_ request: AgentPadCLIRequest, isCallerWaiting: @escaping @MainActor () -> Bool) async -> AgentPadCLIResponse {
         guard let id = sessionUUID(request) else {
             return refuse("close needs --tab <session-uuid>")
         }
         guard let hit = locate(id) else {
             return refuse("no tab with id \(id.uuidString) — run `agentpad-cli list`")
         }
-        // The last tab of a worktree workspace cascades into "remove the
-        // worktree directory" with its own sidebar-hosted confirmation —
-        // a flow a background CLI call can't honestly drive (the sheet may
-        // not even mount). Refuse loudly instead of reporting a close that
-        // didn't happen. Same predicate closeTab's reroute uses.
+        // A last-worktree close needs the directory choices in Workspace details.
         if hit.workspace.closingLastTabCascadesIntoWorktreeRemoval {
-            return refuse("that tab is the last one of a worktree workspace — closing it removes the worktree, which needs in-app confirmation")
+            return refuse("that tab is the last one of a worktree workspace — review the close in Workspace details; directory deletion is optional")
         }
-        // Same semantics as the tab's own ✕ / ⌘W: the shared ConfirmCloseTab
-        // entry honors `terminal.confirm-close-surface`. When it will ask,
-        // bring the tab on screen first so the sheet lands somewhere visible
-        // (and pass the window explicitly — with AgentPad in the background a
-        // detached engine view plus no key window would otherwise skip the
-        // confirmation entirely and kill the process); a plain close stays
-        // silent in the background. The note reports what request() actually
-        // DID, not the pre-read — the two can differ (no anchorable window).
-        switch ConfirmCloseTab.request(
+        // Reveal only an available target, then wait for the inline block to
+        // mount before acknowledging it. The decision belongs to the user
+        // after that acknowledgement; the CLI connection can then close.
+        var handedToUser = false
+        var outcome = ConfirmCloseTab.request(
             hit.session,
             in: hit.workspace,
             store: hit.context.store,
             anchorWindow: hit.context.window(),
-            // Front + reveal ONLY when a confirmation is actually going to be
-            // on screen. A `.windowBusy` refusal changed nothing, so it must
-            // not change what the user is looking at either — and revealing B
-            // under a sheet that asks about A is worse than not revealing.
             willPresent: { [weak self] in
                 self?.activateApp()
                 hit.context.reveal(hit.session, hit.workspace)
-            }
-        ) {
+            }, callerWaiting: { handedToUser || isCallerWaiting() }
+        )
+        if outcome == .presenting { outcome = await ConfirmCloseTab.waitForPresentation(hit.session, store: hit.context.store) }
+        switch outcome {
         case .closed:
             return ok(note: "closed")
         case .confirming:
+            handedToUser = true
             return ok(note: "confirmation shown in \(AppIdentity.appName)")
-        case .windowBusy:
-            // The sheet already on that window belongs to another tab and
-            // will never decide this one — reporting "confirmation shown"
-            // would leave the caller waiting on a dialog that isn't about
-            // its tab. Retrying after the user answers works.
-            return refuse("that tab's window already has a close confirmation waiting for another tab — answer it first")
+        case .presenting, .windowBusy:
+            return refuse("The close confirmation cannot be shown: the window is busy or the terminal is not visible. Nothing was closed.")
         }
     }
 
@@ -296,7 +283,7 @@ final class AgentPadCLIController {
             return refuse("no tab with id \(id.uuidString) — run `agentpad-cli list`")
         }
         // AgentPad: DESIGN-F2.
-        guard !hit.session.isChat else { return refuse("a chat tab takes its destination’s name") }
+        guard hit.session.hasProcess else { return refuse("a chat tab takes its destination’s name") }
         hit.context.store.renameTab(hit.session, to: title)
         return ok(note: "renamed")
     }

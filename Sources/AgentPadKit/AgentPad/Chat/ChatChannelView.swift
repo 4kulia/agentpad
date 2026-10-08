@@ -15,7 +15,6 @@ struct ChatChannelView: View {
         return model
     }
     private var ownerModel: ChatChannelOwnerModel? { conversation.ownerModel }
-    @State private var showingAgents = false
     @State private var window = WindowBox()
     private var org = ChatOrgCurrent.shared
     private var service = ChatService.shared
@@ -29,12 +28,37 @@ struct ChatChannelView: View {
     }
 
     var body: some View {
+        VStack(spacing: 8) {
+            // Channel actions keep one host while the content panels change.
+            if conversation.confirmation.context?.targetID.hasPrefix("message:") != true,
+               conversation.confirmation.context?.targetID.hasPrefix("channel-ask:") != true,
+               conversation.confirmation.context?.targetID.hasPrefix("trust:") != true {
+                InlineConfirmation(coordinator: conversation.confirmation).padding(.horizontal, 16)
+            }
+            panels
+        }
+        .background(ChatAppearance.surface).foregroundStyle(Theme.chromeForeground)
+        .background(WindowReader(box: window, didAttach: navigatePending))
+        .environment(\.openURL, OpenURLAction { ChatMarkdownText.open($0) })
+        .onReceive(NotificationCenter.default.publisher(for: .chatMessageNavigation)) { _ in navigatePending() }
+        .task(id: "\(key.server)|\(key.accountId)|\(key.orgId)|\(card.channelId)") {
+            navigatePending()
+        }
+        .onChange(of: model?.channel) { _, _ in navigatePending() }
+        .onChange(of: model?.threadRoot) { _, _ in
+            if conversation.confirmation.context?.targetID.hasPrefix("message:") == true {
+                conversation.confirmation.invalidate()
+            }
+        }
+    }
+
+    private var panels: some View {
         GeometryReader { geometry in
             if let model {
                 let narrow = geometry.size.width < 784
                 let pinsAvailable = model.b1?.supports("chat.pins") == true
-                let pinsShown = pinsAvailable && model.pins.isPresented
-                let coversConversation = pinsAvailable && model.pins.coversConversation(width: geometry.size.width)
+                let pinsShown = conversation.pinsShown
+                let coversConversation = pinsShown && model.pins.coversConversation(width: geometry.size.width)
                 HSplitView {
                     if !coversConversation {
                         conversationPanes(model, narrow: narrow, pinsShown: pinsShown, width: geometry.size.width)
@@ -57,33 +81,29 @@ struct ChatChannelView: View {
                 }
             }
         }
-        .background(ChatAppearance.surface).foregroundStyle(Theme.chromeForeground)
-        .background(WindowReader(box: window, didAttach: navigatePending))
-        .environment(\.openURL, OpenURLAction { ChatMarkdownText.open($0) })
-        .onReceive(NotificationCenter.default.publisher(for: .chatMessageNavigation)) { _ in navigatePending() }
-        .task(id: "\(key.server)|\(key.accountId)|\(key.orgId)|\(card.channelId)") {
-            navigatePending()
-        }
-        .onChange(of: model?.channel) { _, _ in navigatePending() }
     }
 
     @ViewBuilder private func conversationPanes(_ model: ChatChannelModel, narrow: Bool, pinsShown: Bool, width: Double) -> some View {
-        if !narrow || model.threadRoot == nil || pinsShown {
+        if !narrow || model.threadRoot == nil || pinsShown || conversation.showingAgents {
             VStack(spacing: 0) {
                 header(model)
-                if let b1 = model.b1, b1.supports("chat.pins") {
-                    ChatPinBanner(b1: b1, model: model, members: members, width: width)
+                if conversation.showingAgents {
+                    ScrollView { ChatChannelTrustView(key: key, channel: card.channelId, agents: agents, conversation: conversation) }
+                } else {
+                    if let b1 = model.b1, b1.supports("chat.pins") {
+                        ChatPinBanner(b1: b1, model: model, members: members, width: width)
+                    }
+                    ChatUnreadThreadsBanner(model: model)
+                    if let ownerModel { ChatChannelOwnerPanel(model: ownerModel) }
+                    if model.searching { ChatLocalSearch(model: model) }
+                    ChatTimelineView(model: model, root: nil, members: members, mentionable: mentionable,
+                                     me: key.accountId, archived: card.archived, ownerModel: ownerModel)
+                    if !card.archived { ChatAskStrip(model: model, agents: agents) }
+                    composer(model, root: nil)
                 }
-                ChatUnreadThreadsBanner(model: model)
-                if let ownerModel { ChatChannelOwnerPanel(model: ownerModel) }
-                if model.searching { ChatLocalSearch(model: model) }
-                ChatTimelineView(model: model, root: nil, members: members, mentionable: mentionable,
-                                 me: key.accountId, archived: card.archived, ownerModel: ownerModel)
-                if !card.archived { ChatAskStrip(model: model, agents: agents) }
-                composer(model, root: nil)
             }.frame(minWidth: narrow ? 0 : 440)
         }
-        if let root = model.threadRoot, !pinsShown {
+        if let root = model.threadRoot, !pinsShown, !conversation.showingAgents {
             VStack(spacing: 0) {
                 HStack(spacing: 8) {
                     if narrow {
@@ -133,7 +153,7 @@ struct ChatChannelView: View {
             }
             Spacer(minLength: 0)
             if model.pins.returnsToPins {
-                ChatIconButton(title: "Back to pinned messages", symbol: "pin.fill") { model.pins.open() }
+                ChatIconButton(title: "Back to pinned messages", symbol: "pin.fill") { conversation.togglePins() }
             }
             if model.hasNavigationReturn {
                 ChatIconButton(title: "Back to reading", symbol: "arrow.uturn.backward") { model.returnFromNavigation() }
@@ -144,9 +164,11 @@ struct ChatChannelView: View {
             ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markRead() }
             ChatIconButton(title: "Search loaded history (⌘F)", symbol: "magnifyingglass") { model.setSearching(!model.searching) }
                 .keyboardShortcut("f", modifiers: .command)
-            if service.supports("chat.channel_ux1", key: key) {
-                ChatIconButton(title: "Channel agents", symbol: "sparkles") { showingAgents.toggle() }
-                    .popover(isPresented: $showingAgents) { ChatChannelTrustView(key: key, channel: card.channelId, agents: agents) }
+            if conversation.showingAgents || service.supports("chat.channel_ux1", key: key) {
+                Button(conversation.showingAgents ? "Messages" : "Agents / trust") {
+                    model.pins.close()
+                    conversation.showingAgents.toggle()
+                }
             }
         }
         .padding(.horizontal, 24).frame(height: 64)
@@ -156,7 +178,7 @@ struct ChatChannelView: View {
     @ViewBuilder private func pinsButton(_ model: ChatChannelModel) -> some View {
         if let b1 = model.b1, b1.supports("chat.pins") {
             Button {
-                if model.pins.isPresented { model.pins.close() } else { model.pins.open() }
+                conversation.togglePins()
             } label: {
                 Label("Pinned \(b1.state.pins?.count ?? 0)", systemImage: "pin")
                     .font(Theme.display(11, weight: .medium)).lineLimit(1)
@@ -288,6 +310,9 @@ struct ChatRequestCardRow: View {
         VStack(alignment: .leading, spacing: 2) {
             Text("\(name(card.initiatorAccountId)) asked \(card.agentName) (\(name(card.ownerAccountId))'s agent)").font(.callout)
             Text(card.stateWord).font(.caption).foregroundStyle(card.publication == "publish_failed" ? .orange : .secondary)
+            if let ownerModel {
+                Button("Open Request…") { RequestTabs.shared.open(card.requestId, scope: .server(OrgKey(ownerModel.key))) }.font(.caption)
+            }
             if let ownerModel, ownerModel.canOpenSession(card.requestId) {
                 Button("Open Session") { problem = ownerModel.openSession(card.requestId) }.font(.caption)
                 if let problem { Text(problem).font(.caption).foregroundStyle(.red) }

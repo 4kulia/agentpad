@@ -163,8 +163,23 @@ enum FileTreeLister {
 @MainActor
 @Observable
 final class FileTreeModel {
+    let nameEdit = FileNameEdit()
+    var searchQuery = ""
     private(set) var rootURL: URL?
     private(set) var rows: [FileTreeRow] = []
+    /// Feedback for edits whose tree row is not currently displayed.
+    var headerDraft: FileNameDraft? {
+        guard let rootURL, let draft = nameEdit.draft,
+              draft.kind == .rename || draft.path != FileNameEdit.key(rootURL),
+              !searchQuery.isEmpty || !rows.contains(where: { $0.id == draft.path }) else { return nil }
+        return draft
+    }
+    var headerErrorPaths: [String] {
+        nameEdit.errors.keys.sorted().filter { path in
+            path != rootURL.map(FileNameEdit.key)
+                && (!searchQuery.trimmingCharacters(in: .whitespaces).isEmpty || !rows.contains(where: { $0.id == path }))
+        }
+    }
     /// Per-file `+/−` counts from the same `git diff … HEAD` the status bar
     /// aggregates, keyed by the row id (absolute standardized path). Pushed
     /// by `WorkspaceStore` on the status bar's own refresh triggers so the
@@ -294,6 +309,7 @@ final class FileTreeModel {
         let token = activationToken
         liveActivationToken.withLock { $0 = token }
         isMounted = true
+        nameEdit.isVisible = true
         let root = root.map(Self.canonicalRoot)
         if rootURL?.path != root?.path {
             resetState(to: root)
@@ -310,6 +326,7 @@ final class FileTreeModel {
     func deactivate(token: Int? = nil) {
         if let token, token != activationToken { return }
         isMounted = false
+        nameEdit.isVisible = false
         liveActivationToken.withLock { $0 = 0 }
         isLoading = false
         cancelAllWatchers()

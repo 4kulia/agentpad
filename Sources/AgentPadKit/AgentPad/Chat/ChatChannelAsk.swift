@@ -13,7 +13,7 @@ enum ChatChannelAsk {
     static let maxTextBytes = 32 * 1024
 
     /// An offer to ask, after the user's own message named the agent.
-    struct Offer: Equatable, Identifiable {
+    struct Offer: Codable, Equatable, Identifiable {
         /// The message that asked.
         var messageId: String
         var agentId: String
@@ -124,9 +124,9 @@ extension ChatService {
     /// server's events bring it; until then the queue's row stands for it.
     @discardableResult
     func askInChannel(_ key: ChatOrgKey, channel: String, agentId: String, root: String, text: String,
-                      context: [ChatMessage]) throws -> String {
+                      context: [ChatMessage], requestID: String? = nil) throws -> String {
         guard let store = orgSessions[key]?.store else { throw ChatError.notConnected }
-        let id = UUID().uuidString.lowercased()
+        let id = requestID ?? UUID().uuidString.lowercased()
         let prepared = try prepareCommand(key, type: ChatChannelAsk.commandType, args: ChatChannelAsk.args(
             requestId: id, agentId: agentId, channel: channel, root: root, text: text, context: context))
         try store.queue.write { db in _ = try prepared.table.insert(db, prepared.record, seq: prepared.record.seq) }

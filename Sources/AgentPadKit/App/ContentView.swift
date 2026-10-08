@@ -22,6 +22,22 @@ struct ContentView: View {
             topStrip
             Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
 
+            if store.workspaceRenameInHeader, let workspace = store.active {
+                HStack {
+                    if workspace.nameEdit.isEditing {
+                        InlineNameField(edit: workspace.nameEdit, label: "Workspace title") { text in
+                            store.renameWorkspace(workspace, to: text); return nil
+                        }
+                    } else {
+                        Text(workspace.title).lineLimit(1)
+                            .onTapGesture(count: 2) { store.requestRenameActiveWorkspace() }
+                    }
+                    Spacer(minLength: 0)
+                    Button("Workspace details") { LocalFormTabs.shared.details(workspace, from: store) }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 5)
+            }
+
             GeometryReader { geo in
                 ZStack(alignment: .topLeading) {
                     if store.sidebarMode != .hidden {

@@ -77,25 +77,10 @@ enum InboxTime {
     }
 }
 
-/// Single source for the inbox panel's height math, shared by the SwiftUI
-/// frames (`InboxView`) and the NSPanel sizing (`InboxWindowController`) so the
-/// two can't drift — a mismatch leaves a chrome strip at the panel's edge. The
-/// per-section frames reference these same constants.
 enum InboxLayout {
-    static let headerHeight: CGFloat = 50   // single row, fits the 28pt buttons
+    static let headerHeight: CGFloat = 50
     static let rowHeight: CGFloat = 50
     static let emptyHeight: CGFloat = 100
-    static let maxListHeight: CGFloat = 412
-
-    /// Height of the scrollable list for `rowCount` rows (+8 list v-padding, capped).
-    static func listHeight(rowCount: Int) -> CGFloat {
-        min(CGFloat(rowCount) * rowHeight + 8, maxListHeight)
-    }
-    /// Total panel content: header + hairline + list (or the empty block).
-    static func panelHeight(rowCount: Int) -> CGFloat {
-        let base = headerHeight + 1
-        return rowCount == 0 ? base + emptyHeight : base + listHeight(rowCount: rowCount)
-    }
 }
 
 // MARK: - Top-chrome bell
@@ -130,7 +115,7 @@ struct InboxBell: View {
     }
 }
 
-// MARK: - Panel view
+// MARK: - Notification content
 
 struct InboxView: View {
     var inbox = NotificationInbox.shared
@@ -147,17 +132,11 @@ struct InboxView: View {
                 list
             }
         }
-        .frame(width: 420, height: InboxLayout.panelHeight(rowCount: inbox.events.count), alignment: .top)
-        // Fill the whole panel with the chrome background, content top-aligned,
-        // so any rounding slack lands at the bottom as chrome rather than the
-        // panel's default window color showing through as a mismatched strip.
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .glassWindowBackground(fallback: Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
-        // The hosting controller drops the titlebar safe area
-        // (`safeAreaRegions = []`); this is the matching SwiftUI-side guard,
-        // same as `ContentView` does for the main window.
-        .ignoresSafeArea(.all)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("notifications-inbox-content")
     }
 
     private var header: some View {
@@ -205,13 +184,13 @@ struct InboxView: View {
         ScrollView {
             LazyVStack(spacing: 0) {
                 ForEach(inbox.events) { event in
-                    InboxRow(event: event)
-                        .onTapGesture { onActivate(event) }
+                    Button { onActivate(event) } label: { InboxRow(event: event) }
+                        .buttonStyle(.plain).accessibilityIdentifier("notification-" + event.id)
                 }
             }
             .padding(.vertical, 4)
         }
-        .frame(height: InboxLayout.listHeight(rowCount: inbox.events.count))
+        .frame(maxHeight: .infinity)
     }
 
     private var empty: some View {
@@ -287,102 +266,5 @@ private struct InboxRow: View {
         .background(isHovered ? Theme.chromeHover : Color.clear)
         .contentShape(Rectangle())
         .onHover { isHovered = $0 }
-    }
-}
-
-// MARK: - Floating panel host
-
-/// Singleton NSPanel host for the inbox — mirrors `CommandPaletteWindowController`
-/// (nonactivating floating panel, rebuild the `NSHostingController` on each
-/// `show` for a clean SwiftUI state, dismiss on resign-key). Anchored top-right
-/// (near the bell) rather than centered.
-@MainActor
-final class InboxWindowController: NSWindowController, DismissablePanel {
-    static let shared = InboxWindowController()
-
-    private static let panelSize = NSSize(width: 420, height: 480)
-
-    convenience init() {
-        let panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: Self.panelSize),
-            styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        panel.titleVisibility = .hidden
-        panel.titlebarAppearsTransparent = true
-        panel.isMovableByWindowBackground = false
-        panel.hidesOnDeactivate = true
-        panel.level = .floating
-        panel.isReleasedWhenClosed = false
-        panel.appearance = Theme.windowAppearance
-        panel.applyGlassBacking()
-        self.init(window: panel)
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(panelResignedKey(_:)),
-            name: NSWindow.didResignKeyNotification, object: panel
-        )
-    }
-
-    @objc private func panelResignedKey(_ note: Notification) {
-        dismiss()
-    }
-
-    func toggle(anchor: NSWindow?, onActivate: @escaping (NotificationInbox.Event) -> Void) {
-        if window?.isVisible == true {
-            dismiss()
-        } else {
-            show(anchor: anchor, onActivate: onActivate)
-        }
-    }
-
-    func show(anchor: NSWindow?, onActivate: @escaping (NotificationInbox.Event) -> Void) {
-        guard let panel = window else { return }
-        let view = InboxView(
-            onActivate: { [weak self] event in
-                self?.dismiss()
-                onActivate(event)
-            },
-            onClear: { [weak self] in self?.dismiss() }
-        )
-        // Fresh host on each open keeps the SwiftUI state clean (matches the
-        // Command Palette's rebuild-on-show rationale).
-        let host = NSHostingController(rootView: view)
-        // Drop the titlebar safe-area inset at the hosting layer. With it, the
-        // hosting view's fitting height ran 28pt over the content, leaving the
-        // panel taller than the content and a chrome strip at the bottom.
-        host.safeAreaRegions = []
-        panel.contentViewController = host
-        // Size the panel to the content ourselves, sharing InboxLayout with the
-        // SwiftUI frames. (Content-driven `.preferredContentSize` sizing was
-        // tried and crashed on the list's then-unbounded ScrollView.)
-        let height = InboxLayout.panelHeight(rowCount: NotificationInbox.shared.events.count)
-        panel.setContentSize(NSSize(width: Self.panelSize.width, height: height))
-        positionTopRight(of: anchor)
-        panel.makeKeyAndOrderFront(nil)
-    }
-
-    func dismiss() {
-        window?.orderOut(nil)
-    }
-
-    private func positionTopRight(of anchor: NSWindow?) {
-        guard let panel = window else { return }
-        // Read back the size just set via `setContentSize` so the panel pins to
-        // the top-right corner regardless of how tall it ended up.
-        let size = panel.frame.size
-        let ref = anchor?.frame ?? NSScreen.main?.visibleFrame ?? .zero
-        let preferred = NSPoint(
-            x: ref.maxX - size.width - 16,
-            y: ref.maxY - 44 - size.height
-        )
-        let visibleFrame = anchor?.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? ref
-        panel.setFrameOrigin(PanelPlacement.clampedOrigin(
-            preferred: preferred,
-            panelSize: size,
-            visibleFrame: visibleFrame
-        ))
     }
 }

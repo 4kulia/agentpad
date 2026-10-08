@@ -122,12 +122,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // — must run before any window is created and before any libghostty
         // surface is spawned, since `LibghosttyApp` reads `~/.agentpad/settings.json`
         // at process init when the first surface is created.
-        AgentPadOnboarding.runIfNeeded()
-        let settings = AgentPadSettingsModel.shared
         // Onboarding can construct the shared model before a potential import
         // writes settings.json. Reload so first-launch imports are reflected
         // in the windows created below.
-        settings.load()
+        SupportTabs.shared.navigation.loadConfiguration(onboarding: { AgentPadOnboarding.runIfNeeded() },
+                                                        load: { AgentPadSettingsModel.shared.load() })
+        let settings = AgentPadSettingsModel.shared
         // Keep the observable settings model independent of NSApplication.
         // These are the only two imperative app-wide effects a save needs;
         // wiring narrow callbacks here leaves AppDelegate as the owner of
@@ -159,7 +159,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // Before the windows come back: their Claude sessions read the team
         // tools' config once, at their start (DESIGN-D6 §7.2).
         TeamUI.prepareTeamTools()
+        TabRouter.shared.stores = { [weak self] in self?.windowControllers.map(\.store) ?? [] }
+        TabRouter.shared.revealWindow = { [weak self] store in
+            guard let controller = self?.windowControllers.first(where: { $0.store === store }) else { return }
+            controller.window?.deminiaturize(nil); controller.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        SupportTabs.shared.install()
+        TabRouter.shared.ensureHost = { [weak self] in self?.ensureWorkspaceHost()?.store }
+        SupportTabs.shared.activateNotice = { [weak self] event in self?.activateFromInbox(event) }
         restoreWindows()
+        SupportTabs.shared.navigation.finishStartup()
 
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -174,12 +184,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 completion(.failure("\(AppIdentity.appName) is shutting down"))
                 return
             }
-            self.cliController.handle(
-                request,
-                origin: origin, // AgentPad: Y4
-                isCallerWaiting: isCallerWaiting,
-                completion: completion
-            )
+            self.handleCLIRequest(request, origin: origin, isCallerWaiting: isCallerWaiting, completion: completion)
         }
         hookServer.onShellCommandRequest = { [weak self] request in
             guard let self, !self.isTerminating else { return nil }
@@ -209,7 +214,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         notificationNavigation.open = { [weak self] in self?.openAttention($0) ?? false }
         notificationNavigation.unavailable = {
-            Task { await TeamUI.showError("This item is no longer available or no longer needs a decision", TeamError.storage("")) }
+            SupportTabs.shared.noticeUnavailable()
         }
         AttentionCoordinator.shared.navigation = notificationNavigation
         AttentionCoordinator.shared.terminalFocused = { [weak self] in self?.isSessionVisible($0) ?? false }
@@ -244,12 +249,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 }
             }
         }
-        TeamWindows.showCallsTab = { [weak self] in
-            guard let store = self?.activeStore else { return }
-            if store.sidebarMode != .full { store.setSidebarMode(.full) }
-            store.setSidebarContent(.team)
-            NSApp.activate(ignoringOtherApps: true)
-        }
         // AgentPad: correct own Claude tabs whose hooks left a stale state.
         ExternalSessionMonitor.shared.onOwnSessions = { [weak self] own in
             for controller in self?.windowControllers ?? [] {
@@ -277,9 +276,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
         // LAST: windows + hook server + monitors all exist now, so a deep
         // link that raced launch can finally act.
+        finishDeepLinkStartup()
+    }
+
+    private func finishDeepLinkStartup() {
         deepLinksReady = true
-        for link in pendingDeepLinks { handleDeepLink(link) }
-        pendingDeepLinks = []
+        let links = pendingDeepLinks; pendingDeepLinks.removeAll()
+        for link in links { handleDeepLink(link) }
     }
 
     /// System mode has two jobs on a macOS appearance flip: explicitly apply
@@ -302,14 +305,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// Rebuilds every window persisted in `state.json`, or opens one default
     /// window on a fresh install.
     private func restoreWindows() {
+        guard SupportTabs.shared.navigation.configurationLoaded else {
+            _ = SupportTabs.shared.navigation.admit { [weak self] in
+                guard let self else { return }
+                if windowControllers.isEmpty { restoreWindows() } else { _ = revealHiddenWindow() }
+            }
+            return
+        }
         let ids = appPersistence.windowIds
         if ids.isEmpty {
             addWindow()
         } else {
             for id in ids { addWindow(windowId: id) }
         }
-        // `addWindow` keys each as it's created, so the last restored window
-        // ends up frontmost — AgentPad doesn't persist which window was key.
+        TabRouter.shared.reconcileRestoredTabs()
+        // `addWindow` keys each as it's created; duplicate Connection routes
+        // then focus their surviving tab. The previous key window isn't saved.
         //
         // Worktree two-way reconcile runs off the main actor so launch
         // isn't blocked by N × `git worktree list` subprocesses. Sidebar
@@ -326,10 +337,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// `⌘⇧N` default) gets an empty store, which opens one default
     /// workspace; a restored id loads that window's persisted slice.
     @discardableResult
-    private func addWindow(windowId: UUID = UUID()) -> AgentPadWindowController {
+    private func addWindow(windowId: UUID = UUID(), initiallyEmpty: Bool = false) -> AgentPadWindowController {
+        precondition(SupportTabs.shared.navigation.configurationLoaded, "Welcome must finish before workspace/runtime construction")
         let persistence = WindowPersistence(windowId: windowId, app: appPersistence)
         let store = WorkspaceStore(
             persistence: persistence,
+            initiallyEmpty: initiallyEmpty,
             peerStores: { [weak self] in self?.windowControllers.map(\.store) ?? [] },
             moveToNewWindow: { [weak self] id in self?.moveTabToNewWindow(sessionId: id) },
             onSessionAlert: { [weak self] id, kind in self?.handleSessionAlert(id, kind) },
@@ -377,24 +390,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
     }
 
-    /// Right-click → "Move to New Window": creates a fresh window and pulls
-    /// the session into it via the same cross-window machinery as a drag
-    /// between existing windows. The new window's throwaway default tab is
-    /// discarded once the adoption lands — `discardTab` (vs `closeTab`)
-    /// keeps it off the `⌘⇧T` reopen stack since the user never asked for it.
+    /// Transfers a live tab into an empty container, without a temporary shell.
     private func moveTabToNewWindow(sessionId: UUID) {
-        let controller = addWindow()
-        guard let workspace = controller.store.active,
-              let pane = workspace.activePane else { return }
-        let defaultTab = pane.tabs.first
-        controller.store.handleTabDrop(droppedId: sessionId, to: pane, at: pane.tabs.count, in: workspace)
-        // `count > 1` is a soft-fail guard for the rare case where
-        // cross-window adoption returned false (e.g. the source store
-        // vanished between right-click and here) — without it we'd discard
-        // the placeholder, leaving the new window with zero tabs.
-        if let defaultTab, pane.tabs.count > 1 {
-            controller.store.discardTab(defaultTab, in: workspace)
-        }
+        let controller = addWindow(initiallyEmpty: true)
+        guard let workspace = controller.store.active, let pane = workspace.activePane else { return }
+        controller.store.handleTabDrop(droppedId: sessionId, to: pane, at: 0, in: workspace)
     }
 
     /// No other window is on screen. Evaluated against the live array, which
@@ -408,6 +408,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// and scrollback stay as they are; the next Dock click brings the same
     /// window back. One of several windows, or any window during ⌘Q, really closes.
     private func shouldCloseWindow(_ controller: AgentPadWindowController) -> Bool {
+        guard controller.store.tabCloseCoordinator.prepare(controller.store.allSessions), controller.store.flushPersistence() else { return false }
         guard isLastWindow(controller), !isTerminating else { return true }
         controller.hideInsteadOfClose()
         return false
@@ -587,7 +588,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     /// Deep-link wrapper around `resumeSession` — failures become the
-    /// visible sheet (the link just activated the app, so silence would
+    /// support tab (the link just activated the app, so silence would
     /// read as a dead link), dropped tiers stay log-only exactly as before.
     private func resumeSessionFromDeepLink(agentId: String, conversationId: String, cwd: String?) {
         resumeSession(agentId: agentId, conversationId: conversationId, cwd: cwd) { [weak self] outcome in
@@ -597,7 +598,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             case .failed(let reason):
                 self?.presentDeepLinkFailure(reason)
             case .dropped(let reason):
-                NSLog("agentpad: resume request dropped — %@", reason)
+                NSLog("agentpad: resume request dropped — %@", LinkFailureMessage(reason: reason).text)
             }
         }
     }
@@ -819,23 +820,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// subtly wrong: `activeController` can still find a controller in the
     /// window between a close and its deallocation).
     private func deepLinkController() -> (controller: AgentPadWindowController, builtWindow: Bool)? {
+        guard SupportTabs.shared.navigation.configurationLoaded else { return nil }
         revealHiddenWindow()
         if let controller = activeController { return (controller, false) }
         guard !isTerminating else { return nil }
         return (addWindow(), true)
     }
 
-    private func presentDeepLinkFailure(_ reason: String) {
-        NSLog("agentpad: deep link rejected — %@", reason)
-        // Defensive cap besides the parse-level limits: the sheet has no
-        // scroll view, so an oversized reason must never reach layout.
-        let display = reason.count > 500 ? String(reason.prefix(500)) + "…" : reason
-        guard let window = deepLinkController()?.controller.window else { return }
-        // A sheet on a miniaturized window is invisible (NSApp.activate does
-        // not deminiaturize) — front it like the success path does.
-        front(window)
-        DeepLinkFailurePresenter.present(on: window, reason: display)
+    private func ensureWorkspaceHost() -> AgentPadWindowController? {
+        guard SupportTabs.shared.navigation.ready, !isTerminating else { return nil }
+        revealHiddenWindow()
+        let controller = activeController ?? addWindow(initiallyEmpty: true)
+        if let window = controller.window { front(window) }
+        return controller
     }
+
+    private func presentDeepLinkFailure(_ reason: String) { SupportTabs.shared.linkFailed(reason) }
 
     /// True when some window already runs the conversation and was revealed.
     private func revealOpenConversation(agentId: String, conversationId: String) -> Bool {
@@ -859,6 +859,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// closures so the controller's decisions stay unit-testable without an
     /// AppDelegate (DeepLinkTests' split: pure decisions pinned, AppKit
     /// manual).
+    private func handleCLIRequest(_ request: AgentPadCLIRequest, origin: AgentPadCallerOrigin,
+                                  isCallerWaiting: @escaping @MainActor () -> Bool,
+                                  completion: @escaping @MainActor (AgentPadCLIResponse) -> Void) {
+        guard SupportTabs.shared.navigation.admit({ [weak self] in
+            self?.handleCLIRequest(request, origin: origin, isCallerWaiting: isCallerWaiting, completion: completion)
+        }) else { return }
+        guard !isTerminating, isCallerWaiting() else {
+            completion(.failure("The request is no longer active")); return
+        }
+        cliController.handle(request, origin: origin, isCallerWaiting: isCallerWaiting, completion: completion)
+    }
+
     private lazy var cliController = AgentPadCLIController(
         appVersion: AgentPadApp.displayVersion,
         windows: { [weak self] in
@@ -995,14 +1007,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         revealTab(location.session, in: location.workspace, controller: location.controller)
     }
 
-    /// Toggle the agent inbox panel — from the top-chrome bell or ⇧⌘I.
-    @objc func handleShowInbox() {
-        revealHiddenWindow()
-        InboxWindowController.shared.toggle(
-            anchor: activeController?.window,
-            onActivate: { [weak self] event in self?.activateFromInbox(event) }
-        )
-    }
+    /// Open the notification tab from the top-chrome bell or ⇧⌘I.
+    @objc func handleShowInbox() { SupportTabs.shared.navigation.open(.notifications) }
 
     /// Inbox row click → mark that event read, bring AgentPad forward, jump to the
     /// tab. The jump no-ops if the session has since closed (event outlives it).
@@ -1011,18 +1017,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     private func openAttention(_ event: AttentionEvent) -> Bool {
+        guard SupportTabs.shared.navigation.admit({ [weak self] in _ = self?.openAttention(event) }) else { return false }
         NSApp.activate(ignoringOtherApps: true)
-        func team(_ destination: AttentionDestination) -> Bool {
-            revealHiddenWindow()
-            let targetWindow = AttentionFocus.window(for: destination)
-            guard let controller = windowControllers.first(where: { targetWindow != nil && $0.window === targetWindow })
-                ?? windowControllers.first(where: { $0.store.sidebarContent == .team }) ?? activeController else { return false }
-            controller.store.setSidebarMode(.full)
-            controller.store.setSidebarContent(.team)
-            controller.window?.deminiaturize(nil); controller.window?.makeKeyAndOrderFront(nil)
-            AttentionSelection.shared.select(destination)
-            return true
-        }
         func channel(_ id: String) -> Session? {
             guard let scope = event.scope, let key = ChatAttention.key(scope),
                   ChatNotifications.allowed(.shared, key, channel: id) else { return nil }
@@ -1037,27 +1033,31 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             revealTab(location.session, in: location.workspace, controller: location.controller)
             return true
         case .external(let id): AttentionCoordinator.shared.activate(.external(id)); return true
-        case .team, .version: return team(event.destination)
-        case .folder(let id, let request):
-            if let folder = TeamService.shared.calls.accessRequests.first(where: { $0.id == id }), let name = folder.scope?.channelId {
-                guard channel(name) != nil else { return false }
-                AttentionSelection.shared.select(.channel(name, request: request)); return true
-            }
-            return team(event.destination)
-        case .channel(let id, _):
-            guard channel(id) != nil else { return false }
-            AttentionSelection.shared.select(event.destination); return true
+        case .team(let id, _):
+            guard let id else { return TeamTabs.shared.showActivity(section: "requests") != nil }
+            return RequestTabs.shared.open(id, scope: event.scope.flatMap(ChatAttention.key).map { .server(OrgKey($0)) } ?? .local) != nil
+        case .version(let id):
+            guard let request = ClaudeVersionApprovals.shared.pending.first(where: { $0.id == id })?.callId else { return false }
+            return RequestTabs.shared.open(request) != nil
+        case .folder(_, let request), .channel(_, let request):
+            return RequestTabs.shared.open(request, scope: event.scope.flatMap(ChatAttention.key).map { .server(OrgKey($0)) } ?? .local) != nil
         case .message(let id, let message, _, let sequence):
             guard let tab = channel(id), let scope = event.scope, let key = ChatAttention.key(scope) else { return false }
             ChatMessageNavigation.request(ChatMessageLink(key: key, channel: id, message: message, sequence: sequence), key: key, destination: tab.engine.view)
             return true
-        case .organization: ChatOrgWindow.show(); AttentionSelection.shared.select(event.destination); return true
-        case .connect: ChatConnectWindow.show(); return true
+        case .organization:
+            guard let scope = event.scope, let key = ChatAttention.key(scope) else { return false }
+            OrganizationTabs.show(key: OrgKey(key)); AttentionSelection.shared.select(event.destination); return true
+        case .connect: return ConnectionTabs.shared.show() != nil
         case .recovery(let id):
-            if id == "publications" { TeamUI.showAgents() } else { TeamUI.showTeam() }
+            if id == "publications" { TeamUI.showAgents() } else { TeamTabs.shared.showActivity(section: id == "delivery" ? "delivery" : "connection") }
             return true
-        case .update: handleCheckForUpdates(NSMenuItem()); return true
-        case .sheet(let id): return PendingConfirmations.shared.open(id)
+        case .linkFailure(let windowID):
+            let store = windowControllers.first { $0.windowId == windowID }?.store
+            return SupportTabs.shared.navigation.open(.linkFailure, from: store) != nil
+        case .update: SupportTabs.shared.settings(.updates); return true
+        case .sheet: return false
+        case .tabAction(_, let id): return PendingConfirmations.shared.open(id)
         case .invitation, .directMessage, .publicationProposal: return false
         }
     }
@@ -1132,11 +1132,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // glass→off toggle doesn't leave a window see-through. Every AgentPad
         // window (main + the shared panels) carries glass on macOS 26.
         let auxiliary = [
-            AgentPadSettingsWindowController.shared.window,
-            UpdatePromptWindowController.shared.window,
             CommandPaletteWindowController.shared.window,
-            InboxWindowController.shared.window,
-            AboutWindowController.shared.window,
         ]
         for window in windowControllers.map(\.window) + auxiliary {
             window?.appearance = appearance
@@ -1163,6 +1159,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if terminationReplyPending { return .terminateLater }
+        // Save every editor before stopping even the first process.
+        var saved = true
+        for controller in windowControllers {
+            if !controller.store.tabCloseCoordinator.prepare(controller.store.allSessions) || !controller.store.flushPersistence() { saved = false }
+        }
+        guard saved else { return .terminateCancel }
 
         // Runs before AppKit closes the windows, so every `windowWillClose`
         // that follows sees the flag and keeps its persisted slot. Start every
@@ -1497,6 +1499,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     // MARK: - Menu actions
 
     @objc private func handleNewWindow() {
+        guard SupportTabs.shared.navigation.admit({ [weak self] in self?.handleNewWindow() }) else { return }
         // ⌘⇧N is already in-app, but the Dock-tile "New Window" can fire while
         // AgentPad is in the background — without activating, the new window opens
         // behind whatever app is frontmost.
@@ -1636,15 +1639,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                   let ws = target.store.workspaces.first(where: { $0.id == wsId }) else { return }
             if let window = target.window { front(window) }
             target.store.activateWorkspace(ws)
-            target.store.pendingCreateWorktreeRequest = ws
-            if target.store.sidebarMode == .hidden {
-                // Matches ContentView / View menu's reveal behaviour — without
-                // the animation wrap the sidebar snaps from 0 to 220pt the moment
-                // the palette routes a worktree-create request through.
-                withAnimation(Theme.chromeTransition) {
-                    target.store.setSidebarMode(.full)
-                }
-            }
+            target.store.requestCreateWorktree(ws)
         case .agent(let templateId):
             guard let store = activeStore, let ws = store.active else { return }
             let template = AgentTemplate.visibleOrdered(model: AgentPadSettingsModel.shared)
@@ -1695,9 +1690,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 panel.dismiss()
             } else if let panel = aux as? NSSavePanel {
                 panel.cancel(nil)
-            } else if let parent = aux.sheetParent,
-                      let controller = controller(for: parent) {
-                controller.store.requestDismissActiveSheet()
             } else if aux.styleMask.contains(.closable) {
                 aux.performClose(nil)
             }
@@ -1820,7 +1812,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             guard terminalWindowIsKey, let session = activeStore?.active?.activeSession else { return false }
             // AgentPad: expose the same refusal as the tab's export controls.
             menuItem.toolTip = AgentAnswerSource.problem(session)?.errorDescription
-            return AgentAnswerWindow.available(session)
+            return CompositionTabs.available(session)
         }
 
         if menuItemMatches(
@@ -1839,7 +1831,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         ) {
             // AgentPad: none of these is for a channel tab (DESIGN-F2).
             guard let session = activeStore?.active?.activeSession else { return false }
-            return terminalWindowIsKey && !session.isChat
+            return terminalWindowIsKey && session.hasProcess
         }
 
         if menuItemMatches(
@@ -1967,12 +1959,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     @objc private func handleCopyAgentAnswer() {
         guard keyAuxiliaryWindow == nil, let store = activeStore, let session = store.active?.activeSession else { return }
-        AgentAnswerWindow.open(session: session, store: store, copyOnly: true)
+        CompositionTabs.shared.forward(session: session, store: store, copyOnly: true)
     }
 
     @objc private func handleForwardAgentAnswer() {
         guard keyAuxiliaryWindow == nil, let store = activeStore, let session = store.active?.activeSession else { return }
-        AgentAnswerWindow.open(session: session, store: store)
+        CompositionTabs.shared.forward(session: session, store: store)
     }
 
     @objc private func handleComposePrompt() {
@@ -1998,7 +1990,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     @objc private func handleAbout() {
-        AboutWindowController.shared.show()
+        SupportTabs.shared.settings(.about)
     }
 
     @objc private func handleOpenIssues() {
@@ -2010,42 +2002,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     @objc private func handleCheckForUpdates(_ sender: NSMenuItem) {
-        // AgentPad: the packaged app updates itself (Updater.swift).
-        if AgentPadUpdater.shared.isAvailable {
-            AgentPadUpdater.shared.checkForUpdates()
-            return
-        }
-        let originalTitle = sender.title
-        sender.title = String(localized: "Checking for Updates…", bundle: .agentPadResources)
-        sender.isEnabled = false
-        UpdateAttention.shared.beginCheck()
-        // AGENTPAD_FAKE_VERSION lets us preview the "newer release" prompt without
-        // mutating AgentPadApp.displayVersion. Launch via:
-        //   open --env AGENTPAD_FAKE_VERSION=0.11.0 /Applications/AgentPad.app
-        let currentVersion = ProcessInfo.processInfo.environment["AGENTPAD_FAKE_VERSION"]
-            ?? AgentPadApp.displayVersion
-        Task { @MainActor in
-            let outcome = await UpdateChecker.check(currentVersion: currentVersion)
-            sender.title = originalTitle
-            sender.isEnabled = true
-            UpdatePromptWindowController.present(outcome: outcome, currentVersion: currentVersion)
-        }
+        guard SupportTabs.shared.settings(.updates) != nil else { return }
+        SupportTabs.shared.updates.check()
     }
 
     // AgentPad: Team menu.
     @objc private func handleTeamWindow() { TeamUI.showTeam() }
     @objc private func handleTeamAgents() { TeamUI.showAgents() }
-    @objc private func handleTeamCalls() { TeamWindows.showCalls() }
-    @objc private func handleChatConnect() { ChatConnectWindow.show() }
-    @objc private func handleChatOrganization() { ChatOrgWindow.show() }
-    @objc private func handleChatDisconnect() { ChatConnectWindow.disconnect() }
+    @objc private func handleTeamCalls() { TeamTabs.shared.showActivity(section: "requests") }
+    @objc private func handleChatConnect() { ConnectionTabs.shared.show() }
+    @objc private func handleChatOrganization() { OrganizationTabs.show() }
+    @objc private func handleChatDisconnect() { ConnectionTabs.shared.disconnect() }
 
-    @objc private func handleOpenSettings() {
-        // Pass a live resolver, not a snapshot — the Settings window is a
-        // singleton that outlives any one window; a captured store would
-        // dangle once its window closed.
-        AgentPadSettingsWindowController.show(storeProvider: { [weak self] in self?.activeStore })
-    }
+    @objc private func handleOpenSettings() { SupportTabs.shared.settings() }
 
     private func openAgentPadFromMenuBar() {
         NSApp.activate(ignoringOtherApps: true)
@@ -2167,3 +2136,157 @@ final class DockTabMenuFiller: NSObject, NSMenuDelegate {
         watch = nil
     }
 }
+
+#if DEBUG
+// Runs only in the isolated --self-check-first-launch process. These checks
+// exercise the real menu, CLI, URL, window and runtime entry points.
+extension AppDelegate {
+    func checkFirstLaunch(mode: String) async throws {
+        func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
+            try AgentPadFirstLaunchSelfCheck.require(try condition(), message)
+        }
+        let directory = AgentPadSettings.directory
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let ghostty = directory.appendingPathComponent("ghostty-config")
+        let imported = mode.hasPrefix("import-")
+        let existing = mode == "existing" || mode == "restart"
+        if mode != "no-config" {
+            try "confirm-close-surface = true\nfont-size = 17\nbackground-blur = \(mode == "import-glass" ? "macos-glass-regular" : "false")\n"
+                .write(to: ghostty, atomically: true, encoding: .utf8)
+        }
+        if mode == "existing" { try AgentPadSettings.writeChecked(["terminal": ["font-size": 19]]) }
+        let initial = try? Data(contentsOf: AgentPadSettings.url)
+        let navigation = SupportTabs.shared.navigation, router = TabRouter.shared
+        router.stores = { [weak self] in self?.windowControllers.map(\.store) ?? [] }
+        router.ensureHost = { [weak self] in self?.ensureWorkspaceHost()?.store }
+        router.revealWindow = { [weak self] store in
+            self?.windowControllers.first { $0.store === store }?.window?.makeKeyAndOrderFront(nil)
+        }
+        SupportTabs.shared.install()
+        installMainMenu()
+        var cliAnswer: AgentPadCLIResponse?
+        var earlyError: Error?
+        var prompts = 0
+        let earlyEntries: @MainActor () throws -> Void = { [self] in
+            handleOpenSettings()
+            let key = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+                windowNumber: NSApp.keyWindow?.windowNumber ?? 0, context: nil, characters: ",",
+                charactersIgnoringModifiers: ",", isARepeat: false, keyCode: 43)!
+            _ = NSApp.mainMenu?.performKeyEquivalent(with: key)
+            try require(router.open(.settings) == nil, "direct Settings router bypass")
+            handleChatConnect()
+            try require(router.open(.connection) == nil, "direct Connection router bypass")
+            handleNewWindow()
+            restoreWindows()
+            _ = applicationShouldHandleReopen(NSApp, hasVisibleWindows: false)
+            handleCLIRequest(.init(verb: .open, agent: "terminal"), origin: .outside, isCallerWaiting: { true }) { cliAnswer = $0 }
+            application(NSApp, open: [URL(string: "agentpad://resume?agent=claude&id=")!])
+            try require(windowControllers.isEmpty, "entry created a workspace during Welcome")
+            try require(!NSApp.windows.contains { $0.isVisible && $0 !== NSApp.modalWindow }, "entry opened an auxiliary window during Welcome")
+            try require(!LibghosttyApp.initialized, "entry initialized libghostty during Welcome")
+            try require(cliAnswer == nil, "CLI executed before startup finished")
+            try require((try? Data(contentsOf: AgentPadSettings.url)) == initial, "entry saved settings during Welcome")
+            try require(!pendingDeepLinks.isEmpty, "deep link was not deferred")
+        }
+        let timer = Timer(timeInterval: 0.05, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard NSApp.modalWindow != nil else { return }
+                prompts += 1
+                do { try earlyEntries() } catch { earlyError = error }
+                let title = imported ? String(localized: "Use ghostty settings", bundle: .agentPadResources)
+                    : String(localized: "Start fresh", bundle: .agentPadResources)
+                func buttons(_ view: NSView) -> [NSButton] {
+                    (view as? NSButton).map { [$0] } ?? view.subviews.flatMap(buttons)
+                }
+                if let view = NSApp.modalWindow?.contentView, let button = buttons(view).first(where: { $0.title == title }) {
+                    button.performClick(nil)
+                } else {
+                    earlyError = AgentPadFirstLaunchSelfCheck.Failure.check("Welcome choice button is missing")
+                    NSApp.stopModal(withCode: .abort)
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        if existing || mode == "no-config" { try earlyEntries() }
+        var events: [String] = []
+        navigation.loadConfiguration(onboarding: {
+            AgentPadOnboarding.runIfNeeded(ghosttyConfig: ghostty)
+            events.append("written")
+        }, load: {
+            AgentPadSettingsModel.shared.load()
+            events.append("loaded")
+        })
+        timer.invalidate()
+        if let earlyError { throw earlyError }
+        try require(prompts == (existing || mode == "no-config" ? 0 : 1), "Welcome shown or skipped incorrectly")
+        try require(events == ["written", "loaded"], "configuration load order changed")
+        try require(windowControllers.isEmpty && !LibghosttyApp.initialized, "early empty window/runtime")
+        try require(FileManager.default.fileExists(atPath: AgentPadSettings.url.path), "startup did not write settings")
+        let settings = AgentPadSettingsModel.shared
+        if existing { try require(try Data(contentsOf: AgentPadSettings.url) == initial, "existing settings overwritten") }
+        if imported { try require(settings.fontSize == 17, "import was not loaded into Settings") }
+        if mode == "no-config" { try require(try String(contentsOf: AgentPadSettings.url, encoding: .utf8) == AgentPadSettings.defaultTemplate, "missing default template") }
+
+        // Even an empty main window exercises applyGlassBacking, which can be
+        // the very first access to LibghosttyApp before a surface exists.
+        let controller = addWindow(initiallyEmpty: true)
+        events.append("window")
+        let store = controller.store
+        let workspace = store.active!
+        if imported {
+            let terminal = store.addTab(in: workspace)
+            // No view has mounted yet; use a shell without user rc files.
+            // Launching the editor as a foreground job also exercises the real
+            // PTY group, rather than the privileged /usr/bin/login wrapper.
+            terminal.engine.start(config: TerminalSessionConfig(command: "/bin/bash --noprofile --norc",
+                arguments: [], workingDirectory: directory.path, environment: [:]))
+            NSApp.activate(ignoringOtherApps: true)
+            try await AgentPadFirstLaunchSelfCheck.until { terminal.engine.foregroundPid != nil }
+            terminal.engine.sendInput("/usr/bin/vi -u NONE -i NONE \(directory.path)/scratch.txt\r")
+            try await AgentPadFirstLaunchSelfCheck.until {
+                guard let pid = terminal.engine.foregroundPid, let info = ProcessInfoReader.info(of: pid) else { return false }
+                return ["vi", "vim"].contains(info.name) && terminal.engine.needsConfirmQuit
+            }
+            events.append("surface")
+            let pid = terminal.engine.foregroundPid!
+            let close = ConfirmCloseTab.request(terminal, in: workspace, store: store)
+            try require(close == .presenting, "first terminal close: \(close), pid \(pid), process \(String(describing: ProcessInfoReader.info(of: pid))), host \(terminal.engine.view.window != nil), phase \(terminal.terminalConfirmation.phase)")
+            try await AgentPadFirstLaunchSelfCheck.until { terminal.terminalConfirmation.isVisible }
+            terminal.terminalConfirmation.cancel()
+            try require(store.allSessions.contains { $0 === terminal }, "Cancel closed the first terminal")
+            try require(kill(pid, 0) == 0 && terminal.engine.needsConfirmQuit, "Cancel stopped the editor")
+            try require(controller.window?.attachedSheet == nil && NSApp.modalWindow == nil, "terminal close used a modal")
+            try require((Theme.glassStyle != nil) == (mode == "import-glass"), "glass configuration mismatch")
+        }
+        navigation.finishStartup()
+        finishDeepLinkStartup()
+        try await AgentPadFirstLaunchSelfCheck.until { cliAnswer != nil }
+        try require(cliAnswer?.ok == true, "deferred CLI failed")
+        try require(pendingDeepLinks.isEmpty, "deferred link was not drained")
+        try require(router.find(.connection, windowID: store.windowID) != nil, "deferred Connection did not open")
+        try require(windowControllers.count > 1, "deferred New Window/restore did not run")
+        try require(events.prefix(3) == ["written", "loaded", "window"], "startup order changed")
+        try await AgentPadFirstLaunchSelfCheck.until { LibghosttyApp.initialized }
+        if mode == "restart" {
+            try require(settings.customAgents.count == 1 && !settings.notificationSound, "post-Welcome edits were lost after restart")
+        } else if imported || mode == "fresh" {
+            try require(SupportTabs.shared.settings() != nil, "Settings unavailable after choice")
+            settings.addCustomAgent()
+            settings.notificationSound = false
+            settings.scheduleSave()
+            try settings.flushSaveChecked()
+        }
+        // A repeated launch step must skip Welcome and preserve later edits.
+        let saved = try Data(contentsOf: AgentPadSettings.url)
+        AgentPadOnboarding.runIfNeeded(ghosttyConfig: ghostty)
+        try require(try Data(contentsOf: AgentPadSettings.url) == saved, "onboarding ran twice")
+    }
+
+    func endFirstLaunchCheck() async {
+        for controller in windowControllers { controller.store.terminate(); controller.window?.orderOut(nil) }
+        // Surface teardown is asynchronous; allow the PTYs to finish before
+        // the subprocess exits, including on a failed assertion.
+        try? await Task.sleep(for: .milliseconds(700))
+    }
+}
+#endif

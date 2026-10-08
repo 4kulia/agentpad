@@ -112,7 +112,7 @@ struct SessionInfoView: View {
                 }
 
                 // AgentPad: a channel tab has no processes (DESIGN-F2).
-                if !session.isChat { SessionProcessesSection(store: store, session: session) }
+                if session.hasProcess { SessionProcessesSection(store: store, session: session) }
 
                 if hasRuntimeInfo(session) {
                     SessionInfoSection(title: SessionInfoRules.runtimeTitle, store: store) {
@@ -222,7 +222,10 @@ private struct SessionProcessesSection: View {
                     .font(SessionInfo.valueFont)
                     .foregroundStyle(Theme.chromeMuted)
             } else {
-                ForEach(processes) { ProcessRow(process: $0) }
+                ForEach(processes) { ProcessRow(process: $0, session: session) }
+                if session.terminalConfirmation.context?.targetID.hasPrefix("process:") == true {
+                    TerminalConfirmation(session: session)
+                }
             }
             // The scan is honest but incomplete over SSH: the local tty only
             // carries the ssh process itself, so say so rather than letting
@@ -461,6 +464,7 @@ private struct SectionDisclosureStyle: ButtonStyle {
 /// One process on the session's terminal, shell at depth 0.
 private struct ProcessRow: View {
     let process: SessionProcess
+    let session: Session
 
     @State private var contextMenu: PopoverPresentation<SessionProcess>?
 
@@ -527,7 +531,7 @@ private struct ProcessRow: View {
             contextMenu = PopoverPresentation(value: process)
         })
         .popover(item: $contextMenu, arrowEdge: .trailing) { presented in
-            ProcessContextMenu(process: presented.value) { contextMenu = nil }
+            ProcessContextMenu(process: presented.value, session: session) { contextMenu = nil }
         }
     }
 }
@@ -564,15 +568,12 @@ private struct PortLink: View {
     }
 }
 
-/// Copy PID / copy port URLs / two-step kill. The kill row arms on the first
-/// click and only sends SIGTERM on the second, recolored as a warning while
-/// armed; `.popover(item:)`'s fresh identity per open means an armed-but-
-/// abandoned kill resets the moment the menu closes.
+/// Process actions share the terminal tab’s inline decision.
 private struct ProcessContextMenu: View {
     let process: SessionProcess
+    let session: Session
     let dismiss: () -> Void
 
-    @State private var killArmed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -593,24 +594,9 @@ private struct ProcessContextMenu: View {
                 }
             }
             AgentPadMenuDivider()
-            AgentPadMenuRow(
-                title: killArmed ? "Confirm Kill" : "Kill Process",
-                titleColor: killArmed ? Theme.activityFailure : nil
-            ) {
-                guard killArmed else {
-                    killArmed = true
-                    return
-                }
+            AgentPadMenuRow(title: "Kill Process") {
                 dismiss()
-                // SIGTERM, not SIGKILL — the polite ask. Identity is
-                // re-verified first: this menu can sit open long after the
-                // target exited, and a recycled pid must never take the hit
-                // (Codex review). A refusal — gone, recycled, or not ours to
-                // signal — beeps instead of failing silently.
-                if !SessionProcessScanner.identityMatches(pid: process.pid, startedAtUs: process.startedAtUs)
-                    || kill(process.pid, SIGTERM) != 0 {
-                    NSSound.beep()
-                }
+                TerminalProcessActions.requestKill(process, session: session)
             }
         }
         .padding(Theme.space1)

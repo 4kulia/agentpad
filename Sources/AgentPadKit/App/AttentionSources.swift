@@ -33,7 +33,8 @@ extension AttentionCoordinator {
         case .terminal(let id): return terminalExists(id)
         case .external(let id): return ExternalSessionMonitor.shared.sessions.contains { $0.id == id && $0.monitorState == .attention }
         case .version(let id): return ClaudeVersionApprovals.shared.pending.contains { $0.id == id }
-        case .sheet(let id): return PendingConfirmations.shared.valid(id)
+        case .sheet: return false // Legacy address; sheets no longer register decisions.
+        case .tabAction(_, let id): return PendingConfirmations.shared.valid(id)
         case .invitation, .directMessage, .publicationProposal: return false
         default: return true
         }

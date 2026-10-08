@@ -430,8 +430,10 @@ final class ChatMessagesTests: XCTestCase {
             answers.setBytes("/v1/orgs/\(org)/attachments/\(file.id)/preview", png)
             answers.setBytes("/v1/orgs/\(org)/attachments/\(file.id)/original", png)
             _ = try await manager.load(message, file: file, preview: true)
-            try await manager.open(message, file: file)
-            XCTAssertNotNil(manager.image(message, file: file)); XCTAssertNotNil(manager.viewer)
+            let viewerState = TabState(route: .viewer(OrgKey(key), channelID: channel, messageID: message.id, attachmentID: file.id))
+            let viewer = AttachmentViewerModel(state: viewerState, tabs: CompositionTabs(router: TabRouter(), chat: service))
+            await viewer.load()
+            XCTAssertNotNil(manager.image(message, file: file)); XCTAssertNotNil(viewer.preview)
             // A failed rights refresh must leave the gate closed; no WS event is
             // delivered. This exercises the actual feed/outbox HTTP callback.
             answers.set("/v1/orgs/\(org)/state", "{}", status: 503)
@@ -450,7 +452,7 @@ final class ChatMessagesTests: XCTestCase {
             try await waitUntil("HTTP refusal") { try store.outbox.commands().contains { $0.commandId == command.commandId && $0.state == .failed } }
             XCTAssertEqual(try doubt(store), true, type)
             XCTAssertNil(manager.image(message, file: file), type)
-            XCTAssertNil(manager.viewer, type)
+            XCTAssertNil(viewer.preview, type)
             XCTAssertNil(manager.stamp(channel: channel), type)
             XCTAssertTrue(sync.needsSnapshot)
             try await waitUntil("rights recheck") { ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/orgs/\(self.org)/state" }.count > stateReads }

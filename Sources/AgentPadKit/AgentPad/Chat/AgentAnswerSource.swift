@@ -18,7 +18,7 @@ enum AgentAnswerSource {
     }
 
     static func supports(_ session: Session) -> Bool {
-        !session.isChat && [AgentTemplate.claudeCodeID, AgentTemplate.codex.id].contains(session.displayAgent.rosterId)
+        session.hasProcess && [AgentTemplate.claudeCodeID, AgentTemplate.codex.id].contains(session.displayAgent.rosterId)
     }
 
     /// Surface routing and history IDs alone never prove PID → journal.
@@ -54,11 +54,12 @@ enum AgentAnswerSource {
     typealias Reader = @Sendable (AgentAnswerTranscript.Agent, String, URL) throws -> String
 
     static func read(session: Session, store: WorkspaceStore, inspector: AgentAnswerProvenance.Inspector = .init(),
-                     reader: @escaping Reader = { try AgentAnswerTranscript.read(agent: $0, conversation: $1, root: $2) }) async throws -> Answer {
+                     reader: @escaping Reader = { try AgentAnswerTranscript.read(agent: $0, conversation: $1, root: $2) },
+                     owner: (@MainActor () -> WorkspaceStore?)? = nil) async throws -> Answer {
         if let problem = problem(session, inspector: inspector) { throw problem }
         guard let binding = session.answerBinding else { throw AgentAnswerTranscript.Problem.unbound }
         let current: @MainActor () -> Bool = { [weak session, weak store] in
-            guard let session, let store else { return false }
+            guard let session, let store = owner?() ?? store else { return false }
             return session.answerBinding == binding && problem(session, inspector: inspector) == nil
                 && store.workspaces.contains { $0.root.allPanes.contains { $0.tabs.contains { $0 === session } } }
         }

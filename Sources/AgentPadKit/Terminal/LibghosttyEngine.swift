@@ -10,10 +10,16 @@ import GhosttyKit
 @MainActor
 final class LibghosttyApp {
     static let shared = LibghosttyApp()
+    #if DEBUG
+    private(set) static var initialized = false
+    #endif
 
     private(set) var app: ghostty_app_t?
 
     private init() {
+        #if DEBUG
+        Self.initialized = true
+        #endif
         var argv: [UnsafeMutablePointer<CChar>?] = [nil]
         let initResult = argv.withUnsafeMutableBufferPointer {
             ghostty_init(0, $0.baseAddress)
@@ -524,7 +530,7 @@ private let agentPadReadClipboardCb: ghostty_runtime_read_clipboard_cb = { userd
 
 /// The core judged a clipboard read risky — an unsafe paste (newline into a
 /// non-bracketed prompt, `clipboard-paste-protection`) or an OSC 52 read
-/// needing authorization (`clipboard-read = ask`). Show a consent sheet;
+/// needing authorization (`clipboard-read = ask`). Show an inline decision;
 /// BOTH outcomes must complete the request (deny = empty string) or the
 /// core-side request object leaks (upstream `clipboardConfirmationComplete`
 /// contract).
@@ -717,6 +723,8 @@ final class LibghosttyEngine: TerminalEngine {
 /// the Metal layer and draws into it.
 @MainActor
 final class GhosttySurfaceView: NSView, NSMenuItemValidation {
+    weak var confirmationSession: Session?
+    private var pendingClipboardReads: Set<Int> = []
     /// Vsync-aligned render driver. Replaces the old free-running 60Hz `Timer`,
     /// which presented off-vsync into the IOSurfaceLayer → beat-frequency judder
     /// + torn frames on a ProMotion (120Hz) display, most visible while scrolling
@@ -936,6 +944,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     // `LibghosttyEngine.terminate()` when a session is closed.
 
     func releaseSurface() {
+        confirmationSession?.terminalConfirmation.invalidate()
         guard let dying = surface else { return }
         // Despite the C API's `foreground_pid` name, libghostty returns the
         // PTY's `tcgetpgrp` value. An interactive shell puts its foreground
@@ -2029,7 +2038,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         }
     }
 
-    /// Consent sheet for a risky clipboard READ (unsafe paste / OSC 52 read).
+    /// Inline decision for a risky clipboard READ (unsafe paste / OSC 52 read).
     /// Both buttons complete the request: Allow returns the contents with
     /// confirmed=true (the core re-checks nothing further), Cancel returns an
     /// empty string so the core-side request object is freed.
@@ -2038,35 +2047,39 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         stateBits: Int,
         request: ghostty_clipboard_request_e
     ) {
+        guard pendingClipboardReads.insert(stateBits).inserted else { return }
         let decide: @MainActor (Bool) -> Void = { [weak self] allowed in
-            self?.completeClipboardRequest(
+            guard let self, self.pendingClipboardReads.remove(stateBits) != nil else { return }
+            self.completeClipboardRequest(
                 stateBits: stateBits,
                 text: allowed ? contents : "",
                 confirmed: true
             )
         }
-        guard let window else {
-            // No window to anchor a sheet (detached/background surface) — deny.
+        guard let window, let session = confirmationSession else {
+            // An unowned or detached surface cannot ask for consent.
             decide(false)
             return
         }
         ClipboardConfirmPresenter.present(
-            on: window,
+            on: window, session: session,
             kind: request == GHOSTTY_CLIPBOARD_REQUEST_PASTE ? .unsafePaste : .oscRead,
             contents: contents,
+            stillValid: { [weak self, weak window, weak session] in self?.surface != nil && self?.window === window && self?.confirmationSession === session },
             onDecision: decide
         )
     }
 
-    /// Consent sheet for `clipboard-write = ask` (OSC 52 write). The core
-    /// doesn't hold a request open for writes — the host owns both the dialog
+    /// Inline decision for `clipboard-write = ask` (OSC 52 write). The core
+    /// doesn't hold a request open for writes — the host owns both the decision
     /// and, on consent, the pasteboard write itself.
     func presentClipboardWriteConfirmation(contents: String) {
-        guard let window else { return }
+        guard let window, let session = confirmationSession else { return }
         ClipboardConfirmPresenter.present(
-            on: window,
+            on: window, session: session,
             kind: .oscWrite,
-            contents: contents
+            contents: contents,
+            stillValid: { [weak self, weak window, weak session] in self?.surface != nil && self?.window === window && self?.confirmationSession === session }
         ) { [weak self] allowed in
             guard allowed else { return }
             self?.writeClipboard(contents)

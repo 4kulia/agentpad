@@ -116,6 +116,8 @@ struct ChatAttachmentDraft: Codable, Equatable, Sendable, Identifiable {
     var problem: String?
     /// Local ownership survives Send until the server confirms publication.
     var queued: Bool? = nil
+    /// Bound to the stored bytes. Missing on drafts written before sanitization.
+    var sanitizedImageSHA256: String? = nil
     var id: String { file.id }
     var prepareArgs: ChatJSON { .object([
         "attachment_id": .string(id), "channel_id": .string(channel), "message_id": .string(messageId),
@@ -269,6 +271,7 @@ enum ChatAttachmentError: String, Error, LocalizedError {
     case contextLost = "A selected context file is no longer available. The request cannot run; select the context again in a new request."
     case unavailable = "File unavailable."
     case type = "Choose PNG, JPEG, PDF or a supported UTF-8 text file."
+    case animatedGIF = "Animated GIF attachments are not supported by this server. Choose another file."
     case source = "Choose a regular local file, not a folder, package, link or network location."
     case size = "The selected files exceed the server’s size or count limit."
     case name = "The file name is too long or contains unsupported characters."

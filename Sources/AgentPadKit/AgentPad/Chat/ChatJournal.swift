@@ -8,10 +8,12 @@ import GRDB
 final class ChatJournal: Sendable {
     let url: URL
     let queue: DatabaseQueue
+    let resetBackup: URL?
 
-    private init(url: URL, queue: DatabaseQueue) {
+    private init(url: URL, queue: DatabaseQueue, resetBackup: URL? = nil) {
         self.url = url
         self.queue = queue
+        self.resetBackup = resetBackup
     }
 
     /// A damaged journal throws `corrupt`: server runs on this Mac stop until
@@ -24,8 +26,20 @@ final class ChatJournal: Sendable {
     /// "Reset Run Journal" in the Team window: the damaged file is set aside
     /// and an empty one made.
     static func reset(files: ChatFiles) throws -> ChatJournal {
-        if FileManager.default.fileExists(atPath: files.journalURL.path) { try ChatDatabase.setAside(files.journalURL) }
-        return try open(files: files)
+        let fm = FileManager.default
+        var backup: URL?
+        if fm.fileExists(atPath: files.journalURL.path) {
+            var path = files.journalURL.path + ".corrupt"
+            if fm.fileExists(atPath: path) { path += "." + UUID().uuidString }
+            let suffixes = ["", "-wal", "-shm"].filter { fm.fileExists(atPath: files.journalURL.path + $0) }
+            // Copy every component before touching the originals. Previous
+            // backups and uncheckpointed SQLite data are never discarded.
+            for suffix in suffixes { try fm.copyItem(atPath: files.journalURL.path + suffix, toPath: path + suffix) }
+            backup = URL(fileURLWithPath: path)
+            for suffix in suffixes { try fm.removeItem(atPath: files.journalURL.path + suffix) }
+        }
+        let fresh = try open(files: files)
+        return ChatJournal(url: fresh.url, queue: fresh.queue, resetBackup: backup)
     }
 
     /// The executor's send queue of one organization.

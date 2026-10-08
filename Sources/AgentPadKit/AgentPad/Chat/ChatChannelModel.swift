@@ -30,6 +30,10 @@ final class ChatChannelModel {
 
     let key: ChatOrgKey
     let channel: String
+    weak var confirmation: ConfirmationCoordinator?
+    var tabID: UUID?
+    var channelAsk: ChannelAskModel?
+    var deletionRoot: String?
     private(set) var feed = Feed()
     private(set) var thread: [ChatMessage] = []
     private(set) var threadRoot: String?
@@ -721,6 +725,26 @@ final class ChatChannelModel {
         catch { problem = error.localizedDescription }
     }
 
+    static let deletionConsequences = "Copies already in the context of a running agent stay."
+    @discardableResult
+    func requestDelete(_ message: ChatMessage, root: String? = nil) -> Bool {
+        guard let confirmation, let tabID, let identity = service.consentIdentity(key) else { return false }
+        deletionRoot = root
+        return confirmation.request(.init(tabID: tabID, targetID: "message:\(message.id)", scope: OrgKey(key),
+            generation: identity.generation, revision: String(message.revision), deadline: Date().addingTimeInterval(120)),
+            title: "Delete this message?", consequences: Self.deletionConsequences, verb: "Delete", destructive: true,
+            stillValid: { [self] in
+                _ = feed; _ = thread
+                guard accessConfirmed, service.consentIdentity(key) == identity,
+                      ChatNotifications.allowed(service, key, channel: channel),
+                      let current = self.message(message.id) else { return false }
+                return current.revision == message.revision && current.hasFixed && !current.deleted && !current.changing
+                    && current.localState == nil && current.authorAccountId == key.accountId
+            }) { [self] in
+                try service.change(key, messageId: message.id, text: nil, expectedRevision: message.revision)
+            }
+    }
+
     func retry(_ message: ChatMessage) {
         do { try service.retry(key, messageId: message.messageId) } catch { problem = error.localizedDescription }
     }
@@ -761,7 +785,7 @@ final class ChatChannelModel {
     /// Nil when the request went to the queue; else why not. Only once the
     /// message that asked is the server's: the answer's thread must be a
     /// root it has.
-    func ask(_ offer: ChatChannelAsk.Offer, text: String, context: [ChatMessage], agents: [ChatChannelAgent]) -> String? {
+    func ask(_ offer: ChatChannelAsk.Offer, text: String, context: [ChatMessage], agents: [ChatChannelAgent], requestID: String? = nil) -> String? {
         if let problem = ChatChannelAsk.textProblem(text) { return problem }
         guard agents.contains(where: { $0.agentId == offer.agentId && $0.enabled }) else { return "The agent is no longer in the channel." }
         guard let root = message(offer.root), ChatChannelAsk.eligible(root) else { return "The message is not sent yet." }
@@ -770,9 +794,9 @@ final class ChatChannelModel {
             if offer.ux1 {
                 guard let source = message(offer.messageId), source.text == text,
                       let agent = agents.first(where: { $0.agentId == offer.agentId }) else { return "The question changed. Review it and choose the context again." }
-                try service.retryChannelCall(key, source: source, agent: agent, context: taken)
+                try service.retryChannelCall(key, source: source, agent: agent, context: taken, requestID: requestID)
             } else {
-                try service.askInChannel(key, channel: channel, agentId: offer.agentId, root: offer.root, text: text, context: taken)
+                try service.askInChannel(key, channel: channel, agentId: offer.agentId, root: offer.root, text: text, context: taken, requestID: requestID)
             }
             dismissOffer(offer)
             return nil

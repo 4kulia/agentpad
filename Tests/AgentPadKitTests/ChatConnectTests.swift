@@ -173,6 +173,332 @@ final class ChatConnectTests: XCTestCase {
         XCTAssertEqual(model.error, "The server address must start with https://.")
     }
 
+    func testConnectionTabMoveCloseReopenAndRestartNeverKeepSecrets() async throws {
+        let ui = root.appendingPathComponent("ui")
+        let app = AppPersistence(fileURL: ui.appendingPathComponent("state-v2.json"))
+        var stores: [WorkspaceStore] = []
+        func makeStore(_ id: UUID) -> WorkspaceStore {
+            WorkspaceStore(persistence: WindowPersistence(windowId: id, app: app), initiallyEmpty: true, engineFactory: {
+                XCTFail("Connection allocated a terminal"); return TestEngine()
+            }, peerStores: { stores })
+        }
+        let a = makeStore(UUID()), b = makeStore(UUID()); stores = [a, b]
+        defer { stores.forEach { $0.terminate() } }
+        let router = TabRouter(); router.stores = { stores }; router.ensureHost = { a }
+        let navigation = SupportTabNavigation(router: router); navigation.finishStartup()
+        let (model, service) = model()
+        let tabs = ConnectionTabs(navigation: navigation, service: service)
+        let tab = try XCTUnwrap(tabs.show()), state = try XCTUnwrap(tab.tabState)
+        state.connectionForm = model
+        let token = "aps_TRANSIENT_SECRET", code = "87654321"
+        serve(orgs: [org("org-a"), org("org-b")], token: token)
+        await toCode(model); model.code = code
+        XCTAssertTrue(a.flushPersistence())
+        XCTAssertTrue(tabs.show() === tab)
+        XCTAssertTrue(tabs.model(state) === model)
+        XCTAssertTrue(b.handleTabDrop(droppedId: tab.id, in: b.active!))
+        XCTAssertTrue(tabs.show() === tab)
+        XCTAssertTrue(tabs.model(state) === model)
+        XCTAssertEqual(model.code, code)
+        await model.submitCode()
+        XCTAssertEqual(model.code, "")
+        XCTAssertNil(state.draft)
+        XCTAssertTrue(b.flushPersistence())
+        let restartedApp = AppPersistence(fileURL: ui.appendingPathComponent("state-v2.json"))
+        let restored = WorkspaceStore(persistence: WindowPersistence(windowId: b.windowID, app: restartedApp), initiallyEmpty: true,
+            engineFactory: { XCTFail("restored login started a process"); return TestEngine() })
+        defer { restored.terminate() }
+        let restoredState = try XCTUnwrap(restored.allSessions.first?.tabState)
+        XCTAssertEqual(tabs.model(restoredState).step, .address)
+        XCTAssertEqual(tabs.model(restoredState).code, "")
+        b.closeTab(tab, in: b.active!)
+        XCTAssertTrue(model.isClosed)
+        XCTAssertEqual(model.code, "")
+        XCTAssertNil(state.connectionForm)
+        let reopened = try XCTUnwrap(b.reopenLastClosedTab()?.tabState)
+        XCTAssertEqual(tabs.model(reopened).step, .address)
+        XCTAssertEqual(tabs.model(reopened).code, "")
+        XCTAssertTrue(b.flushPersistence())
+        let until = Date().addingTimeInterval(2)
+        while requests("DELETE", "/v1/auth/session").isEmpty, Date() < until { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(requests("DELETE", "/v1/auth/session").count, 1, "close revokes the unchosen session")
+        XCTAssertNil(service.connection)
+        let uiFiles = FileManager.default.enumerator(at: ui, includingPropertiesForKeys: [.isRegularFileKey])!.allObjects.compactMap { $0 as? URL }
+        for file in uiFiles {
+            guard (try file.resourceValues(forKeys: [.isRegularFileKey])).isRegularFile == true else { continue }
+            let text = String(decoding: try Data(contentsOf: file), as: UTF8.self)
+            for secret in [code, token, "s-new", "anna@example.com"] { XCTAssertFalse(text.contains(secret), file.lastPathComponent) }
+        }
+    }
+
+    private func connectionStore(_ persistence: any Persistence = InMemoryPersistence(),
+                                 peers: @escaping @MainActor () -> [WorkspaceStore] = { [] }) -> WorkspaceStore {
+        WorkspaceStore(persistence: persistence, initiallyEmpty: true, engineFactory: {
+            XCTFail("Connection allocated a terminal"); return TestEngine()
+        }, peerStores: peers)
+    }
+
+    func testReviewConnectionLeavingClearsCodeAndPendingAuthorization() async throws {
+        for path in ["leave", "last-window", "hide", "close-tab", "quit"] {
+            for authenticated in [false, true] {
+                serve(orgs: [org("org-a"), org("org-b")])
+                let tokens = FakeTokenStore(), (model, service) = model(tokens)
+                let store = connectionStore()
+                defer { store.terminate() }
+                let tab = store.openToolTab(.connection), state = try XCTUnwrap(tab.tabState)
+                state.connectionForm = model
+                await toCode(model)
+                if authenticated { await model.submitCode() }
+                let context = "\(path), authenticated: \(authenticated)"
+                switch path {
+                case "leave": state.leave()
+                case "last-window":
+                    // The last-window close prepares every tab, then hides the
+                    // live store. Dock reopening reuses this same TabState.
+                    XCTAssertTrue(store.tabCloseCoordinator.prepare(store.allSessions))
+                    XCTAssertTrue(model.isClosed, context)
+                    store.setOnScreen(false)
+                case "hide": store.setOnScreen(false)
+                case "close-tab": store.closeTab(tab, in: try XCTUnwrap(store.active))
+                default:
+                    XCTAssertTrue(store.tabCloseCoordinator.prepare(store.allSessions))
+                    XCTAssertTrue(model.isClosed, context)
+                    store.terminate()
+                }
+                XCTAssertTrue(model.isClosed, context)
+                XCTAssertEqual(model.code, "", context)
+                XCTAssertEqual(model.email, "", context)
+                XCTAssertNil(model.codeSentAt, context)
+                XCTAssertEqual(model.step, .address, context)
+                XCTAssertNil(state.connectionForm, context)
+                XCTAssertNil(service.connection, context)
+                XCTAssertTrue(tokens.items.isEmpty, context)
+                if !store.isTerminated {
+                    store.setOnScreen(true)
+                    let reopened = store.openToolTab(.connection)
+                    let fresh = ConnectionTabs(service: service).model(try XCTUnwrap(reopened.tabState))
+                    XCTAssertFalse(fresh === model, context)
+                    XCTAssertFalse(fresh.isClosed, context)
+                    XCTAssertEqual(fresh.step, .address, context)
+                    XCTAssertEqual(fresh.code, "", context)
+                }
+                if authenticated {
+                    let until = Date().addingTimeInterval(1)
+                    while requests("DELETE", "/v1/auth/session").isEmpty, Date() < until {
+                        try await Task.sleep(for: .milliseconds(5))
+                    }
+                    XCTAssertEqual(requests("DELETE", "/v1/auth/session").count, 1, context)
+                    XCTAssertEqual(requests("DELETE", "/v1/auth/session").first?.request.value(forHTTPHeaderField: "Authorization"), "Bearer aps_new", context)
+                }
+                // Also clean up the deliberately failing pre-fix run before
+                // resetting the stub server for the next case.
+                model.close()
+                if authenticated {
+                    let until = Date().addingTimeInterval(1)
+                    while requests("DELETE", "/v1/auth/session").isEmpty, Date() < until {
+                        try await Task.sleep(for: .milliseconds(5))
+                    }
+                }
+            }
+        }
+    }
+
+    func testReviewConnectionReopenAndDirectOpenFocusTheOtherWindow() throws {
+        var stores: [WorkspaceStore] = []
+        let a = connectionStore(peers: { stores }), b = connectionStore(peers: { stores })
+        stores = [a, b]
+        defer { stores.forEach { $0.terminate() } }
+        let router = TabRouter(); router.stores = { stores }
+        var revealed: [UUID] = []
+        let previousReveal = TabRouter.shared.revealWindow
+        defer { TabRouter.shared.revealWindow = previousReveal }
+        TabRouter.shared.revealWindow = { revealed.append($0.windowID) }
+        router.revealWindow = { revealed.append($0.windowID) }
+        let closed = a.openToolTab(.connection)
+        _ = a.openToolTab(.settings)
+        a.closeTab(closed, in: try XCTUnwrap(a.active))
+        let live = b.openToolTab(.connection), workspace = try XCTUnwrap(b.active)
+        let state = try XCTUnwrap(live.tabState), tabs = ConnectionTabs(service: model().1)
+        let form = tabs.model(state); form.code = "87654321"
+        for operation in ["reopen", "direct", "router"] {
+            _ = b.addEmptyWorkspace()
+            revealed.removeAll()
+            let found: Session?
+            switch operation {
+            case "reopen": found = a.reopenLastClosedTab()
+            case "direct": found = a.openToolTab(.connection)
+            default: found = router.open(.connection, from: a)
+            }
+            XCTAssertTrue(found === live, operation)
+            XCTAssertEqual(stores.flatMap(\.allSessions).filter { $0.toolRoute == .connection }.count, 1, operation)
+            XCTAssertTrue(b.active === workspace, operation)
+            XCTAssertTrue(workspace.activeSession === live, operation)
+            XCTAssertEqual(revealed.last, b.windowID, operation)
+            XCTAssertTrue(tabs.model(state) === form, operation)
+            XCTAssertEqual(form.code, "87654321", operation)
+        }
+        XCTAssertFalse(a.canReopenClosedTab)
+    }
+
+    func testReviewConnectionCloseUsesItsOwnIdentityEvenWithLegacyDuplicates() throws {
+        // Simulate two tabs restored from an older build before reconciliation.
+        let a = connectionStore(), b = connectionStore()
+        defer { a.terminate(); b.terminate() }
+        let first = a.openToolTab(.connection), second = b.openToolTab(.connection)
+        let router = TabRouter(); router.stores = { [a, b] }
+        let navigation = SupportTabNavigation(router: router); navigation.finishStartup()
+        let tabs = ConnectionTabs(navigation: navigation, service: model().1)
+        let state = try XCTUnwrap(second.tabState)
+        tabs.close(state) // The same action is used by both Cancel and Close.
+        XCTAssertTrue(a.allSessions.contains { $0 === first })
+        XCTAssertFalse(b.allSessions.contains { $0 === second })
+        XCTAssertTrue(state.isClosed)
+        tabs.close(state) // A stale callback cannot close the remaining tab.
+        XCTAssertTrue(a.allSessions.contains { $0 === first })
+    }
+
+    func testReviewConnectionRestoreDeduplicatesAndRevealsTheSurvivingTab() throws {
+        var restored: [WorkspaceStore] = []
+        for _ in 0..<2 {
+            let persistence = InMemoryPersistence(), seed = connectionStore(persistence)
+            _ = seed.openToolTab(.connection)
+            _ = seed.openToolTab(.settings)
+            XCTAssertTrue(seed.flushPersistence())
+            seed.terminate()
+            restored.append(connectionStore(InMemoryPersistence(initial: try XCTUnwrap(persistence.saved))))
+        }
+        defer { restored.forEach { $0.terminate() } }
+        let first = try XCTUnwrap(restored[0].allSessions.first { $0.toolRoute == .connection })
+        let duplicate = try XCTUnwrap(restored[1].allSessions.first { $0.toolRoute == .connection })
+        let router = TabRouter(); router.stores = { restored }
+        var revealed: [UUID] = []
+        router.revealWindow = { revealed.append($0.windowID) }
+        router.reconcileRestoredTabs()
+        XCTAssertEqual(restored.flatMap(\.allSessions).filter { $0.toolRoute == .connection }.map(\.id), [first.id])
+        XCTAssertTrue(duplicate.tabState?.isClosed == true)
+        XCTAssertTrue(restored[0].active?.activeSession === first)
+        XCTAssertEqual(revealed, [restored[0].windowID])
+    }
+
+    func testReviewConnectionKeychainFailureKeepsOrganizationRetryAndBackUsable() async throws {
+        for recovery in ["retry", "back"] {
+            serve(orgs: [org("org-a", name: "Anna"), org("org-b", name: "Anna")])
+            let tokens = FakeTokenStore(), switched = Counter()
+            let (model, service) = model(tokens, switched: switched)
+            await toCode(model); await model.submitCode()
+            let choice = model.step
+            tokens.failure = .keychain("denied")
+            await model.choose("org-a")
+            XCTAssertEqual(model.step, choice)
+            XCTAssertTrue(model.error?.contains("denied") == true)
+            XCTAssertFalse(model.busy)
+            XCTAssertNil(service.connection)
+            XCTAssertTrue(tokens.items.isEmpty)
+            XCTAssertEqual(switched.value, 0)
+            XCTAssertTrue(requests("DELETE", "/v1/auth/session").isEmpty, "a retry needs the pending authorization")
+            tokens.failure = nil
+            if recovery == "retry" {
+                await model.choose("org-b")
+                XCTAssertEqual(model.step, .done)
+                XCTAssertNil(model.error)
+                XCTAssertEqual(service.connection?.orgId, "org-b")
+                XCTAssertEqual(switched.value, 1)
+                XCTAssertEqual(try files.loadConnections().first?.orgId, "org-b")
+                await service.disconnect()
+            } else {
+                model.back()
+                XCTAssertEqual(model.step, .address)
+                XCTAssertNil(model.error)
+                let until = Date().addingTimeInterval(1)
+                while requests("DELETE", "/v1/auth/session").isEmpty, Date() < until {
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                XCTAssertEqual(requests("DELETE", "/v1/auth/session").count, 1)
+                await toCode(model)
+                await model.submitCode(); await model.choose("org-b")
+                XCTAssertEqual(model.step, .done)
+                await service.disconnect()
+            }
+        }
+    }
+
+    func testClosingDuringAuthenticationRevokesLateAnswerAndCannotSignIn() async throws {
+        serve(orgs: [org("org-a")])
+        let (model, service) = model()
+        await toCode(model)
+        ChatStubProtocol.delay = 0.15
+        let submit = Task { await model.submitCode() }
+        let until = Date().addingTimeInterval(2)
+        while requests("POST", "/v1/auth/session").isEmpty, Date() < until { try await Task.sleep(for: .milliseconds(5)) }
+        model.close()
+        XCTAssertEqual(model.code, "")
+        await submit.value
+        XCTAssertNil(service.connection)
+        XCTAssertEqual(model.step, .address)
+        XCTAssertNil(model.error)
+        XCTAssertEqual(requests("DELETE", "/v1/auth/session").count, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: files.serversURL.path))
+    }
+
+    func testNameValidationAndRestorationUseTheRealConnection() async throws {
+        serve(orgs: [org("org-a")])
+        let (model, service) = model()
+        await toCode(model); await model.submitCode()
+        let tabs = ConnectionTabs(service: service), state = TabState(route: .connection)
+        state.connectionForm = model
+        XCTAssertTrue(tabs.model(state) === model, "the connection update must preserve the name step")
+        model.displayName = "  "
+        await model.saveName()
+        XCTAssertNotNil(model.error)
+        guard case .name = model.step else { return XCTFail("name step lost") }
+        model.close()
+        let restored = ChatConnectModel(service: service)
+        XCTAssertEqual(restored.step, .done)
+        XCTAssertEqual(restored.code, "")
+        XCTAssertEqual(restored.displayName, "")
+    }
+
+    func testClosingWhileOrganizationChoiceWaitsForTheCoreCannotCommit() async throws {
+        serve(orgs: [org("org-a"), org("org-b")])
+        let (model, service) = model()
+        await toCode(model); await model.submitCode()
+        let gate = AsyncGate()
+        var entered = false
+        service.onBeforeDisconnect { entered = true; await gate.wait() }
+        let holdingCore = Task { await service.disconnect() }
+        let deadline = Date().addingTimeInterval(2)
+        while !entered, Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(entered)
+        let choice = Task { await model.choose("org-a") }
+        while !model.busy, Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(model.busy)
+        model.close()
+        await gate.open()
+        await holdingCore.value; await choice.value
+        XCTAssertNil(service.connection)
+        XCTAssertTrue(model.isClosed)
+        XCTAssertNil(model.error)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: files.serversURL.path))
+        XCTAssertEqual(requests("DELETE", "/v1/auth/session").count, 1)
+    }
+
+    func testRepeatedSendAndSubmitDoNotStartParallelRequests() async throws {
+        serve(orgs: [org("org-a"), org("org-b")])
+        ChatStubProtocol.delay = 0.05
+        let (model, _) = model()
+        let first = Task { await model.sendCode() }
+        await Task.yield()
+        await model.sendCode(); await first.value
+        XCTAssertEqual(requests("POST", "/v1/auth/code").count, 1)
+        model.code = "12345678"
+        let submit = Task { await model.submitCode() }
+        await Task.yield()
+        await model.submitCode(); await submit.value
+        XCTAssertEqual(requests("POST", "/v1/auth/session").count, 1)
+        model.back()
+        XCTAssertEqual(model.code, "")
+    }
+
     /// Signing in again with the old token kept: the old session is closed with it.
     func testSigningInAgainClosesTheOldSession() async throws {
         let id = UUID().uuidString.lowercased()

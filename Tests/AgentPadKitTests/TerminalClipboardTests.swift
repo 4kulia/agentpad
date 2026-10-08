@@ -140,22 +140,26 @@ final class TerminalClipboardTests: XCTestCase {
             t.clipboard.setString("before\0after", forType: .string)
             XCTAssertTrue(t.view.pasteFromClipboardViaCore())
             XCTAssertEqual(t.output.take(), "before after")
-            let earlier = Set(AttentionLedger.shared.events.filter { $0.source == "sheet" }.map(\.id))
+            let earlier = Set(AttentionLedger.shared.events.filter { $0.source == "tab-confirmation" }.map(\.id))
             t.clipboard.setString("one\ntwo", forType: .string)
             XCTAssertTrue(t.view.pasteFromClipboardViaCore())
             XCTAssertEqual(t.output.take(), "")
-            let cancel = try XCTUnwrap(t.window.attachedSheet?.windowController as? ConsentSheetController)
-            let waiting = AttentionLedger.shared.events.filter { $0.source == "sheet" && !earlier.contains($0.id) }.map(\.id)
+            let cancel = t.session.terminalConfirmation
+            XCTAssertNil(t.window.attachedSheet)
+            cancel.shown(true)
+            let waiting = AttentionLedger.shared.events.filter { $0.source == "tab-confirmation" && !earlier.contains($0.id) }.map(\.id)
             XCTAssertEqual(waiting.count, 1)
             XCTAssertEqual(AttentionLedger.shared.events.first(where: { $0.id == waiting.first })?.body, "")
-            cancel.finish(false)
-            cancel.finish(true) // A late second button/teardown cannot grant consent.
+            cancel.cancel()
+            cancel.confirm() // A late second button/teardown cannot grant consent.
             XCTAssertTrue(AttentionLedger.shared.events.filter { waiting.contains($0.id) }.isEmpty)
             XCTAssertEqual(t.output.take(), "")
             XCTAssertTrue(t.view.pasteFromClipboardViaCore())
-            let allow = try XCTUnwrap(t.window.attachedSheet?.windowController as? ConsentSheetController)
+            let allow = t.session.terminalConfirmation
+            allow.shown(true)
             t.clipboard.setString("changed after the prompt", forType: .string)
-            allow.finish(true)
+            allow.confirm()
+            await t.settleDecision()
             XCTAssertEqual(t.output.take(), "one\rtwo")
         }
     }
@@ -166,10 +170,109 @@ final class TerminalClipboardTests: XCTestCase {
             t.clipboard.setString("a\u{1B}[201~\u{03}b", forType: .string)
             XCTAssertTrue(t.view.pasteFromClipboardViaCore())
             XCTAssertEqual(t.output.take(), "")
-            let allow = try XCTUnwrap(t.window.attachedSheet?.windowController as? ConsentSheetController)
-            allow.finish(true)
+            let allow = t.session.terminalConfirmation
+            allow.shown(true)
+            allow.confirm()
+            await t.settleDecision()
             // Embedded ESC is data filtered by Ghostty; never a second fence.
             XCTAssertEqual(t.output.take(), "\u{1B}[200~a [201~ b\u{1B}[201~")
+        }
+    }
+
+    func testClipboardDeadlineAndHiddenOrClosedSurfaceDenyPendingCoreRead() async throws {
+        for ending in ["deadline", "hidden", "surface"] {
+            try await withTerminal { t in
+                t.clipboard.setString("first\nsecond", forType: .string)
+                XCTAssertTrue(t.view.pasteFromClipboardViaCore())
+                let c = t.session.terminalConfirmation
+                XCTAssertEqual(c.phase, .awaiting)
+                c.shown(true)
+                switch ending {
+                case "deadline": c.now = { .distantFuture }; c.validate()
+                case "hidden": c.shown(false)
+                default: t.view.releaseSurface()
+                }
+                c.confirm(); c.cancel(); c.invalidate()
+                XCTAssertEqual(c.phase, .invalidated)
+                XCTAssertNil(t.session.clipboardPreview)
+                XCTAssertEqual(t.output.take(), "")
+                if ending != "surface" {
+                    c.now = Date.init
+                    XCTAssertTrue(t.view.pasteFromClipboardViaCore())
+                    c.shown(true); c.confirm(); c.confirm()
+                    await t.settleDecision()
+                    XCTAssertEqual(t.output.take(), "first\rsecond", "Only the new request is completed with data, exactly once")
+                }
+            }
+        }
+    }
+
+    func testClipboardMoveAndTabCloseDenyWithoutTransferringConsent() async throws {
+        for moving in [false, true] {
+            try await withTerminal { t in
+                let source = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: { TestEngine() })
+                let destination = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: { TestEngine() }, peerStores: { [source] })
+                defer { source.terminate(); destination.terminate() }
+                let workspace = try XCTUnwrap(source.active), pane = try XCTUnwrap(workspace.activePane)
+                pane.tabs.append(t.session); pane.activeTabId = t.session.id
+                t.clipboard.setString("private\nsnapshot", forType: .string)
+                XCTAssertTrue(t.view.pasteFromClipboardViaCore())
+                let c = t.session.terminalConfirmation
+                c.shown(true)
+                if moving {
+                    XCTAssertTrue(destination.handleTabDrop(droppedId: t.session.id, in: try XCTUnwrap(destination.active)))
+                } else { source.closeTab(t.session, in: workspace) }
+                c.confirm()
+                XCTAssertEqual(c.phase, .invalidated)
+                XCTAssertNil(t.session.clipboardPreview)
+                XCTAssertEqual(t.output.take(), "")
+            }
+        }
+    }
+
+    func testClipboardLimitsPendingRequestsPerWindowAndWriteUsesSnapshot() async throws {
+        try await withTerminal { t in
+            t.clipboard.setString("unchanged", forType: .string)
+            t.view.presentClipboardWriteConfirmation(contents: "reviewed write")
+            let c = t.session.terminalConfirmation
+            c.shown(true)
+            let other = Session(engine: TestEngine(), currentDirectory: FileManager.default.temporaryDirectory, agent: .terminal)
+            var replies: [Bool] = []
+            ClipboardConfirmPresenter.present(on: t.window, session: other, kind: .oscRead, contents: "new request",
+                stillValid: { true }, onDecision: { replies.append($0) })
+            XCTAssertEqual(replies, [false], "A competing request is denied once, without a queue")
+            XCTAssertEqual(try XCTUnwrap(t.clipboard.string(forType: .string)), "unchanged")
+            t.clipboard.setString("changed while waiting", forType: .string)
+            c.confirm(); c.confirm(); c.cancel()
+            await t.settleDecision()
+            XCTAssertEqual(t.clipboard.string(forType: .string), "reviewed write")
+            XCTAssertNil(t.session.clipboardPreview)
+            XCTAssertEqual(replies, [false])
+            XCTAssertNil(t.window.attachedSheet)
+        }
+    }
+
+    func testOSCReadUsesReviewedSnapshotAndCompletesOnlyOnce() async throws {
+        try await withTerminal(extraConfig: "clipboard-read = ask\n") { t in
+            t.clipboard.setString("reviewed OSC snapshot", forType: .string)
+            t.feed("\u{1B}]52;c;?\u{7}")
+            let c = t.session.terminalConfirmation
+            for _ in 0..<100 where !c.isAwaiting {
+                ghostty_app_tick(t.app)
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertEqual(c.phase, .awaiting)
+            XCTAssertEqual(t.output.take(), "")
+            c.shown(true)
+            t.clipboard.setString("changed clipboard", forType: .string)
+            c.confirm(); c.confirm()
+            await t.settleDecision()
+            let response = t.output.take()
+            let snapshot = Data("reviewed OSC snapshot".utf8).base64EncodedString()
+            XCTAssertEqual(response.components(separatedBy: snapshot).count, 2)
+            XCTAssertFalse(response.contains(Data("changed clipboard".utf8).base64EncodedString()))
+            c.confirm(); c.cancel()
+            XCTAssertEqual(t.output.take(), "")
         }
     }
 
@@ -239,11 +342,11 @@ final class TerminalClipboardTests: XCTestCase {
 
     private func withTerminal(
         extraConfig: String = "",
-        _ body: (ClipboardTerminal) throws -> Void
+        _ body: (ClipboardTerminal) async throws -> Void
     ) async throws {
         let terminal = try ClipboardTerminal(extraConfig: extraConfig)
         do {
-            try body(terminal)
+            try await body(terminal)
         } catch {
             await terminal.close()
             throw error
@@ -254,6 +357,7 @@ final class TerminalClipboardTests: XCTestCase {
 
 @MainActor
 private final class ClipboardTerminal {
+    let session = Session(engine: TestEngine(), currentDirectory: FileManager.default.temporaryDirectory, agent: .terminal)
     let window: NSWindow
     let view: GhosttySurfaceView
     let clipboard = NSPasteboard(name: .init("agentpad-clipboard-contract-\(UUID())"))
@@ -277,6 +381,7 @@ private final class ClipboardTerminal {
             styleMask: [.borderless], backing: .buffered, defer: false)
         view = GhosttySurfaceView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         view.clipboard = clipboard
+        view.confirmationSession = session
         window.contentView = view
         var surfaceConfig = ghostty_surface_config_new()
         surfaceConfig.scale_factor = Double(window.backingScaleFactor)
@@ -303,8 +408,13 @@ private final class ClipboardTerminal {
             windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
     }
 
+    func settleDecision() async {
+        for _ in 0..<100 where session.terminalConfirmation.isExecuting { await Task.yield() }
+        XCTAssertFalse(session.terminalConfirmation.isExecuting)
+    }
+
     func close() async {
-        (window.attachedSheet?.windowController as? ConsentSheetController)?.finish(false)
+        session.terminalConfirmation.invalidate()
         view.releaseSurface()
         await withCheckedContinuation { continuation in
             SurfaceTeardownCoordinator.shared.whenDrained { continuation.resume() }

@@ -436,20 +436,23 @@ extension ChatService {
         var id: String { runId }
     }
 
-    func undeliveredResults() -> [UndeliveredResult] {
+    func undeliveredResults(key: ChatOrgKey? = nil) -> [UndeliveredResult] {
         _ = publishRevision
         guard let journal else { return [] }
         return (try? journal.queue.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT r.run_id, r.request_id, r.agent_id, r.result_text FROM runs r
                 WHERE \(ChatTeamCallStore.personal("r")) AND r.outcome = 'finished' AND r.result_text IS NOT NULL
+                    AND (? IS NULL OR EXISTS(SELECT 1 FROM approvals a WHERE a.id = r.approval_id
+                        AND a.server = ? AND a.account_id = ? AND a.org_id = ?))
                     AND NOT EXISTS(SELECT 1 FROM run_commands c WHERE c.order_key = 'exec:run:' || r.run_id
                                    AND c.type = 'result.deliver' AND c.state = 'sent'
                                    -- taken by the server's generation now (review D4-p2-5)
                                    AND c.sent_generation IS (SELECT coalesce(g.pending_generation, g.generation) FROM org_generations g
                                        WHERE g.server = c.server AND g.account_id = c.account_id AND g.org_id = c.org_id))
                 ORDER BY r.ended_at
-                """).map { UndeliveredResult(runId: $0["run_id"], requestId: $0["request_id"], agentId: $0["agent_id"], text: $0["result_text"]) }
+                """, arguments: [key?.server.description, key?.server.description, key?.accountId, key?.orgId])
+                    .map { UndeliveredResult(runId: $0["run_id"], requestId: $0["request_id"], agentId: $0["agent_id"], text: $0["result_text"]) }
         }) ?? []
     }
 }
@@ -799,17 +802,21 @@ final class ChatOwnerSide {
 
     /// Channel consent always fetches /content again at the Allow boundary.
     /// The synchronous personal-call path cannot reuse a displayed snapshot.
-    func decideChannel(_ key: ChatOrgKey, requestId: String, allow: Bool, reason: String?) async -> String? {
+    func decideChannel(_ key: ChatOrgKey, requestId: String, allow: Bool, reason: String?,
+                       stillValid: () -> Bool = { true }) async -> String? {
         guard let service, let request = try? service.orgSessions[key]?.store?.calls.request(requestId), request.kind == "channel" else {
             return "The channel request is not available."
         }
+        guard stillValid() else { return "The reviewed request changed. Review it again." }
         if !allow { return saveDecision(key, requestId: requestId, allow: false, reason: reason) }
         do {
             guard try await service.loadChannelContent(key, request: request, refresh: true) else {
                 return "The channel or its current context is not available; try again."
             }
+            guard stillValid() else { return "The reviewed request or context changed. Review it again." }
             return saveDecision(key, requestId: requestId, allow: allow, reason: reason)
         } catch ChatAttachmentError.contextLost {
+            guard stillValid() else { return "The reviewed attachments changed. Review the request again." }
             return saveDecision(key, requestId: requestId, allow: false, reason: ChatAttachmentError.contextLost.localizedDescription)
                 ?? ChatAttachmentError.contextLost.localizedDescription
         } catch { return "The current context could not be loaded; try again." }

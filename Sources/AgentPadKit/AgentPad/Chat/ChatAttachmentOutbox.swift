@@ -6,10 +6,20 @@ extension ChatAttachmentManager {
     /// Callers never use this for a post whose outcome is still unknown.
     func renewed(_ draft: ChatAttachmentDraft, capture: Stamp) throws -> ChatAttachmentDraft {
         guard let limits else { throw ChatAttachmentError.paused }
-        let data = try ChatAttachmentStorage.read(storage.url(key, id: draft.id), limit: limits.fileBytes)
+        var data = try ChatAttachmentStorage.read(storage.url(key, id: draft.id), limit: limits.fileBytes)
         guard data.count == draft.file.size, ChatAttachments.digest(data) == draft.sha256 else { throw ChatAttachmentError.hash }
         var next = draft
         next.file.attachmentId = UUID().uuidString.lowercased()
+        if draft.file.isImage, draft.sanitizedImageSHA256 != draft.sha256 {
+            // A legacy reservation may already exist on the server. New bytes
+            // require a new ID as well as a new prepare command and digest.
+            let sanitized = try ChatAttachmentWorker.sanitizedFile(data, name: draft.file.name, limits: limits)
+            data = sanitized.0
+            next.file = try ChatAttachmentStorage.descriptor(data: data, name: sanitized.1, limits: limits)
+            next.file.position = draft.file.position
+            next.sha256 = ChatAttachments.digest(data)
+            next.sanitizedImageSHA256 = next.sha256
+        }
         next.prepareCommand = ChatUUID.v7(); next.completeCommand = ChatUUID.v7()
         next.session = capture.session; next.generation = capture.generation
         next.expiresAt = Date().addingTimeInterval(Double(limits.draftTTLSeconds))
@@ -24,7 +34,9 @@ extension ChatAttachmentManager {
             for row in try Row.fetchAll(db, sql: "SELECT rowid, \(column) FROM \(table) WHERE \(column) != '[]'") {
                 var manifest = try JSONDecoder().decode([ChatAttachmentManifest].self, from: Data((row[column] as String).utf8))
                 guard manifest.contains(where: { $0.id == draft.id }) else { continue }
-                for i in manifest.indices where manifest[i].id == draft.id { manifest[i].file.attachmentId = next.id }
+                for i in manifest.indices where manifest[i].id == draft.id {
+                    manifest[i].file = next.file; manifest[i].sha256 = next.sha256
+                }
                 try db.execute(sql: "UPDATE \(table) SET \(column) = ? WHERE rowid = ?",
                     arguments: [String(decoding: try JSONEncoder().encode(manifest), as: UTF8.self), row["rowid"] as Int64])
             }
@@ -64,7 +76,7 @@ extension ChatService {
         }
         var args = Self.args(original)
         let files = row.attachments.map { file -> ChatAttachment in
-            var next = file; next.attachmentId = replacements[file.id]?.id ?? file.id; return next
+            replacements[file.id]?.file ?? file
         }
         args["attachment_ids"] = .array(files.map { .string($0.id) })
         let prepared = try prepareCommand(key, type: original.type, args: .object(args))
