@@ -1,31 +1,43 @@
 # AgentPad
 
-**Every coding-agent session and its files in one macOS window.**
+**Your coding agents and your team in one macOS window.**
 
-If you run several Claude Code or Codex sessions at once, they end up scattered across terminal tabs, and finding the one that is waiting for you turns into a search. AgentPad puts them in one place: every live session, wherever it was started; every past conversation, ready to resume; and the selected session's files right beside the terminal.
+If you run several Claude Code or Codex sessions at once, they end up scattered across terminal tabs, and finding the one that is waiting for you turns into a search. AgentPad puts them in one place, next to your team's chat: every live session, wherever it was started; every past conversation, ready to resume; the session's files beside the terminal; channels and direct messages where people and agents work together.
 
-AgentPad is a fork of [kooky](https://github.com/iAmCorey/kooky) by Corey Chiu, a native terminal for AI coding built on SwiftUI and [libghostty](https://github.com/ghostty-org/ghostty). It keeps everything kooky does and adds a session hub, a file manager and a file preview.
+AgentPad is a fork of [kooky](https://github.com/iAmCorey/kooky) by Corey Chiu, a native terminal for AI coding built on SwiftUI and [libghostty](https://github.com/ghostty-org/ghostty). It keeps everything kooky does and adds a session hub, team chat, a file manager and a file preview.
 
-> Screenshots are coming.
+![AgentPad: agent sessions, needs attention, channels and direct messages in one window](assets/screenshot.png)
+
+<sub>Illustration: the people, projects and agents in it are made up.</sub>
 
 ## Layout
 
-Three panes, all collapsible:
+- **Workspaces** in the narrow rail on the far left. Each keeps its own set of tabs.
+- **Sidebar:** *Needs attention* on top, then channels, direct messages and agents.
+- **Tabs and splits** in the middle: agent sessions, terminals, channels, conversations and settings all open as tabs. Split a pane side by side or top and bottom, drag a tab to another pane or workspace; the session keeps running.
+- **Sessions** on the right, hidden by default: everything that is running or recently ran.
 
-- **Files** on the left: the selected session's folder.
-- **Terminal** in the middle, with a read-only file preview docked underneath.
-- **Sessions** on the right: one list of everything that is running or recently ran.
+Nothing opens as a blocking pop-up window: connecting a team, publishing an agent, requests and confirmations open as tabs or inline.
+
+## Needs attention
+
+One list at the top of the sidebar for everything waiting for you:
+
+- an agent waiting for your input or a tool approval;
+- a run that failed;
+- with a team connected: mentions, unread direct messages and calls from colleagues waiting for your approval.
+
+Click a row to go there. A row clears once you have opened the tab, and comes back if the agent asks again. Muting a conversation removes it from the list. Which reasons are shown is set in Settings.
 
 ## Sessions
 
 - **One list for all sessions.** It shows agent tabs inside AgentPad, live Claude Code sessions running in other terminals (Terminal.app, iTerm2 and others), and recent conversations from disk.
-- **Grouped by what they need from you:** *Needs you*, *Running*, *Idle*, *Recent*. Each row shows the conversation title, its folder and how long it has been in that state. You can switch to grouping by project and search by title or path.
+- **All sessions** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>H</kbd>): every past session of every supported agent on this Mac, titled by its first request. Search by title, first request or folder, rename a session, and resume it in a tab. Sessions started automatically are hidden unless they are waiting for you or failed. Works fully offline.
 - **Sessions in other terminals.** Click one to bring its Terminal.app or iTerm2 tab to the front. **Move Here** closes an idle session in its terminal and resumes the same conversation in an AgentPad tab, so nothing in the conversation is lost. **Show Files** points the file tree at that session's folder.
-- **Attention:**
-  - a Dock badge counts the sessions waiting for you;
-  - <kbd>⌘</kbd><kbd>⇧</kbd><kbd>U</kbd> cycles through them;
-  - notifications name the session and the reason it is waiting, and clicking one takes you there.
-- **Resume any past conversation** of a supported agent in a new tab, in its original folder.
+- **Tabs survive restarts.** After quitting, restarting or updating AgentPad, agent tabs come back as agents and continue their conversations.
+- **Attention outside the window:** a Dock badge counts the sessions waiting for you; <kbd>⌘</kbd><kbd>⇧</kbd><kbd>U</kbd> cycles through them; notifications name the session and the reason, and clicking one takes you there.
+- **Share an answer:** right-click a Claude Code tab → **Forward…** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>F</kbd>) sends the agent's last answer to a channel, or **Copy as Markdown** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>C</kbd>).
+- <kbd>⌘</kbd>-click a file path in the terminal to open it in the preview (`path:line` jumps to the line).
 
 ### Supported agents
 
@@ -74,30 +86,28 @@ Click a file to preview it under the terminal. Drag the divider to resize the pr
 - **Live reload:** the preview follows the file as the agent rewrites it.
 - **Large files:** text files over 5 MB show their first 5 MB.
 
-## Team work
+## Team
 
-*In progress: team work moves to an AgentPad server. Connecting and publishing agents work today; calls to colleagues come back once the server delivers them. Team settings of AgentPad 1.0.x (direct pairing) are not carried over: set them up again.*
+Team features need an AgentPad server your team shares. Without one, AgentPad is a local app: no account, and no network requests beyond update checks.
 
-Team work goes through an AgentPad server your team shares:
+**Connect:** the server's address and your email; enter the code the server mails you. An organization has members and teams; channels belong to teams.
 
-1. **Team → Connect to a Server…**: the server's address and your email; enter the code the server mails you.
-2. **Team → Team…** shows the connection and anything that needs you; **Team → Disconnect from the Server…** turns team work off.
+### Chat
 
-Let your colleague's agents ask yours:
+- **Channels** with threads, mentions, reactions, pinned messages and Markdown.
+- **Attachments:** paste a screenshot (<kbd>⌘</kbd><kbd>V</kbd>) or drop files into a message; images show in the feed. Photo location and camera data are removed before upload.
+- **Direct messages** with anyone in the organization: threads, editing and deleting. Everyone is listed under *Direct messages*; people you talked to recently are on top. Notifications for direct messages show neither the name nor the text.
+- **Unread** and **Mentions** list the messages themselves, including thread replies. A channel's counter counts messages in the channel itself; thread replies are marked "new" on the thread.
+- Unsent messages are kept if you disconnect, and sent when you reconnect.
 
-- **Team → Published Agents… → Publish Agent…**: a name, what to ask it about, a project folder, and its rights — *Read*, *Read and git* (a repository's top folder), or *Edit*. Files with secrets (`.env`, keys) are excluded from reading by default.
-- Or right-click a Claude Code session in the right panel → **Publish to Team ▸ Publish…**, and publish the session itself (each call works on a copy of its conversation, which stays untouched; the agent disappears when the conversation is deleted), a fresh agent in its folder, or both.
+### Agents in the team
 
-An agent can be given more folders than its project (a second checkout, a shared knowledge repository). While it works, it can also ask for another folder: the request appears in the Team tab and the right panel with **Allow Once**, **Always** (added to the agent for good) and **Deny**, and the conversation goes on with the folder once allowed.
+- **Publish an agent** so colleagues' agents can ask yours: a name, what to ask it about, a project folder and its rights — *Read*, *Read and git*, or *Edit*. Files with secrets (`.env`, keys) are excluded from reading by default. You can publish a fresh agent in a folder or a Claude Code session itself (each call works on a copy of the conversation).
+- **Every call waits for the owner.** It shows up in *Needs attention* with its full text; nothing runs until the owner clicks **Allow**. Then Claude Code runs in the agent's folder with those rights only — the owner's own Claude Code settings and MCP servers are not used — and the answer goes back. **Watch** shows live what the agent does; **Continue…** opens its conversation for you to carry on.
+- **Agents in channels:** add a published agent to a channel and mention it; the call still waits for its owner's approval.
+- **From your own sessions:** while connected, agent sessions in AgentPad get tools to find colleagues' agents and ask them (`team_agents`, `team_ask`, `team_check`, `team_cancel`) and to read and post in your channels (`chat_channels`, `chat_read`, `chat_post`). These are passed at launch; your configuration is not changed. Posts from a session are signed with its name. From the command line: `agentpad-cli team agents`, `agentpad-cli team ask backend@masha "How does auth work in your branch?"`.
 
-Every call shows up at the top of the right panel with its full text. Nothing runs until the owner clicks **Allow**; then Claude Code runs in the agent's folder with those rights only — the owner's own Claude Code settings and MCP servers are not used — and the answer goes back. The **Team** tab in the left sidebar lists the calls received and sent, with their state and answers, and Allow / Decline / Stop / Cancel; **Watch** opens a tab that shows, live, what the agent working on a call does, and **Continue…** opens its conversation for you to carry on.
-
-Calling a colleague's agent:
-
-- **From a Claude Code session in AgentPad**, just ask: "ask Masha's backend agent how auth works in her branch". While connected to a server, every new session gets the tools `team_agents`, `team_ask`, `team_check` and `team_cancel` (an MCP server passed at launch; your configuration is not changed). `team_ask` asks for your permission, since it sends text to another person.
-- **From the command line**, for any other agent: `agentpad-cli team agents`, `agentpad-cli team ask backend@masha "How does auth work in your branch?"` (`--thread <id>` continues the conversation).
-
-AgentPad connects only to the server you chose, over HTTPS; the sign-in is kept in the macOS keychain. Disconnecting closes the connection. Published agents and calls live in `~/Library/Application Support/agentpad/team-server/`, the connection in `…/agentpad/chat/`; the `team/` folder of 1.0.x is no longer used and can be deleted.
+AgentPad connects only to the server you chose, over HTTPS; the sign-in is kept in the macOS keychain. Disconnecting closes the connection.
 
 ## Where the data comes from
 
@@ -113,10 +123,19 @@ Claude Code's session files are an internal format. AgentPad treats them defensi
 
 ## Privacy
 
-There is no telemetry, and no accounts or sync unless you connect to a team server. Conversations and files stay on your Mac. AgentPad makes no network requests on its own, with two exceptions:
+There is no telemetry. Conversations and files stay on your Mac. AgentPad makes no network requests on its own, with two exceptions:
 
 - **Updates.** Once a day, and when you choose **Check for Updates…**, AgentPad reads the list of releases (`appcast.xml`) from this repository's latest GitHub release. Nothing about you or your Mac is sent.
-- **Team work**, while connected, talks to the AgentPad server you connected to (see above), and to nothing else.
+- **Team**, while connected, talks to the AgentPad server you connected to, and to nothing else. Your agent conversations are not uploaded; only what you or your agents post to the chat, and the questions and answers of calls between agents, go to the server.
+
+## Roadmap
+
+Planned next, in this order:
+
+- **1.1.13 — agents in direct messages.** Agents in your own tabs can read and send direct messages when you ask them to, signed with the session's name; and read images and documents attached in channels. Published agents and colleagues' calls never get access to your direct messages.
+- **1.1.14 — search everywhere.** One field for channels and direct messages (on the server) and the text of your agent conversations (indexed only on your Mac, never uploaded).
+- **1.1.15 — agents as contacts.** Agent profiles and one list of people and agents; **New agent** (agent type and folder, its sessions show up underneath); your own avatars.
+- **1.1.16 — Telegram.** Bring the Telegram conversations that matter into AgentPad and answer from either side.
 
 ## Install
 
