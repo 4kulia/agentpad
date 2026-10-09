@@ -140,7 +140,7 @@ struct AttentionEvent: Identifiable, Equatable, Codable, Sendable {
     /// or changing the notification history/read state.
     var clearsAttentionOnView: Bool {
         switch (source, destination) {
-        case ("terminal", .terminal): return kind == .input || kind == .failure
+        case ("terminal", .terminal): return kind == .input || kind == .completion || kind == .failure
         case ("external", .external): return kind == .input
         default: return false
         }

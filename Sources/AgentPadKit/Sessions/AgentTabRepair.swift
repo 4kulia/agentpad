@@ -47,7 +47,7 @@ enum AgentTabRepair {
                           tab.channel == nil, tab.inbox == nil,
                           WorkspaceStore.normalizedSSHHost(tab.sshWorkspaceHost ?? sshRemoteHost) == nil,
                           let id = tab.conversationId?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty,
-                          visibility.allows(conversationId: id)
+                          visibility.allows(conversationId: id, root: claudeProjectsRoot)
                     else { continue }
                     if case let .agent(agentId, conversationId) = match(id) {
                         pane.tabs[i].agentId = agentId

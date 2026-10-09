@@ -38,6 +38,9 @@ enum SessionCatalogScanner {
         var scanned: Int
         var total: Int
         var skipped: Int
+        /// Only records added since the previous progress callback. nil keeps
+        /// injected/legacy scanners compatible; the profile store also dedupes.
+        var discoveredRecords: [AgentSessionRecord]? = nil
     }
     /// Read-only even in offline mode; personal calls are automatic, channel calls excluded by their own policy.
     static func automaticConversations(journalURL: URL) -> Set<String> {
@@ -56,31 +59,35 @@ enum SessionCatalogScanner {
                      progress: @Sendable (Progress) -> Void = { _ in }) -> Progress {
         let old = SessionHeaderCache.load(cacheURL)
         var cache = SessionHeaderCache(), records: [String: AgentSessionRecord] = [:]
+        var discovered: [AgentSessionRecord] = []
+        func include(_ record: AgentSessionRecord) {
+            var record = record
+            if automatic.contains(record.conversationId) { record.automatic = true }
+            records[record.id] = record
+            discovered.append(record)
+        }
         var files: [(agent: String, file: URL, date: Date)] = []
         for store in AgentSessionScanner.stores {
             guard let root = roots[store.agentId] else { continue }
             if store.agentId == AgentTemplate.claudeCodeID {
                 files += AgentSessionScanner.claudeSessionFiles(under: root).filter {
-                    visibility.allows(conversationId: $0.item.deletingPathExtension().lastPathComponent)
+                    visibility.allows(conversationId: $0.item.deletingPathExtension().lastPathComponent, root: root)
                 }.map { (store.agentId, $0.item, $0.mtime) }
             } else if store.agentId == AgentTemplate.codex.id {
                 files += AgentSessionScanner.codexRolloutFiles(under: root).map { (store.agentId, $0.item, $0.mtime) }
             } else {
                 // SQLite queries always run, regardless of the main file's mtime (WAL).
                 for record in visibility.apply(collect(store, root)) {
-                    if records[record.id].map({ $0.lastActivity >= record.lastActivity }) != true { records[record.id] = record }
+                    if records[record.id].map({ $0.lastActivity >= record.lastActivity }) != true { include(record) }
                 }
             }
         }
         files.sort { $0.date != $1.date ? $0.date > $1.date : $0.file.path < $1.file.path }
         var skipped = 0
         func snapshot(_ scanned: Int) -> Progress {
-            let ordered = records.values.map { record in
-                var record = record
-                if automatic.contains(record.conversationId) { record.automatic = true }
-                return record
-            }.sorted { $0.lastActivity != $1.lastActivity ? $0.lastActivity > $1.lastActivity : $0.id < $1.id }
-            return Progress(records: ordered, scanned: scanned, total: files.count, skipped: skipped)
+            let ordered = records.values.sorted { $0.lastActivity != $1.lastActivity ? $0.lastActivity > $1.lastActivity : $0.id < $1.id }
+            defer { discovered.removeAll(keepingCapacity: true) }
+            return Progress(records: ordered, scanned: scanned, total: files.count, skipped: skipped, discoveredRecords: discovered)
         }
         progress(snapshot(0))
         for (index, entry) in files.enumerated() {
@@ -103,8 +110,9 @@ enum SessionCatalogScanner {
                 }
             }
             cache.headers[entry.file.path] = header
-            if let record = header.record, visibility.allows(agentId: record.agentId, conversationId: record.conversationId) {
-                if records[record.id] == nil { records[record.id] = record }
+            if let record = header.record, visibility.allows(agentId: record.agentId, conversationId: record.conversationId,
+                                                           startedAt: record.startedAt, root: roots[record.agentId]!) {
+                if records[record.id] == nil { include(record) }
             } else { skipped += 1 }
             if (index + 1).isMultiple(of: 50) { progress(snapshot(index + 1)) }
         }
@@ -118,7 +126,7 @@ enum SessionCatalogScanner {
 
 @MainActor @Observable
 final class SessionCatalog {
-    static let shared = SessionCatalog { progress in
+    static let shared = SessionCatalog(profiles: .shared) { progress in
         SessionCatalogScanner.scan(roots: Dictionary(uniqueKeysWithValues: AgentSessionScanner.stores.map { ($0.agentId, $0.defaultRoot()) }),
             cacheURL: SessionCatalogFiles.directory.appendingPathComponent("session-headers.json"), visibility: .current(),
             automatic: SessionCatalogScanner.automaticConversations(journalURL: ChatFiles.standard.journalURL), progress: progress)
@@ -135,7 +143,8 @@ final class SessionCatalog {
     private var lastScan: Date?
     private var scanID = UUID()
     @ObservationIgnored private var deferred: Task<Void, Never>?
-    init(scan: @escaping Scan) { self.scan = scan }
+    @ObservationIgnored private let profiles: AgentProfileStore?
+    init(profiles: AgentProfileStore? = nil, scan: @escaping Scan) { self.profiles = profiles; self.scan = scan }
 
     func refresh(force: Bool = false) {
         guard !isScanning else { schedule(); return }
@@ -145,13 +154,18 @@ final class SessionCatalog {
         scanID = UUID(); let id = scanID
         let scan = scan
         Task {
-            let result = await Task.detached(priority: .utility) { [self] in
-                scan { update in Task { @MainActor [self] in
-                    guard self.isScanning, self.scanID == id, update.scanned >= self.scanned else { return }
-                    self.apply(update)
-                } }
-            }.value
-            apply(result); isScanning = false; lastScan = Date()
+            let (updates, continuation) = AsyncStream<SessionCatalogScanner.Progress>.makeStream()
+            Task.detached(priority: .utility) {
+                let result = scan { continuation.yield($0) }
+                continuation.yield(result); continuation.finish()
+            }
+            // Preserve callback order: dropping a progress snapshot would now
+            // also drop its discovery increment.
+            for await update in updates {
+                guard scanID == id else { return }
+                apply(update)
+            }
+            isScanning = false; lastScan = Date()
         }
     }
     func count(including live: [AllSessionItem]) -> Int {
@@ -159,6 +173,7 @@ final class SessionCatalog {
         return records.count + live.count - Set(live.filter(\.canRename).map { $0.record.nameKey }).intersection(recordKeys).count
     }
     private func apply(_ update: SessionCatalogScanner.Progress) {
+        do { try profiles?.discover(update.discoveredRecords ?? update.records) } catch { /* Profiles expose discovery/save errors. */ }
         recordKeys = Set(update.records.map(\.nameKey))
         records = update.records; scanned = update.scanned; total = update.total; skipped = update.skipped; revision += 1
     }

@@ -24,6 +24,14 @@ struct AgentAnswerProvenance: Equatable, Sendable {
     let process: ChatSessionIdentity.Process
     let snapshots: [Snapshot]
 
+    /// The authenticated hook-to-Claude chain does not depend on the other
+    /// processes on its TTY. Personal tools independently verify their MCP
+    /// caller's live ancestry; answer export additionally needs the TTY scan.
+    struct Hook: Sendable {
+        let owner: Snapshot
+        let lineage: [Snapshot]
+    }
+
     static func capture(parentPID: Int32?, origin: AgentPadCallerOrigin,
                         inspector: Inspector = Inspector()) -> Self? {
         try? verify(parentPID: parentPID, origin: origin, inspector: inspector)
@@ -31,6 +39,11 @@ struct AgentAnswerProvenance: Equatable, Sendable {
 
     static func verify(parentPID: Int32?, origin: AgentPadCallerOrigin,
                        inspector: Inspector = Inspector()) throws(AgentAnswerTranscript.Problem) -> Self {
+        try verify(hook: verifyHook(parentPID: parentPID, origin: origin, inspector: inspector), inspector: inspector)
+    }
+
+    static func verifyHook(parentPID: Int32?, origin: AgentPadCallerOrigin,
+                           inspector: Inspector = Inspector()) throws(AgentAnswerTranscript.Problem) -> Hook {
         guard let parentPID, parentPID > 1,
               case .localProcess(let peerPID, let start) = origin,
               let peer = inspector.kernel.process(peerPID), peer.startedAtUs == start,
@@ -64,6 +77,16 @@ struct AgentAnswerProvenance: Equatable, Sendable {
         guard hookLineage.allSatisfy({ $0.process.terminal == nil || $0.process.terminal == tty }) else {
             throw .hookAncestry
         }
+        guard hookLineage.allSatisfy({ inspector.kernel.process($0.process.pid) == $0.process
+            && inspector.kernel.image($0.process.pid) == $0.image }) else { throw .processUnavailable }
+        return Hook(owner: owner, lineage: hookLineage)
+    }
+
+    static func verify(hook: Hook, inspector: Inspector = Inspector()) throws(AgentAnswerTranscript.Problem) -> Self {
+        let claude = hook.owner.process
+        guard let tty = claude.terminal else { throw .claudeTerminal }
+        let hookLineage = hook.lineage
+        let signed = Dictionary(hookLineage.map { ($0.process.pid, $0.process == claude) }, uniquingKeysWith: { a, _ in a })
         let rows = inspector.scan(claude.pid)
         var snapshots: [Snapshot] = []
         var candidates: [ChatSessionIdentity.Process] = []

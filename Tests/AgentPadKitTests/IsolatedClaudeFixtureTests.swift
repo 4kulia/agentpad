@@ -86,7 +86,7 @@ final class IsolatedClaudeFixtureTests: XCTestCase {
         defer { isolated.remove() }
         let binary = try NativeVersionFixture.make(in: isolated.project)
         let request = TeamRunRequest(agent: TeamPublishedAgent(name: "isolated", description: "test", folder: isolated.project.path, access: .read),
-                                     prompt: "fixture", sessionId: UUID().uuidString, resume: false, callerName: "test", callerProject: nil)
+                                     prompt: "fixture", sessionId: UUID().uuidString, resume: false, callerName: "test", callerProject: nil, dmHistoryFiles: ChatFiles(directory: isolated.root.appendingPathComponent("chat")))
         _ = try await isolated.runner(claudePath: binary.path).run(request, onActivity: { _ in })
         for phase in ["version", "executor"] {
             let actualHome = try String(contentsOf: isolated.project.appendingPathComponent("\(phase)-home"), encoding: .utf8)

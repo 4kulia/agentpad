@@ -179,7 +179,8 @@ final class ChatInboxTests: XCTestCase {
         XCTAssertNil(model.problem)
         XCTAssertEqual(requests, [nil, nil, 100, 99, 98, 97])
         finish = true; model.retry()
-        try await wait { !model.loading }
+        // Loading can finish before GRDB publishes the final page to the UI.
+        try await wait { !model.loading && model.entries(org).count == 6 }
         XCTAssertEqual(requests.last!, 96, "continue below the five pages already loaded")
         XCTAssertEqual(model.entries(org).count, 6)
         XCTAssertFalse(model.limited)

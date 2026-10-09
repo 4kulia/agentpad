@@ -19,7 +19,7 @@ struct OrgKey: Codable, Hashable, Sendable {
 enum TeamScope: Codable, Hashable, Sendable { case local, server(OrgKey) }
 
 enum SettingsTabSection: String, CaseIterable, Codable, Sendable {
-    case general, appearance, agents, terminals, openIn, statusBar, notifications, advanced, about, updates
+    case general, appearance, agents, terminals, openIn, statusBar, notifications, search, advanced, about, updates
     var title: String {
         switch self {
         case .openIn: "Open in"
@@ -35,6 +35,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
     case settings
     case notifications
     case allSessions
+    case search
     case directMessage(ChatDMRef)
     case directMessageDraft(OrgKey, peer: String)
     case newDM(OrgKey)
@@ -50,6 +51,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
     case forward(sourceSessionID: UUID, answerSnapshotID: UUID)
     case connection
     case newChannel(OrgKey, teamID: String, draftID: UUID)
+    case newAgent(draftID: UUID)
     case newSSH(draftID: UUID)
     case newWorktree(repository: String, sourceWorkspaceID: UUID, draftID: UUID)
     case workspaceDetails(UUID)
@@ -61,7 +63,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
     case unavailable(UUID)
 
     var isWindowScoped: Bool {
-        switch self { case .settings, .notifications, .allSessions, .linkFailure: true; default: false }
+        switch self { case .settings, .notifications, .allSessions, .search, .linkFailure: true; default: false }
     }
     func key(windowID: UUID) -> TabKey {
         // Source metadata is pinned on the route but is not a second identity.
@@ -80,6 +82,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         case .settings: "Settings"
         case .notifications: "Notifications"
         case .allSessions: "All sessions"
+        case .search: "Search results"
         case .directMessage, .directMessageDraft: "Direct message"
         case .newDM: "New message"
         case .linkFailure: "Link could not be opened"
@@ -94,6 +97,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         case .forward: "Forward"
         case .connection: "Connection"
         case .newChannel: "New channel"
+        case .newAgent: "New agent"
         case .newSSH: "New SSH workspace"
         case .newWorktree: "New worktree"
         case .workspaceDetails: "Workspace details"
@@ -110,6 +114,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         case .settings: "gearshape"
         case .notifications: "bell"
         case .allSessions: "clock"
+        case .search: "magnifyingglass"
         case .linkFailure, .unavailable: "exclamationmark.triangle"
         default: "rectangle.on.rectangle"
         }
@@ -159,6 +164,7 @@ final class TabState {
     @ObservationIgnored var canShowConfirmation: () -> Bool = { true }
     let settingsScreen = SettingsScreenState()
     var allSessionsModel: AllSessionsModel?
+    var dmSearchTarget: String?
     var dmPendingThread: String?
     var dmModel: ChatDMModel?
     var dmPeerModel: ChatDMPeerModel?

@@ -1048,6 +1048,15 @@ final class TeamCalls {
         )
         request.runToolsCallId = call.id
         request.continuesLog = continuing
+        request.isExecutorConversation = true
+        request.dmHistoryFiles = ChatFiles(directory: storage.directory.deletingLastPathComponent().appendingPathComponent("chat"))
+        do { try ExecutorConversations(files: request.dmHistoryFiles).record(request.sessionId) }
+        catch {
+            if let i = incoming.firstIndex(where: { $0.id == call.id }) {
+                finish(at: i, .failed, detail: "The owner's Mac could not save the executor conversation, so it did not run.")
+            }
+            return
+        }
         let runner = self.runner
         let callId = call.id
         // The run's callbacks belong to the store it began in (review D8h-p2-9).

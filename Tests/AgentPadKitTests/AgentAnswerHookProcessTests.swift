@@ -24,7 +24,7 @@ final class AgentAnswerHookProcessTests: XCTestCase {
         }
         let verified = expectation(description: "real shell hook bound to its foreground wrapper")
         let server = HookServer(socketPath: path, answerInspector: inspector) { message in
-            guard case .conversationId(let journal, let surface, let provenance, let failure) = message else { return }
+            guard case .conversationId(let journal, let surface, let provenance, let failure, _) = message else { return }
             defer { verified.fulfill() }
             XCTAssertEqual(surface, tab.id)
             XCTAssertEqual(journal, id)

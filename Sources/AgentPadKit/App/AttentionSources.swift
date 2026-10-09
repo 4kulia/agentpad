@@ -19,6 +19,36 @@ extension ClaudeVersionApprovals {
 }
 
 extension AttentionCoordinator {
+    static func terminalEvent(_ session: Session, kind: SessionAlertKind, workspaceTitle: String,
+                              visibility: ChannelConversationFilter) -> AttentionEvent? {
+        // Channel runs have their own gated request/publication sources. Never
+        // turn their terminal title or OSC text into a personal notification.
+        guard visibility.allows(agentId: session.displayAgent.id, conversationId: session.conversationId) else { return nil }
+        let eventKind: AttentionKind
+        switch kind {
+        case .attention: eventKind = .input
+        case .completed: eventKind = .completion
+        case .failure: eventKind = .failure
+        case .programNotification:
+            // Claude can send its idle reminder over OSC without a Notification
+            // hook reaching us. The known wait supplies the meaning; arbitrary
+            // program text from a shell or a working agent is not an input request.
+            let waiting = !session.displayAgent.isShell && session.activityState == .attention
+                && session.attentionReason != .failure && session.backgroundWork == nil
+            eventKind = waiting ? .input : .program
+        }
+        let episode = eventKind == .program
+            ? "\(session.notificationIncarnation):program:\(session.programNotificationEpisode)" : session.attentionEpisode
+        var event = AttentionEvent(source: "terminal", object: session.id.uuidString,
+            episode: episode, kind: eventKind, destination: .terminal(session.id))
+        event.localBody = "\(session.title) · \(workspaceTitle)"
+        if case .programNotification(let title, let body) = kind {
+            event.localTitle = title.isEmpty ? session.displayAgent.title : title
+            event.localBody = body
+        }
+        return event
+    }
+
     func focused(_ event: AttentionEvent) -> Bool {
         if case .terminal(let id) = event.destination { return terminalFocused(id) }
         if case .message(let channel, _, let thread, _) = event.destination {
@@ -131,9 +161,9 @@ extension AttentionCoordinator {
         }
     }
 
-    func endTerminalWaiting(_ id: UUID) {
-        for event in AttentionLedger.shared.events where event.destination == .terminal(id) && event.kind == .input {
-            AttentionLedger.shared.resolve(event.id)
+    func endTerminalWaiting(_ id: UUID, ledger: AttentionLedger = .shared) {
+        for event in ledger.events where event.destination == .terminal(id) && event.kind == .input {
+            ledger.resolve(event.id)
         }
     }
 }

@@ -16,7 +16,7 @@ final class TeamRunnerDiagnosticsTests: XCTestCase {
 
     private func request() -> TeamRunRequest {
         TeamRunRequest(agent: TeamPublishedAgent(name: "diagnostic", description: "fixture", folder: isolated.project.path, access: .read),
-                       prompt: "test", sessionId: UUID().uuidString, resume: false, callerName: "test", callerProject: nil)
+                       prompt: "test", sessionId: UUID().uuidString, resume: false, callerName: "test", callerProject: nil, dmHistoryFiles: ChatFiles(directory: isolated.root.appendingPathComponent("chat")))
     }
 
     private func write(_ name: String, _ text: String) throws {

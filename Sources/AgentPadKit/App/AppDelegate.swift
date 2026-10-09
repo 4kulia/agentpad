@@ -33,7 +33,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // window set, and no future mutation site can forget to.
         didSet { AgentMonitor.shared.windowGeneration += 1 }
     }
-    private let appPersistence = AppPersistence()
+    private let appPersistence: AppPersistence
+    private let agentProfiles: AgentProfileStore
     /// Set in `applicationShouldTerminate` so `windowWillClose` (fired for
     /// every window during ⌘Q) can tell "app quitting" from "user closed
     /// one window" — the former keeps each window's persisted slot.
@@ -76,9 +77,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 store.applyHookEvent(agent: agent, event: event, sessionId: sessionId, details: details)
             case .shellEnvironment(let env, let sessionId):
                 store.applyShellEnvironment(env, sessionId: sessionId)
-            case .conversationId(let conversationId, let sessionId, let provenance, let failure):
+            case .conversationId(let conversationId, let sessionId, let provenance, let failure, let hook):
                 // AgentPad: preserve hook provenance separately from monitor IDs.
-                store.applyHookConversationId(conversationId: conversationId, sessionId: sessionId, provenance: provenance, failure: failure)
+                store.applyHookConversationId(conversationId: conversationId, sessionId: sessionId, provenance: provenance, failure: failure, hook: hook)
             case .toolCall(let agent, let toolName, let identifier, let event, let success, let toolUseId, let sessionId, let mainThread):
                 store.applyToolCallEvent(
                     agent: agent,
@@ -97,7 +98,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
 
-    public override init() { super.init() }
+    public override convenience init() {
+        self.init(appPersistence: AppPersistence(), agentProfiles: .shared)
+    }
+
+    init(appPersistence: AppPersistence, agentProfiles: AgentProfileStore) {
+        self.appPersistence = appPersistence
+        self.agentProfiles = agentProfiles
+        super.init()
+    }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         MainThreadWatchdog.shared.start()
@@ -951,25 +960,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         guard let location = dockTabLocation(for: sessionId) else { return }
         let session = location.session
         if kind == .completed || kind == .failure { SessionCatalog.shared.refresh() }
-        // Channel runs have their own gated request/publication sources. Never
-        // turn their terminal title or OSC text into a personal notification.
-        guard ChannelConversationFilter.current().allows(agentId: session.displayAgent.id,
-                                                         conversationId: session.conversationId) else { return }
-        let eventKind: AttentionKind
-        switch kind {
-        case .attention: eventKind = .input
-        case .completed: eventKind = .completion
-        case .failure: eventKind = .failure
-        case .programNotification: eventKind = .program
-        }
-        var event = AttentionEvent(source: "terminal", object: session.id.uuidString,
-            episode: "\(session.notificationIncarnation):\(session.notificationPhase):\(session.notificationEpisode)",
-            kind: eventKind, destination: .terminal(session.id))
-        event.localBody = "\(session.title) · \(location.workspace.title)"
-        if case .programNotification(let title, let body) = kind {
-            event.localTitle = title.isEmpty ? session.displayAgent.title : title
-            event.localBody = body
-        }
+        guard let event = AttentionCoordinator.terminalEvent(session, kind: kind,
+            workspaceTitle: location.workspace.title, visibility: .current()) else { return }
         AttentionLedger.shared.upsert(event)
     }
 
@@ -1167,14 +1159,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         for controller in windowControllers {
             if !controller.store.tabCloseCoordinator.prepare(controller.store.allSessions) || !controller.store.flushPersistence() { saved = false }
         }
-        guard saved else { return .terminateCancel }
+        guard saved, flushTerminationPersistence() else { return .terminateCancel }
 
         // Runs before AppKit closes the windows, so every `windowWillClose`
         // that follows sees the flag and keeps its persisted slot. Start every
         // surface before waiting: one slow agent must not strand another tab.
         isTerminating = true
         for controller in windowControllers {
-            controller.store.flushPersistence()
             controller.store.terminate()
         }
         guard !SurfaceTeardownCoordinator.shared.isDrained else { return .terminateNow }
@@ -1221,15 +1212,26 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // app termination, so flush each retained window's store here. The
         // store uses its pre-teardown snapshot, preserving changes made in
         // the final second before ⌘Q without persisting shutdown output.
-        for controller in windowControllers {
-            controller.store.flushPersistence()
-        }
+        flushTerminationPersistence()
         // If closed-lid mode is engaged, re-enable lid sleep before dying —
         // a system-wide pmset flag outlives the process, unlike assertions.
         SleepGuard.shared.shutdownCleanup()
         agentMenuBarController?.stop()
         hookServer.stop()
         AgentPadShellIntegration.cleanup()
+    }
+
+    @discardableResult
+    func flushTerminationPersistence() -> Bool {
+        var saved = true
+        // Discovery can outlive the last window or finish while surfaces drain.
+        // Flush the shared archive synchronously even when no windows remain.
+        do { try agentProfiles.flush() }
+        catch { saved = false }
+        for controller in windowControllers {
+            if !controller.store.flushPersistence() { saved = false }
+        }
+        return saved
     }
 
     /// Returning to the foreground counts as seeing the active tab — clear its
@@ -1270,6 +1272,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         openRecentMenu.delegate = openRecentMenuDelegate
         mainMenu.addItem(submenu(buildMenu(title: "File", entries: [
             selfRow("New Tab", #selector(handleNewTab), "t"),
+            selfRow("New Agent…", #selector(handleNewAgent), "n", modifiers: [.option, .command]),
             selfRow("New Workspace", #selector(handleNewWorkspace), "n"),
             selfRow("New SSH Workspace…", #selector(handleNewSSHWorkspace)),
             selfRow("New Window", #selector(handleNewWindow), "n", modifiers: [.command, .shift]),
@@ -1522,6 +1525,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         store.addTab(in: workspace, template: template)
     }
 
+    @objc private func handleNewAgent() {
+        LocalFormTabs.shared.newAgent(from: activeStore)
+    }
+
     @objc private func handleNewWorkspace() {
         revealHiddenWindow()
         activeStore?.addWorkspace()
@@ -1594,28 +1601,41 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// The runtime dispatch goes through Obj-C selectors either way.
     @objc func handleQuickOpen() {
         revealHiddenWindow()
-        // Built fresh every open so a workspace added / tab renamed since
-        // the panel was last shown reflects in the index without us
-        // tracking invalidations. `toggle` makes ⌘P symmetric — press to
-        // open, press again (or Esc) to dismiss.
-        CommandPaletteWindowController.shared.toggle(
-            items: { [weak self] in
-                guard let self else { return [] }
-                return PaletteIndex.build(
-                    controllers: self.windowControllers,
-                    model: AgentPadSettingsModel.shared,
-                    recentFolders: RecentFolders.shared.existing
-                )
-            },
-            anchor: activeController?.window,
-            onActivate: { [weak self] item in self?.activate(item) },
-            // AgentPad: the index copies titles; a channel tab's may stop being
-            // the user's to see while the palette is open — it closes then (DESIGN-F2).
-            watch: { [weak self] in
-                self?.windowControllers.flatMap { $0.store.workspaces }.flatMap { $0.root.allPanes.flatMap(\.tabs) }
-                    .filter { $0.channel != nil }.map(\.title) ?? []
-            }
-        )
+        guard let store = activeStore else { return }
+        prepareSearch(in: store)
+        store.search.begin()
+    }
+
+    func prepareSearch(in store: WorkspaceStore) {
+        let snapshot = PaletteIndex.snapshot(controllers: windowControllers, model: .shared,
+            recentFolders: RecentFolders.shared.paths.map { URL(fileURLWithPath: $0, isDirectory: true) })
+        store.search.quickItems = { PaletteIndex.build(snapshot) }
+        store.search.quickAllowedIDs = { [weak self] items in
+            _ = AgentMonitor.shared.windowGeneration
+            let model = ChatOrgCurrent.shared.model, scope = model?.key.map(OrgKey.init)
+            let agents = Set(ChatSidebarSnapshot(model: model, active: nil).agents.map(\.id))
+            // DM card changes also invalidate cached tab permissions.
+            if let key = ChatService.shared.connection?.orgKey { _ = ChatService.shared.dmList(key)?.entries }
+            return Set(items.filter { item in
+                switch item.kind {
+                case .channel(let ref):
+                    guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key) else { return false }
+                    return ChatNotifications.allowed(.shared, key, channel: ref.channel)
+                case .teamAgent(let itemScope, let id):
+                    return itemScope == scope && agents.contains(id)
+                case .tab(let id, let workspace, let window):
+                    guard let ws = self?.windowControllers.first(where: { $0.windowId == window })?.store.workspaces.first(where: { $0.id == workspace }),
+                          let tab = ws.root.pane(containingSessionId: id)?.tabs.first(where: { $0.id == id }) else { return false }
+                    if let ref = tab.channel {
+                        guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key), ChatNotifications.allowed(.shared, key, channel: ref.channel) else { return false }
+                    }
+                    if case .directMessage(let ref) = tab.toolRoute, ref.key.map({ ChatService.shared.dmAllowed($0, ref.dm) }) != true { return false }
+                    return tab.title == item.title
+                default: return true
+                }
+            }.map(\.id))
+        }
+        store.search.activateQuick = { [weak self] item in self?.activate(item) }
     }
 
     /// Routes a palette pick to the owning window + workspace. Workspace
@@ -1649,6 +1669,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             let template = AgentTemplate.visibleOrdered(model: AgentPadSettingsModel.shared)
                 .first(where: { $0.id == templateId }) ?? .terminal
             store.addTab(in: ws, template: template)
+        case .channel(let ref):
+            guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key), ChatNotifications.allowed(.shared, key, channel: ref.channel) else { return }
+            _ = activeStore?.showChannel(ref)
+        case .teamAgent(let scope, let id):
+            guard let model = ChatOrgCurrent.shared.model, model.key.map(OrgKey.init) == scope,
+                  ChatSidebarSnapshot(model: model, active: nil).agents.contains(where: { $0.id == id }) else { return }
+            SupportTabs.shared.navigation.open(.agent(scope, agentID: id), from: activeStore)
         case .createSSHWorkspace:
             handleNewSSHWorkspace()
         case .openRecentFolder(let path):
@@ -1821,6 +1848,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             return CompositionTabs.available(session)
         }
 
+        if menuItemMatches(menuItem, #selector(handleFind)), let session = activeStore?.active?.activeSession {
+            if session.channel != nil || session.toolRoute == .search { return terminalWindowIsKey }
+            if case .directMessage = session.toolRoute { return terminalWindowIsKey }
+        }
+
         if menuItemMatches(
             menuItem,
             #selector(handleFind),
@@ -1951,8 +1983,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
     }
 
-    @objc private func handleFind() {
-        guard let session = activeStore?.active?.activeSession else { return }
+    @objc func handleFind() {
+        guard let store = activeStore, let session = store.active?.activeSession else { return }
+        if session.toolRoute == .search { prepareSearch(in: store); store.search.begin(); return }
+        if let ref = session.channel {
+            prepareSearch(in: store); store.search.source = .messages; store.search.scope = .channel; store.search.target = ref.channel
+            store.search.begin(); return
+        }
+        if case .directMessage(let ref) = session.toolRoute {
+            prepareSearch(in: store); store.search.source = .messages; store.search.scope = .dm; store.search.target = ref.dm
+            store.search.begin(); return
+        }
         // ⌘F is a toggle on the active tab. Search state is per-session, so
         // ⌘F in pane A doesn't affect pane B's open search bar — both can
         // be active simultaneously, each with their own needle / count.

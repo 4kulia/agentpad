@@ -122,7 +122,7 @@ struct ChatChannelView: View {
                         ChatIconButton(title: "Back to reading", symbol: "arrow.uturn.backward") { model.returnFromNavigation() }
                     }
                     if narrow {
-                        ChatIconButton(title: "Search loaded history (⌘F)", symbol: "magnifyingglass") { model.setSearching(!model.searching) }
+                        ChatIconButton(title: "Search in this channel (⌘F)", symbol: "magnifyingglass") { NSApp.sendAction(#selector(AppDelegate.handleFind), to: nil, from: nil) }
                             .keyboardShortcut("f", modifiers: .command)
                     }
                     ChatIconButton(title: "Close thread", symbol: "xmark") { model.openThread(nil) }
@@ -162,7 +162,7 @@ struct ChatChannelView: View {
             connectionStatus
             pinsButton(model)
             ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markRead() }
-            ChatIconButton(title: "Search loaded history (⌘F)", symbol: "magnifyingglass") { model.setSearching(!model.searching) }
+            ChatIconButton(title: "Search in this channel (⌘F)", symbol: "magnifyingglass") { NSApp.sendAction(#selector(AppDelegate.handleFind), to: nil, from: nil) }
                 .keyboardShortcut("f", modifiers: .command)
             if conversation.showingAgents || service.supports("chat.channel_ux1", key: key) {
                 Button(conversation.showingAgents ? "Messages" : "Agents / trust") {

@@ -3,15 +3,18 @@ import Foundation
 /// Sidebar preferences are independent of banner delivery and decision ownership.
 struct AttentionListSettings: Equatable, Sendable {
     var approvals = true
+    var finished = true
     var mentions = true
     var dm = true
     static func read(_ values: [String: Any]) -> Self {
         Self(approvals: values["approvals"] as? Bool ?? true,
+             finished: values["finished"] as? Bool ?? true,
              mentions: values["mentions"] as? Bool ?? true, dm: values["dm"] as? Bool ?? true)
     }
     func persisted(over values: [String: Any] = [:]) -> [String: Any] {
         var result = values
         result["approvals"] = approvals ? nil : false
+        result["finished"] = finished ? nil : false
         result["mentions"] = mentions ? nil : false
         result["dm"] = dm ? nil : false
         return result
@@ -76,6 +79,7 @@ struct AttentionCurrent: Sendable {
     struct Terminal: Sendable {
         var episode: String
         var failed: Bool
+        var finished = false
         var title: String = ""
         var agentID: String = ""
         var agentName: String = ""
@@ -112,12 +116,15 @@ enum AttentionList {
                 guard settings.approvals else { return nil }; tier = 0
             case .confirmation, .version, .signIn: tier = 0
             case .input: tier = 1
+            case .completion:
+                guard settings.finished, event.source == "terminal" else { return nil }; tier = 1
             case .failure, .recovery: tier = 2
             default: return nil
             }
             guard !["link-failure", "post-outcome"].contains(event.source) else { return nil }
-            if event.source == "terminal", event.kind == .failure {
-                guard case .terminal(let id) = event.destination, let tab = current.terminals[id], tab.failed,
+            if event.source == "terminal", event.kind == .failure || event.kind == .completion {
+                guard case .terminal(let id) = event.destination, let tab = current.terminals[id],
+                      event.kind == .failure ? tab.failed : tab.finished,
                       AttentionEvent(source: event.source, object: id.uuidString, episode: tab.episode,
                                      kind: event.kind, destination: event.destination).id == event.id else { return nil }
             }
@@ -131,7 +138,7 @@ enum AttentionList {
                 action: .event(event.id), secondary: dismissible ? .dismiss : nil, inFlight: event.actionInFlight)
             if case .terminal(let id) = event.destination, let tab = current.terminals[id] {
                 item.title = tab.title.isEmpty ? event.title : tab.title
-                item.subtitle = event.kind.title
+                item.subtitle = event.kind == .completion ? "Finished · waiting for you" : event.kind.title
                 item.subjectID = tab.agentID; item.subjectName = tab.agentName; item.subjectIsAgent = true
             }
             if let label = current.labels[event.id] {

@@ -70,23 +70,54 @@ final class ChatPersonalAccessTests: XCTestCase {
     }
 
     func testUntrustedHistorySurfaceAndProcessCannotBorrowPersonalBinding() throws {
-        let engine = TestEngine(); engine.foregroundPid = 22
+        let fixture = AnswerProcessFixture()
+        let engine = TestEngine(); engine.foregroundPid = AnswerProcessFixture.claude
         let session = Session(engine: engine, currentDirectory: root, agent: .claudeCode)
         let id = UUID().uuidString.lowercased()
         session.conversationId = id
-        let process = ChatSessionIdentity.Process(pid: 22, parent: 21, startedAtUs: 30, terminal: 42)
-        let caller = ChatLocalCaller(surface: session.id.uuidString.lowercased(), claudePID: 22, claudeStart: 30, signature: "Personal")
-        XCTAssertThrowsError(try ChatPersonalAccess.conversation(caller: caller, sessions: [session]))
+        let process = try XCTUnwrap(fixture.inspector.kernel.process(AnswerProcessFixture.claude))
+        let caller = ChatLocalCaller(surface: session.id.uuidString.lowercased(), claudePID: process.pid, claudeStart: process.startedAtUs, signature: "Personal")
+        func conversation(_ caller: ChatLocalCaller) throws -> ChatPersonalAccess.Conversation {
+            try ChatPersonalAccess.conversation(caller: caller, sessions: [session], kernel: fixture.inspector.kernel)
+        }
+        XCTAssertThrowsError(try conversation(caller))
         session.answerBinding = .init(conversation: id, process: process)
-        XCTAssertThrowsError(try ChatPersonalAccess.conversation(caller: caller, sessions: [session]))
-        session.answerBinding = .init(conversation: id, process: process, provenance: .init(process: process, snapshots: []))
-        XCTAssertEqual(try ChatPersonalAccess.conversation(caller: caller, sessions: [session]), .init(id))
-        for altered in [ChatLocalCaller(surface: UUID().uuidString, claudePID: 22, claudeStart: 30, signature: "Personal"),
-                        ChatLocalCaller(surface: caller.surface, claudePID: 23, claudeStart: 30, signature: "Personal"),
-                        ChatLocalCaller(surface: caller.surface, claudePID: 22, claudeStart: 31, signature: "Personal")] {
-            XCTAssertThrowsError(try ChatPersonalAccess.conversation(caller: altered, sessions: [session]))
+        XCTAssertThrowsError(try conversation(caller))
+        try fixture.bind(session, conversation: id)
+        XCTAssertEqual(try conversation(caller), .init(id))
+        for altered in [ChatLocalCaller(surface: UUID().uuidString, claudePID: process.pid, claudeStart: process.startedAtUs, signature: "Personal"),
+                        ChatLocalCaller(surface: caller.surface, claudePID: process.pid + 1, claudeStart: process.startedAtUs, signature: "Personal"),
+                        ChatLocalCaller(surface: caller.surface, claudePID: process.pid, claudeStart: process.startedAtUs + 1, signature: "Personal")] {
+            XCTAssertThrowsError(try conversation(altered))
         }
         session.conversationId = UUID().uuidString
-        XCTAssertThrowsError(try ChatPersonalAccess.conversation(caller: caller, sessions: [session]))
+        XCTAssertThrowsError(try conversation(caller))
+        session.conversationId = id
+        fixture.add(process.pid, parent: process.parent, name: "replaced-image")
+        XCTAssertThrowsError(try conversation(caller), "same PID/start must not survive exec")
+    }
+
+    func testSavedResumeIDsUnverifiedHooksAndForeignOwnersCannotAuthorizePersonalTools() throws {
+        let fixture = AnswerProcessFixture(), id = UUID().uuidString.lowercased()
+        let session = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode,
+            conversationId: id, launchedConversationId: id)
+        session.resumedConversationId = id
+        let caller = ChatLocalCaller(surface: session.id.uuidString.lowercased(), claudePID: AnswerProcessFixture.claude,
+            claudeStart: 100, signature: "Personal")
+        func conversation() throws -> ChatPersonalAccess.Conversation {
+            try ChatPersonalAccess.conversation(caller: caller, sessions: [session], kernel: fixture.inspector.kernel)
+        }
+        XCTAssertThrowsError(try conversation(), "restored metadata is not process evidence")
+        try fixture.bind(session, conversation: id)
+        XCTAssertNoThrow(try conversation())
+        AgentAnswerSource.recordHook(conversation: id, session: session, provenance: nil, inspector: fixture.inspector)
+        XCTAssertThrowsError(try conversation(), "an unauthenticated hook cannot retain old trust")
+        let foreign: Int32 = 99_999_990
+        fixture.add(foreign, parent: AnswerProcessFixture.shell, name: "claude", trusted: true)
+        fixture.add(AnswerProcessFixture.hook, parent: foreign, name: "agentpad-hook")
+        let hook = try AgentAnswerProvenance.verifyHook(parentPID: foreign,
+            origin: .localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100), inspector: fixture.inspector)
+        AgentAnswerSource.recordHook(conversation: id, session: session, provenance: nil, hook: hook, inspector: fixture.inspector)
+        XCTAssertThrowsError(try conversation(), "a hook routed to another surface cannot borrow its caller")
     }
 }

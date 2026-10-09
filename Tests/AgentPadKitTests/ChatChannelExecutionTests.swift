@@ -1088,7 +1088,7 @@ final class ChatChannelExecutionTests: XCTestCase {
             try f.move("starting", 4, run: approval.runId)
             _ = try await XCTUnwrap(f.service.launcher).launch(approvalId: approval.id)
             XCTAssertEqual(f.runner.requests.first?.agent.access, profile)
-            XCTAssertEqual(f.runner.requests.first?.isChannelConversation, true)
+            XCTAssertEqual(f.runner.requests.first?.isExecutorConversation, true)
             XCTAssertTrue(f.runner.requests.first?.prompt.contains("A refund was retried.") == true)
             XCTAssertFalse(f.runner.requests.first?.prompt.contains("Changed AFTER Allow") == true)
             XCTAssertEqual(f.runner.calls, 1)
@@ -1354,7 +1354,7 @@ final class ChatChannelExecutionTests: XCTestCase {
         _ = try await running.value
         XCTAssertEqual(f.runner.calls, 2)
         XCTAssertEqual(f.runner.requests.first?.sessionId, f.runner.requests.last?.sessionId)
-        XCTAssertEqual(f.runner.requests.last?.isChannelConversation, true)
+        XCTAssertEqual(f.runner.requests.last?.isExecutorConversation, true)
         XCTAssertEqual(f.runner.requests.last?.agent.extraFolders, [folder.path])
         XCTAssertEqual(try f.journal.runs().count, 1)
     }

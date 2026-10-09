@@ -24,6 +24,7 @@ final class LocalFormState {
     var name = "" { didSet { saveSSH() } }
     var host = "" { didSet { saveSSH() } }
     var directory = "" { didSet { saveSSH() } }
+    var newAgent = NewAgentDraft() { didSet { changed(.newAgent(newAgent)) } }
     var worktree = WorktreeFormDraft() { didSet { changed(.worktreeForm(worktree)) } }
     var tag = WorkspaceTagDraft() { didSet { changed(.workspaceTag(tag)) } }
     var error: String?
@@ -56,7 +57,40 @@ final class LocalFormTabs {
     var addWorktree: @MainActor (URL, URL, WorktreeManager.BranchMode) async -> Result<Void, WorktreeManager.GitError> = { root, path, mode in
         await Task.detached(priority: .userInitiated) { WorktreeManager.add(repoPath: root, path: path, mode: mode) }.value
     }
+    var agentTemplates: () -> [AgentTemplate] = { AgentTemplate.visibleOrdered(model: .shared).filter { !$0.isShell } }
+    var agentOptions: (String) -> String = { AgentPadSettingsModel.shared.agentOptions[$0] ?? "" }
     init(router: TabRouter = .shared) { self.router = router }
+
+    @discardableResult
+    func newAgent(from store: WorkspaceStore? = nil) -> Session? {
+        let existing = existingDraft { if case .newAgent = $0 { true } else { false } }
+        return router.open(existing ?? .newAgent(draftID: UUID()), from: store)
+    }
+
+    func duplicateAgent(_ state: TabState) -> AgentProfile? {
+        let draft = form(state).newAgent
+        guard !draft.folder.isEmpty, let store = owner(state)?.store,
+              let template = agentTemplates().first(where: { $0.id == draft.templateID }) else { return nil }
+        return store.agentProfiles.existing(rosterID: template.rosterId, folder: URL(fileURLWithPath: draft.folder))
+    }
+
+    func addAgent(_ state: TabState) {
+        let form = form(state)
+        guard !state.isClosed, !form.completed, let location = owner(state) else { return }
+        let draft = form.newAgent
+        guard let template = agentTemplates().first(where: { $0.id == draft.templateID }) else {
+            form.error = "Choose an agent type."; return
+        }
+        guard !draft.folder.isEmpty else { form.error = "Choose a folder."; return }
+        if duplicateAgent(state) == nil, let error = InlineNameEdit.problem(draft.name) { form.error = error; return }
+        do {
+            let profile = try location.store.agentProfiles.add(template: template,
+                folder: URL(fileURLWithPath: draft.folder), name: draft.name, launchOptions: agentOptions(template.id))
+            form.error = nil
+            location.store.revealAgentProfile(profile.id)
+            finish(state, submittedDraft: state.draft)
+        } catch { form.error = error.localizedDescription }
+    }
 
     func owner(_ state: TabState) -> TabRouter.Location? {
         for store in router.stores() {
@@ -127,10 +161,12 @@ final class LocalFormTabs {
         form.changed = { _ in }
         defer { form.changed = changed }
         form.name = ""; form.host = ""; form.directory = ""
+        form.newAgent = NewAgentDraft(templateID: agentTemplates().first?.id ?? "")
         form.worktree = WorktreeFormDraft()
         form.tag = WorkspaceTagDraft()
         form.error = nil
         switch state.draft?.payload {
+        case .newAgent(let draft): form.newAgent = draft
         case .ssh(let name, let host, let directory): form.name = name; form.host = host; form.directory = directory
         case .worktreeForm(let draft): form.worktree = draft
         case .worktree(let branch, let directory): form.worktree.branch = branch; form.worktree.directory = directory
@@ -287,7 +323,12 @@ final class LocalFormTabs {
         guard state.draft == submittedDraft else { return }
         form(state).completed = true
         clearDraft(state)
-        guard state.saveError == nil, let location = owner(state) else { return }
-        location.store.closeTab(location.session, in: location.workspace)
+        guard state.saveError == nil, let location = owner(state) else {
+            if case .newAgent = state.route { form(state).completed = false }
+            return
+        }
+        if case .newAgent = state.route {
+            location.store.closeCompletedAgentForm(location.session, in: location.workspace)
+        } else { location.store.closeTab(location.session, in: location.workspace) }
     }
 }

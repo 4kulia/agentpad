@@ -206,7 +206,7 @@ final class AllSessionsTests: XCTestCase {
         cleared.conversationId = UUID().uuidString
         cleared.resumedConversationId = fixture.id
         let before = store.allSessions.count
-        await AllSessionsActions.activate(disk(record(fixture.id, agent: "claude-code")), model: model, store: store, monitor: monitor)
+        await AllSessionsActions.activate(disk(record(fixture.id, agent: "claude-code", folder: FileManager.default.temporaryDirectory.path)), model: model, store: store, monitor: monitor)
         XCTAssertNil(model.resumeError)
         XCTAssertEqual(store.allSessions.count, before + 1)
         XCTAssertEqual(store.active?.activeSession?.conversationId, fixture.id)
@@ -220,7 +220,7 @@ final class AllSessionsTests: XCTestCase {
             store.conversationVisibility = { .init(channelIds: []) }
             if onlySSH { store.workspaces[0].sshRemoteHost = "host" }
             let calls = CatalogCounter(), model = actionModel()
-            let item = disk(record(fixture.id.uppercased(), agent: "claude-code"))
+            let item = disk(record(fixture.id.uppercased(), agent: "claude-code", folder: FileManager.default.temporaryDirectory.path))
             await AllSessionsActions.activate(item, model: model, store: store, monitor: AgentMonitor(), resolveClaude: { id, root, visibility in
                 XCTAssertFalse(Thread.isMainThread)
                 calls.increment()
@@ -251,7 +251,7 @@ final class AllSessionsTests: XCTestCase {
         monitor.storesProvider = { [first, second] }
         var focused: UUID?
         monitor.onActivate = { focused = $0 }
-        let item = disk(record(fixture.id, agent: "claude-code")), entered = CatalogCounter()
+        let item = disk(record(fixture.id, agent: "claude-code", folder: FileManager.default.temporaryDirectory.path)), entered = CatalogCounter()
         let release = DispatchSemaphore(value: 0)
         defer { release.signal() }
         let before = first.allSessions.count + second.allSessions.count
@@ -284,7 +284,7 @@ final class AllSessionsTests: XCTestCase {
             model.state.allSessionsModel = model
             let before = store.allSessions.count
             model.resume {
-                await AllSessionsActions.activate(self.disk(self.record(fixture.id, agent: "claude-code")), model: model,
+                await AllSessionsActions.activate(self.disk(self.record(fixture.id, agent: "claude-code", folder: FileManager.default.temporaryDirectory.path)), model: model,
                     store: store, resolveClaude: { id, root, visibility in
                         entered.increment()
                         _ = release.wait(timeout: .now() + 5)
@@ -310,7 +310,7 @@ final class AllSessionsTests: XCTestCase {
         defer { release.signal() }
         let before = store.allSessions.count
         let pending = Task {
-            await AllSessionsActions.activate(disk(record(fixture.id, agent: "claude-code")), model: model,
+            await AllSessionsActions.activate(disk(record(fixture.id, agent: "claude-code", folder: FileManager.default.temporaryDirectory.path)), model: model,
                 store: store, resolveClaude: { id, root, visibility in
                     entered.increment()
                     _ = release.wait(timeout: .now() + 5)
@@ -330,7 +330,7 @@ final class AllSessionsTests: XCTestCase {
         defer { store.terminate() }
         store.conversationVisibility = { .init(channelIds: []) }
         let model = actionModel(), before = store.allSessions.count, calls = CatalogCounter()
-        await AllSessionsActions.activate(disk(record(fixture.id, agent: "claude-code")), model: model, store: store,
+        await AllSessionsActions.activate(disk(record(fixture.id, agent: "claude-code", folder: FileManager.default.temporaryDirectory.path)), model: model, store: store,
             monitor: AgentMonitor(), resolveClaude: { _, _, _ in
                 XCTAssertFalse(Thread.isMainThread); calls.increment()
                 return .failure(.notFound)

@@ -381,7 +381,7 @@ final class TeamRunRecoveryTests: XCTestCase {
         try "#!/bin/sh\ntouch \(marker)\nsleep 2\n".write(toFile: early, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: early)
         let agent = TeamPublishedAgent(name: "x", description: "d", folder: root.path)
-        let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false, callerName: "M", callerProject: nil)
+        let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false, callerName: "M", callerProject: nil, dmHistoryFiles: ChatFiles(directory: root.appendingPathComponent("chat")))
         let seen = TeamStartBox()
         let markerExisted = Counter(), registered = Counter()
         let run = Task.detached {
@@ -543,7 +543,7 @@ final class TeamRunRecoveryTests: XCTestCase {
         try "#!/bin/sh\ntouch \(marker)\nsleep 5\n".write(toFile: early, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: early)
         let agent = TeamPublishedAgent(name: "x", description: "d", folder: root.path)
-        let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false, callerName: "M", callerProject: nil)
+        let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false, callerName: "M", callerProject: nil, dmHistoryFiles: ChatFiles(directory: root.appendingPathComponent("chat")))
         let seen = TeamStartBox()
         let run = Task.detached {
             try await ClaudeCodeRunner(fixturePath: early).run(request, onActivity: { _ in }, onProcessStarted: {

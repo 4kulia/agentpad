@@ -24,7 +24,7 @@ final class TeamRunnerVersionTests: XCTestCase {
 
     func request(_ profile: TeamAccessProfile = .read, resume: Bool = false) -> TeamRunRequest {
         TeamRunRequest(agent: TeamPublishedAgent(name: "y2", description: "test", folder: root.path, access: profile),
-                       prompt: "test", sessionId: UUID().uuidString, resume: resume, callerName: "test", callerProject: nil)
+                       prompt: "test", sessionId: UUID().uuidString, resume: resume, callerName: "test", callerProject: nil, dmHistoryFiles: ChatFiles(directory: root.appendingPathComponent("chat")))
     }
 
     func setVersion(_ text: String) throws { try text.write(to: root.appendingPathComponent("version.txt"), atomically: true, encoding: .utf8) }
@@ -398,7 +398,7 @@ final class TeamRunnerVersionTests: XCTestCase {
             var req = request()
             if !resume { req.agent.sessionId = UUID().uuidString }
             let next = TeamRunRequest(agent: req.agent, prompt: req.prompt, sessionId: req.sessionId, resume: resume,
-                                      callerName: req.callerName, callerProject: nil)
+                                      callerName: req.callerName, callerProject: nil, dmHistoryFiles: req.dmHistoryFiles)
             let waiting = Task { try await runner().run(next, onActivity: { _ in }) }
             try await wait { !self.approvals.pending.isEmpty }
             approvals.decide(try XCTUnwrap(approvals.pending.first?.id), allow: false)

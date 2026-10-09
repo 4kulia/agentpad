@@ -167,6 +167,19 @@ final class AgentPadHookKitTests: XCTestCase {
         )
     }
 
+    func testChatPreToolHookRefreshesConversationAfterResumeAndClear() {
+        for tool in ["chat_channels", "chat_read", "chat_post"] {
+            let payload = ["agent": "claude", "kind": "tool", "event": "pre",
+                           "tool_name": "mcp__agentpad-team__\(tool)", AgentPadHookKit.mainThreadKey: "true"]
+            XCTAssertTrue(AgentPadHookKit.shouldMirrorClaudeConversationId(payload: payload, environment: [:]))
+            for replacement in [["event": "post"], [AgentPadHookKit.mainThreadKey: "false"], ["tool_name": "Bash"]] {
+                XCTAssertFalse(AgentPadHookKit.shouldMirrorClaudeConversationId(payload: payload.merging(replacement) { _, b in b }, environment: [:]))
+            }
+            XCTAssertFalse(AgentPadHookKit.shouldMirrorClaudeConversationId(payload: payload,
+                environment: [AgentPadHookKit.claudeNoSessionPersistenceKey: "1"]))
+        }
+    }
+
     func testSupportedNonClaudeLifecycleMirrorsConversationId() {
         for agent in ["gemini", "copilot", "cursor-agent", "kimi", "kiro-cli", "droid", "agy"] {
             XCTAssertTrue(

@@ -58,6 +58,8 @@ final class Session: Identifiable {
     }
     var toolRoute: ToolRoute? { if case .tool(let route) = content { route } else { nil } }
     var tabState: TabState? { (engine as? NativeTabEngine)?.state }
+    /// A temporary restore failure must not replace the saved terminal tab.
+    var unavailableTab: PersistedTab?
     var hasProcess: Bool { content.hasProcess }
     var isChat: Bool { channel != nil || inbox != nil }
     /// Initial template the tab was opened with. Promoted at runtime when an
@@ -92,6 +94,9 @@ final class Session: Identifiable {
     /// sync via OSC 7 (`engine.onPwdChange`). Drives the tab title so users see
     /// where they are, not which agent template the tab was launched from.
     var currentDirectory: URL
+    var profileID: UUID?
+    /// Pinned for profile launches; OSC cwd changes must not rewrite history.
+    var profileOriginalCwd: URL?
     /// Runtime state; not persisted. Resets to `.idle` after relaunch.
     let catalogStartedAt = Date()
     var activityState: SessionActivityState = .idle
@@ -177,6 +182,8 @@ final class Session: Identifiable {
     let launchedConversationId: String?
     /// AgentPad: runtime export binding, separate from persisted/monitored IDs.
     var answerBinding: AgentAnswerSource.Binding?
+    /// Verified hook owner; personal MCP access rechecks this against its caller.
+    var personalBinding: ChatPersonalAccess.Binding?
     var answerBindingProblem: AgentAnswerTranscript.Problem?
     /// Exit status of the most recent command — populated from libghostty's
     /// `OSC 133;D` event. `nil` until the shell reports its first finish (or
@@ -423,6 +430,8 @@ final class Session: Identifiable {
     var notificationIncarnation = UUID()
     var notificationEpisode = 0
     var notificationPhase = "turn"
+    /// OSC notifications cannot advance or replace the current turn's episode.
+    var programNotificationEpisode = 0
     var attentionReason: SessionAttentionReason = .input
     var awaitingAgentExitOutcome = false
     var pendingAgentLaunch: (id: UUID, isAgent: Bool)?

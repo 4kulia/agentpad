@@ -24,12 +24,22 @@ enum AgentAnswerSource {
     /// Surface routing and history IDs alone never prove PID → journal.
     static func recordHook(conversation: String, session: Session, provenance: AgentAnswerProvenance?,
                            failure: AgentAnswerTranscript.Problem? = nil,
+                           hook: AgentAnswerProvenance.Hook? = nil,
                            inspector: AgentAnswerProvenance.Inspector = .init()) {
+        session.personalBinding = nil
         session.answerBinding = nil
         session.answerBindingProblem = failure ?? .hookIdentity
         guard session.displayAgent.rosterId == AgentTemplate.claudeCodeID,
-              session.effectiveRemoteHost == nil, UUID(uuidString: conversation) != nil,
-              let provenance else { return }
+              session.effectiveRemoteHost == nil, UUID(uuidString: conversation) != nil else { return }
+        // An MCP child starting/exiting can invalidate the export snapshot
+        // after ACK. Retain the authenticated owner for personal tools, which
+        // verify their own caller and tab before comparing this exact process.
+        if let owner = hook?.owner ?? provenance?.snapshots.first(where: { $0.process == provenance?.process }),
+           inspector.kernel.process(owner.process.pid) == owner.process,
+           inspector.kernel.image(owner.process.pid) == owner.image {
+            session.personalBinding = .init(conversation: conversation, owner: owner)
+        }
+        guard let provenance else { return }
         guard provenance.isCurrent(inspector: inspector) else { session.answerBindingProblem = .changed; return }
         guard provenance.matchesForeground(session.engine.foregroundPid, inspector: inspector) else {
             session.answerBindingProblem = .foregroundMismatch

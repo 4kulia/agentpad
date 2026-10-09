@@ -117,11 +117,14 @@ final class PaletteIndexMatchTests: XCTestCase {
 
 @MainActor
 final class PaletteIndexRecentFolderTests: XCTestCase {
-    func testRecentFoldersBecomeOpenEntries() {
+    func testRecentFoldersBecomeOpenEntries() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("palette-\(UUID())/proj-x", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder.deletingLastPathComponent()) }
         let items = PaletteIndex.build(
             controllers: [],
             model: AgentPadSettingsModel.shared,
-            recentFolders: [URL(fileURLWithPath: "/tmp/proj-x", isDirectory: true)]
+            recentFolders: [folder]
         )
 
         let recent = items.filter {
@@ -130,7 +133,7 @@ final class PaletteIndexRecentFolderTests: XCTestCase {
         }
         XCTAssertEqual(recent.count, 1)
         XCTAssertEqual(recent.first?.title, "proj-x")
-        XCTAssertEqual(recent.first?.kind, .openRecentFolder(path: "/tmp/proj-x"))
+        XCTAssertEqual(recent.first?.kind, .openRecentFolder(path: folder.path))
         XCTAssertTrue(recent.first?.subtitle.hasPrefix("recent · ") == true)
     }
 

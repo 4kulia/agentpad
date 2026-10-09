@@ -27,15 +27,9 @@ extension ChatSessionTools {
         let key = ChatOrgKey(server: connection.server, accountId: connection.accountId, orgId: org)
         guard service.supports("chat.dm", key: key), service.supports("chat.dm.session_signature", key: key) else { throw Failure(code: "unsupported") }
         guard service.dmToolsEnabled() else { throw Failure(code: "dm_access_disabled") }
-        func personal() throws -> ChatPersonalAccess.Conversation {
-            do {
-                guard try revalidate() else { throw Failure(code: "dm_not_allowed") }
-                let conversation = try personalConversation()
-                try ChatPersonalAccess.require(conversation, caller: caller, service: service)
-                return conversation
-            } catch { throw Failure(code: "dm_not_allowed") }
-        }
-        let conversation = try personal()
+        let personal = try ChatPersonalAccess.Authorization(caller: caller, service: service,
+            personalConversation: personalConversation, revalidate: revalidate)
+        let conversation = personal.conversation
         guard args["attachment_id"] == nil else { throw Failure(code: "unsupported") }
         guard isCallerWaiting(), !Task.isCancelled, service.dmAllowed(key), let sync = service.dmSync(key),
               let store = service.orgSessions[key]?.store, let token = service.token else { throw Failure(code: "not_connected") }
@@ -55,7 +49,7 @@ extension ChatSessionTools {
                       try String.fetchOne(db, sql: "SELECT generation FROM meta WHERE id = 1") == generation
                           && Int.fetchOne(db, sql: "SELECT epoch FROM dm_meta") == stamp.1
                   }) else { throw Failure(code: "not_found") }
-            guard try personal() == conversation else { throw Failure(code: "dm_not_allowed") }
+            try personal.requireCurrent()
         }
         func recordUse() throws {
             try current()

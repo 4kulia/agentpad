@@ -143,10 +143,14 @@ final class SessionCatalogTests: XCTestCase {
     func testCatalogIsUncappedAndProgressPublishesBeforeCompletion() throws {
         for index in 0..<175 { _ = try file("session-\(index)") }
         let callbacks = CatalogCounter()
+        let discovered = CatalogCounter()
         let result = SessionCatalogScanner.scan(roots: ["claude-code": claude], cacheURL: cache, visibility: .init(channelIds: []), progress: { snapshot in
             if snapshot.scanned > 0 && snapshot.scanned < snapshot.total { callbacks.increment() }
+            for _ in snapshot.discoveredRecords ?? [] { discovered.increment() }
         })
         XCTAssertEqual(result.records.count, 175); XCTAssertGreaterThan(callbacks.count, 0)
+        XCTAssertEqual(discovered.count + (result.discoveredRecords?.count ?? 0), 175,
+            "Profile discovery receives each record once across all progress increments")
     }
     func testPreviewReadsOnlyLastThreeMessagesAndNeverIndexesTheirText() throws {
         let file = try file("preview")

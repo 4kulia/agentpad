@@ -1173,7 +1173,7 @@ final class ChatUX1Tests: XCTestCase {
         let publishedSurface = UUID()
         try f.service.bindPublication(f.key, agent: CallJSON.agent, surface: publishedSurface)
         let input = try JSONSerialization.data(withJSONObject: ["surface": tab.id.uuidString, "kind": "conversationId", "conversationId": f.agent.sessionId!])
-        guard case .conversationId(let forged, let surface, _, _) = HookServer.parseMessage(input) else { return XCTFail("hook not parsed") }
+        guard case .conversationId(let forged, let surface, _, _, _) = HookServer.parseMessage(input) else { return XCTFail("hook not parsed") }
         workspace.applyConversationId(conversationId: forged, sessionId: surface)
         XCTAssertEqual(tab.conversationId, f.agent.sessionId, "the real B model has the forged A UUID")
         let processes: [SessionProcessScanner.Raw] = [

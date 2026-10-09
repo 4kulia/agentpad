@@ -9,6 +9,7 @@ struct TabDraft: Codable, Equatable, Identifiable {
         case publication(name: String, folder: String, instructions: String, teamIDs: [String])
         case publicationForm(PublicationDraft)
         case organizationForm(OrganizationDraft)
+        case newAgent(NewAgentDraft)
         case ssh(name: String, host: String, directory: String)
         case worktree(branch: String, directory: String)
         case worktreeForm(WorktreeFormDraft)

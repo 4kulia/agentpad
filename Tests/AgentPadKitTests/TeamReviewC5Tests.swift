@@ -77,7 +77,7 @@ final class TeamReviewC5Tests: XCTestCase {
         try "#!/bin/sh\ntouch \(marker)\n".write(toFile: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script)
         let agent = TeamPublishedAgent(name: "x", description: "d", folder: long)
-        let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false, callerName: "M", callerProject: nil)
+        let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false, callerName: "M", callerProject: nil, dmHistoryFiles: ChatFiles(directory: root.appendingPathComponent("chat")))
         let process = TeamValueBox<TeamProcessStart>()
         do {
             _ = try await ClaudeCodeRunner(fixturePath: script).run(request, onActivity: { _ in }, onProcessStarted: { process.set($0) })
@@ -103,7 +103,7 @@ final class TeamReviewC5Tests: XCTestCase {
         try "#!/bin/sh\ntouch \(file)\n".write(toFile: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script)
         let agent = TeamPublishedAgent(name: "x", description: "d", folder: root.path)
-        let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false, callerName: "M", callerProject: nil)
+        let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false, callerName: "M", callerProject: nil, dmHistoryFiles: ChatFiles(directory: root.appendingPathComponent("chat")))
         do {
             _ = try await ClaudeCodeRunner(fixturePath: script).run(request, onActivity: { _ in }, onProcessStarted: { _ in
                 throw ChatError.storage("disk full")

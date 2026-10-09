@@ -46,7 +46,7 @@ enum ClaudeSessionResume {
         visibility: ChannelConversationFilter = .current()
     ) -> Result<String, Refusal> {
         guard isFullId(id) else { return .failure(.fullIdRequired) }
-        guard visibility.allows(conversationId: id) else { return .failure(.channelConversation) }
+        guard visibility.allows(conversationId: id, root: root) else { return .failure(.channelConversation) }
         guard let file = AgentSessionScanner.claudeTranscript(conversationId: id, root: root),
               (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
         else { return .failure(.notFound) }

@@ -47,6 +47,249 @@ final class ChatSessionDMToolsTests: XCTestCase {
         {"dm_id":"\(dm)","peer":{"account_id":"\(CallJSON.boris)","name":"Peer","handle":"peer","active":true},"state":"active","version":1,"created_at":"2026-10-09T00:00:00Z"}
         """.utf8)
     }
+
+    private let mcp: Int32 = 99_999_980
+
+    private func authenticatedCall(_ args: [String: ChatJSON], tab: Session, processes: AnswerProcessFixture,
+                                   origin: AgentPadCallerOrigin? = nil) async throws -> AgentPadCLIResponse {
+        var request = AgentPadCLIRequest(verb: .team)
+        request.chatArguments = String(decoding: try JSONEncoder().encode(ChatJSON.object(args)), as: UTF8.self)
+        return await ChatSessionTools.handle(request, origin: origin ?? .localProcess(pid: mcp, startedAtUs: 100),
+            sessions: { [tab] }, service: f.service, signatureVerifier: processes.inspector.signed,
+            scan: processes.inspector.scan, kernel: processes.inspector.kernel)
+    }
+
+    private func serveDM(beforeResponse: @escaping @Sendable () -> Void = {}) {
+        let card = card(), dm = dm
+        ChatStubProtocol.reset { request, bytes in
+            beforeResponse()
+            if request.httpMethod == "POST" {
+                let command = try! JSONDecoder().decode(ChatCommandEnvelope.self, from: bytes)
+                let result: ChatJSON = command.type == "dm.open" ? .object(["dm_id": .string(dm)]) :
+                    .object(["dm_id": .string(dm), "message_id": command.args["message_id"]!,
+                             "author_session_name": command.args["author_session_name"]!])
+                return .success(.init(status: 200, body: try! JSONEncoder().encode(ChatCommandAnswer(events: [], result: result))))
+            }
+            let body: Data
+            if request.url!.path.hasSuffix("/dms") {
+                body = Data("{\"dms\":[\(String(decoding: card, as: UTF8.self))],\"next\":null}".utf8)
+            } else if request.url!.path.hasSuffix("/messages") || request.url!.path.contains("/threads/") {
+                body = Data(#"{"messages":[],"next":null}"#.utf8)
+            } else { body = card }
+            return .success(.init(status: 200, body: body))
+        }
+    }
+
+    /// Exercise the real handler, including MCP identity and conversation
+    /// binding. The lower-level call() fixture supplies an approved ID and
+    /// cannot catch the released app's intermittent hook/export rejection.
+    private func afterSuccessfulSendAndBatchHook(_ args: [String: ChatJSON],
+                                                file: StaticString = #filePath, line: UInt = #line) async throws -> ChatJSON {
+        let processes = AnswerProcessFixture()
+        processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
+        let tab = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode)
+        tab.customTitle = "Personal fixture"
+        try processes.bind(tab, conversation: conversation)
+        tab.conversationId = conversation
+        XCTAssertNil(tab.launchedConversationId, "This is a new tab, not a restore")
+        serveDM()
+        let members = try await authenticatedCall(["tool": .string("chat_channels"), "scope": .string("members")], tab: tab, processes: processes)
+        XCTAssertTrue(members.ok, members.chatResult ?? "", file: file, line: line)
+        let people = try JSONDecoder().decode(ChatJSON.self, from: Data((members.chatResult ?? "{}").utf8))["members"]
+        guard case .array(let people) = people else { throw ChatSessionTools.Failure(code: "missing_members") }
+        XCTAssertEqual(people.count, 1, file: file, line: line)
+        let sent = try await authenticatedCall(["tool": .string("chat_post"), "org_id": .string(f.key.orgId),
+            "kind": .string("dm"), "peer_account_id": .string(CallJSON.boris), "text": .string("hello")], tab: tab, processes: processes)
+        let sentJSON = try JSONDecoder().decode(ChatJSON.self, from: Data((sent.chatResult ?? "{}").utf8))
+        XCTAssertTrue(sent.ok, sent.chatResult ?? "", file: file, line: line)
+        XCTAssertEqual(sentJSON["status"], .string("sent"), file: file, line: line)
+        XCTAssertEqual(sentJSON["dm_id"], .string(dm), file: file, line: line)
+        XCTAssertEqual(sentJSON["author_session_name"], .string("Personal fixture"), file: file, line: line)
+        XCTAssertTrue(try ChatDMHistory(files: f.service.files).contains(conversation))
+
+        // PostToolBatch mirrors the ID even in 1.1.13. A helper starting
+        // between authentication and delivery invalidates export provenance,
+        // although the signed Claude, its conversation and MCP child are unchanged.
+        let batch = AgentPadHookKit.buildToolBatchPayload(agent: "claude", surface: tab.id.uuidString)
+        XCTAssertTrue(AgentPadHookKit.shouldMirrorClaudeConversationId(payload: batch, environment: [:]))
+        let proof = try XCTUnwrap(processes.capture())
+        processes.add(99_999_981, parent: AnswerProcessFixture.claude, name: "helper")
+        AgentAnswerSource.recordHook(conversation: conversation, session: tab, provenance: proof, inspector: processes.inspector)
+        XCTAssertNil(tab.answerBinding)
+        XCTAssertEqual(tab.answerBindingProblem, .changed)
+
+        let response = try await authenticatedCall(args, tab: tab, processes: processes)
+        XCTAssertTrue(response.ok, response.chatResult ?? "", file: file, line: line)
+        return try JSONDecoder().decode(ChatJSON.self, from: Data((response.chatResult ?? "{}").utf8))
+    }
+
+    func testFreshPersonalDMListWithOrgAfterSuccessfulSendAndBatchHook() async throws {
+        let result = try await afterSuccessfulSendAndBatchHook(["tool": .string("chat_channels"),
+            "scope": .string("dms"), "org_id": .string(f.key.orgId)])
+        XCTAssertEqual(result["org_id"], .string(f.key.orgId))
+        guard case .array(let cards) = result["dms"] else { return XCTFail("Missing DM catalog") }
+        XCTAssertEqual(cards.first?["dm_id"], .string(dm))
+    }
+
+    func testFreshPersonalDMListWithoutOrgAfterSuccessfulSendAndBatchHook() async throws {
+        let result = try await afterSuccessfulSendAndBatchHook(["tool": .string("chat_channels"), "scope": .string("dms")])
+        XCTAssertEqual(result["org_id"], .string(f.key.orgId))
+        guard case .array(let cards) = result["dms"] else { return XCTFail("Missing DM catalog") }
+        XCTAssertEqual(cards.first?["dm_id"], .string(dm))
+    }
+
+    func testFreshPersonalDMOpenAfterSuccessfulSendAndBatchHook() async throws {
+        let result = try await afterSuccessfulSendAndBatchHook(["tool": .string("chat_post"), "org_id": .string(f.key.orgId),
+            "kind": .string("dm"), "peer_account_id": .string(CallJSON.boris), "open_only": .bool(true)])
+        XCTAssertEqual(result["status"], .string("opened"))
+        XCTAssertEqual(result["dm_id"], .string(dm))
+    }
+
+    func testFreshPersonalDMReadAfterSuccessfulSendAndBatchHook() async throws {
+        let result = try await afterSuccessfulSendAndBatchHook(["tool": .string("chat_read"), "org_id": .string(f.key.orgId),
+            "kind": .string("dm"), "dm_id": .string(dm)])
+        XCTAssertEqual(result["messages"], .array([]))
+        XCTAssertEqual(result["dm_id"], .string(dm))
+        XCTAssertEqual(try f.store.dmRead { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM dm_marks") }, 0)
+    }
+
+    private var personalDMOperations: [[String: ChatJSON]] {
+        [
+            ["tool": .string("chat_channels"), "scope": .string("members")],
+            ["tool": .string("chat_channels"), "scope": .string("dms")],
+            ["tool": .string("chat_channels"), "scope": .string("dms"), "org_id": .string(f.key.orgId)],
+            ["tool": .string("chat_post"), "org_id": .string(f.key.orgId), "kind": .string("dm"),
+             "peer_account_id": .string(CallJSON.boris), "open_only": .bool(true)],
+            ["tool": .string("chat_post"), "org_id": .string(f.key.orgId), "kind": .string("dm"),
+             "peer_account_id": .string(CallJSON.boris), "text": .string("hello")],
+            ["tool": .string("chat_post"), "org_id": .string(f.key.orgId), "kind": .string("dm"),
+             "dm_id": .string(dm), "text": .string("hello")],
+            ["tool": .string("chat_read"), "org_id": .string(f.key.orgId), "kind": .string("dm"), "dm_id": .string(dm)],
+            ["tool": .string("chat_read"), "org_id": .string(f.key.orgId), "kind": .string("dm"),
+             "dm_id": .string(dm), "thread_root_id": .string(UUID().uuidString)]
+        ]
+    }
+
+    func testEveryDMOperationAllowsPersonalConversationAlreadyInDMHistory() async throws {
+        let processes = AnswerProcessFixture()
+        processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
+        let tab = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode)
+        try processes.bind(tab, conversation: conversation)
+        tab.conversationId = conversation
+        tab.answerBinding = nil
+        try ChatDMHistory(files: f.service.files).record(conversation)
+        serveDM()
+        for args in personalDMOperations {
+            let response = try await authenticatedCall(args, tab: tab, processes: processes)
+            XCTAssertTrue(response.ok, "\(args): \(response.chatResult ?? "")")
+        }
+    }
+
+    func testEveryAwaitingDMOperationDiscardsResultWhenTabBecomesPublished() async throws {
+        let processes = AnswerProcessFixture()
+        processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
+        let tab = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode)
+        try processes.bind(tab, conversation: conversation)
+        tab.conversationId = conversation
+        for args in personalDMOperations where args["scope"] != .string("members") {
+            let entered = expectation(description: "DM request awaiting response"), gate = Gate()
+            entered.assertForOverFulfill = false
+            gate.close()
+            defer { gate.open() }
+            serveDM { entered.fulfill(); gate.pass() }
+            let pending = Task { try await self.authenticatedCall(args, tab: tab, processes: processes) }
+            await fulfillment(of: [entered], timeout: 3)
+            let surface = tab.id.uuidString.lowercased()
+            try await f.journal.queue.write { db in
+                try db.execute(sql: "INSERT INTO publication_surfaces (server, account_id, org_id, agent_id, surface_id, session_id, generation) VALUES ('s', 'a', 'o', 'agent', ?, 'session', 'generation')",
+                    arguments: [surface])
+            }
+            gate.open()
+            let response = try await pending.value
+            XCTAssertEqual(response.error, "dm_not_allowed", "\(args)")
+            XCTAssertEqual(response.chatResult, "{\"error\":\"dm_not_allowed\"}")
+            let posts = try ChatStubProtocol.seen.filter { $0.request.httpMethod == "POST" }
+                .map { try JSONDecoder().decode(ChatCommandEnvelope.self, from: $0.body).type }
+            XCTAssertEqual(posts, args["peer_account_id"] == nil ? [] : ["dm.open"], "No message may send after publication")
+            try await f.journal.queue.write { try $0.execute(sql: "DELETE FROM publication_surfaces") }
+        }
+    }
+
+    func testEveryDMOperationDeniesExecutorPublicationAndAllRunHistories() async throws {
+        let processes = AnswerProcessFixture(), launch = UUID().uuidString.lowercased()
+        processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
+        let tab = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode, launchedConversationId: launch)
+        try processes.bind(tab, conversation: conversation)
+        tab.conversationId = conversation
+        tab.answerBinding = nil // the personal binding must not weaken role checks
+        func denyAll(_ origin: AgentPadCallerOrigin? = nil) async throws {
+            for args in personalDMOperations {
+                let result = try await authenticatedCall(args, tab: tab, processes: processes, origin: origin)
+                XCTAssertEqual(result.error, "dm_not_allowed", "\(args)")
+                XCTAssertEqual(result.chatResult, "{\"error\":\"dm_not_allowed\"}")
+            }
+        }
+        for origin in [AgentPadCallerOrigin.outside, .teamRun(callId: nil)] { try await denyAll(origin) }
+        for id in [launch, conversation] {
+            f.agent.sessionId = id
+            f.agent.enabled = false
+            try await denyAll()
+        }
+        f.agent.sessionId = nil
+        let surface = tab.id.uuidString.lowercased()
+        try await f.journal.queue.write { db in
+            try db.execute(sql: "INSERT INTO publication_surfaces (server, account_id, org_id, agent_id, surface_id, session_id, generation) VALUES ('s', 'a', 'o', 'agent', ?, 'old-session', 'old-generation')",
+                arguments: [surface])
+        }
+        try await denyAll()
+        try await f.journal.queue.write { db in
+            try db.execute(sql: "DELETE FROM publication_surfaces")
+            try db.execute(sql: "INSERT INTO approvals (id, server, account_id, org_id, request_id, agent_id, kind, params, params_hash, run_id, start_command_id, generation, created_at) VALUES ('a', 'other-server', 'other-account', 'other-org', 'r', 'agent', 'personal', '{}', 'hash', 'run', 'cmd', 'g', ?)", arguments: [Date()])
+        }
+        for id in [launch, conversation] {
+            for kind in ["personal", "channel", "future-kind"] {
+                try await f.journal.queue.write { db in
+                    try db.execute(sql: "INSERT INTO runs (run_id, request_id, approval_id, agent_id, conversation_id, started_at, ended_at, kind) VALUES ('run', 'r', 'a', 'agent', ?, ?, ?, ?)",
+                        arguments: [id.uppercased(), Date(), Date(), kind])
+                }
+                try await denyAll()
+                try await f.journal.queue.write { try $0.execute(sql: "DELETE FROM runs") }
+            }
+        }
+        XCTAssertTrue(ChatStubProtocol.seen.isEmpty)
+        XCTAssertTrue(try f.store.outbox.commands().isEmpty)
+        XCTAssertFalse(try ChatDMHistory(files: f.service.files).contains(conversation))
+    }
+
+    func testEveryDMOperationUsesSameSettingCapabilityAndHistoryChecks() async throws {
+        let processes = AnswerProcessFixture()
+        processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
+        let tab = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode)
+        try processes.bind(tab, conversation: conversation)
+        tab.conversationId = conversation
+        for code in ["dm_access_disabled", "unsupported"] {
+            f.service.dmToolsEnabled = { code != "dm_access_disabled" }
+            f.service.serverCapabilities[f.key.server] = code == "unsupported" ? ["chat.dm"] : ["chat.dm", "chat.dm.session_signature"]
+            for args in personalDMOperations {
+                let result = try await authenticatedCall(args, tab: tab, processes: processes)
+                XCTAssertEqual(result.error, code, "\(args)")
+            }
+        }
+        XCTAssertTrue(ChatStubProtocol.seen.isEmpty)
+        f.service.dmToolsEnabled = { true }
+        f.service.serverCapabilities[f.key.server] = ["chat.dm", "chat.dm.session_signature"]
+        // A broken taint ledger never releases private data or sends a command.
+        let history = ChatDMHistory(files: f.service.files)
+        try Data("broken".utf8).write(to: history.url)
+        serveDM()
+        for args in personalDMOperations {
+            let result = try await authenticatedCall(args, tab: tab, processes: processes)
+            XCTAssertEqual(result.error, "dm_not_allowed", "\(args)")
+            XCTAssertEqual(result.chatResult, "{\"error\":\"dm_not_allowed\"}")
+        }
+        XCTAssertTrue(ChatStubProtocol.seen.allSatisfy { $0.request.httpMethod == "GET" })
+        XCTAssertTrue(history.needsFreshSession(conversation))
+    }
     func testDefaultSettingAndDisabledUnsupportedDisconnectedMakeNoNetworkCalls() async throws {
         XCTAssertTrue(ChatDMSettings.enabled(in: [:]))
         XCTAssertFalse(ChatDMSettings.enabled(in: ["agents": ["directMessages": false]]))
@@ -187,7 +430,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
         func read() async throws -> ChatJSON {
             try await ChatSessionTools.call(.object(["tool": .string("chat_read"), "org_id": .string(f.key.orgId),
                 "kind": .string("dm"), "dm_id": .string(dm)]), caller: caller, service: f.service,
-                personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab]) }, revalidate: { true })
+                personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
         }
         try bind(personal)
         // A manually resumed executor history must stop blocking access once
@@ -236,11 +479,173 @@ final class ChatSessionDMToolsTests: XCTestCase {
                 var args = payload; args["org_id"] = .string(f.key.orgId)
                 await refused("dm_not_allowed") {
                     try await ChatSessionTools.call(.object(args), caller: caller, service: self.f.service,
-                        personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab]) }, revalidate: { true })
+                        personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
                 }
             }
         }
         XCTAssertTrue(ChatStubProtocol.seen.isEmpty)
+    }
+
+    func testReceivedConversationHookDeniesPersonalToolsUntilEveryHookSettles() async throws {
+        let processes = AnswerProcessFixture(), store = makeTestStore()
+        defer { store.terminate() }
+        processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
+        let tab = try XCTUnwrap(store.active?.activeSession)
+        tab.agent = .claudeCode
+        let old = UUID().uuidString.lowercased(), pending = UUID().uuidString.lowercased(), latest = UUID().uuidString.lowercased()
+        try processes.bind(tab, conversation: old)
+        tab.conversationId = old
+        let caller = ChatLocalCaller(surface: tab.id.uuidString.lowercased(), claudePID: AnswerProcessFixture.claude,
+                                     claudeStart: 100, signature: "Private tab title")
+        let reading = expectation(description: "personal read awaiting its response"), responseGate = Gate()
+        reading.assertForOverFulfill = false
+        responseGate.close()
+        defer { responseGate.open() }
+        serveDM { reading.fulfill(); responseGate.pass() }
+        let read = Task {
+            try await self.authenticatedCall(["tool": .string("chat_read"), "org_id": .string(self.f.key.orgId),
+                "kind": .string("dm"), "dm_id": .string(self.dm)], tab: tab, processes: processes)
+        }
+        await fulfillment(of: [reading], timeout: 3)
+        let waiting = expectation(description: "new hook received but verification blocked")
+        let applied = expectation(description: "a later hook applied while the first is still pending")
+        let delayed = DelayedConversationScan(started: waiting, inspector: processes.inspector)
+        defer { delayed.resume.signal() }
+        var inspector = processes.inspector
+        inspector.scan = { delayed.scan($0) }
+        let path = NSTemporaryDirectory() + "pending-hook-\(UUID().uuidString.prefix(8)).sock"
+        let server = HookServer(socketPath: path, answerInspector: inspector) { message in
+            guard case .conversationId(let id, let surface, let proof, let failure, let hook) = message else { return }
+            store.applyHookConversationId(conversationId: id, sessionId: surface, provenance: proof,
+                failure: failure, hook: hook, inspector: processes.inspector)
+            if id == latest { applied.fulfill() }
+        }
+        server.originOf = { _ in .localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100) }
+        server.start()
+        defer { server.stop() }
+        let payload = AgentPadHookKit.buildConversationIdPayload(surface: tab.id.uuidString,
+            conversationId: pending, claudeParentPID: AnswerProcessFixture.claude)
+        let sending = Task.detached { AgentPadHookKit.sendPayload(payload, to: path) }
+        await fulfillment(of: [waiting], timeout: 3)
+        _ = await sending.value // the hook client gives up after 200 ms
+        XCTAssertEqual(tab.personalBinding?.conversation, old)
+        responseGate.open()
+        let discarded = try await read.value
+        XCTAssertEqual(discarded.error, "dm_not_allowed", "Receipt must also revoke an in-flight personal read")
+        serveDM()
+        f.service.isServerKnown = { _, _ in true }
+        f.service.serverCapabilities[f.key.server]?.insert("chat.session_tools")
+        let attachment: [String: ChatJSON] = ["tool": .string("chat_read"), "org_id": .string(f.key.orgId),
+            "channel_id": .string(UUID().uuidString), "attachment_id": .string(UUID().uuidString)]
+        for args in personalDMOperations + [attachment] {
+            await refused("dm_not_allowed") {
+                try await ChatSessionTools.call(.object(args), caller: caller, service: self.f.service,
+                    personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: processes.inspector.kernel) },
+                    revalidate: { true })
+            }
+        }
+        let members: [String: ChatJSON] = ["tool": .string("chat_channels"), "scope": .string("members")]
+        let denied = try await authenticatedCall(members, tab: tab, processes: processes)
+        XCTAssertEqual(denied.error, "dm_not_allowed")
+        XCTAssertEqual(try JSONDecoder().decode(ChatJSON.self, from: Data((denied.chatResult ?? "{}").utf8)),
+                       .object(["error": .string("dm_not_allowed")]))
+        XCTAssertTrue(ChatStubProtocol.seen.isEmpty)
+        let history = ChatDMHistory(files: f.service.files)
+        XCTAssertFalse(try history.contains(old))
+        XCTAssertFalse(try history.contains(pending))
+
+        let unrelated = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode)
+        try processes.bind(unrelated, conversation: old)
+        unrelated.conversationId = old
+        var otherCaller = caller
+        otherCaller.surface = unrelated.id.uuidString.lowercased()
+        XCTAssertNoThrow(try ChatPersonalAccess.conversation(caller: otherCaller, sessions: [unrelated], kernel: processes.inspector.kernel))
+
+        let next = AgentPadHookKit.buildConversationIdPayload(surface: tab.id.uuidString,
+            conversationId: latest, claudeParentPID: AnswerProcessFixture.claude)
+        _ = await Task.detached { AgentPadHookKit.sendPayload(next, to: path) }.value
+        await fulfillment(of: [applied], timeout: 3)
+        XCTAssertThrowsError(try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: processes.inspector.kernel),
+                             "Applying one hook must not clear another pending hook")
+        delayed.resume.signal()
+        XCTAssertEqual(tab.personalBinding?.conversation, latest)
+        let allowed = try await authenticatedCall(members, tab: tab, processes: processes)
+        XCTAssertTrue(allowed.ok, allowed.chatResult ?? "")
+        XCTAssertTrue(try history.contains(latest))
+    }
+
+    func testLateConversationHookCannotRollbackBindingTaintOrRunCheck() async throws {
+        for executor in [false, true] {
+            let processes = AnswerProcessFixture(), store = makeTestStore()
+            defer { store.terminate() }
+            processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
+            let tab = try XCTUnwrap(store.active?.activeSession)
+            tab.agent = .claudeCode
+            (tab.engine as? TestEngine)?.foregroundPid = AnswerProcessFixture.claude
+            let old = UUID().uuidString.lowercased(), current = UUID().uuidString.lowercased()
+            if executor {
+                try await f.journal.queue.write { db in
+                    try db.execute(sql: "INSERT INTO approvals (id, server, account_id, org_id, request_id, agent_id, kind, params, params_hash, run_id, start_command_id, generation, created_at) VALUES ('a', 's', 'a', 'o', 'r', 'agent', 'personal', '{}', 'hash', 'run', 'cmd', 'g', ?)", arguments: [Date()])
+                    try db.execute(sql: "INSERT INTO runs (run_id, request_id, approval_id, agent_id, conversation_id, started_at, ended_at, kind) VALUES ('run', 'r', 'a', 'agent', ?, ?, ?, 'personal')", arguments: [current.uppercased(), Date(), Date()])
+                }
+            }
+
+            let waiting = expectation(description: "A authenticated and waiting in export verification")
+            let applied = expectation(description: "B applied before A finishes")
+            let drained = expectation(description: "late A delivery drained")
+            let delayed = DelayedConversationScan(started: waiting, inspector: processes.inspector)
+            defer { delayed.resume.signal() }
+            var inspector = processes.inspector
+            inspector.scan = { delayed.scan($0) }
+            let path = NSTemporaryDirectory() + "late-hook-\(UUID().uuidString.prefix(8)).sock"
+            var delivered: [String] = []
+            let server = HookServer(socketPath: path, answerInspector: inspector) { message in
+                if case .toolBatchResolved = message { drained.fulfill(); return }
+                guard case .conversationId(let id, let surface, let proof, let failure, let hook) = message else { return }
+                delivered.append(id)
+                store.applyHookConversationId(conversationId: id, sessionId: surface, provenance: proof,
+                    failure: failure, hook: hook, inspector: processes.inspector)
+                if id == current { applied.fulfill() }
+            }
+            server.originOf = { _ in .localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100) }
+            server.start()
+            defer { server.stop() }
+            let payloadA = AgentPadHookKit.buildConversationIdPayload(surface: tab.id.uuidString,
+                conversationId: old, claudeParentPID: AnswerProcessFixture.claude)
+            let a = Task.detached { AgentPadHookKit.sendPayload(payloadA, to: path) }
+            await fulfillment(of: [waiting], timeout: 3)
+            let payloadB = AgentPadHookKit.buildConversationIdPayload(surface: tab.id.uuidString,
+                conversationId: current, claudeParentPID: AnswerProcessFixture.claude)
+            let sentB = await Task.detached { AgentPadHookKit.sendPayload(payloadB, to: path) }.value
+            XCTAssertTrue(sentB)
+            await fulfillment(of: [applied], timeout: 3)
+            delayed.resume.signal()
+            let sentA = await a.value
+            XCTAssertTrue(sentA)
+            let marker = AgentPadHookKit.buildToolBatchPayload(agent: "claude", surface: tab.id.uuidString)
+            let sentMarker = await Task.detached { AgentPadHookKit.sendPayload(marker, to: path) }.value
+            XCTAssertTrue(sentMarker)
+            await fulfillment(of: [drained], timeout: 3)
+
+            XCTAssertEqual(delivered, [current])
+            XCTAssertEqual(tab.conversationId, current)
+            XCTAssertEqual(tab.personalBinding?.conversation, current)
+            XCTAssertEqual(tab.answerBinding?.conversation, current)
+            XCTAssertNil(tab.launchedConversationId)
+            serveDM()
+            let response = try await authenticatedCall(["tool": .string("chat_read"), "org_id": .string(f.key.orgId),
+                "kind": .string("dm"), "dm_id": .string(dm)], tab: tab, processes: processes)
+            let history = ChatDMHistory(files: f.service.files)
+            if executor {
+                XCTAssertEqual(response.error, "dm_not_allowed")
+                XCTAssertTrue(ChatStubProtocol.seen.isEmpty)
+                XCTAssertFalse(try history.contains(current))
+            } else {
+                XCTAssertTrue(response.ok, response.chatResult ?? "")
+                XCTAssertTrue(try history.contains(current))
+            }
+            XCTAssertFalse(try history.contains(old))
+        }
     }
 
     func testDMReadTaintsOnlyLaunchAndCurrentConversation() async throws {
@@ -258,7 +663,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
         ChatStubProtocol.reset { _, _ in .success(.init(status: 200, body: Data(#"{"messages":[],"next":null}"#.utf8))) }
         _ = try await ChatSessionTools.call(.object(["tool": .string("chat_read"), "org_id": .string(f.key.orgId),
             "kind": .string("dm"), "dm_id": .string(dm)]), caller: caller, service: f.service,
-            personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab]) }, revalidate: { true })
+            personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
         let history = ChatDMHistory(files: f.service.files)
         XCTAssertTrue(try history.contains(resumed))
         XCTAssertTrue(try history.contains(current))
@@ -352,9 +757,11 @@ final class ChatSessionDMToolsTests: XCTestCase {
     func testSignedRetrySurvivesResumeAndClaudeRestartButCannotBorrowAnotherConversation() async throws {
         let tab = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode, launchedConversationId: conversation)
         tab.resumedConversationId = conversation
+        let process = AnswerProcessFixture()
         func bind(_ id: String, pid: Int32, start: UInt64, name: String) -> ChatLocalCaller {
-            let process = ChatSessionIdentity.Process(pid: pid, parent: 21, startedAtUs: start, terminal: 42)
-            tab.answerBinding = .init(conversation: id, process: process, provenance: .init(process: process, snapshots: []))
+            process.add(pid, parent: 21, name: "claude", trusted: true, start: start)
+            tab.personalBinding = .init(conversation: id, owner: .init(process: process.inspector.kernel.process(pid)!,
+                image: process.inspector.kernel.image(pid)!, isForeground: true))
             tab.conversationId = id
             return ChatLocalCaller(surface: tab.id.uuidString.lowercased(), claudePID: pid, claudeStart: start, signature: name)
         }
@@ -363,7 +770,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
             "kind": .string("dm"), "dm_id": .string(dm), "message_id": .string(UUID().uuidString.lowercased()), "text": .string("retry this exact message")])
         func post(_ caller: ChatLocalCaller) async throws -> ChatJSON {
             try await ChatSessionTools.call(args, caller: caller, service: f.service,
-                personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab]) }, revalidate: { true })
+                personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
         }
         let card = card(), dm = dm
         ChatStubProtocol.reset { request, _ in
@@ -395,5 +802,30 @@ final class ChatSessionDMToolsTests: XCTestCase {
         XCTAssertEqual(sent["author_session_name"]?.string, "Original title")
         XCTAssertEqual(ChatStubProtocol.seen.filter { $0.request.httpMethod == "POST" }.count, 1)
         XCTAssertEqual(try f.store.outbox.commands().count, 1)
+    }
+}
+
+/// Pause only A, after verifyHook authenticated its owner. Its export check
+/// fails after B is installed, exercising the personal-binding fallback too.
+private final class DelayedConversationScan: @unchecked Sendable {
+    private let lock = NSLock()
+    private var first = true
+    private let started: XCTestExpectation
+    private let inspector: AgentAnswerProvenance.Inspector
+    let resume = DispatchSemaphore(value: 0)
+
+    init(started: XCTestExpectation, inspector: AgentAnswerProvenance.Inspector) {
+        self.started = started
+        self.inspector = inspector
+    }
+
+    func scan(_ pid: Int32) -> [SessionProcessScanner.Raw] {
+        let pause = lock.withLock { let value = first; first = false; return value }
+        if pause {
+            started.fulfill()
+            _ = resume.wait(timeout: .now() + 10)
+            return []
+        }
+        return inspector.scan(pid)
     }
 }

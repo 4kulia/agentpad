@@ -162,18 +162,24 @@ public enum AgentPadHookKit {
     public static let claudeNoSessionPersistenceKey = "AGENTPAD_CLAUDE_NO_SESSION_PERSISTENCE"
 
     /// Whether the CLI should mirror this hook payload's conversation id.
-    /// Tool payloads are deliberately skipped because lifecycle hooks already
-    /// carry the same id and tool-heavy turns would otherwise multiply IPC.
+    /// Refresh the binding before AgentPad chat calls, including the first call
+    /// after resume or /clear when the lifecycle hook was late or unavailable.
+    /// Other tool events do not need another conversation IPC round trip.
     /// Claude's ephemeral process marker remains its one agent-specific veto.
     public static func shouldMirrorConversationId(
         agent: String,
         payload: [String: String],
         environment: [String: String]
     ) -> Bool {
-        guard payload["agent"] == agent, payload["kind"] != "tool" else { return false }
+        guard payload["agent"] == agent else { return false }
         if agent == "claude",
            environment[claudeNoSessionPersistenceKey] == "1" {
             return false
+        }
+        if payload["kind"] == "tool" {
+            return agent == "claude" && payload["event"] == "pre" && payload[mainThreadKey] == "true"
+                && ["mcp__agentpad-team__chat_channels", "mcp__agentpad-team__chat_read", "mcp__agentpad-team__chat_post"]
+                    .contains(payload["tool_name"] ?? "")
         }
         switch agent {
         case "claude", "gemini", "copilot", "cursor-agent", "kimi", "kiro-cli", "droid", "agy", "reasonix":

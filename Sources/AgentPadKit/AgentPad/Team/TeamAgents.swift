@@ -152,7 +152,7 @@ enum TeamSessionFiles {
 
     /// The conversation's file, or nil once it is gone.
     static func file(for sessionId: String, root: URL = root, visibility: ChannelConversationFilter = .current()) -> URL? {
-        guard visibility.allows(conversationId: sessionId), isValidId(sessionId),
+        guard visibility.allows(conversationId: sessionId, root: root), isValidId(sessionId),
               let projects = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
         else { return nil }
         let name = "\(sessionId.lowercased()).jsonl"

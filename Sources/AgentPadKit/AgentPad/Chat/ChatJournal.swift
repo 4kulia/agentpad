@@ -9,6 +9,9 @@ final class ChatJournal: Sendable {
     let url: URL
     let queue: DatabaseQueue
     let resetBackup: URL?
+    var executorConversations: ExecutorConversations {
+        ExecutorConversations(files: ChatFiles(directory: url.deletingLastPathComponent()))
+    }
 
     private init(url: URL, queue: DatabaseQueue, resetBackup: URL? = nil) {
         self.url = url
@@ -20,13 +23,16 @@ final class ChatJournal: Sendable {
     /// the user resets it (`reset`), everything else goes on.
     static func open(files: ChatFiles) throws -> ChatJournal {
         try files.prepareDirectory()
-        return ChatJournal(url: files.journalURL, queue: try ChatDatabase.open(files.journalURL, migrator: ChatStoreMigrations.journal))
+        let journal = ChatJournal(url: files.journalURL, queue: try ChatDatabase.open(files.journalURL, migrator: ChatStoreMigrations.journal))
+        try journal.executorConversations.seedOnce(from: journal.queue)
+        return journal
     }
 
     /// "Reset Run Journal" in the Team window: the damaged file is set aside
     /// and an empty one made.
     static func reset(files: ChatFiles) throws -> ChatJournal {
         let fm = FileManager.default
+        let resetAt = Date()
         var backup: URL?
         if fm.fileExists(atPath: files.journalURL.path) {
             var path = files.journalURL.path + ".corrupt"
@@ -36,7 +42,11 @@ final class ChatJournal: Sendable {
             // backups and uncheckpointed SQLite data are never discarded.
             for suffix in suffixes { try fm.copyItem(atPath: files.journalURL.path + suffix, toPath: path + suffix) }
             backup = URL(fileURLWithPath: path)
-            for suffix in suffixes { try fm.removeItem(atPath: files.journalURL.path + suffix) }
+            // Even a read-only SQLite open can change its shared-memory sidecar.
+            try ExecutorConversations(files: files).seedBeforeReset(journalURL: files.journalURL, at: resetAt)
+            for suffix in ["", "-wal", "-shm"] where fm.fileExists(atPath: files.journalURL.path + suffix) {
+                try fm.removeItem(atPath: files.journalURL.path + suffix)
+            }
         }
         let fresh = try open(files: files)
         return ChatJournal(url: fresh.url, queue: fresh.queue, resetBackup: backup)
@@ -286,6 +296,10 @@ extension ChatJournal {
             try db.execute(sql: "UPDATE runs SET pid = NULL, pgid = NULL, process_started_at = NULL WHERE run_id = ? AND outcome IS NULL",
                            arguments: [runId])
             guard db.changesCount == 1 else { throw ChatError.storage("the run \(runId) is not open") }
+            guard let conversation = try String.fetchOne(db, sql: "SELECT conversation_id FROM runs WHERE run_id = ?", arguments: [runId]) else {
+                throw ChatError.storage("the run \(runId) has no conversation")
+            }
+            try executorConversations.record(conversation)
             return true
         }
     }
@@ -316,6 +330,9 @@ extension ChatJournal {
             scoped.org = approval.orgId
             scoped.channelId = params.channelId
             scoped.threadRootId = params.threadRootId
+            // This durable mark precedes both the journal commit and launch.
+            // A later journal rollback may retain a conservative mark.
+            try executorConversations.record(scoped.conversationId)
             try scoped.insert(db)
             return true
         }

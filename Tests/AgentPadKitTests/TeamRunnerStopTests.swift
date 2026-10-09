@@ -190,7 +190,7 @@ final class TeamRunnerStopTests: XCTestCase {
         let runner = ClaudeCodeRunner(fixturePath: try fakeClaude(script), stopTiming: quick)
         let agent = TeamPublishedAgent(name: "y5", description: "d", folder: root.path, access: .read)
         let request = TeamRunRequest(agent: agent, prompt: "p", sessionId: UUID().uuidString, resume: false,
-                                     callerName: "M", callerProject: nil)
+                                     callerName: "M", callerProject: nil, dmHistoryFiles: ChatFiles(directory: root.appendingPathComponent("chat")))
         let box = TeamStartBox()
         let task = Task { try await runner.run(request, onActivity: { _ in }, onProcessStarted: { box.set($0) }) }
         try await waitUntil { box.get() != nil }
@@ -328,7 +328,7 @@ final class TeamRunnerStopTests: XCTestCase {
         var agent = TeamPublishedAgent(name: "y5", description: "d", folder: isolated.project.path, access: .read)
         agent.model = "haiku"
         let request = TeamRunRequest(agent: agent, prompt: "Count slowly from 1 to 200, one number per line.",
-                                     sessionId: UUID().uuidString.lowercased(), resume: false, callerName: "M", callerProject: nil)
+                                     sessionId: UUID().uuidString.lowercased(), resume: false, callerName: "M", callerProject: nil, dmHistoryFiles: ChatFiles(directory: root.appendingPathComponent("chat")))
         let box = TeamStartBox()
         let task = Task { try await runner.run(request, onActivity: { _ in }, onProcessStarted: { box.set($0) }) }
         try await waitUntil { (try? String(contentsOfFile: pidFile, encoding: .utf8)).flatMap { Int32($0) } != nil }

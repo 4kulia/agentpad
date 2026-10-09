@@ -119,6 +119,22 @@ enum RightSidebarContent: String, Codable, Equatable, Sendable, CaseIterable {
 @MainActor
 @Observable
 final class WorkspaceStore {
+    let agentProfiles: AgentProfileStore
+    var expandedAgentProfiles: Set<UUID> = []
+    var revealedAgentProfileID: UUID?
+    var agentProfileRevealRevision = 0
+    var agentProfileErrors: [UUID: String] = [:]
+    @ObservationIgnored var profileTemplates: () -> [AgentTemplate] = { AgentTemplate.all }
+    var profileStores: [WorkspaceStore] { ([self] + peerStores().filter { $0 !== self }).filter { !$0.isTerminated } }
+
+    func revealAgentProfile(_ id: UUID) {
+        expandedAgentProfiles.insert(id)
+        revealedAgentProfileID = id
+        agentProfileRevealRevision += 1
+        setSidebarMode(.full)
+        setSidebarContent(.workspaces)
+    }
+
     private(set) var workspaces: [Workspace] = []
     private(set) var activeWorkspaceId: UUID?
     /// Session id currently being dragged in any pane's tab bar. Shared across
@@ -413,6 +429,7 @@ final class WorkspaceStore {
     /// default a test construction silently inherits; `AppDelegate.addWindow`
     /// wires the real `RecentFolders` sink.
     private let noteRecentFolder: @MainActor (URL) -> Void
+    @ObservationIgnored var searchModel: EverywhereSearchModel?
     let windowID: UUID
     let drafts: DraftRepository
     let tabCloseCoordinator: TabCloseCoordinator
@@ -474,6 +491,8 @@ final class WorkspaceStore {
         /// Captured conversation id so `⌘⇧T` resumes the agent session
         /// the user just closed (subject to `resumeConversations` setting).
         let conversationId: String?
+        var profileID: UUID? = nil
+        var profileOriginalCwd: URL? = nil
         /// The tab's own destination; nil means explicitly local, even if
         /// it was moved into an SSH workspace before being closed.
         let sshWorkspaceHost: String?
@@ -482,6 +501,8 @@ final class WorkspaceStore {
         var inbox: ChatInboxRef? = nil
         var tool: ToolRoute? = nil
         var navigation: TabNavigation? = nil
+        var unavailableTab: PersistedTab? = nil
+        var unavailableMessage: String? = nil
     }
 
     /// LIFO stack of recently-closed tabs for ⌘⇧T (reopen). Capped at
@@ -535,6 +556,7 @@ final class WorkspaceStore {
     init(
         persistence: any Persistence,
         initiallyEmpty: Bool = false,
+        agentProfiles: AgentProfileStore = .shared,
         drafts: DraftRepository? = nil,
         engineFactory: @escaping @MainActor () -> any TerminalEngine = { LibghosttyEngine() },
         optionsProvider: @escaping @MainActor (String) -> String? = { AgentPadSettingsModel.shared.agentOptions[$0] },
@@ -548,6 +570,7 @@ final class WorkspaceStore {
         codexSessionsRoot: URL = CodexUsageMonitor.defaultSessionsRoot()
     ) {
         self.persistence = persistence
+        self.agentProfiles = agentProfiles
         self.windowID = (persistence as? WindowPersistence)?.windowId ?? UUID()
         let repository = drafts ?? (persistence as? WindowPersistence)?.app.drafts ?? DraftRepository()
         self.drafts = repository
@@ -1100,7 +1123,8 @@ final class WorkspaceStore {
         customTitle: String? = nil,
         activate: Bool = true,
         spawnInBackground: Bool = false,
-        connection: TabConnection = .inheritWorkspace
+        connection: TabConnection = .inheritWorkspace,
+        profile: AgentProfile? = nil
     ) -> Session {
         // The raw channel replaces the template's own launch command inside
         // makeSessionConfig, but everything else (Session.agent identity,
@@ -1125,7 +1149,7 @@ final class WorkspaceStore {
         case .local: nil
         case .ssh(let host): host
         }
-        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, claudeResolution: claudeResolution, initialPrompt: initialPrompt, sshRemoteHost: sshHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, spawnInBackground: spawnInBackground)
+        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, claudeResolution: claudeResolution, initialPrompt: initialPrompt, sshRemoteHost: sshHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, spawnInBackground: spawnInBackground, profile: profile)
         configureSession(session, in: workspace, codexRolloutId: session.resumedConversationId)
         target.tabs.append(session)
         // `activate: false` (CLI --no-focus) appends WITHOUT touching the
@@ -1151,7 +1175,9 @@ final class WorkspaceStore {
         // AgentPad: duplicating a channel tab opens the same channel.
         if let channel = session.channel { return openChannelTab(channel, in: workspace, pane: pane) }
         if let inbox = session.inbox { return openInboxTab(inbox, in: workspace, pane: pane) }
-        return addTab(in: workspace, pane: pane, template: session.agent, initialCwd: session.currentDirectory)
+        return addTab(in: workspace, pane: pane, template: session.agent, initialCwd: session.currentDirectory,
+            connection: session.sshWorkspaceHost.map(TabConnection.ssh) ?? .local,
+            profile: session.profileID.flatMap(agentProfiles.profile))
     }
 
     /// History-row convenience — the seam's true dependency is only the
@@ -1173,14 +1199,17 @@ final class WorkspaceStore {
     /// Resume a conversation: a new tab in the active workspace, running the
     /// agent with its resume arguments, spawned in the conversation's own
     /// directory (a different cwd would break every file reference the
-    /// conversation holds — `resolvedSpawnCwd` still falls back to `$HOME`
-    /// when the directory is gone, which at least opens a resumable shell).
+    /// conversation holds). A missing directory refuses the launch.
     /// `forceResume` because both callers (History row click, deep link) are
     /// explicit asks — the `agents.resumeConversations` setting only governs
     /// automatic relaunch-time resume.
     @discardableResult
     func resumeAgentSession(agentId: String, conversationId: String, cwd: URL,
                             claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil) -> Result<Session, ResumeRefusal> {
+        if let binding = agentProfiles.binding(agentID: agentId, conversationID: conversationId) {
+            return resumeProfileConversation(binding, claudeResolution: claudeResolution)
+        }
+        guard isDirectory(cwd) else { return .failure(.missingFolder(cwd.path)) }
         let visibility = conversationVisibility()
         // All sessions resolves off-main. Synchronous callers also resolve only
         // once, then carry that same result through validation and command building.
@@ -1199,6 +1228,7 @@ final class WorkspaceStore {
         let spawned = localSpawn(
             template: template,
             cwd: cwd,
+            cwdIsConfirmed: true,
             conversationId: conversationId,
             forceResume: true,
             claudeResolution: resolution
@@ -1230,7 +1260,7 @@ final class WorkspaceStore {
         claudeProjectsRoot: URL = ClaudeSessionResume.projectsRoot(),
         claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil
     ) -> ResumeRefusal? {
-        guard visibility.allows(agentId: agentId, conversationId: conversationId) else { return .channelConversation }
+        guard visibility.allows(agentId: agentId, conversationId: conversationId, root: claudeProjectsRoot) else { return .channelConversation }
         guard let template = AgentTemplate.builtin(id: agentId), template.supportsResume else {
             return .agentCannotResume
         }
@@ -1249,6 +1279,9 @@ final class WorkspaceStore {
 
     enum ResumeRefusal: Error, Equatable {
         case agentCannotResume
+        case missingFolder(String)
+        case profileUnavailable
+        case templateUnavailable
         case launchOptionsDisablePersistence
         case unusableConversationId
         case channelConversation
@@ -1256,6 +1289,12 @@ final class WorkspaceStore {
 
         func message(agentId: String, conversationId: String) -> String {
             switch self {
+            case .missingFolder(let path):
+                return "Original folder not found: \(path). This session cannot resume in another folder."
+            case .profileUnavailable:
+                return "This agent is no longer available."
+            case .templateUnavailable:
+                return "This agent type is no longer available. Check Settings → Agents."
             case .agentCannotResume:
                 return "agent '\(agentId)' does not support resuming sessions"
             case .launchOptionsDisablePersistence:
@@ -1287,8 +1326,7 @@ final class WorkspaceStore {
     /// than the project — and still answering "ok". A caller that has
     /// verified the path wants a failure there, not a different directory.
     ///
-    /// Resume deliberately leaves this false: its recorded directory may be
-    /// long gone, and opening a resumable shell at `$HOME` beats refusing.
+    /// Resume verifies its original cwd first and always sets this true.
     /// A nil `cwd` means "wherever the landing workspace already is" — the
     /// caller named no directory, so `addTab`/`addWorkspace` fall back to the
     /// workspace's own working directory rather than to some guess made here.
@@ -1629,6 +1667,16 @@ final class WorkspaceStore {
         for tab in toClose { closeTab(tab, in: workspace) }
     }
 
+    /// Completing the form must not close its host window when it is the last
+    /// tab: the newly added agent needs to remain visible, without a seed PTY.
+    func closeCompletedAgentForm(_ session: Session, in workspace: Workspace) {
+        guard case .newAgent = session.toolRoute,
+              let pane = pane(containing: session, in: workspace),
+              let index = pane.tabs.firstIndex(where: { $0.id == session.id }) else { return }
+        teardownSessionMonitors(session)
+        detachSession(session, from: pane, at: index, in: workspace, keepingEmptyPane: true)
+    }
+
     func closeTab(_ session: Session, in workspace: Workspace) {
         tabCloseCoordinator.request(session) { [weak self, weak session, weak workspace] in
             guard let self, let session, let workspace else { return }
@@ -1694,11 +1742,15 @@ final class WorkspaceStore {
             workspaceId: workspace.id,
             paneId: pane.id,
             conversationId: session.conversationId,
+            profileID: session.profileID,
+            profileOriginalCwd: session.profileOriginalCwd,
             sshWorkspaceHost: session.sshWorkspaceHost,
             channel: session.channel,
             inbox: session.inbox,
             tool: session.toolRoute,
-            navigation: session.tabState?.navigation
+            navigation: session.tabState?.navigation,
+            unavailableTab: session.unavailableTab,
+            unavailableMessage: session.unavailableTab == nil ? nil : session.tabState?.message
         ))
         if recentlyClosed.count > Self.closedTabHistoryLimit {
             recentlyClosed.removeFirst(recentlyClosed.count - Self.closedTabHistoryLimit)
@@ -1716,14 +1768,37 @@ final class WorkspaceStore {
     @discardableResult
     func reopenLastClosedTab() -> Session? {
         guard let state = recentlyClosed.popLast() else { return nil }
-        if let tool = state.tool { return openToolTab(tool, navigation: state.navigation ?? TabNavigation()) }
+        if let tool = state.tool {
+            let session = openToolTab(tool, navigation: state.navigation ?? TabNavigation())
+            if var original = state.unavailableTab {
+                original.id = session.id
+                session.unavailableTab = original
+                session.currentDirectory = URL(fileURLWithPath: original.currentDirectoryPath)
+                session.tabState?.message = state.unavailableMessage
+                scheduleSave()
+            }
+            return session
+        }
         guard let workspace = workspaces.first(where: { $0.id == state.workspaceId }) ?? active else {
             return nil
         }
         let pane = workspace.root.allPanes.first { $0.id == state.paneId }
             ?? workspace.activePane
             ?? workspace.root.firstPane
-        let cwd = resolvedSpawnCwd(state.cwd.path)
+        let binding = state.conversationId.flatMap {
+            agentProfiles.binding(agentID: state.agent.rosterId, conversationID: $0)
+        }
+        let profileID = binding?.profileID ?? state.profileID
+        let profile = profileID.flatMap(agentProfiles.profile)
+        let originalCwd = binding?.record.cwd ?? state.profileOriginalCwd ?? state.cwd
+        if let id = profileID, profile == nil || !isDirectory(originalCwd) {
+            let reason: ResumeRefusal = isDirectory(originalCwd) ? .profileUnavailable : .missingFolder(originalCwd.path)
+            agentProfileErrors[id] = reason.message(agentId: state.agent.rosterId, conversationId: state.conversationId ?? "")
+            revealAgentProfile(id)
+            recentlyClosed.append(state)
+            return nil
+        }
+        let cwd = profile == nil ? resolvedSpawnCwd(state.cwd.path) : originalCwd
         if let channel = state.channel, let pane {
             let session = openChannelTab(channel, in: workspace, pane: pane)
             activateWorkspace(workspace)
@@ -1743,7 +1818,8 @@ final class WorkspaceStore {
             template: state.agent,
             initialCwd: cwd,
             conversationId: state.conversationId,
-            connection: state.sshWorkspaceHost.map(TabConnection.ssh) ?? .local
+            connection: state.sshWorkspaceHost.map(TabConnection.ssh) ?? .local,
+            profile: profile
         )
         if let custom = state.customTitle, !custom.isEmpty {
             session.customTitle = custom
@@ -1972,11 +2048,16 @@ final class WorkspaceStore {
         } else if session.agent.isShell {
             // AgentPad: a new agent must report its own journal and process.
             session.answerBinding = nil
+            session.personalBinding = nil
             session.resumedConversationId = nil
             // Includes the default Terminal *and* any TerminalPreset — a
             // user starting Claude inside a preset terminal should get
             // the same icon-upgrade the default Terminal does.
             session.agent = agent
+            if let id = session.profileID, agentProfiles.profile(id)?.rosterID != agent.rosterId {
+                session.profileID = nil
+                session.profileOriginalCwd = nil
+            }
         }
         // SessionStart → UserPromptSubmit on Claude (and BeforeAgent on Gemini)
         // re-fires `.running` per turn; the @Observable setter notifies every
@@ -1995,7 +2076,8 @@ final class WorkspaceStore {
             : nil
         session.hookStateAt = Date()
         applyNotificationTransition(session, state: event.activityState,
-                                    reason: details.reason ?? (event == .turnComplete ? .completion : event == .turnFailure ? .failure : .input))
+                                    reason: details.reason ?? (event == .turnComplete ? .completion : event == .turnFailure ? .failure : .input),
+                                    continuesEpisode: details.notificationType == "idle_prompt")
         if session.agent.id != agentBefore { scheduleSave() }
         // A non-`ended` event means the agent just (re)started — for Codex,
         // (re)point the usage watcher so a manually-typed `codex` lights up
@@ -2015,9 +2097,10 @@ final class WorkspaceStore {
     /// AgentPad: only a hook can establish export provenance; monitors call
     /// applyConversationId directly and only update the resumable history ID.
     func applyHookConversationId(conversationId: String, sessionId: UUID, provenance: AgentAnswerProvenance? = nil,
-                                 failure: AgentAnswerTranscript.Problem? = nil) {
+                                 failure: AgentAnswerTranscript.Problem? = nil, hook: AgentAnswerProvenance.Hook? = nil,
+                                 inspector: AgentAnswerProvenance.Inspector = .init()) {
         guard let session = hookSession(id: sessionId) else { return }
-        AgentAnswerSource.recordHook(conversation: conversationId, session: session, provenance: provenance, failure: failure)
+        AgentAnswerSource.recordHook(conversation: conversationId, session: session, provenance: provenance, failure: failure, hook: hook, inspector: inspector)
         applyConversationId(conversationId: conversationId, sessionId: sessionId)
     }
 
@@ -2029,8 +2112,14 @@ final class WorkspaceStore {
     /// dedup keeps the debounce loop quiet.
     func applyConversationId(conversationId: String, sessionId: UUID) {
         guard let session = hookSession(id: sessionId) else { return }
-        guard session.conversationId != conversationId else { return }
+        if session.conversationId == conversationId { bindProfileConversation(session); return }
+        if session.profileID != nil, session.conversationId != nil {
+            // A new conversation in an already-used tab may follow a shell cd.
+            // The first late ID still belongs to the pinned launch directory.
+            session.profileOriginalCwd = canonicalDiskPath(session.currentDirectory)
+        }
         session.conversationId = conversationId
+        bindProfileConversation(session)
         scheduleSave()
     }
 
@@ -2164,13 +2253,17 @@ final class WorkspaceStore {
 
     /// Hook, status scan and tool progress use the same episode boundary.
     private func applyNotificationTransition(_ session: Session, state: SessionActivityState,
-                                             reason: SessionAttentionReason = .input) {
+                                             reason: SessionAttentionReason = .input, continuesEpisode: Bool = false) {
         let changed = session.activityState != state
         let changedMeaning = state == .attention && session.attentionReason != reason
+        // An idle reminder describes the finished turn, including its viewed
+        // acknowledgement. A permission prompt is a new decision and episode.
+        let sameWait = continuesEpisode && !changed && state == .attention
+            && session.attentionReason == .completion && reason == .input
         if changed || changedMeaning {
-            onSessionWaitingEnded(session.id)
+            if !sameWait { onSessionWaitingEnded(session.id) }
             if state == .attention {
-                session.notificationEpisode += 1
+                if !sameWait { session.notificationEpisode += 1 }
                 session.notificationPhase = "turn"
                 session.attentionReason = reason
             }
@@ -2242,6 +2335,7 @@ final class WorkspaceStore {
     func flushPersistence() -> Bool {
         pendingSave?.cancel(); pendingSave = nil
         do {
+            try agentProfiles.flush()
             for session in allSessions { if let state = session.tabState { try tabCloseCoordinator.save(state) } }
             try persistence.saveChecked(terminationSnapshot ?? snapshot())
             persistenceError = nil
@@ -2368,13 +2462,37 @@ final class WorkspaceStore {
                     pane.tabs.append(makeInboxSession(inbox, id: tab.id, cwd: resolvedSpawnCwd(tab.currentDirectoryPath)))
                     continue
                 }
-                let agent = AgentTemplate.all.first { $0.id == tab.agentId } ?? .terminal
+                let agent = profileTemplates().first { $0.id == tab.agentId } ?? AgentTemplate.builtin(id: tab.agentId)
+                let binding = tab.conversationId.flatMap {
+                    agentProfiles.binding(agentID: agent?.rosterId ?? tab.agentId, conversationID: $0)
+                }
+                let profileID = binding?.profileID ?? tab.profileID
+                let savedProfile = profileID.flatMap(agentProfiles.profile)
+                // Old versions could leave a Codex profile on a tab now running Claude.
+                let profile = savedProfile.flatMap { profile in
+                    if let agent { return profile.rosterID == agent.rosterId ? profile : nil }
+                    return profile.templateID == tab.agentId ? profile : nil
+                }
+                let needsProfile = profileID != nil && (savedProfile == nil || profile != nil)
+                let originalCwd = binding?.record.cwd ?? (needsProfile ? tab.profileOriginalCwd : nil) ?? URL(fileURLWithPath: tab.currentDirectoryPath)
+                if needsProfile && (!isDirectory(originalCwd) || profile == nil || agent == nil) {
+                    let unavailable = makeToolSession(.unavailable(tab.id), id: tab.id, cwd: originalCwd)
+                    unavailable.unavailableTab = tab
+                    let message = !isDirectory(originalCwd)
+                        ? ResumeRefusal.missingFolder(originalCwd.path).message(agentId: tab.agentId, conversationId: tab.conversationId ?? "")
+                        : "This agent type is no longer available. Check Settings → Agents."
+                    unavailable.tabState?.message = message
+                    if let id = profileID { agentProfileErrors[id] = message }
+                    pane.tabs.append(unavailable)
+                    continue
+                }
                 let session = spawnSession(
-                    template: agent,
-                    initialCwd: resolvedSpawnCwd(tab.currentDirectoryPath),
+                    template: agent ?? .terminal,
+                    initialCwd: profile == nil ? resolvedSpawnCwd(tab.currentDirectoryPath) : originalCwd,
                     sessionId: tab.id,
                     conversationId: tab.conversationId,
-                    sshRemoteHost: tab.sshWorkspaceHost.map(Self.normalizedSSHHost) ?? sshRemoteHost
+                    sshRemoteHost: profile == nil ? (tab.sshWorkspaceHost.map(Self.normalizedSSHHost) ?? sshRemoteHost) : nil,
+                    profile: profile
                 )
                 session.customTitle = tab.customTitle
                 pane.tabs.append(session)
@@ -2538,12 +2656,12 @@ final class WorkspaceStore {
     /// Spawns the engine + Session. Caller wires `onPwdChange` / `onFocus`
     /// after a workspace ref is available — `restore` builds sessions before
     /// the workspace exists, so callbacks can't capture it here.
-    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, customTitle: String? = nil, spawnInBackground: Bool = false) -> Session {
+    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, customTitle: String? = nil, spawnInBackground: Bool = false, profile: AgentProfile? = nil) -> Session {
         let engine = engineFactory()
         // Before `engine.start` (and before any view mounts): the flag is
         // what lets the surface come up under a hidden mount (issue #59).
         engine.spawnsWhileHidden = spawnInBackground
-        let extraOptions = optionsProvider(template.id)
+        let extraOptions = profile?.launchOptions ?? optionsProvider(template.id)
         let persistsConversation = template.persistsConversation(extraOptions: extraOptions)
         // Resume gated by user setting — `resumeConversations` flips this off
         // when the user wants every agent tab to start fresh without
@@ -2620,6 +2738,9 @@ final class WorkspaceStore {
             conversationId: normalizedConversationId,
             launchedConversationId: (sshHost == nil && rawLaunchCommand == nil) ? resumedConversationId ?? newSessionId : nil
         )
+        session.profileID = profile?.id
+        session.profileOriginalCwd = profile == nil ? nil : initialCwd
+        bindProfileConversation(session)
         session.pendingAgentLaunch = launchID.map { ($0, !template.isShell) }
         session.resumedConversationId = resumedConversationId
         session.spawnsInBackground = spawnInBackground
@@ -2838,9 +2959,8 @@ final class WorkspaceStore {
             self.closeTab(session, in: workspace)
         }
         engine.onDesktopNotification = { [weak self, weak session] title, body in
-            guard let self, let session else { return }
-            session.notificationPhase = "program"
-            session.notificationEpisode += 1
+            guard let self, !self.isTerminated, let session else { return }
+            session.programNotificationEpisode += 1
             self.onSessionAlert(session.id, .programNotification(title: title, body: body))
         }
         engine.onLinkHover = { [weak session] url in

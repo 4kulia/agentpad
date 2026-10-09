@@ -61,6 +61,11 @@ struct ContentView: View {
                 }
             }
         }
+        .overlay(alignment: .top) {
+            if store.search.suggestions {
+                SearchSuggestionsView(model: store.search).frame(maxWidth: 600).padding(.horizontal, 20).padding(.top, 34)
+            }
+        }
         .glassWindowBackground(fallback: chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
         .ignoresSafeArea(.all)
@@ -119,11 +124,8 @@ struct ContentView: View {
             WindowDragHandle()
                 .overlay {
                     GeometryReader { proxy in
-                        if AgentPadSettingsModel.shared.showSearchPill,
-                           proxy.size.width >= SearchTriggerPill.minimumContainerWidth {
-                            SearchTriggerPill {
-                                NSApp.sendAction(#selector(AppDelegate.handleQuickOpen), to: nil, from: nil)
-                            }
+                        if (AgentPadSettingsModel.shared.showSearchPill && proxy.size.width >= SearchTriggerPill.minimumContainerWidth) || store.search.suggestions {
+                            SearchEverywhereField(store: store, model: store.search)
                             .frame(width: proxy.size.width, height: proxy.size.height)
                         }
                     }

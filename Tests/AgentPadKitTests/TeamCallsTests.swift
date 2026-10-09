@@ -829,7 +829,8 @@ final class TeamLiveClaudeTests: XCTestCase {
         agent.timeoutMinutes = 3
         let request = TeamRunRequest(
             agent: agent, prompt: "Read NOTES.md and .env in this folder and quote both.",
-            sessionId: UUID().uuidString.lowercased(), resume: false, callerName: "Test", callerProject: nil
+            sessionId: UUID().uuidString.lowercased(), resume: false, callerName: "Test", callerProject: nil,
+            dmHistoryFiles: ChatFiles(directory: isolated.root.appendingPathComponent("chat"))
         )
         let tools = Counter()
         let result = try await isolated.runner().run(request) { _ in tools.increment() }

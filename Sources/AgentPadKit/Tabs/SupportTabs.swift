@@ -77,6 +77,9 @@ final class SupportTabs {
         case .directMessage(let ref): return AnyView(ChatDMTab(state: state, ref: ref))
         case .directMessageDraft(let key, let peer): return AnyView(ChatDMPeerTab(state: state, scope: key, peer: peer))
         case .newDM(let key): return AnyView(ChatDMNewView(state: state, scope: key))
+        case .search:
+            if let store = owner(state)?.store { return AnyView(SearchResultsTab(model: store.search, state: state, store: store)) }
+            return AnyView(Text("Search is available in its window."))
         case .allSessions:
             if state.allSessionsModel == nil { state.allSessionsModel = AllSessionsModel(state: state) }
             return AnyView(AllSessionsTab(model: state.allSessionsModel!, owner: { [weak self, weak state] in
@@ -126,6 +129,8 @@ final class SupportTabs {
         case .teamActivity(let scope):
             state.canShowConfirmation = { TeamTabs.shared.canRead(scope) }
             return AnyView(TeamActivityTab(state: state, scope: scope, tabs: .shared))
+        case .newAgent:
+            return AnyView(NewAgentFormView(state: state, tabs: .shared, form: LocalFormTabs.shared.form(state)))
         case .newSSH, .newWorktree, .workspaceDetails:
             return AnyView(LocalFormView(state: state, tabs: .shared, form: LocalFormTabs.shared.form(state)))
         case .files:

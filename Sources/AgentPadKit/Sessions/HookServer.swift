@@ -63,7 +63,7 @@ enum HookMessage {
     /// AgentPad: the socket adds process evidence separately from these fields.
     // AgentPad: only evidence captured from the socket peer may authorize export.
     case conversationId(conversationId: String, sessionId: UUID, provenance: AgentAnswerProvenance? = nil,
-                        failure: AgentAnswerTranscript.Problem? = nil)
+                        failure: AgentAnswerTranscript.Problem? = nil, hook: AgentAnswerProvenance.Hook? = nil)
     /// PreToolUse / PostToolUse event for the activity strip. `agent` is
     /// the base AgentTemplate the slug resolves to (Claude builtin today —
     /// custom Claude-based agents share its slug since `from(hookSlug:)`
@@ -113,6 +113,25 @@ final class HookServer {
     private let path: String
     private var listenFd: Int32 = -1
     private var source: DispatchSourceRead?
+    private var appliedConversationSequences: [UUID: UInt64] = [:]
+
+    /// Receipt happens off-main, before authentication. Keep every outstanding
+    /// hook counted until the main actor applies or rejects it.
+    nonisolated static let pendingConversations = PendingConversations()
+
+    final class PendingConversations: @unchecked Sendable {
+        private let lock = NSLock()
+        private var counts: [UUID: Int] = [:]
+
+        func receive(_ surface: UUID) { lock.withLock { counts[surface, default: 0] += 1 } }
+        func finish(_ surface: UUID) {
+            lock.withLock {
+                if counts[surface] == 1 { counts[surface] = nil }
+                else { counts[surface, default: 0] -= 1 }
+            }
+        }
+        func contains(_ surface: UUID) -> Bool { lock.withLock { counts[surface] != nil } }
+    }
 
     /// Set before `start()`. Nil (never wired) answers CLI requests with a
     /// refusal rather than silence, so a misassembled build still fails loud.
@@ -272,8 +291,16 @@ final class HookServer {
             let peerPID = hooks.readPeerPID(clientFd)
             let origin = hooks.originOf(peerPID)
             DispatchQueue.global(qos: .userInitiated).async {
-                serve(clientFd: clientFd, peerPID: peerPID, origin: origin, hooks: hooks) { received in
-                    DispatchQueue.main.async { MainActor.assumeIsolated { server.server?.dispatch(received) } }
+                serve(clientFd: clientFd, peerPID: peerPID, origin: origin, hooks: hooks, gate: gate) { received in
+                    DispatchQueue.main.async {
+                        defer {
+                            if case .hook(let dict, _, _, _, let sequence) = received, sequence != nil,
+                               let surface = (dict["surface"] as? String).flatMap(UUID.init(uuidString:)) {
+                                pendingConversations.finish(surface)
+                            }
+                        }
+                        MainActor.assumeIsolated { server.server?.dispatch(received) }
+                    }
                 }
             }
         }
@@ -281,7 +308,7 @@ final class HookServer {
 
     /// AgentPad: what the accepting queue hands the main queue.
     private enum Received: @unchecked Sendable {
-        case hook([String: Any], AgentAnswerProvenance?, AgentAnswerTranscript.Problem?)
+        case hook([String: Any], AgentAnswerProvenance?, AgentAnswerTranscript.Problem?, AgentAnswerProvenance.Hook?, sequence: UInt64?)
         case shellCommand(AgentPadShellCommandRequest?, fd: Int32)
         case cli(dict: [String: Any], data: Data, fd: Int32, origin: AgentPadCallerOrigin)
     }
@@ -297,14 +324,22 @@ final class HookServer {
     final class OriginGate: @unchecked Sendable {
         private let lock = NSLock()
         private var hooks = OriginHooks()
+        private var conversationSequences: [UUID: UInt64] = [:]
         func get() -> OriginHooks { lock.withLock { hooks } }
         func set(_ change: (inout OriginHooks) -> Void) { lock.withLock { change(&hooks) } }
+        func receiveConversation(_ surface: UUID) -> UInt64 {
+            lock.withLock {
+                pendingConversations.receive(surface)
+                conversationSequences[surface, default: 0] += 1
+                return conversationSequences[surface]!
+            }
+        }
     }
 
     /// Runs off the main queue for one accepted connection, its sender
     /// already placed at accept (Y4): read the line; a hook is acknowledged
     /// and closed here, everything else is handed on.
-    private nonisolated static func serve(clientFd: Int32, peerPID: pid_t?, origin: AgentPadCallerOrigin, hooks: OriginHooks,
+    private nonisolated static func serve(clientFd: Int32, peerPID: pid_t?, origin: AgentPadCallerOrigin, hooks: OriginHooks, gate: OriginGate,
                                           deliver: @escaping @Sendable (Received) -> Void) {
         var ownsFd = true
         defer { if ownsFd { close(clientFd) } }
@@ -368,6 +403,12 @@ final class HookServer {
 
         guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
 
+        // Stamp receipt before verification can block. Concurrent hooks can
+        // finish in reverse order after /clear or /resume in the same process.
+        let conversationSequence = dict["kind"] as? String == "conversationId"
+            ? (dict["surface"] as? String).flatMap(UUID.init(uuidString:)).map { gate.receiveConversation($0) }
+            : nil
+
         if dict["kind"] as? String == AgentPadShellCommandRequest.kind {
             ownsFd = false
             // AgentPad: only a shell's own process, outside any team run, may
@@ -393,19 +434,27 @@ final class HookServer {
         // AgentPad: a confirmed team run never speaks for a tab (Y4). Queued
         // for the main queue before the sender is answered, so its next
         // message cannot overtake it (review C4-12).
-        if case .teamRun = origin {} else {
+        if case .teamRun = origin {
+            if conversationSequence != nil,
+               let surface = (dict["surface"] as? String).flatMap(UUID.init(uuidString:)) {
+                pendingConversations.finish(surface)
+            }
+        } else {
             // AgentPad: keep the authenticated sender's parent with this UUID.
             // Signature/TTY verification runs here, off the main queue, before ACK.
             var provenance: AgentAnswerProvenance?
             var failure: AgentAnswerTranscript.Problem?
+            var hook: AgentAnswerProvenance.Hook?
             if dict["kind"] as? String == "conversationId" {
                 do {
-                    provenance = try AgentAnswerProvenance.verify(
+                    let authenticated = try AgentAnswerProvenance.verifyHook(
                         parentPID: (dict["claudeParentPID"] as? String).flatMap(Int32.init),
                         origin: origin, inspector: hooks.answerInspector)
+                    hook = authenticated
+                    provenance = try AgentAnswerProvenance.verify(hook: authenticated, inspector: hooks.answerInspector)
                 } catch { failure = error }
             }
-            deliver(.hook(dict, provenance, failure))
+            deliver(.hook(dict, provenance, failure, hook, sequence: conversationSequence))
         }
         // AgentPad: the sender waits for this byte, not for the main queue.
         var ack: UInt8 = 0x0A
@@ -415,8 +464,12 @@ final class HookServer {
     /// AgentPad: the main-queue half of a connection.
     private func dispatch(_ received: Received) {
         switch received {
-        case .hook(let dict, let provenance, let failure):
-            guard let message = Self.parseMessage(dict, provenance: provenance, failure: failure) else { return }
+        case .hook(let dict, let provenance, let failure, let hook, let sequence):
+            guard let message = Self.parseMessage(dict, provenance: provenance, failure: failure, hook: hook) else { return }
+            if let sequence, case .conversationId(_, let surface, _, _, _) = message {
+                guard sequence > appliedConversationSequences[surface, default: 0] else { return }
+                appliedConversationSequences[surface] = sequence
+            }
             handler(message)
         case .shellCommand(let request, let fd):
             let command = !Self.peerHasHungUp(fd) ? request.flatMap { onShellCommandRequest?($0) } : nil
@@ -536,7 +589,7 @@ final class HookServer {
     }
 
     static func parseMessage(_ dict: [String: Any], provenance: AgentAnswerProvenance? = nil,
-                             failure: AgentAnswerTranscript.Problem? = nil) -> HookMessage? {
+                             failure: AgentAnswerTranscript.Problem? = nil, hook: AgentAnswerProvenance.Hook? = nil) -> HookMessage? {
         guard
             let surface = dict["surface"] as? String,
             let id = UUID(uuidString: surface)
@@ -552,7 +605,7 @@ final class HookServer {
         if dict["kind"] as? String == "conversationId",
            let conversationId = dict["conversationId"] as? String,
            !conversationId.isEmpty {
-            return .conversationId(conversationId: conversationId, sessionId: id, provenance: provenance, failure: failure)
+            return .conversationId(conversationId: conversationId, sessionId: id, provenance: provenance, failure: failure, hook: hook)
         }
 
         if dict["kind"] as? String == AgentPadHookKit.toolBatchKind {

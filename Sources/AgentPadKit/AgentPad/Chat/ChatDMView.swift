@@ -21,6 +21,7 @@ struct ChatDMTab: View {
                     let model = ChatDMModel(key: key, dm: ref.dm, state: state, service: service)
                     model.tabID = SupportTabs.shared.owner(state)?.session.id
                     state.dmModel = model
+                    if let target = state.dmSearchTarget { model.navigateToSearchMessage(target); state.dmSearchTarget = nil }
                     if let root = state.dmPendingThread { model.openThread(root); state.dmPendingThread = nil }
                     state.canShowConfirmation = { [weak model] in model?.readable == true }
                     _ = service.dmList(key)

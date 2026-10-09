@@ -86,11 +86,12 @@ final class AttentionSidebarModel {
 
     var items: [AttentionItem] {
         var current = serverCurrent
-        // Reading live observable sessions makes a new run remove its old failure immediately.
+        // Reading live observable sessions removes old outcomes as soon as work resumes.
         for store in AgentMonitor.shared.storesProvider() {
             for session in store.workspaces.flatMap({ $0.root.allPanes.flatMap(\.tabs) }) {
                 current.terminals[session.id] = .init(episode: session.attentionEpisode,
                     failed: session.hasCurrentAttentionFailure,
+                    finished: session.hasCurrentAttentionCompletion,
                     title: session.title, agentID: session.displayAgent.id, agentName: session.displayAgent.title)
             }
         }
@@ -181,6 +182,9 @@ final class AttentionSidebarModel {
 
 extension Session {
     var attentionEpisode: String { "\(notificationIncarnation):\(notificationPhase):\(notificationEpisode)" }
+    var hasCurrentAttentionCompletion: Bool {
+        notificationPhase == "turn" && activityState == .attention && attentionReason == .completion
+    }
     var hasCurrentAttentionFailure: Bool {
         let state = AgentMonitor.state(of: self)
         return state == .failed || (state == .attention && attentionReason == .failure)

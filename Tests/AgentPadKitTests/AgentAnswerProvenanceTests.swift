@@ -119,7 +119,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         let received = expectation(description: "refusal reason delivered with hook")
         let path = NSTemporaryDirectory() + "answer-reason-\(UUID().uuidString.prefix(8)).sock"
         let server = HookServer(socketPath: path, answerInspector: fixture.inspector) { message in
-            guard case .conversationId(let journal, let surface, let proof, let failure) = message else { return }
+            guard case .conversationId(let journal, let surface, let proof, let failure, _) = message else { return }
             XCTAssertNil(proof)
             XCTAssertEqual(failure, .ambiguousClaude)
             store.applyHookConversationId(conversationId: journal, sessionId: surface, provenance: proof, failure: failure)
@@ -416,7 +416,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         let path = NSTemporaryDirectory() + "answer-hook-\(UUID().uuidString.prefix(8)).sock"
         let received = expectation(description: "hook dispatched")
         let server = HookServer(socketPath: path) { message in
-            guard case .conversationId(let id, let surface, let provenance, let failure) = message else { return }
+            guard case .conversationId(let id, let surface, let provenance, let failure, _) = message else { return }
             XCTAssertNil(provenance)
             store.applyHookConversationId(conversationId: id, sessionId: surface, provenance: provenance, failure: failure)
             received.fulfill()
@@ -453,7 +453,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
             return signature(pid)
         }
         let server = HookServer(socketPath: path, answerInspector: inspector) { message in
-            guard case .conversationId(let journal, let surface, let provenance, let failure) = message else { return }
+            guard case .conversationId(let journal, let surface, let provenance, let failure, _) = message else { return }
             XCTAssertEqual(surface, tab.id)
             XCTAssertEqual(journal, id)
             XCTAssertEqual(provenance?.process.pid, AnswerProcessFixture.claude)

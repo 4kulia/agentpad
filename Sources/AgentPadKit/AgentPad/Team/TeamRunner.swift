@@ -28,9 +28,9 @@ struct TeamRunRequest: Sendable {
     var onPreflightProcess: (@Sendable (TeamProcessStart?) throws -> Void)? = nil
     /// Local UI only: never sent to the caller, whose activity has no paths.
     var onVersionReady: (@MainActor @Sendable (ClaudeVersionPreflight.Ready) -> Void)? = nil
-    /// Set only by the channel approval gateway. Ordinary resume and session
-    /// agents cannot use a channel transcript as a source.
-    var isChannelConversation = false
+    /// Set by the approval gateway for the run's own target. Ordinary resume
+    /// and session agents cannot use executor transcripts as a source.
+    var isExecutorConversation = false
     var dmHistoryFiles: ChatFiles = .standard
 }
 
@@ -191,7 +191,7 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         guard ClaudeSessionResume.isFullId(request.sessionId) else {
             throw ClaudeSessionResume.Refusal.fullIdRequired
         }
-        guard request.isChannelConversation || visibility.allows(conversationId: request.sessionId) else {
+        guard request.isExecutorConversation || visibility.allows(conversationId: request.sessionId, root: sessionFilesRoot) else {
             throw ClaudeSessionResume.Refusal.channelConversation
         }
         let history = ChatDMHistory(files: request.dmHistoryFiles)
@@ -201,9 +201,9 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         if privateResume {
             sessionArguments = ["--session-id", UUID().uuidString.lowercased()]
         } else if request.resume {
-            // Continuing an approved channel run stays within its gateway;
+            // Continuing an approved executor run stays within its gateway;
             // opening/forking it as a personal session remains forbidden.
-            let policy = request.isChannelConversation ? ChannelConversationFilter(channelIds: []) : visibility
+            let policy = request.isExecutorConversation ? ChannelConversationFilter(channelIds: []) : visibility
             let id = try ClaudeSessionResume.resolve(request.sessionId, root: sessionFilesRoot, visibility: policy).get()
             sessionArguments = ["--resume", id]
         } else if let source = agent.sessionId, !privateSource {
@@ -441,6 +441,14 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         let arguments: [String]
         do { arguments = try Self.arguments(for: request, sessionFilesRoot: sessionFilesRoot) + extraArguments }
         catch { throw TeamRunnerError.didNotStart(error.localizedDescription) }
+        // Also cover runs outside the journal gateway. Record the actual ID
+        // selected by arguments(), including a fresh ID after DM taint.
+        let sessionFlag = arguments.firstIndex(of: "--session-id") ?? arguments.firstIndex(of: "--resume")
+        guard let sessionFlag, arguments.indices.contains(sessionFlag + 1) else {
+            throw TeamRunnerError.didNotStart("missing executor conversation")
+        }
+        do { try ExecutorConversations(files: request.dmHistoryFiles).record(arguments[sessionFlag + 1]) }
+        catch { throw TeamRunnerError.didNotStart("its conversation could not be recorded: \(error.localizedDescription)") }
         do {
             spawned = try TeamSpawn.suspended(
                 path: claude, arguments: arguments, environment: environment,

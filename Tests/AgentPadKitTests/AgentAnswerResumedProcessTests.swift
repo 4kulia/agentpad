@@ -68,8 +68,9 @@ final class AgentAnswerResumedProcessTests: XCTestCase {
             return ChatClaudeProcess.hasValidSignature(pid, requirement: requirement, auditToken: ChatClaudeProcess.auditToken(of: pid))
         }
         let received = expectation(description: "detached hook from resumed versioned Claude")
+        var personalCaller: ChatLocalCaller?
         let server = HookServer(socketPath: socket, answerInspector: inspector) { message in
-            guard case .conversationId(let id, let surface, let proof, let failure) = message else { return }
+            guard case .conversationId(let id, let surface, let proof, let failure, _) = message else { return }
             defer { received.fulfill() }
             XCTAssertEqual(id, journal)
             XCTAssertEqual(surface, tab.id)
@@ -88,6 +89,11 @@ final class AgentAnswerResumedProcessTests: XCTestCase {
             (tab.engine as? TestEngine)?.foregroundPid = launch?.process.pid
             AgentAnswerSource.recordHook(conversation: id, session: tab, provenance: proof, failure: failure)
             XCTAssertNil(AgentAnswerSource.problem(tab))
+            let caller = ChatLocalCaller(surface: tab.id.uuidString.lowercased(), claudePID: proof.process.pid,
+                claudeStart: proof.process.startedAtUs, signature: "Resumed")
+            personalCaller = caller
+            XCTAssertNil(try? ChatPersonalAccess.conversation(caller: caller, sessions: [tab]),
+                         "The hook remains pending until its handler returns")
         }
         server.start()
         defer { server.stop() }
@@ -152,6 +158,8 @@ final class AgentAnswerResumedProcessTests: XCTestCase {
         try child.run()
         defer { try? Data().write(to: release) }
         await fulfillment(of: [received], timeout: 10)
+        let caller = try XCTUnwrap(personalCaller)
+        XCTAssertEqual(try ChatPersonalAccess.conversation(caller: caller, sessions: [tab]), .init(journal))
         if tab.answerBinding != nil {
             do {
                 let answer = try await AgentAnswerSource.read(session: tab, store: store) { _, id, _ in

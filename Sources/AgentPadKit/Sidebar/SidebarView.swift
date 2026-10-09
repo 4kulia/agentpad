@@ -321,6 +321,7 @@ struct SidebarView: View {
                         )
                     }
                 } else {
+                    AgentProfilesSection(store: store)
                     // A workspace is "top-level" either because it has no
                     // parent, or because its parent is gone — defensive
                     // fallback so a bug that strands a worktree (parent
@@ -348,7 +349,13 @@ struct SidebarView: View {
         .onChange(of: store.pendingRenameWorkspace?.id) { _, _ in
             revealWorkspaceForRename(using: proxy)
         }
-        .onAppear { revealWorkspaceForRename(using: proxy) }
+        .onAppear {
+            revealWorkspaceForRename(using: proxy)
+            if let id = store.revealedAgentProfileID { proxy.scrollTo(id, anchor: .top) }
+        }
+        .onChange(of: store.agentProfileRevealRevision) { _, _ in
+            if let id = store.revealedAgentProfileID { proxy.scrollTo(id, anchor: .top) }
+        }
     }
 
     @ViewBuilder

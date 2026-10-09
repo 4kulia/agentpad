@@ -30,8 +30,11 @@ enum ChatSessionTools {
             privateAccess = json["attachment_id"] != nil || json["kind"]?.string == "dm" || ["dms", "members"].contains(json["scope"]?.string ?? "")
             let verified = try await ChatSessionIdentity.verify(origin, sessions: sessions(), scan: scan,
                                                                 signatureVerifier: signatureVerifier, kernel: kernel)
+            if privateAccess {
+                try await ChatPersonalAccess.waitForConversation(verified, sessions: sessions, kernel: kernel, isCallerWaiting: isCallerWaiting)
+            }
             let result = try await call(json, caller: verified.caller, service: service, isCallerWaiting: isCallerWaiting,
-                personalConversation: { try ChatPersonalAccess.conversation(caller: verified.caller, sessions: sessions()) }) {
+                personalConversation: { try ChatPersonalAccess.conversation(caller: verified.caller, sessions: sessions(), kernel: kernel) }) {
                 try ChatSessionIdentity.revalidate(verified, sessions: sessions(), kernel: kernel)
                 return true
             }

@@ -57,12 +57,14 @@ enum PaletteItemKind: Hashable, Sendable {
     case agent(templateId: String)
     /// Open the SSH-workspace destination sheet in the active window.
     case createSSHWorkspace
+    case channel(ChannelRef)
+    case teamAgent(OrgKey, String)
     /// Open a recently used project folder as a new workspace in the
     /// active window (issue #28 — "pick from my projects" without ⌘O).
     case openRecentFolder(path: String)
 }
 
-struct PaletteItem: Identifiable, Hashable {
+struct PaletteItem: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
     let subtitle: String
@@ -76,13 +78,23 @@ enum PaletteIndex {
     /// Build the live index from every open window + the settings model's
     /// visible templates. Rebuilt fresh on every palette open so additions
     /// / closures / renames all show up without cache invalidation.
-    static func build(
+    struct Snapshot: Sendable {
+        var items: [PaletteItem]
+        var worktrees: [UUID: URL]
+    }
+    static func build(controllers: [AgentPadWindowController], model: AgentPadSettingsModel,
+                      recentFolders: [URL] = [], bundle: Bundle = .agentPadResources) -> [PaletteItem] {
+        build(snapshot(controllers: controllers, model: model, recentFolders: recentFolders, bundle: bundle))
+    }
+    /// Capture UI state on its actor; defer all filesystem checks to the worker.
+    static func snapshot(
         controllers: [AgentPadWindowController],
         model: AgentPadSettingsModel,
         recentFolders: [URL] = [],
         bundle: Bundle = .agentPadResources
-    ) -> [PaletteItem] {
+    ) -> Snapshot {
         var items: [PaletteItem] = []
+        var worktrees: [UUID: URL] = [:]
         let multiWindow = controllers.count > 1
         for (idx, controller) in controllers.enumerated() {
             let winLabel = multiWindow
@@ -100,7 +112,8 @@ enum PaletteIndex {
                     symbol: "folder",
                     iconAsset: nil
                 ))
-                if ws.worktreeParentId == nil, GitWatcher.findGitDir(near: ws.workingDirectory) != nil {
+                if ws.worktreeParentId == nil {
+                    worktrees[ws.id] = ws.workingDirectory
                     items.append(PaletteItem(
                         id: "create-worktree-\(ws.id.uuidString)",
                         title: String.localizedStringWithFormat(
@@ -115,6 +128,11 @@ enum PaletteIndex {
                 }
                 for pane in ws.root.allPanes {
                     for tab in pane.tabs {
+                        if let ref = tab.channel {
+                            guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key),
+                                  ChatNotifications.allowed(.shared, key, channel: ref.channel) else { continue }
+                        }
+                        if case .directMessage(let ref) = tab.toolRoute, ref.key.map({ ChatService.shared.dmAllowed($0, ref.dm) }) != true { continue }
                         items.append(PaletteItem(
                             id: "tab-\(tab.id.uuidString)",
                             title: tab.title,
@@ -173,7 +191,30 @@ enum PaletteIndex {
                 iconAsset: nil
             ))
         }
-        return items
+        if let model = ChatOrgCurrent.shared.model, let key = model.key {
+            let snapshot = ChatSidebarSnapshot(model: model, active: nil)
+            items += snapshot.teams.flatMap(\.channels).map { channel in
+                PaletteItem(id: "channel:" + channel.id, title: "# " + channel.card.name, subtitle: "channel",
+                    kind: .channel(ChannelRef(key, channel: channel.id)), symbol: "number", iconAsset: nil)
+            }
+            items += snapshot.agents.map { agent in
+                PaletteItem(id: "team-agent:" + agent.id, title: agent.name, subtitle: agent.owner,
+                    kind: .teamAgent(OrgKey(key), agent.id), symbol: "person.crop.square", iconAsset: nil)
+            }
+        }
+        return Snapshot(items: items, worktrees: worktrees)
+    }
+    nonisolated static func build(_ snapshot: Snapshot) -> [PaletteItem] {
+        snapshot.items.filter { item in
+            switch item.kind {
+            case .createWorktree(let id, _):
+                return snapshot.worktrees[id].flatMap { GitWatcher.findGitDir(near: $0) } != nil
+            case .openRecentFolder(let path):
+                var directory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: path, isDirectory: &directory) && directory.boolValue
+            default: return true
+            }
+        }
     }
 
     /// Rank items by fuzzy score against `query`. Empty query returns the

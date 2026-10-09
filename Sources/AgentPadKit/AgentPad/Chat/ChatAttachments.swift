@@ -368,13 +368,14 @@ struct ChatAttachmentStorage: Sendable {
     /// Resolve symlinks again at publication AND each process start.
     static func checkFolders(_ folders: [String], data: URL = dataDirectory, temporary: URL = FileManager.default.temporaryDirectory,
                              home: URL = FileManager.default.homeDirectoryForCurrentUser, executionDirectory: URL? = nil) throws {
-        let protected = try [data, temporary, home.appendingPathComponent("Library")].map { try resolvedFolder($0.path) }
+        let search = home.appendingPathComponent("Library/Application Support/agentpad/search")
+        let protected = try [data, temporary, home.appendingPathComponent("Library"), search].map { try resolvedFolder($0.path) }
         let managed = protected[0], temp = protected[1]
         let execution = try executionDirectory.map { try resolvedFolder($0.path) }
         for folder in folders {
             let path = try resolvedFolder((folder as NSString).expandingTildeInPath)
             if protected.contains(where: { $0.relative(to: path) != nil }) { throw ChatAttachmentError.folders }
-            if path.relative(to: managed) != nil { throw ChatAttachmentError.folders }
+            if path.relative(to: managed) != nil || path.relative(to: protected[3]) != nil { throw ChatAttachmentError.folders }
             if let relative = path.relative(to: temp), let name = relative.first, name.lowercased().hasPrefix("agentpad-call-") {
                 guard let execution, path.relative(to: execution)?.isEmpty == true, relative.count == 1,
                       UUID(uuidString: String(name.dropFirst("agentpad-call-".count))) != nil,

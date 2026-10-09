@@ -179,6 +179,13 @@ final class ChatDMModel: ChatConversationPresentation {
         try? store.dmWrite { try ChatDMStore.markRead($0, ref.dm, root: root, through: seq) }
         if clearingBoundary { boundaries[root ?? ""] = seq }
     }
+    func revealSearchMessage(_ message: ChatMessage, in messages: [ChatMessage]) {
+        guard readable else { return }
+        if let store { content = (try? store.dmRead { try ChatDMContent.read($0, dm: ref.dm) }) ?? content }
+        shown = max(shown, messages.filter { $0.threadRootId == nil && ($0.seq ?? 0) >= (message.seq ?? 0) }.count)
+        openThread(message.threadRootId)
+        revealMessageID = message.id
+    }
     func finishNavigation() {}
     @discardableResult func dismissTransient() -> Bool {
         if editing != nil { cancelEditing() }

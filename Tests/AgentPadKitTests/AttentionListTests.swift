@@ -70,6 +70,29 @@ final class AttentionListTests: XCTestCase {
         XCTAssertTrue(session.hasCurrentAttentionFailure)
     }
 
+    func testFinishedSettingDefaultsOnAndOnlyCurrentTerminalTurnAppears() {
+        XCTAssertTrue(AttentionListSettings.read([:]).finished)
+        let values = AttentionListSettings(finished: false).persisted(over: ["future": "kept"])
+        XCTAssertEqual(values["finished"] as? Bool, false)
+        XCTAssertEqual(values["future"] as? String, "kept")
+        XCTAssertFalse(AttentionListSettings.read(values).finished)
+        XCTAssertNil(AttentionListSettings().persisted(over: values)["finished"])
+
+        let id = UUID(), episode = "incarnation:turn:1"
+        let finished = AttentionEvent(source: "terminal", object: id.uuidString, episode: episode,
+                                      kind: .completion, destination: .terminal(id))
+        var current = AttentionCurrent(terminals: [id: .init(episode: episode, failed: false, finished: true)])
+        XCTAssertEqual(AttentionList.items(ledger: [finished], current: current).map(\.tier), [1])
+        current.terminals[id]?.episode = "incarnation:turn:2"
+        XCTAssertTrue(AttentionList.items(ledger: [finished], current: current).isEmpty)
+        current.terminals[id]?.episode = episode
+        current.terminals[id]?.finished = false
+        XCTAssertTrue(AttentionList.items(ledger: [finished], current: current).isEmpty)
+        current.terminals = [:]
+        XCTAssertTrue(AttentionList.items(ledger: [finished], current: current).isEmpty)
+        XCTAssertTrue(AttentionList.items(ledger: [event(.completion, source: "run-outcome")], current: current).isEmpty)
+    }
+
     func testAggregateKeysOrderGateMuteAndPreferences() {
         let older = AttentionConversation(scope: scope, id: "one", title: "#one", count: 2, time: Date(timeIntervalSince1970: 1), firstMessage: "first", firstSequence: 1)
         var newer = older; newer.id = "two"; newer.time = Date(timeIntervalSince1970: 2)

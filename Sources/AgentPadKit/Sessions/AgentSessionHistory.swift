@@ -148,7 +148,7 @@ enum AgentSessionScanner {
     /// newest record wins — the same one a full scan would rank first.
     static func findRecord(agentId: String, conversationId: String, root: URL,
                            visibility: ChannelConversationFilter = .current()) -> AgentSessionRecord? {
-        guard visibility.allows(agentId: agentId, conversationId: conversationId),
+        guard visibility.allows(agentId: agentId, conversationId: conversationId, root: root),
               let store = stores.first(where: { $0.agentId == agentId }) else { return nil }
         if agentId == AgentTemplate.claudeCodeID {
             guard case .success(let id) = ClaudeSessionResume.resolve(conversationId, root: root, visibility: visibility),
@@ -221,7 +221,7 @@ enum AgentSessionScanner {
     private static func collectClaude(root: URL, visibility: ChannelConversationFilter) -> [AgentSessionRecord] {
         // Exclude before reading titles/context and before the history cap.
         let files = claudeSessionFiles(under: root).filter {
-            visibility.allows(conversationId: $0.item.deletingPathExtension().lastPathComponent)
+            visibility.allows(conversationId: $0.item.deletingPathExtension().lastPathComponent, root: root)
         }
         return scanStore(files: files, parse: claudeRecord)
     }
@@ -510,7 +510,8 @@ final class AgentSessionHistory {
     static let shared = AgentSessionHistory()
     @ObservationIgnored var visibility: () -> ChannelConversationFilter = { .current() }
     @ObservationIgnored var scan: @Sendable () -> [AgentSessionRecord] = { AgentSessionScanner.scanDefaultRoots() }
-    init() {}
+    @ObservationIgnored let profiles: AgentProfileStore
+    init(profiles: AgentProfileStore = .shared) { self.profiles = profiles }
     /// Appear-triggered refreshes within this window reuse the last result —
     /// every panel remount (agents↔history flip, hidden↔full) fires one, and
     /// a full rescan is ~75MB of file-head I/O. The header's rescan button
@@ -543,6 +544,8 @@ final class AgentSessionHistory {
             let result = await Task.detached(priority: .utility) {
                 scan()
             }.value
+            // Discovery, not the add form, attaches local history.
+            do { try profiles.discover(visibility().apply(result)) } catch { /* Store exposes the save error. */ }
             // Equality gate: most rescans find nothing new, and an
             // `@Observable` write re-renders every window's History pane
             // regardless of change.

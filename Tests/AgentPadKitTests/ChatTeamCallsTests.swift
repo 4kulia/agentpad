@@ -3883,7 +3883,7 @@ final class ChatTeamCallsTests: XCTestCase {
             let versions = ClaudeVersionApprovals()
             let preflight = ClaudeVersionPreflight(readVersion: { _, _ in "2.1.290" }, approvals: { versions })
             let request = TeamRunRequest(agent: agent("silent", folder), prompt: "test", sessionId: transcripts.id,
-                                         resume: resume, callerName: "test", callerProject: nil)
+                                         resume: resume, callerName: "test", callerProject: nil, dmHistoryFiles: ChatFiles(directory: folder.appendingPathComponent("chat")))
             let start = TeamStartBox(), organization = org
             let task = Task {
                 try await ClaudeCodeRunner(claudePath: binary.path, preflight: preflight, sessionFilesRoot: transcripts.root).run(request, onActivity: { text in

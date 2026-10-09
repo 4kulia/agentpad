@@ -93,7 +93,7 @@ final class ChatMCPDownloadsTests: XCTestCase {
         func download() async throws -> ChatJSON {
             try await ChatSessionTools.call(.object(["tool": .string("chat_read"), "org_id": .string(f.key.orgId),
                 "channel_id": .string(channel), "attachment_id": .string(file.id)]), caller: caller, service: f.service,
-                personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab]) }, revalidate: { true })
+                personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
         }
         try bind(personal)
         let body = try page()

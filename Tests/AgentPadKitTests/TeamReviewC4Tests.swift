@@ -153,7 +153,7 @@ final class TeamReviewC4Tests: XCTestCase {
         let path = NSTemporaryDirectory() + "agentpad-c4-\(UUID().uuidString.prefix(6)).sock"
         var seen: [String] = []
         let server = HookServer(socketPath: path) { message in
-            if case .conversationId(let id, _, _, _) = message { seen.append(id) }
+            if case .conversationId(let id, _, _, _, _) = message { seen.append(id) }
         }
         server.originOf = { _ in .outside }
         server.start()

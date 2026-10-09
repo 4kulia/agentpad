@@ -81,6 +81,43 @@ final class ChatDMTests: XCTestCase {
         scope.close(); scope = nil
     }
     private func ready() async throws { try await sync.reloadCatalog(valid: { true }) }
+    func testSearchNavigationRevealsExactSavedMessageWithoutWritingReadMarks() async throws {
+        try await ready()
+        let page = try decode("dm_messages_response", as: ChatDMMessagesPage.self)
+        try write { db in for message in page.messages { try ChatDMStore.write(db, message) } }
+        let target = try XCTUnwrap(page.messages.last)
+        let before = try read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM dm_marks") }
+        let model = ChatDMModel(key: key, dm: dm, service: service)
+        model.navigateToSearchMessage(target.messageId)
+        XCTAssertEqual(model.revealMessageID, target.messageId)
+        XCTAssertEqual(model.threadRoot, target.threadRootId)
+        XCTAssertEqual(try read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM dm_marks") }, before)
+        model.stop()
+    }
+    func testSearchServiceRequiresCapabilitiesAndInvalidatesOnlyChangedCachedMessages() async throws {
+        try await ready(); try store.setGeneration("search-generation")
+        service.makeAPI = { ChatAPI(server: $0, protocolClasses: [ChatStubProtocol.self]) }
+        let model = ChatSearchModel(service: service)
+        let request = ChatSearchRequest(query: "release")
+        model.search(request, debounce: false)
+        XCTAssertFalse(ChatStubProtocol.seen.contains { $0.request.url?.path.hasSuffix("/chat/search") == true })
+        service.serverCapabilities[server] = ["chat.dm", "chat.search"]
+        let target = try decode("dm_messages_response", as: ChatDMMessagesPage.self).messages[0]
+        let hit = ChatSearchHit(kind: .dm, targetID: dm, messageID: target.messageId, messageSeq: target.seq, revision: target.revision,
+                                authorAccountID: target.authorAccountId, createdAt: target.createdAt, snippet: "release")
+        routes.set("/v1/orgs/\(org)/chat/search", String(decoding: try JSONEncoder().encode(ChatSearchPage(hits: [hit], next: nil)), as: UTF8.self))
+        model.search(request, debounce: false)
+        try await wait { !model.loading }
+        XCTAssertEqual(model.hits.count, 1)
+        try write { try ChatDMStore.write($0, target) }
+        XCTAssertEqual(model.hits, [hit], "An unchanged cache fill must preserve search results")
+        var edited = target; edited.revision += 1; edited.text = "changed"
+        try write { try ChatDMStore.write($0, edited) }
+        XCTAssertTrue(model.hits.isEmpty, "A newer message revision fences the stale snippet before the UI callback")
+        model.invalidate()
+        service.serverCapabilities[server] = ["chat.search"]
+        XCTAssertEqual(service.searchAvailability, .unsupported)
+    }
     private func wait(_ condition: () -> Bool) async throws {
         for _ in 0..<300 { if condition() { return }; try await Task.sleep(for: .milliseconds(10)) }
         XCTFail("DM work did not settle")

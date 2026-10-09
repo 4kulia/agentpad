@@ -169,7 +169,7 @@ struct TeamLaunchParams: Codable, Equatable, Sendable {
             callerName: inputs.callerName, callerProject: inputs.callerProject, logURL: logURL
         )
         request.continuesLog = segment != nil
-        request.isChannelConversation = channelId != nil
+        request.isExecutorConversation = true
         // Its run tools — folders asked of the owner — are this request's (D4b §2.5).
         request.runToolsCallId = inputs.requestId
         return request

@@ -1281,6 +1281,7 @@ struct AgentPadSettingsView: View {
                 || selected == .appearance
                 || selected == .agents
                 || selected == .terminals
+                || selected == .search
             {
                 Color.clear.frame(height: 26)
             } else {
@@ -1314,6 +1315,7 @@ struct AgentPadSettingsView: View {
             case .openIn: openInDetail
             case .statusBar: statusBarDetail
             case .notifications: notificationsDetail
+            case .search: SearchSettingsView(controller: .shared)
             case .advanced: advancedDetail
             case .about:
                 AboutView()
@@ -1637,6 +1639,9 @@ struct AgentPadSettingsView: View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Needs attention").font(.headline).padding(.vertical, 12)
             SettingsRow(label: "Agents waiting for your input") { Text("Always").foregroundStyle(.secondary) }
+            SettingsRow(label: "Finished agents waiting for you") {
+                Toggle("", isOn: $model.attentionSettings.finished).labelsHidden().toggleStyle(.switch)
+            }
             SettingsRow(label: "Run errors and Claude Code checks") { Text("Always").foregroundStyle(.secondary) }
             SettingsRow(label: "Calls waiting for your approval") {
                 Toggle("", isOn: $model.attentionSettings.approvals).labelsHidden().toggleStyle(.switch)

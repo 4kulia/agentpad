@@ -13,7 +13,7 @@ final class ChannelConversationTests: XCTestCase {
     override func setUp() async throws {
         root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("channel-conversations-\(UUID().uuidString)")
         journal = try ChatJournal.open(files: ChatFiles(directory: root.appendingPathComponent("chat")))
-        for (id, kind) in [(channel, "channel"), (personal, "personal")] {
+        for (id, kind) in [(channel, "channel")] {
             let approval = ChatApproval(id: UUID().uuidString, server: "https://chat.example.com", accountId: "fixture", orgId: "fixture",
                 requestId: UUID().uuidString, agentId: "fixture", kind: "initial", params: "{}", paramsHash: "fixture",
                 runId: UUID().uuidString, startCommandId: UUID().uuidString, generation: "g1", createdAt: Date())
@@ -200,12 +200,12 @@ final class ChannelConversationTests: XCTestCase {
         let args = try ClaudeCodeRunner.arguments(for: request(personal.uppercased(), resume: true), sessionFilesRoot: projects, visibility: visibility())
         XCTAssertEqual(args[try XCTUnwrap(args.firstIndex(of: "--resume")) + 1], personal)
         var internalChannel = request(channel, resume: true)
-        internalChannel.isChannelConversation = true
+        internalChannel.isExecutorConversation = true
         let channelArgs = try ClaudeCodeRunner.arguments(for: internalChannel, sessionFilesRoot: projects, visibility: visibility())
         XCTAssertEqual(channelArgs[try XCTUnwrap(channelArgs.firstIndex(of: "--resume")) + 1], channel)
         internalChannel.agent.sessionId = channel
         let fork = TeamRunRequest(agent: internalChannel.agent, prompt: "fixture", sessionId: UUID().uuidString, resume: false,
-                                  callerName: "Fixture", callerProject: nil, isChannelConversation: true)
+                                  callerName: "Fixture", callerProject: nil, isExecutorConversation: true)
         XCTAssertThrowsError(try ClaudeCodeRunner.arguments(for: fork, sessionFilesRoot: projects, visibility: visibility()), "even channel runs cannot fork channel transcripts")
     }
 
