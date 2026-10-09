@@ -86,6 +86,7 @@ final class ChatSyncTests: XCTestCase {
         """#.utf8)
         let state = stateJSON()
         let capabilities = String(decoding: try! JSONEncoder().encode(serverCapabilities), as: UTF8.self)
+        let supportsDM = serverCapabilities.contains("chat.dm")
         let info = Data(#"{"name":"s","version":"0.1.0","generation":"g1","api_versions":["v1"],"capabilities":\#(capabilities)}"#.utf8)
         ChatStubProtocol.reset { request, _ in
             if request.url?.path == "/v1/me", failingMe.take() { return .success(.init(status: 500, body: Data(#"{"error":"internal"}"#.utf8))) }
@@ -103,6 +104,9 @@ final class ChatSyncTests: XCTestCase {
             return switch request.url?.path {
             case "/v1/me": .success(.init(status: 200, body: meJSON))
             case "/v1/server": .success(.init(status: 200, body: info))
+            case "/v1/orgs/\(org)/dms": supportsDM
+                ? .success(.init(status: 200, body: Data(#"{"dms":[],"next":null}"#.utf8)))
+                : .success(.init(status: 404, body: Data(#"{"error":"not_found"}"#.utf8)))
             case "/v1/orgs/\(org)/state": .success(.init(status: 200, body: state))
             case let path? where path.hasPrefix("/v1/orgs/") && path.hasSuffix("/state"):
                 // Another organization of the same account: a state of its own.
@@ -163,6 +167,52 @@ final class ChatSyncTests: XCTestCase {
     private var commandRequests: Int { ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/commands" }.count }
 
     private var transport: FakeSocketTransport { transports.last! }
+
+    func testFirstServerCheckEnablesDMsWithoutB1() async throws {
+        serverCapabilities.append("chat.dm")
+        serve()
+        let service = try await connected()
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        XCTAssertTrue(sync.dm.enabled)
+        XCTAssertTrue(service.dmAllowed(key))
+        XCTAssertFalse(sync.needsSnapshot)
+        XCTAssertTrue(ChatStubProtocol.seen.contains { $0.request.url?.path == "/v1/orgs/\(org)/dms" })
+    }
+
+    func testServerCapabilityRollbackDisablesDMsAndCompletesOrgSnapshot() async throws {
+        serverCapabilities.append("chat.dm")
+        serve()
+        let service = try await connected()
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        // Establish a previously enabled DM session independently of startup.
+        sync.dm.configure(true)
+        try await sync.dm.reloadCatalog(valid: { true })
+        XCTAssertTrue(sync.dm.readable())
+
+        serverCapabilities.removeAll { $0 == "chat.dm" }
+        serve() // /dms now returns 404.
+        try await service.socket?.checkServer()
+        XCTAssertFalse(sync.dm.enabled)
+        XCTAssertFalse(sync.dm.ready)
+        sync.requestSnapshot()
+        await sync.snapshotNow()
+        XCTAssertFalse(sync.needsSnapshot, "A server without DMs must still finish the organization snapshot")
+        XCTAssertFalse(ChatStubProtocol.seen.contains { $0.request.url?.path == "/v1/orgs/\(org)/dms" })
+    }
+
+    func testLaterServerCheckEnablesDMsAndRequestsCatalog() async throws {
+        let service = try await connected()
+        let sync = try XCTUnwrap(service.orgSessions[key]?.sync)
+        XCTAssertFalse(sync.dm.enabled)
+        serverCapabilities.append("chat.dm")
+        serve()
+        try await service.socket?.checkServer()
+        await sync.snapshotNow()
+        XCTAssertTrue(sync.dm.enabled)
+        XCTAssertTrue(service.dmAllowed(key))
+        XCTAssertFalse(sync.needsSnapshot)
+        XCTAssertTrue(ChatStubProtocol.seen.contains { $0.request.url?.path == "/v1/orgs/\(org)/dms" })
+    }
 
     func testFeedReconnectKeepsB1AndOfflinePresentationButGenerationAndAccessStillClear() async throws {
         serverCapabilities += ChatB1.capabilities.sorted()

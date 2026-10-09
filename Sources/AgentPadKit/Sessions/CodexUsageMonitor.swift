@@ -479,12 +479,16 @@ final class CodexUsageMonitor {
     /// from ONE payload parse instead of paying the newline-bounded read
     /// twice per rollout.
     nonisolated static func sessionMetaPayload(atPath path: String) -> [String: Any]? {
-        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        try? readSessionMetaPayload(atPath: path)
+    }
+
+    nonisolated static func readSessionMetaPayload(atPath path: String) throws -> [String: Any]? {
+        let fh = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
         defer { try? fh.close() }
         var data = Data()
         let newline = UInt8(0x0A)
         while data.count < 4 * 1024 * 1024 {  // safety cap against a missing newline
-            guard let chunk = try? fh.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
+            guard let chunk = try fh.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
             data.append(chunk)
             if let nl = data.firstIndex(of: newline) {
                 data = data.prefix(upTo: nl)

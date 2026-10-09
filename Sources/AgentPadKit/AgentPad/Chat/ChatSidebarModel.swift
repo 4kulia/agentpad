@@ -13,6 +13,7 @@ struct ChatSidebarPreferences: Codable, Equatable {
         }
     }
 
+    var attentionCollapsed: Bool?
     var width: Double = 248
     var collapsed: [Section] = []
 

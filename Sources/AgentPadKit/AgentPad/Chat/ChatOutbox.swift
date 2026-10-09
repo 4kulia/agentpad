@@ -356,7 +356,10 @@ final class ChatOutbox {
             sent.error = nil
             sent.nextAttemptAt = nil
             do {
+                // Don't send can cancel a DM while HTTP is in flight. A late
+                // acceptance still wins; its owner hydrates the same message ID.
                 _ = try queue.update(sent, ifState: .pending) || queue.update(sent, ifState: .unconfirmed)
+                    || (sent.type == "dm.message.post" && queue.update(sent, ifState: .dropped))
                 // Revocation may have erased the body while HTTP was in flight.
                 // Its successful answer still belongs to the command's owner.
                 onSent(sent, try? JSONDecoder().decode(ChatCommandAnswer.self, from: answer.body))

@@ -26,7 +26,7 @@ struct UnifiedSessionsView: View {
         let historyWindow = query.trimmingCharacters(in: .whitespaces).isEmpty
             ? Array(history.records.prefix(Self.recentLimit + own.count + ext.count))
             : history.records
-        let items = SessionListModel.items(own: own, external: ext, history: historyWindow)
+        let items = SessionListModel.items(own: own, external: ext, history: historyWindow, names: SessionNames.shared.values)
         let filtered = SessionListModel.filter(items, query: query, recentLimit: Self.recentLimit, searchLimit: Self.searchLimit)
         let sections = groupByProject ? SessionListModel.byProject(filtered) : SessionListModel.byStatus(filtered)
         let liveCount = items.filter { $0.group != .recent }.count
@@ -62,6 +62,7 @@ struct UnifiedSessionsView: View {
             Spacer(minLength: 0)
         }
         .onAppear { history.refresh() }
+        .task { await SessionNames.shared.load() }
     }
 
     private var searchField: some View {
@@ -194,11 +195,17 @@ enum SessionListModel {
         own: [AgentMonitor.Entry],
         external: [ExternalAgentSession],
         history: [AgentSessionRecord],
-        visibility: ChannelConversationFilter = .current()
+        visibility: ChannelConversationFilter = .current(), names: [SessionNameKey: String] = [:]
     ) -> [SessionListItem] {
         var live = Set<String>()
         var result: [SessionListItem] = []
-        for entry in own where visibility.allows(agentId: entry.agent.rosterId, conversationId: entry.conversationId) {
+        let titles = Dictionary(history.map { ($0.nameKey, $0.title) }, uniquingKeysWith: { first, _ in first })
+        for original in own where visibility.allows(agentId: original.agent.rosterId, conversationId: original.conversationId) {
+            var entry = original
+            if let id = entry.conversationId {
+                let key = SessionNameKey(entry.agent.rosterId, id)
+                entry.tabTitle = names[key] ?? titles[key] ?? entry.tabTitle
+            }
             if let id = entry.conversationId { live.insert(id) }
             result.append(SessionListItem(
                 id: "own:\(entry.id.uuidString)",
@@ -209,7 +216,10 @@ enum SessionListModel {
                 date: nil
             ))
         }
-        for session in external where visibility.allows(conversationId: session.sessionId) {
+        for original in external where visibility.allows(conversationId: original.sessionId) {
+            var session = original
+            let key = SessionNameKey(AgentTemplate.claudeCodeID, session.sessionId)
+            session.title = names[key] ?? titles[key] ?? session.title
             live.insert(session.sessionId)
             result.append(SessionListItem(
                 id: "ext:\(session.id)",

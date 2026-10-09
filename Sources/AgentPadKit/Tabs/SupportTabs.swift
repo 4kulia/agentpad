@@ -74,6 +74,13 @@ final class SupportTabs {
 
     func content(_ state: TabState) -> AnyView {
         switch state.route {
+        case .directMessage(let ref): return AnyView(ChatDMTab(state: state, ref: ref))
+        case .newDM(let key): return AnyView(ChatDMNewView(state: state, scope: key))
+        case .allSessions:
+            if state.allSessionsModel == nil { state.allSessionsModel = AllSessionsModel(state: state) }
+            return AnyView(AllSessionsTab(model: state.allSessionsModel!, owner: { [weak self, weak state] in
+                guard let state else { return nil }; return self?.owner(state)?.store
+            }))
         case .agent: return AnyView(AgentTab(state: state, tabs: .shared))
         case .ask: return AnyView(PersonalAskTab(state: state, model: CompositionTabs.shared.askModel(state)))
         case .newChannel: return AnyView(NewChannelTab(model: CompositionTabs.shared.channelModel(state)))
@@ -248,7 +255,8 @@ struct NotificationTabView: View {
 extension ToolRoute {
     var organizationScope: OrgKey? {
         switch self {
-        case .organization(let key), .agent(let key, _), .ask(let key, _), .newChannel(let key, _, _), .viewer(let key, _, _, _): return key
+        case .newDM(let key), .organization(let key), .agent(let key, _), .ask(let key, _), .newChannel(let key, _, _), .viewer(let key, _, _, _): return key
+        case .directMessage(let ref): return ref.key.map(OrgKey.init)
         case .request(let scope, _), .publishedAgents(let scope), .teamActivity(let scope), .publication(let scope, _), .publish(let scope, _, _, _):
             if case .server(let key) = scope { return key }; return nil
         default: return nil

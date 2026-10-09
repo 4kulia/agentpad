@@ -24,6 +24,9 @@ extension AttentionCoordinator {
         if case .message(let channel, _, let thread, _) = event.destination {
             return ChatNotifications.isLooking(thread.map { "t:\($0)" } ?? "c:\(channel)")
         }
+        if case .directMessage(let dm, _, let thread, _) = event.destination, let scope = event.scope, let key = ChatAttention.key(scope) {
+            return ChatNotifications.isLooking(ChatDMRef(key, dm: dm).place + (thread.map { ":thread:\($0)" } ?? ""))
+        }
         return AttentionFocus.focused(event.destination)
     }
 
@@ -35,7 +38,7 @@ extension AttentionCoordinator {
         case .version(let id): return ClaudeVersionApprovals.shared.pending.contains { $0.id == id }
         case .sheet: return false // Legacy address; sheets no longer register decisions.
         case .tabAction(_, let id): return PendingConfirmations.shared.valid(id)
-        case .invitation, .directMessage, .publicationProposal: return false
+        case .invitation, .publicationProposal: return false
         default: return true
         }
     }
@@ -55,7 +58,7 @@ extension AttentionCoordinator {
                 let restored = ledger.metadata.markers.values.compactMap(\.locator).filter {
                     $0.scope == scope && !$0.kind.needsDecision && valid($0)
                 }
-                ledger.upsert(restored, live: { _ in true })
+                ledger.upsert(restored, live: { $0.kind != .dm })
             }
             for agent in calls.agents {
                 let status = service.publishStatus(agent, key: key).status
@@ -111,8 +114,9 @@ extension AttentionCoordinator {
         for source in ["request", "publication-review", "folder", "version", "block", "connection", "agent-publication", "launch-help"] {
             ledger.reconcile(source: source, keeping: ids)
         }
-        ledger.upsert(events, live: { $0.scope == nil || live || $0.kind.needsDecision })
+        ledger.upsert(events, live: { $0.kind != .dm && ($0.scope == nil || live || $0.kind.needsDecision) })
         ledger.validateAll()
+        AttentionSidebarModel.shared.refresh(service: service, ledger: ledger)
         navigation?.retryPending()
         refreshBadge()
     }

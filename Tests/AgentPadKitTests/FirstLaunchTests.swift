@@ -1,14 +1,22 @@
 #if DEBUG
 import Foundation
+import CoreGraphics
 import XCTest
 
 /// Each child has its own settings/state files and its first-ever libghostty
 /// runtime. It drives the existing NSAlert and the real AppDelegate entries.
 final class FirstLaunchTests: XCTestCase {
     private func check(_ modes: [String]) throws {
+        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+              session[kCGSessionOnConsoleKey as String] as? Bool == true,
+              session[kCGSessionLoginDoneKey as String] as? Bool == true,
+              session["CGSSessionScreenIsLocked"] as? Bool != true else {
+            throw XCTSkip("First-launch checks require an unlocked, logged-in GUI session on the console.")
+        }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("agentpad-first-launch-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        var succeeded = false
+        defer { if succeeded { try? FileManager.default.removeItem(at: root) } }
         let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         for mode in modes {
             let log = root.appendingPathComponent(mode + ".log")
@@ -29,10 +37,11 @@ final class FirstLaunchTests: XCTestCase {
             process.waitUntilExit()
             try output.close()
             let text = try String(contentsOf: log, encoding: .utf8)
-            XCTAssertEqual(process.terminationStatus, 0, "\(mode): \(text.suffix(6000))")
+            XCTAssertEqual(process.terminationStatus, 0, "\(mode); diagnostic log: \(log.path): \(text.suffix(6000))")
             XCTAssertTrue(text.contains("First launch \(mode): PASS"), "\(mode): \(text.suffix(6000))")
             if process.terminationStatus != 0 { return }
         }
+        succeeded = true
     }
     func testImportWithoutGlassFirstEditorCancelAndRestart() throws { try check(["import-opaque", "restart"]) }
     func testImportWithGlassFirstEditorCancelAndRestart() throws { try check(["import-glass", "restart"]) }

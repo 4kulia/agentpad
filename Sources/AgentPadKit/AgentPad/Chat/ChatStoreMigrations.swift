@@ -542,6 +542,7 @@ enum ChatStoreMigrations {
                 END;
                 """)
         }
+        migrator.registerMigration("release-25-direct-messages", migrate: ChatDMStore.migrate)
         return migrator
     }
 

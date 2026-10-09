@@ -49,13 +49,13 @@ final class AgentSessionScannerTests: XCTestCase {
         XCTAssertEqual(record.conversationId, file.deletingPathExtension().lastPathComponent)
     }
 
-    func testClaudeRecordFallsBackToSummaryThenUserText() throws {
+    func testClaudeRecordPrefersFirstPromptBeforeSummary() throws {
         let dir = claudeRoot.appendingPathComponent("-tmp-proj")
         let withSummary = try writeFile("\(UUID().uuidString).jsonl", in: dir, lines: [
             #"{"type":"summary","summary":"compact summary"}"#,
             claudeUserLine(text: "raw prompt"),
         ])
-        XCTAssertEqual(AgentSessionScanner.claudeRecord(file: withSummary, mtime: Date())?.title, "compact summary")
+        XCTAssertEqual(AgentSessionScanner.claudeRecord(file: withSummary, mtime: Date())?.title, "raw prompt")
 
         let userOnly = try writeFile("\(UUID().uuidString).jsonl", in: dir, lines: [
             claudeUserLine(text: "raw prompt"),
@@ -115,13 +115,13 @@ final class AgentSessionScannerTests: XCTestCase {
         XCTAssertEqual(record.title, "fix the flaky test")
     }
 
-    func testCodexRecordWithoutUserMessageIsUntitledButResumable() throws {
+    func testCodexRecordWithoutUserMessageNamesItsFolderAndIsResumable() throws {
         let dir = codexRoot.appendingPathComponent("2026/07/01")
         let file = try writeFile("rollout-x.jsonl", in: dir, lines: [
             #"{"type":"session_meta","payload":{"id":"thread-9","cwd":"/tmp/proj"}}"#,
         ])
         let record = try XCTUnwrap(AgentSessionScanner.codexRecord(file: file, mtime: Date()))
-        XCTAssertEqual(record.title, "")
+        XCTAssertEqual(record.title, "Session in proj")
         XCTAssertEqual(record.conversationId, "thread-9")
     }
 

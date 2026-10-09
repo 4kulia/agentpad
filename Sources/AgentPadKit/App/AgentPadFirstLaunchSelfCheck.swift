@@ -9,10 +9,10 @@ public enum AgentPadFirstLaunchSelfCheck {
     static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
         if try !condition() { throw Failure.check(message) }
     }
-    static func until(_ condition: () -> Bool) async throws {
+    static func until(_ message: String, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(8)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
-        try require(condition(), "timed out waiting for the first terminal or inline confirmation")
+        try require(condition(), "Timed out waiting for \(message); app active: \(NSApp.isActive), key window: \(String(describing: NSApp.keyWindow?.windowNumber))")
     }
     public static func run() -> Never {
         guard ProcessInfo.processInfo.environment["AGENTPAD_DEBUG_CONFIG_DIRECTORY"] != nil,

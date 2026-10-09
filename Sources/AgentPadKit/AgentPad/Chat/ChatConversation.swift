@@ -165,6 +165,7 @@ extension ChatService {
 
     /// Owners of `message.*` answers, by the one dispatcher (D5's way).
     func installConversations() {
+        installDMCommands()
         installB1()
         commandOwners["message.post_with_attachments"] = { [weak self] key, record, outcome in self?.postAnswered(key, record, outcome) }
         commandOwners["message.post"] = { [weak self] key, record, outcome in self?.postAnswered(key, record, outcome) }

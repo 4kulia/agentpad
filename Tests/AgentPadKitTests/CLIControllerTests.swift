@@ -137,6 +137,34 @@ final class CLIControllerTests: XCTestCase {
         XCTAssertEqual(agentTab.id, workspace.activeSession?.id.uuidString)
     }
 
+    func testDirectMessageTabsAreInvisibleAndUnaddressableToSessionCLI() async throws {
+        let store = makeStore(), controller = makeController(stores: [store])
+        let key = ChatOrgKey(server: try ChatServerAddress(parsing: "https://chat.example.com"), accountId: "me", orgId: "org")
+        let dm = store.openToolTab(.directMessage(ChatDMRef(key, dm: "private-id")))
+        let picker = store.openToolTab(.newDM(OrgKey(key)))
+        let response = await respond(controller, AgentPadCLIRequest(verb: .list))
+        let tabs = try XCTUnwrap(response.windows).flatMap(\.workspaces).flatMap(\.tabs)
+        XCTAssertFalse(tabs.contains { $0.id == dm.id.uuidString || $0.id == picker.id.uuidString })
+        let focus = AgentPadCLIRequest(verb: .focus, tab: dm.id.uuidString)
+        let refused = await respond(controller, focus)
+        XCTAssertFalse(refused.ok); XCTAssertTrue(revealed.isEmpty)
+    }
+
+    func testDisconnectClosesOnlyChannelAndDMTabsOfItsScope() throws {
+        let store = makeStore(), local = try XCTUnwrap(store.active?.activeSession)
+        let key = ChatOrgKey(server: try ChatServerAddress(parsing: "https://chat.example.com"), accountId: "me", orgId: "org")
+        let other = ChatOrgKey(server: key.server, accountId: "me", orgId: "other")
+        let direct = store.openToolTab(.directMessage(ChatDMRef(key, dm: "private-id")))
+        let picker = store.openToolTab(.newDM(OrgKey(key)))
+        let unrelated = store.openToolTab(.directMessage(ChatDMRef(other, dm: "other-dm")))
+        let channel = try XCTUnwrap(store.showChannel(ChannelRef(key, channel: "channel")))
+        ChatConversationTabs.close(key, stores: [store])
+        let tabs = store.workspaces.flatMap { $0.root.allPanes.flatMap(\.tabs) }
+        XCTAssertTrue(tabs.contains { $0 === local }); XCTAssertTrue(tabs.contains { $0 === unrelated })
+        for removed in [direct, picker, channel] { XCTAssertFalse(tabs.contains { $0 === removed }) }
+        XCTAssertTrue(direct.tabState?.isClosed ?? true)
+    }
+
     // MARK: open
 
     func testOpenPlainTerminalTab() async throws {

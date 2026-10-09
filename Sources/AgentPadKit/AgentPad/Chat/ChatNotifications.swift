@@ -141,6 +141,7 @@ enum ChatNotifications {
             if let service { reconcile(service) }
         }
         session.noticeWatch = try? DatabaseRegionObservation(tracking: Table("channels"), Table("teams"), Table("messages"),
+                                                             Table("dm_meta"), Table("dm_cards"), Table("dm_messages"), Table("dm_marks"), Table("dm_preferences"), Table("dm_notified"),
                                                              Table("notified"), Table("my_threads"), Table("read_marks"), Table("thread_read_marks"), Table("meta"), Table("requests"))
             .start(in: store.queue, onError: { _ in }) { _ in changes.schedule() }
     }

@@ -152,6 +152,7 @@ enum ChatEvents {
     /// sync rereads its channel or takes an organization snapshot.
     @discardableResult
     static func apply(_ db: Database, _ event: ChatEvent) throws -> Bool {
+        if ChatDMStore.events.contains(event.type) { return try ChatDMStore.apply(db, event) }
         if ChatB1.events.contains(event.type) { return true }
         if ChatChannels.eventTypes.contains(event.type) { return try ChatChannels.apply(db, event) }
         if ChatChannelAgents.reads(event) { return try ChatChannelAgents.apply(db, event) }

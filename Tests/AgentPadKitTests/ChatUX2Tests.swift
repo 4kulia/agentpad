@@ -68,11 +68,11 @@ final class ChatUX2Tests: XCTestCase {
         XCTAssertFalse(ChatAuthorIdentity(human).isBot)
         XCTAssertTrue(ChatAuthorIdentity(message("b", session: "Terminal")).isBot)
         XCTAssertTrue(ChatAuthorIdentity(message("c", agent: "agent")).isBot)
-        XCTAssertEqual(ChatAuthorIdentity.initials(" Марина  Иванова "), "МИ")
-        XCTAssertEqual(ChatAuthorIdentity.initials("🐇 Rabbit"), "🐇R")
+        XCTAssertEqual(AvatarPlaceholder.letter(" Марина  Иванова "), "М")
+        XCTAssertEqual(AvatarPlaceholder.letter("🐇 Rabbit"), "R")
         let identity = ChatAuthorIdentity(human)
         human.text = "edited"; human.authorAgentName = "renamed"
-        XCTAssertEqual(identity.colorIndex, ChatAuthorIdentity(human).colorIndex)
+        XCTAssertEqual(identity.avatarID, ChatAuthorIdentity(human).avatarID)
     }
 
     func testReplySummaryCountsOnlyKnownPostsAndDistinctIdentities() {

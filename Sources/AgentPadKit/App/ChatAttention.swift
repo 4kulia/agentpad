@@ -3,6 +3,16 @@ import GRDB
 
 @MainActor
 enum ChatAttention {
+    nonisolated static func latestLocalRequestIDs(_ db: Database, account: String) throws -> Set<String> {
+        Set(try String.fetchAll(db, sql: """
+            SELECT request_id FROM (
+                SELECT request_id, ROW_NUMBER() OVER (
+                    PARTITION BY COALESCE(agent_id, request_id) ORDER BY julianday(created_at) DESC, request_id DESC
+                ) AS rank FROM requests WHERE owner_account_id = ? AND on_this_device = 1
+            ) WHERE rank = 1
+            """, arguments: [account]))
+    }
+
     static func scope(_ key: ChatOrgKey, _ service: ChatService) -> AttentionScope {
         AttentionScope(server: key.server.description, account: key.accountId, organization: key.orgId,
                        generation: (try? service.orgSessions[key]?.store?.generation) ?? "")
@@ -84,6 +94,7 @@ enum ChatAttention {
         }
         guard personalAllowed(key, service), let store = service.orgSessions[key]?.store else { return false }
         switch event.destination {
+        case .directMessage: return ChatDMNotices.valid(event, service: service)
         case .channel(let channel, let id):
             guard service.channelAgentAllowed(key, channel: channel), let row = try? store.calls.request(id) else { return false }
             if event.kind == .decision { return decisionDue(row, key: key, service: service) }
@@ -141,12 +152,13 @@ enum ChatAttention {
                 .compactMap { try ChatCallStore.request(db, $0) }
         }) ?? []
         var result: [AttentionEvent] = []
-        var latestOwnerAgents = Set<String>()
+        // Status updates on an old request cannot make it the latest run.
+        let latestRequests = (try? store.queue.read { try Self.latestLocalRequestIDs($0, account: key.accountId) }) ?? []
         for original in requests {
             var request = original
             var timestamp = request.updatedAt.flatMap(ChatStore.date) ?? request.createdAt.flatMap(ChatStore.date) ?? .distantPast
             let localOwner = request.ownerAccountId == key.accountId && request.onThisDevice
-            let latestForAgent = localOwner && latestOwnerAgents.insert(request.agentId ?? request.requestId).inserted
+            let latestForAgent = localOwner && latestRequests.contains(request.requestId)
             let approval = localOwner ? try? service.journal?.approval(key, requestId: request.requestId) : nil
             let localRun = approval.flatMap { try? service.journal?.run($0.runId) }
             if !request.state.isFinal, let run = localRun, let outcome = run.outcome,
@@ -235,6 +247,7 @@ enum ChatAttention {
                     scope: scope, timestamp: row["command_created_at"]))
             }
         }
+        result += ChatDMNotices.events(service, key)
         return result
     }
 }

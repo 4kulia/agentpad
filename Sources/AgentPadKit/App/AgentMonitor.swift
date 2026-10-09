@@ -72,7 +72,7 @@ final class AgentMonitor {
         let id: UUID            // sessionId
         let agent: AgentTemplate
         let state: State
-        let tabTitle: String
+        var tabTitle: String
         /// The WORKSPACE's directory, not the session's live cwd. This line
         /// answers "which project", and a `cd` into a subdirectory would
         /// otherwise rename the row — head truncation keeps the deepest

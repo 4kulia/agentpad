@@ -307,6 +307,7 @@ final class AgentPadSettingsModel {
     /// Persisted under `notifications.attention` / `.failure` (non-default only).
     var notifyOnAttention: Bool = true
     var notifyOnFailure: Bool = true
+    var attentionSettings = AttentionListSettings()
     var notificationSound = true
     var disabledNotificationCategories: Set<AttentionCategory> = []
 
@@ -466,6 +467,7 @@ final class AgentPadSettingsModel {
         )
         awakeMode = (general["awakeMode"] as? String).flatMap(AwakeMode.init) ?? .auto
 
+        attentionSettings = AttentionListSettings.read(parsed["attention"] as? [String: Any] ?? [:])
         let notifications = parsed["notifications"] as? [String: Any] ?? [:]
         let notificationPreferences = AttentionPreferences.read(notifications)
         notificationsEnabled = notificationPreferences.enabled
@@ -752,6 +754,8 @@ final class AgentPadSettingsModel {
             parsed["appearance"] = appearance
         }
 
+        let attention = attentionSettings.persisted(over: parsed["attention"] as? [String: Any] ?? [:])
+        parsed["attention"] = attention.isEmpty ? nil : attention
         var notifications = parsed["notifications"] as? [String: Any] ?? [:]
         notifications = notificationPreferences.persisted(over: notifications)
         if notifications.isEmpty {
@@ -1620,6 +1624,20 @@ struct AgentPadSettingsView: View {
 
     private var notificationsDetail: some View {
         VStack(alignment: .leading, spacing: 0) {
+            Text("Needs attention").font(.headline).padding(.vertical, 12)
+            SettingsRow(label: "Agents waiting for your input") { Text("Always").foregroundStyle(.secondary) }
+            SettingsRow(label: "Run errors and Claude Code checks") { Text("Always").foregroundStyle(.secondary) }
+            SettingsRow(label: "Calls waiting for your approval") {
+                Toggle("", isOn: $model.attentionSettings.approvals).labelsHidden().toggleStyle(.switch)
+            }
+            SettingsRow(label: "Mentions in channels") {
+                Toggle("", isOn: $model.attentionSettings.mentions).labelsHidden().toggleStyle(.switch)
+            }
+            SettingsRow(label: "Direct messages") {
+                Toggle("", isOn: $model.attentionSettings.dm).labelsHidden().toggleStyle(.switch)
+            }
+            Text("Banners").font(.headline).padding(.vertical, 12)
+
             ForEach(AttentionCategory.allCases, id: \.self) { category in
                 SettingsRow(label: category.label) {
                     Toggle("", isOn: Binding(get: { model.notificationEnabled(category) },
@@ -1638,6 +1656,7 @@ struct AgentPadSettingsView: View {
                 }
             }
         }
+        .onChange(of: model.attentionSettings) { _, _ in model.scheduleSave() }
         .task { await AttentionCoordinator.shared.notificationManager?.refreshAuthorization() }
     }
 

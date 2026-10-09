@@ -28,11 +28,12 @@ struct ChatSidebarModePicker: View {
             Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
             let layout = compact ? AnyLayout(VStackLayout(spacing: 3)) : AnyLayout(HStackLayout(spacing: 3))
             layout {
-                mode(.workspaces, title: "Sessions", icon: "rectangle.stack")
+                mode(.workspaces, title: "Sessions", icon: "rectangle.stack",
+                     badge: compact && !AttentionSidebarModel.shared.items.isEmpty ? "•" : nil)
                 mode(.files, title: "Files", icon: "folder")
                 mode(.team, title: "Team", icon: "person.2", badge: teamNeedsAttention ? "•" : nil)
                 mode(.chat, title: "Chat", icon: "bubble.left.and.bubble.right",
-                     badge: mentions > 0 ? "\(mentions)" : nil)
+                     badge: compact && !AttentionSidebarModel.shared.items.isEmpty ? "•" : mentions > 0 ? "\(mentions)" : nil)
             }.padding(.horizontal, compact ? 4 : 9).padding(.top, 9).padding(.bottom, 12)
         }
         .task(id: ChatOrgCurrent.identity()) { ChatOrgCurrent.shared.refresh() }
@@ -76,6 +77,7 @@ struct ChatSidebarView: View {
     @Bindable var store: WorkspaceStore
     @Bindable var navigation: ChatSidebarNavigation
     let model: ChatOrgModel?
+    var attention = AttentionSidebarModel.shared
     @State private var organizationMenu = false
     @State private var channelNameEdit = InlineNameEdit()
     @State private var renamingChannel: ChatChannelCard?
@@ -90,27 +92,7 @@ struct ChatSidebarView: View {
 
     var body: some View {
         let snapshot = snapshot
-        VStack(spacing: 0) {
-            organization(snapshot)
-            switch snapshot.state {
-            case .notConnected:
-                empty(ChatOrgSidebarSection.reason(ChatService.shared.state) ?? "Connect to an organization to see its channels.")
-                Button("Connect…") { ConnectionTabs.shared.show() }.padding(.bottom, 16)
-            case .checking:
-                ProgressView().controlSize(.small).padding(.top, 16)
-                empty(model?.notice ?? "Checking access…")
-            case .noChannels:
-                empty("This server has no channels.")
-            case .ready:
-                searchField
-                savedViews(snapshot)
-                tree(snapshot)
-            }
-            Spacer(minLength: 0)
-            if let me = model?.members.first(where: { $0.accountId == model?.me }) {
-                account(me)
-            }
-        }
+        sidebar(snapshot)
         .task(id: ChatOrgCurrent.identity()) {
             ChatOrgCurrent.shared.refresh()
             navigation.adopt(ChatOrgCurrent.identity())
@@ -135,6 +117,31 @@ struct ChatSidebarView: View {
         .onKeyPress(characters: CharacterSet(charactersIn: "f")) { press in
             guard press.modifiers == .command else { return .ignored }
             focus = .search; return .handled
+        }
+    }
+
+    private func sidebar(_ snapshot: ChatSidebarSnapshot) -> some View {
+        VStack(spacing: 0) {
+            organization(snapshot)
+            if case .ready = snapshot.state {} else { AttentionSidebarSection(store: store, model: attention) }
+            switch snapshot.state {
+            case .notConnected:
+                ChatDisconnectedRow()
+            case .checking:
+                ProgressView().controlSize(.small).padding(.top, 16)
+                empty(model?.notice ?? "Checking access…")
+            case .noChannels:
+                empty("This server has no channels.")
+            case .ready:
+                searchField
+                AttentionSidebarSection(store: store, model: attention)
+                savedViews(snapshot)
+                tree(snapshot)
+            }
+            Spacer(minLength: 0)
+            if let me = model?.members.first(where: { $0.accountId == model?.me }) {
+                account(me)
+            }
         }
     }
 
@@ -232,6 +239,7 @@ struct ChatSidebarView: View {
                     ForEach(teams) { team in
                         teamSection(team)
                     }
+                    if let key = model?.key { ChatDMSidebarSection(store: store, key: key) }
                     if snapshot.agentsServed, navigation.filter == .all, !agents.isEmpty || !filtering {
                         sectionHeading(.agents, title: "Agents")
                             .padding(.top, 24).id(ChatSidebarRowID.agents)
@@ -384,9 +392,7 @@ struct ChatSidebarView: View {
         let id = ChatSidebarRowID.agent(agent.id)
         return Button { navigation.selection = id; openAgent(agent.id) } label: {
             HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "sparkles").font(.system(size: 15)).foregroundStyle(ChatSidebarStyle.accent)
-                    .frame(width: 23, height: 23).background(ChatSidebarStyle.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
-                    .accessibilityHidden(true)
+                ContactAvatar(stableID: agent.id, name: agent.name, kind: .agent, size: 23)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(agent.name).font(Theme.display(11)).lineLimit(2)
                     Text(agentCaption(agent)).font(Theme.display(9)).foregroundStyle(ChatSidebarStyle.secondary).lineLimit(2)
@@ -414,8 +420,7 @@ struct ChatSidebarView: View {
 
     private func account(_ me: ChatOrgView.Member) -> some View {
         HStack(spacing: 9) {
-            Text(String(me.name.prefix(1)).uppercased()).font(Theme.display(11, weight: .semibold))
-                .frame(width: 27, height: 27).background(Theme.chromeSelection, in: RoundedRectangle(cornerRadius: 8)).accessibilityHidden(true)
+            ContactAvatar(stableID: me.accountId, name: me.name, kind: .person, size: 27)
             VStack(alignment: .leading, spacing: 2) {
                 Text(me.name).font(Theme.display(11, weight: .medium)).lineLimit(1)
                 Text("@\(me.handle)").font(Theme.display(10)).foregroundStyle(ChatSidebarStyle.secondary).lineLimit(1)

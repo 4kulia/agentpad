@@ -31,6 +31,7 @@ struct ChatMessageLink: Equatable {
     }
 
     var url: URL? {
+        guard !channel.isEmpty else { return nil }
         var parts = URLComponents()
         parts.scheme = AgentPadDeepLink.scheme; parts.host = "chat"
         parts.queryItems = [URLQueryItem(name: "server", value: server.description), URLQueryItem(name: "org", value: org),

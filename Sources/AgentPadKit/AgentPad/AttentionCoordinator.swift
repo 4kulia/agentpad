@@ -68,6 +68,7 @@ final class AttentionCoordinator {
         // history scan only runs on demand, so nudge it (at most every 10s).
         ExternalSessionMonitor.shared.onSessionsEnded = { [weak self] _ in
             self?.scheduleHistoryRefresh()
+            SessionCatalog.shared.refresh()
         }
     }
 
@@ -141,7 +142,9 @@ final class AttentionCoordinator {
         let first = seenWaitingEpisodes == nil
         for session in waiting {
             var event = AttentionEvent(source: "external", object: session.id, episode: Self.episodeKey(session),
-                                       kind: .input, destination: .external(session.id))
+                                       kind: .input, destination: .external(session.id), timestamp: session.statusSince ?? Date())
+            event.localTitle = session.displayTitle
+            event.localBody = "Claude Code · Needs your input"
             event.isRead = first
             if first { AttentionLedger.shared.metadata.update(event.id) { $0.delivered = true } }
             AttentionLedger.shared.upsert(event)

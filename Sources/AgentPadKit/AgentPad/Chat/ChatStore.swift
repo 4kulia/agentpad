@@ -586,6 +586,9 @@ final class ChatStore: Sendable {
             // told as "gone" before its snapshot (F2).
             try db.execute(sql: "UPDATE meta SET rights_in_doubt = 1 WHERE id = 1")
             try ChatB1.reset(db)
+            try ChatDMStore.clear(db)
+            // A restore must never replay an unsent private message implicitly.
+            try db.execute(sql: "UPDATE outbox SET state = 'unconfirmed' WHERE type LIKE 'dm.%' AND state = 'pending'")
             try db.execute(sql: "DELETE FROM my_threads")
             try ChatB1.cancelIntents(db, condition: "1")
             // Messages of the server go; one this Mac is sending stays with its command (F3).
@@ -828,7 +831,7 @@ final class ChatStore: Sendable {
             // transaction, so nothing it brings is removed after it (review C9-5, C9-7).
             if let streams {
                 // Channel streams are not the snapshot's: their cursors go with their cards (F3).
-                let kept = Set(try String.fetchAll(db, sql: "SELECT stream FROM cursors WHERE stream NOT LIKE 'channel:%'"))
+                let kept = Set(try String.fetchAll(db, sql: "SELECT stream FROM cursors WHERE stream NOT LIKE 'channel:%' AND stream NOT LIKE 'dm:%'"))
                 for gone in kept.subtracting(streams) { try Self.drop(db, stream: gone) }
             }
             if let members = snapshot.members {

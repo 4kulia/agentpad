@@ -260,7 +260,8 @@ struct AgentTemplate: Identifiable, Hashable {
         sshHost: String? = nil,
         rawLaunchCommand: String? = nil,
         claudeProjectsRoot: URL = ClaudeSessionResume.projectsRoot(),
-        visibility: ChannelConversationFilter = .current()
+        visibility: ChannelConversationFilter = .current(),
+        claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil
     ) -> TerminalSessionConfig {
         // Pick a shell that has a AgentPad integration wrapper. Plain terminal
         // sessions respect $SHELL where we have a wrapper (zsh/bash/fish); other
@@ -314,7 +315,8 @@ struct AgentTemplate: Identifiable, Hashable {
             newSessionId: newSessionId,
             initialPrompt: initialPrompt,
             claudeProjectsRoot: claudeProjectsRoot,
-            visibility: visibility
+            visibility: visibility,
+            claudeResolution: claudeResolution
         ) {
             config.environment["AGENTPAD_AGENT"] = launch
         }
@@ -331,7 +333,8 @@ struct AgentTemplate: Identifiable, Hashable {
         newSessionId: String?,
         initialPrompt: String?,
         claudeProjectsRoot: URL,
-        visibility: ChannelConversationFilter
+        visibility: ChannelConversationFilter,
+        claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil
     ) -> String? {
         guard let initialCommand else { return nil }
         let trimmedExtras = extraOptions?.trimmingCharacters(in: .whitespaces) ?? ""
@@ -339,7 +342,7 @@ struct AgentTemplate: Identifiable, Hashable {
         var resumeId = resumeId
         if rosterId == Self.claudeCodeID, trimmedPrompt.isEmpty,
            persistsConversation(extraOptions: extraOptions), let id = resumeId {
-            switch ClaudeSessionResume.resolve(id, root: claudeProjectsRoot, visibility: visibility) {
+            switch claudeResolution ?? ClaudeSessionResume.resolve(id, root: claudeProjectsRoot, visibility: visibility) {
             case .success(let fullId): resumeId = fullId
             case .failure(let refusal): return refusal.shellCommand
             }

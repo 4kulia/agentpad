@@ -36,24 +36,8 @@ struct ChatAvatar: View {
     let identity: ChatAuthorIdentity
     let name: String
     var size: CGFloat = 32
-    private var tint: Color {
-        if identity.isBot { return ChatAppearance.accent }
-        let light = Theme.resolved.isLight
-        switch identity.colorIndex {
-        case 0: return light ? Color(red: 0.46, green: 0.29, blue: 0.13) : Color(red: 0.91, green: 0.76, blue: 0.62)
-        case 1: return light ? Color(red: 0.24, green: 0.35, blue: 0.48) : Color(red: 0.67, green: 0.82, blue: 0.90)
-        case 2: return light ? Color(red: 0.26, green: 0.40, blue: 0.29) : Color(red: 0.69, green: 0.82, blue: 0.72)
-        default: return light ? Color(red: 0.42, green: 0.30, blue: 0.52) : Color(red: 0.84, green: 0.78, blue: 0.89)
-        }
-    }
     var body: some View {
-        Group {
-            if identity.isBot { Image(systemName: "sparkles").font(.system(size: size * 0.53)) }
-            else { Text(ChatAuthorIdentity.initials(name)).font(Theme.display(size * 0.37, weight: .semibold)) }
-        }
-        .foregroundStyle(tint).frame(width: size, height: size)
-        .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: size * 0.31))
-        .accessibilityHidden(true)
+        ContactAvatar(stableID: identity.avatarID, name: name, kind: identity.isBot ? .agent : .person, size: size)
     }
 }
 

@@ -263,9 +263,12 @@ final class ChatConnectionTests: XCTestCase {
         try service.saveSignIn(conn, token: "aps_x")
         try await service.start(mode: .server)
         let cache = files.cacheURL(try XCTUnwrap(conn.orgKey))
-        try Data("x".utf8).write(to: cache)
-        try Data("x".utf8).write(to: URL(fileURLWithPath: cache.path + "-wal"))
-        try Data("j".utf8).write(to: files.journalURL)
+        // Use the real SQLite files created by start. Disconnect must inspect
+        // the own-message outbox before removing the cache, so marker bytes
+        // would instead test an unreadable queue (covered by ChatDMTests).
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cache.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: files.journalURL.path))
+        XCTAssertTrue(try XCTUnwrap(service.orgSessions[try XCTUnwrap(conn.orgKey)]?.store).outbox.commands().isEmpty)
 
         var order: [String] = []
         var remoteCalls = 0

@@ -9,13 +9,13 @@ import SwiftUI
 /// session store, NOT from AgentPad's persistence: that's the point — sessions
 /// started outside AgentPad (or in tabs long closed) are still listed, and no
 /// hook-side id capture is needed because the id is already in the file.
-struct AgentSessionRecord: Identifiable, Hashable, Sendable {
+struct AgentSessionRecord: Identifiable, Hashable, Codable, Sendable {
     /// Builtin `AgentTemplate` id ("claude-code" / "codex").
     let agentId: String
     let conversationId: String
     /// Best-effort display title; empty when nothing usable was found
     /// (the UI shows a placeholder — the record is still resumable).
-    let title: String
+    var title: String
     /// The directory the conversation ran in. Resume respawns here so the
     /// conversation's file references stay valid.
     let cwd: URL
@@ -25,16 +25,35 @@ struct AgentSessionRecord: Identifiable, Hashable, Sendable {
     /// Session file's modification date — "when this conversation last moved".
     let lastActivity: Date
 
-    init(agentId: String, conversationId: String, title: String, cwd: URL, lastActivity: Date) {
+    var agentTitle: String?
+    var summary: String?
+    var firstPrompt: String?
+    var automatic: Bool
+    var startedAt: Date?
+    var fileURL: URL?
+
+    init(agentId: String, conversationId: String, title: String, cwd: URL, lastActivity: Date,
+         agentTitle: String? = nil, summary: String? = nil, firstPrompt: String? = nil,
+         automatic: Bool = false, startedAt: Date? = nil, fileURL: URL? = nil) {
         self.agentId = agentId
         self.conversationId = conversationId
         self.title = title
         self.cwd = cwd
         self.cwdPath = cwd.path
         self.lastActivity = lastActivity
+        self.agentTitle = agentTitle; self.summary = summary
+        self.firstPrompt = SessionTitle.boundedPrompt(firstPrompt)
+        self.automatic = automatic; self.startedAt = startedAt; self.fileURL = fileURL
     }
 
     var id: String { "\(agentId):\(conversationId)" }
+    var nameKey: SessionNameKey { SessionNameKey(agentId, conversationId) }
+    func resolvedTitle(manual: String? = nil) -> String {
+        SessionTitle.resolve(manual: manual, agentName: agentTitle, firstPrompt: firstPrompt,
+                             summary: summary ?? title, folder: cwd)
+    }
+    func named(_ name: String?) -> Self { var copy = self; copy.title = resolvedTitle(manual: name); return copy }
+
 }
 
 // MARK: - Scanner
@@ -240,7 +259,7 @@ enum AgentSessionScanner {
         }
     }
 
-    private static func claudeSessionFiles(under root: URL) -> [(item: URL, mtime: Date)] {
+    static func claudeSessionFiles(under root: URL) -> [(item: URL, mtime: Date)] {
         // Session files sit next to same-named checkpoint DIRECTORIES;
         // the UUID gate also keeps stray non-session jsonl out.
         projectFiles(under: root) { file in
@@ -284,12 +303,20 @@ enum AgentSessionScanner {
     static let summaryMarker = Data("\"summary\"".utf8)
 
     static func claudeRecord(file: URL, mtime: Date) -> AgentSessionRecord? {
+        try? readClaudeRecord(file: file, mtime: mtime)
+    }
+
+    /// Catalog callers distinguish an unreadable file from a successfully parsed
+    /// non-session, so transient I/O errors never become negative cache entries.
+    static func readClaudeRecord(file: URL, mtime: Date) throws -> AgentSessionRecord? {
         let conversationId = file.deletingPathExtension().lastPathComponent
         var customTitle: String?
         var summary: String?
         var firstUserText: String?
         var cwd: String?
-        for line in headLines(of: file) {
+        var automatic = false
+        var startedAt: Date?
+        for line in try readHeadLines(of: file) {
             // Once the first-wins fields are settled, the only lines that can
             // still change the record are `custom-title` (last wins — a rename
             // appends rather than rewrites, so the whole head must be walked)
@@ -303,6 +330,8 @@ enum AgentSessionScanner {
                 continue
             }
             guard let object = jsonObject(line) else { continue }
+            if object["entrypoint"] as? String == "sdk-cli" { automatic = true }
+            if startedAt == nil { startedAt = (object["timestamp"] as? String).flatMap(ChatStore.date) }
             switch object["type"] as? String {
             case "custom-title":
                 if let value = object["customTitle"] as? String { customTitle = value }
@@ -330,9 +359,10 @@ enum AgentSessionScanner {
         return AgentSessionRecord(
             agentId: AgentTemplate.claudeCodeID,
             conversationId: conversationId,
-            title: cleanedTitle(customTitle ?? summary ?? firstUserText ?? ""),
+            title: SessionTitle.resolve(agentName: customTitle, firstPrompt: firstUserText, summary: summary, folder: URL(fileURLWithPath: cwd)),
             cwd: URL(fileURLWithPath: cwd),
-            lastActivity: mtime
+            lastActivity: mtime, agentTitle: customTitle, summary: summary, firstPrompt: firstUserText,
+            automatic: automatic, startedAt: startedAt, fileURL: file
         )
     }
 
@@ -349,7 +379,7 @@ enum AgentSessionScanner {
 
     // MARK: Codex (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl)
 
-    private static func codexRolloutFiles(under root: URL) -> [(item: URL, mtime: Date)] {
+    static func codexRolloutFiles(under root: URL) -> [(item: URL, mtime: Date)] {
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(
             at: root,
@@ -370,7 +400,11 @@ enum AgentSessionScanner {
     private static let userMessageMarker = Data("user_message".utf8)
 
     static func codexRecord(file: URL, mtime: Date) -> AgentSessionRecord? {
-        let lines = headLines(of: file)
+        try? readCodexRecord(file: file, mtime: mtime)
+    }
+
+    static func readCodexRecord(file: URL, mtime: Date) throws -> AgentSessionRecord? {
+        let lines = try readHeadLines(of: file)
         // The meta usually parses straight from the in-head first line — one
         // read for the whole record. Only a session_meta line LARGER than the
         // head cap (truncated -> parse fails) falls back to the monitor's
@@ -381,12 +415,13 @@ enum AgentSessionScanner {
            object["type"] as? String == "session_meta" {
             meta = object["payload"] as? [String: Any]
         } else {
-            meta = CodexUsageMonitor.sessionMetaPayload(atPath: file.path)
+            meta = try CodexUsageMonitor.readSessionMetaPayload(atPath: file.path)
         }
         guard let meta,
               let conversationId = CodexUsageMonitor.conversationId(fromSessionMetaPayload: meta),
               let cwd = CodexUsageMonitor.cwd(fromSessionMetaPayload: meta)
         else { return nil }
+        if (meta["source"] as? [String: Any])?["subagent"] != nil { return nil }
         var title: String?
         for line in lines.dropFirst() {
             // The head is dominated by the giant session_meta and injected
@@ -408,9 +443,11 @@ enum AgentSessionScanner {
         return AgentSessionRecord(
             agentId: AgentTemplate.codex.id,
             conversationId: conversationId,
-            title: cleanedTitle(title ?? ""),
+            title: SessionTitle.resolve(firstPrompt: title, folder: URL(fileURLWithPath: cwd)),
             cwd: URL(fileURLWithPath: cwd),
-            lastActivity: mtime
+            lastActivity: mtime, firstPrompt: title,
+            automatic: meta["originator"] as? String == "codex_exec" || meta["source"] as? String == "exec",
+            startedAt: (meta["timestamp"] as? String).flatMap(ChatStore.date), fileURL: file
         )
     }
 
@@ -422,9 +459,13 @@ enum AgentSessionScanner {
     /// full pass. A line truncated at the boundary simply fails JSON parsing
     /// and is skipped.
     static func headLines(of file: URL) -> [Data] {
-        guard let handle = try? FileHandle(forReadingFrom: file) else { return [] }
+        (try? readHeadLines(of: file)) ?? []
+    }
+
+    static func readHeadLines(of file: URL) throws -> [Data] {
+        let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: headByteLimit), !data.isEmpty else { return [] }
+        guard let data = try handle.read(upToCount: headByteLimit), !data.isEmpty else { return [] }
         return data.split(separator: UInt8(ascii: "\n"))
     }
 
@@ -441,6 +482,7 @@ enum AgentSessionScanner {
         guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty,
               !trimmed.hasPrefix("<"),
+              !trimmed.hasPrefix("/"),
               !trimmed.hasPrefix("Caveat:")
         else { return nil }
         return trimmed
@@ -476,7 +518,10 @@ final class AgentSessionHistory {
     private static let minSecondsBetweenScans: TimeInterval = 30
 
     private var scannedRecords: [AgentSessionRecord] = []
-    var records: [AgentSessionRecord] { visibility().apply(scannedRecords) }
+    var records: [AgentSessionRecord] {
+        let names = SessionNames.shared.values
+        return visibility().apply(scannedRecords).map { $0.named(names[$0.nameKey]) }
+    }
     /// True only until the FIRST scan lands — refreshes after that keep the
     /// stale list on screen instead of flashing a spinner over it.
     private(set) var isInitialLoad = true
@@ -647,6 +692,7 @@ struct SessionHistoryView: View {
             Spacer(minLength: 0)
         }
         .onAppear { history.refresh() }
+        .task { await SessionNames.shared.load() }
     }
 
     /// A refused resume is a configuration problem (launch options that

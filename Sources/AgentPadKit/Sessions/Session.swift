@@ -93,6 +93,7 @@ final class Session: Identifiable {
     /// where they are, not which agent template the tab was launched from.
     var currentDirectory: URL
     /// Runtime state; not persisted. Resets to `.idle` after relaunch.
+    let catalogStartedAt = Date()
     var activityState: SessionActivityState = .idle
     /// Empty / whitespace input via `renameTab` clears this back to `nil` so
     /// the tab title resumes tracking the cwd.
@@ -494,6 +495,7 @@ final class Session: Identifiable {
     /// render as blank.
     var title: String {
         // AgentPad: a channel tab shows its channel's name while it may be seen (DESIGN-F2).
+        if case .directMessage(let ref) = toolRoute { return ChatDMTabs.title(ref) }
         if let toolRoute { return toolRoute.title }
         if let channel { return ChannelTabs.title(channel) }
         if let inbox { return inbox.kind.title }
@@ -524,4 +526,11 @@ final class Session: Identifiable {
 /// Original hook meaning; activity colour is intentionally independent.
 enum SessionAttentionReason: String, Sendable, Equatable {
     case input, completion, failure
+}
+
+
+extension Session {
+    var isDirectMessageTab: Bool {
+        switch toolRoute { case .directMessage, .newDM: return true; default: return false }
+    }
 }

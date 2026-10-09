@@ -210,7 +210,7 @@ final class AgentPadCLIController {
             // AgentPad: team work (Team/TeamCLIHandler.swift).
             // AgentPad: re-resolve live tab identity before and after channel MCP awaits.
             Task { @MainActor in completion(await TeamCLIHandler.handle(request, service: teamService(), origin: origin,
-                chatSessions: { self.windows().flatMap { $0.store.workspaces.flatMap { $0.root.allPanes.flatMap(\.tabs) } } },
+                chatSessions: { self.windows().flatMap { $0.store.workspaces.flatMap { $0.root.allPanes.flatMap(\.tabs) } }.filter { !$0.isDirectMessageTab } },
                 isCallerWaiting: isCallerWaiting)) }
         }
     }
@@ -644,7 +644,7 @@ final class AgentPadCLIController {
         for context in windows() {
             for workspace in context.store.workspaces {
                 if let pane = workspace.root.pane(containingSessionId: id),
-                   let session = pane.tabs.first(where: { $0.id == id }) {
+                   let session = pane.tabs.first(where: { $0.id == id && !$0.isDirectMessageTab }) {
                     return (context, workspace, session)
                 }
             }
@@ -684,7 +684,7 @@ final class AgentPadCLIController {
                         path: workspace.diskPath.path,
                         isActive: store.activeWorkspaceId == workspace.id,
                         tabs: workspace.root.allPanes.flatMap { pane in
-                            pane.tabs.map { tab in
+                            pane.tabs.filter { !$0.isDirectMessageTab }.map { tab in
                                 // AgentPad: a channel tab tells its channel only while it may be seen (DESIGN-F2).
                                 if let channel = tab.channel {
                                     let state = ChannelTabs.state(channel)

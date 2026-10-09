@@ -71,7 +71,7 @@ extension AgentSessionScanner {
             conversationId: conversationId,
             title: cleanedTitle(renamedTitle ?? headerTitle ?? firstUserText ?? ""),
             cwd: URL(fileURLWithPath: cwd),
-            lastActivity: mtime
+            lastActivity: mtime, agentTitle: renamedTitle ?? headerTitle, firstPrompt: firstUserText, fileURL: file
         )
     }
 
@@ -115,7 +115,7 @@ extension AgentSessionScanner {
                 conversationId: entry.id,
                 title: cleanedTitle(title),
                 cwd: URL(fileURLWithPath: entry.cwd),
-                lastActivity: mtime
+                lastActivity: mtime, agentTitle: title, fileURL: entry.stateURL
             )
         }
     }
@@ -183,6 +183,7 @@ extension AgentSessionScanner {
                   let cwd = info["cwd"] as? String, !cwd.isEmpty
             else { return nil }
             var title = (object["session_summary"] as? String) ?? ""
+            let summary = title
             if title.isEmpty {
                 let history = file.deletingLastPathComponent().appendingPathComponent("chat_history.jsonl")
                 for line in headLines(of: history) {
@@ -203,7 +204,7 @@ extension AgentSessionScanner {
                 conversationId: id,
                 title: cleanedTitle(title),
                 cwd: URL(fileURLWithPath: cwd),
-                lastActivity: mtime
+                lastActivity: mtime, summary: summary, firstPrompt: summary.isEmpty ? title : nil, fileURL: file
             )
         }
     }
@@ -239,7 +240,7 @@ extension AgentSessionScanner {
                 conversationId: id,
                 title: cleanedTitle((object["title"] as? String) ?? ""),
                 cwd: URL(fileURLWithPath: cwd),
-                lastActivity: updatedMs.map { Date(timeIntervalSince1970: $0 / 1000) } ?? mtime
+                lastActivity: updatedMs.map { Date(timeIntervalSince1970: $0 / 1000) } ?? mtime, agentTitle: object["title"] as? String, fileURL: file
             )
         }
     }
@@ -299,7 +300,7 @@ extension AgentSessionScanner {
                 conversationId: id,
                 title: cleanedTitle(fields["name"] ?? ""),
                 cwd: URL(fileURLWithPath: cwd),
-                lastActivity: mtime
+                lastActivity: mtime, agentTitle: fields["name"], fileURL: file
             )
         }
     }
@@ -324,7 +325,8 @@ extension AgentSessionScanner {
         SELECT key, conversation_id, \
         COALESCE(json_extract(value, '$.latest_summary'), \
                  json_extract(value, '$.history[0].user.content.Prompt.prompt'), '') , \
-        updated_at FROM conversations_v2 ORDER BY updated_at DESC LIMIT \(perAgentCap)
+        updated_at, json_extract(value, '$.latest_summary'), \
+        json_extract(value, '$.history[0].user.content.Prompt.prompt') FROM conversations_v2 ORDER BY updated_at DESC LIMIT \(perAgentCap)
         """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
@@ -346,7 +348,9 @@ extension AgentSessionScanner {
                 conversationId: id,
                 title: cleanedTitle(displayableUserText(title) ?? ""),
                 cwd: URL(fileURLWithPath: cwd),
-                lastActivity: Date(timeIntervalSince1970: TimeInterval(updatedMs) / 1000)
+                lastActivity: Date(timeIntervalSince1970: TimeInterval(updatedMs) / 1000),
+                summary: sqlite3_column_text(statement, 4).map { String(cString: $0) },
+                firstPrompt: sqlite3_column_text(statement, 5).map { String(cString: $0) }
             ))
         }
         return records
@@ -433,7 +437,7 @@ extension AgentSessionScanner {
             conversationId: sessionId,
             title: cleanedTitle(summary ?? firstUserText ?? ""),
             cwd: URL(fileURLWithPath: cwd),
-            lastActivity: mtime
+            lastActivity: mtime, summary: summary, firstPrompt: firstUserText, fileURL: file
         )
     }
 
@@ -508,7 +512,7 @@ extension AgentSessionScanner {
             conversationId: id,
             title: cleanedTitle(title),
             cwd: URL(fileURLWithPath: cwd),
-            lastActivity: mtime
+            lastActivity: mtime, agentTitle: title, fileURL: file
         )
     }
 
@@ -557,7 +561,8 @@ extension AgentSessionScanner {
             conversationId: stem,
             title: cleanedTitle(title ?? ""),
             cwd: URL(fileURLWithPath: cwd),
-            lastActivity: mtime
+            lastActivity: mtime, agentTitle: object["custom_title"] as? String, summary: object["topic_title"] as? String,
+            firstPrompt: object["preview"] as? String, fileURL: file
         )
     }
 

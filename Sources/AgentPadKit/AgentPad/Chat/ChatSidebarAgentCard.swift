@@ -14,6 +14,7 @@ struct ChatSidebarAgentCard: View {
             if let model, let actions = ChatSidebarAgentActions(agentID: agentID, active: active, model: model) {
                 let agent = actions.agent
                 HStack {
+                    ContactAvatar(stableID: agentID, name: agent.name, kind: .agent)
                     Text(agent.name).font(Theme.display(14, weight: .semibold))
                     Text("BOT").font(Theme.mono(10)).foregroundStyle(ChatSidebarStyle.secondary)
                 }

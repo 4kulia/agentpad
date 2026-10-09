@@ -9,7 +9,7 @@ private struct ChatTimelineFrames: PreferenceKey {
 /// Shared geometry and keyboard behavior; channel and each thread keep separate
 /// positions in the tab model. No network or read marks come from row appearance.
 struct ChatTimelineView: View {
-    let model: ChatChannelModel
+    let model: any ChatConversationPresentation
     let root: String?
     let members: [ChatOrgView.Member]
     let mentionable: [(account: String, handle: String)]
@@ -28,7 +28,7 @@ struct ChatTimelineView: View {
 
     private var messages: [ChatMessage] { model.conversationMessages(root: root) }
     private var position: ChatScrollPosition { model.positions[root ?? ""] ?? ChatScrollPosition() }
-    private var place: String { root.map { "t:\($0)" } ?? "c:\(model.channel)" }
+    private var place: String { model.notificationPlace(root: root) }
     private var rows: [ChatFeedLayout.Row] { ChatFeedLayout.rows(messages, unreadID: root == nil ? model.feed.unreadID : model.threadUnreadID) }
 
     var body: some View {
@@ -97,7 +97,7 @@ struct ChatTimelineView: View {
                 }
                 .coordinateSpace(name: coordinate)
                 .focusable().focused($focused)
-                .accessibilityLabel(root == nil ? "Channel messages" : "Thread messages")
+                .accessibilityLabel(root == nil ? (model.isDM ? "Direct messages" : "Channel messages") : "Thread messages")
                 .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(focused ? ChatAppearance.accent : .clear, lineWidth: 2))
                 .onChange(of: model.focusRequest, initial: true) { _, request in
                     if request?.area == (root == nil ? .feed : .thread) { focused = true }

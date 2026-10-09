@@ -3,7 +3,7 @@ import SwiftUI
 
 /// One message, with discoverable hover actions and the same context menu.
 struct ChatMessageRow: View {
-    let model: ChatChannelModel
+    let model: any ChatConversationPresentation
     let message: ChatMessage
     let members: [ChatOrgView.Member]
     let mentionable: [(account: String, handle: String)]
@@ -65,7 +65,7 @@ struct ChatMessageRow: View {
                     }.frame(minHeight: 19, alignment: .leading)
                 }
                 if editing != nil && !message.deleted { editor } else { body(of: message) }
-                if !message.deleted, let attachments = model.service.attachments(model.key), attachments.limits != nil {
+                if !model.isDM, !message.deleted, let attachments = model.service.attachments(model.key), attachments.limits != nil {
                     ChatMessageAttachments(manager: attachments, message: message, inThread: inThread)
                 }
                 if message.editedAt != nil && !message.deleted { Text("edited").font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary) }
@@ -98,7 +98,7 @@ struct ChatMessageRow: View {
                         model.openThread(message.threadRootId ?? source)
                     }.buttonStyle(.link).font(Theme.display(10))
                 }
-                ChatSourceProgress(model: model, source: message.messageId)
+                if let channel = model as? ChatChannelModel { ChatSourceProgress(model: channel, source: message.messageId) }
                 if !inThread {
                     if let b1 = model.b1, b1.supports("chat.thread_summary"), let summary = b1.state.metadata[message.id]?.threadSummary {
                         if summary.replyCount > 0 {
@@ -192,9 +192,12 @@ struct ChatMessageRow: View {
         case .sending:
             Text(message.attachments.isEmpty ? "sending…" : (model.service.attachments(model.key)?.pauseReason ?? "sending…"))
                 .foregroundStyle(.secondary).font(.caption)
+            if model.isDM {
+                Button("Don't send") { model.discard(message) }.buttonStyle(.link).font(.caption)
+            }
         case .failed:
             Text("not sent: \(ChatChannelModel.reason(message.localError))").foregroundStyle(ChatAppearance.failure).font(.caption)
-            if !archived && model.service.canRetryPost(model.key, row: message) {
+            if !archived && model.canRetry(message) {
                 Button("Retry") { model.retry(message) }.buttonStyle(.link).font(.caption)
             }
             Button("Delete") { model.discard(message) }.buttonStyle(.link).font(.caption)
@@ -214,8 +217,8 @@ struct ChatMessageRow: View {
         } else {
             VStack(alignment: .leading, spacing: 2) {
                 ChatMentionText(markdown: message.attachmentOnly && model.service.supports("chat.attachments", key: model.key) ? "" : message.text, addresses: mentionable.map(\.handle)
-                    + (ChatOrgCurrent.shared.model?.agents(in: message.channelId).compactMap(\.address) ?? []), fontSize: inThread ? 13 : 14)
-                ChatAgentMembershipHint(model: model, text: message.text)
+                    + (model.isDM ? [] : ChatOrgCurrent.shared.model?.agents(in: message.channelId).compactMap(\.address) ?? []), fontSize: inThread ? 13 : 14)
+                if let channel = model as? ChatChannelModel { ChatAgentMembershipHint(model: channel, text: message.text) }
                 if message.stale != nil { Text("updating…").foregroundStyle(.secondary).font(.caption) }
             }
         }
@@ -233,8 +236,9 @@ struct ChatMessageRow: View {
                         .disabled(model.editing != nil)
                         .buttonStyle(.link).font(.caption)
                     Button("Copy") {
+                        guard let current = model.message(message.id)?.localEdit else { return }
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(local.text ?? "", forType: .string)
+                        NSPasteboard.general.setString(current.text ?? "", forType: .string)
                     }
                     .buttonStyle(.link).font(.caption)
                 }
@@ -262,7 +266,7 @@ struct ChatMessageRow: View {
                 if message.loading { Text("Loading the current message…").foregroundStyle(ChatAppearance.secondary).font(.caption) }
                 if let problem = editing?.problem { Text(problem).foregroundStyle(ChatAppearance.failure).font(.caption) }
                 Spacer()
-                if archived { Text("Archived: it can't be changed").foregroundStyle(.secondary).font(.caption) }
+                if archived { Text(model.isDM ? "Read-only: it can't be changed" : "Archived: it can't be changed").foregroundStyle(.secondary).font(.caption) }
                 Button("Cancel") { model.cancelEditing() }
                 Button("Save") { save() }
                     .disabled(!canSave)
@@ -279,8 +283,8 @@ struct ChatMessageRow: View {
         model.saveEditing(members: mentionable)
     }
 
-    private var canReply: Bool { message.hasFixed && !message.deleted && message.localState == nil }
-    private var canDelete: Bool { mine && message.hasFixed && !message.deleted && !message.changing && message.localState == nil }
+    private var canReply: Bool { message.hasFixed && (!message.deleted || model.isDM) && message.localState == nil }
+    private var canDelete: Bool { model.canDelete(message) }
 
     @ViewBuilder
     private var hoverActions: some View {
@@ -306,7 +310,7 @@ struct ChatMessageRow: View {
 
     @ViewBuilder
     private var menu: some View {
-        if message.hasFixed, !message.deleted {
+        if message.hasFixed, !message.deleted || model.isDM {
             if let b1 = model.b1 {
                 if b1.supports("chat.reactions") { Button("Add reaction…") { showingReactions = true }.disabled(!b1.canChange) }
                 if b1.supports("chat.pins") {
@@ -315,13 +319,14 @@ struct ChatMessageRow: View {
                 }
             }
             if canReply { Button("Reply in Thread") { model.openThread(message.threadRootId ?? message.messageId) } }
-            if message.seq != nil, let link = ChatMessageLink(key: model.key, message: message).url {
+            if !model.isDM, message.seq != nil, let link = ChatMessageLink(key: model.key, message: message).url {
                 Button("Copy message link") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(link.absoluteString, forType: .string) }
             }
             Toggle("Always show time", isOn: $alwaysShowTime)
             Button("Copy text") {
+                guard let text = model.copyText(message) else { return }
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(message.text, forType: .string)
+                NSPasteboard.general.setString(text, forType: .string)
             }
             if mine {
                 // One change at a time (review F3b-2).

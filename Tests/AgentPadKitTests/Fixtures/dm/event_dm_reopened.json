@@ -1,0 +1,18 @@
+{
+  "stream": "dm:2c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+  "seq": 2,
+  "id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01",
+  "type": "dm.reopened",
+  "actor": null,
+  "body": {
+    "dm_id": "2c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+    "version": 3,
+    "state": "active",
+    "closed_at": null
+  },
+  "command_id": null,
+  "at": "2026-10-08T09:00:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null
+}

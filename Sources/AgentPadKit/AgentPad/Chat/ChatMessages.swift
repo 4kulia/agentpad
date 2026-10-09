@@ -73,6 +73,7 @@ struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
     enum LocalState: String, Codable, Sendable { case sending, failed }
     var messageId: String
     var channelId: String
+    var dmId: String? = nil
     var threadRootId: String?
     var authorAccountId: String
     var seq: Int?
@@ -121,6 +122,7 @@ struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         messageId = try c.decode(String.self, forKey: .messageId)
         channelId = try c.decode(String.self, forKey: .channelId)
+        dmId = try c.decodeIfPresent(String.self, forKey: .dmId)
         threadRootId = try c.decodeIfPresent(String.self, forKey: .threadRootId)
         authorAccountId = try c.decode(String.self, forKey: .authorAccountId)
         seq = try c.decodeIfPresent(Int.self, forKey: .seq)

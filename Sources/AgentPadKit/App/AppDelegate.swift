@@ -947,6 +947,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private func handleSessionAlert(_ sessionId: UUID, _ kind: SessionAlertKind) {
         guard let location = dockTabLocation(for: sessionId) else { return }
         let session = location.session
+        if kind == .completed || kind == .failure { SessionCatalog.shared.refresh() }
         // Channel runs have their own gated request/publication sources. Never
         // turn their terminal title or OSC text into a personal notification.
         guard ChannelConversationFilter.current().allows(agentId: session.displayAgent.id,
@@ -1058,7 +1059,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         case .update: SupportTabs.shared.settings(.updates); return true
         case .sheet: return false
         case .tabAction(_, let id): return PendingConfirmations.shared.open(id)
-        case .invitation, .directMessage, .publicationProposal: return false
+        case .directMessage(let dm, _, let thread, _):
+            guard let scope = event.scope, ChatAttention.sameScope(scope, .shared), let key = ChatAttention.key(scope),
+                  let tab = ChatDMTabs.open(ChatDMRef(key, dm: dm)) else { return false }
+            tab.tabState?.dmPendingThread = thread
+            tab.tabState?.dmModel?.openThread(thread)
+            return true
+        case .invitation, .publicationProposal: return false
         }
     }
 
@@ -1372,6 +1379,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             responderRow("Zoom", #selector(NSWindow.performZoom(_:))),
             selfRow("Center", #selector(handleCenterWindow)),
             .separator,
+            selfRow("All sessions", #selector(handleAllSessions), "h", modifiers: [.command, .shift]),
             selfRow("Next Session Needing You", #selector(handleNextWaitingSession), "u", modifiers: [.command, .shift]),
         ])
         mainMenu.addItem(submenu(windowMenu))
@@ -1703,6 +1711,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     @objc private func handleReopenClosedTab() {
         activeStore?.reopenLastClosedTab()
     }
+
+    @objc private func handleAllSessions() { SupportTabs.shared.navigation.open(.allSessions) }
 
     @objc private func handleNextWaitingSession() {
         AttentionCoordinator.shared.jumpToNextWaiting()
@@ -2241,17 +2251,22 @@ extension AppDelegate {
             terminal.engine.start(config: TerminalSessionConfig(command: "/bin/bash --noprofile --norc",
                 arguments: [], workingDirectory: directory.path, environment: [:]))
             NSApp.activate(ignoringOtherApps: true)
-            try await AgentPadFirstLaunchSelfCheck.until { terminal.engine.foregroundPid != nil }
+            try await AgentPadFirstLaunchSelfCheck.until("the first terminal foreground process") { terminal.engine.foregroundPid != nil }
             terminal.engine.sendInput("/usr/bin/vi -u NONE -i NONE \(directory.path)/scratch.txt\r")
-            try await AgentPadFirstLaunchSelfCheck.until {
+            try await AgentPadFirstLaunchSelfCheck.until("the editor to require quit confirmation") {
                 guard let pid = terminal.engine.foregroundPid, let info = ProcessInfoReader.info(of: pid) else { return false }
                 return ["vi", "vim"].contains(info.name) && terminal.engine.needsConfirmQuit
             }
             events.append("surface")
             let pid = terminal.engine.foregroundPid!
+            controller.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            try await AgentPadFirstLaunchSelfCheck.until("the terminal window to become key") {
+                controller.window?.isKeyWindow == true && terminal.engine.view.window === controller.window
+            }
             let close = ConfirmCloseTab.request(terminal, in: workspace, store: store)
             try require(close == .presenting, "first terminal close: \(close), pid \(pid), process \(String(describing: ProcessInfoReader.info(of: pid))), host \(terminal.engine.view.window != nil), phase \(terminal.terminalConfirmation.phase)")
-            try await AgentPadFirstLaunchSelfCheck.until { terminal.terminalConfirmation.isVisible }
+            try await AgentPadFirstLaunchSelfCheck.until("inline close confirmation to become visible") { terminal.terminalConfirmation.isVisible }
             terminal.terminalConfirmation.cancel()
             try require(store.allSessions.contains { $0 === terminal }, "Cancel closed the first terminal")
             try require(kill(pid, 0) == 0 && terminal.engine.needsConfirmQuit, "Cancel stopped the editor")
@@ -2260,13 +2275,13 @@ extension AppDelegate {
         }
         navigation.finishStartup()
         finishDeepLinkStartup()
-        try await AgentPadFirstLaunchSelfCheck.until { cliAnswer != nil }
+        try await AgentPadFirstLaunchSelfCheck.until("the deferred CLI response") { cliAnswer != nil }
         try require(cliAnswer?.ok == true, "deferred CLI failed")
         try require(pendingDeepLinks.isEmpty, "deferred link was not drained")
         try require(router.find(.connection, windowID: store.windowID) != nil, "deferred Connection did not open")
         try require(windowControllers.count > 1, "deferred New Window/restore did not run")
         try require(events.prefix(3) == ["written", "loaded", "window"], "startup order changed")
-        try await AgentPadFirstLaunchSelfCheck.until { LibghosttyApp.initialized }
+        try await AgentPadFirstLaunchSelfCheck.until("libghostty initialization") { LibghosttyApp.initialized }
         if mode == "restart" {
             try require(settings.customAgents.count == 1 && !settings.notificationSound, "post-Welcome edits were lost after restart")
         } else if imported || mode == "fresh" {

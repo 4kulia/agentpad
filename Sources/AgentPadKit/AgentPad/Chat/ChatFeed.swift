@@ -37,7 +37,11 @@ final class ChatFeed: ChatSocketLifecycle {
             service?.serverAttachmentLimits[connection.server] = info.limits?.attachments
             service?.attachmentManagers.values.forEach { $0.reconcile() }
             if let key = connection.orgKey {
-                service?.orgSessions[key]?.sync?.b1.configure(Set(info.capabilities), limits: info.limits?.chatB1)
+                let sync = service?.orgSessions[key]?.sync
+                sync?.b1.configure(Set(info.capabilities), limits: info.limits?.chatB1)
+                let hadDM = sync?.dm.enabled == true
+                sync?.dm.configure(info.capabilities.contains("chat.dm"))
+                if !hadDM && info.capabilities.contains("chat.dm") { sync?.requestSnapshot() }
                 service?.orgSessions[key]?.outbox?.pump()
             }
         }
@@ -215,6 +219,7 @@ final class ChatFeed: ChatSocketLifecycle {
         sync.onInStep = { [weak fresh] in fresh?.actions?.run() }
         sync.onChannelsPaused = { [weak fresh] paused in if fresh?.pausedChannels != paused { fresh?.pausedChannels = paused } }
         sync.setOpenChannels(service.openChannels(key))
+        sync.dm.setOpen(Set(service.openDMTabs.keys.filter { $0.belongs(to: key) }.map(\.dm)))
         sync.onLiveEvent = { [weak service] event in
             guard let service else { return }
             let admin = ["invitation.create", "invitation.accept", "invitation.revoke"].contains(event.type)
@@ -223,6 +228,10 @@ final class ChatFeed: ChatSocketLifecycle {
             service.onNotice(AttentionEvent(source: "organization-event", object: event.stream, episode: String(event.seq),
                 kind: .account, destination: .organization(key.orgId, section: admin ? .invitations : .members), scope: ChatAttention.scope(key, service)))
         }
+        sync.dm.onLiveMessage = { [weak service] dm, id in
+            if let service { ChatDMNotices.live(service, key, dm: dm, id: id) }
+        }
+        sync.dm.onChanged = { [weak service] in if let service { ChatNotifications.reconcile(service) } }
         sync.onLiveMessage = { [weak fresh, weak service] channel, id in
             guard let store = fresh?.store, let service else { return }
             ChatNotifications.live(service, key, store: store, channel: channel, messageId: id)
@@ -238,6 +247,11 @@ final class ChatFeed: ChatSocketLifecycle {
         }
         fresh.snapshotOwed = sync.needsSnapshot
         sync.sessionId = connection.sessionId
+        sync.dm.sessionId = connection.sessionId
+        sync.dm.isCurrent = { [weak service, weak fresh, connection] in
+            service?.state == .signedIn && service?.connection == connection && fresh?.doubtNotWritten == false
+        }
+        sync.dm.configure(service.supports("chat.dm", key: key))
         sync.onStorageProblem = { [weak fresh] failed in
             guard let fresh else { return }
             // Each failure, and the end of one, begins a new epoch: a view
@@ -256,6 +270,9 @@ final class ChatFeed: ChatSocketLifecycle {
             service?.serverB1Limits[key.server] = info.limits?.chatB1
             service?.serverAttachmentLimits[key.server] = info.limits?.attachments
             service?.attachmentManagers.values.forEach { $0.reconcile() }
+            let hadDM = fresh?.sync?.dm.enabled == true
+            fresh?.sync?.dm.configure(info.capabilities.contains("chat.dm"))
+            if !hadDM && info.capabilities.contains("chat.dm") { fresh?.sync?.requestSnapshot() }
             fresh?.outbox?.pump()
         }
         sync.b1.canNotify = { [weak service] channel in
@@ -290,6 +307,7 @@ extension ChatService {
             }
         }
         outbox.maySendCommand = { [weak self] record in
+            if ChatDMStore.commands.contains(record.type) { return self?.supports("chat.dm", key: key) == true }
             if let capability = attachmentCapability(record.type) {
                 return self?.supports(capability, key: key) == true && self?.attachments(key)?.limits != nil
                     && self?.attachments(key)?.postReady(record) == true
@@ -297,6 +315,7 @@ extension ChatService {
             return !ChatB1.commands.contains(record.type) || self?.supports(ChatB1.capability(for: record.type), key: key) == true
         }
         outbox.isSuspended = { [weak self] record in
+            if ChatDMStore.commands.contains(record.type) { return self?.supports("chat.dm", key: key) != true }
             guard let capability = attachmentCapability(record.type) else { return false }
             return self?.supports(capability, key: key) != true || self?.attachments(key)?.limits == nil
         }

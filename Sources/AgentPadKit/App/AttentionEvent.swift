@@ -10,7 +10,7 @@ struct AttentionScope: Codable, Hashable, Sendable {
 }
 
 enum AttentionCategory: String, CaseIterable, Codable, Sendable {
-    case decisions, attention, completion, failure, publication, mentions, replies, account, updates, program
+    case decisions, attention, completion, failure, publication, mentions, replies, dm, account, updates, program
 
     var label: String {
         switch self {
@@ -21,6 +21,7 @@ enum AttentionCategory: String, CaseIterable, Codable, Sendable {
         case .publication: return "Answers published or sent"
         case .mentions: return "Mentions of me"
         case .replies: return "Replies in my threads"
+        case .dm: return "Direct messages"
         case .account: return "Sign-in, access and devices"
         case .updates: return "App updates"
         case .program: return "Terminal program notifications"
@@ -30,7 +31,7 @@ enum AttentionCategory: String, CaseIterable, Codable, Sendable {
 
 enum AttentionKind: String, Codable, Sendable {
     case decision, version, folder, publicationReview, input, recovery, signIn
-    case completion, failure, stopped, publication, mention, reply, account, update, updateFailure, updateInstalled, confirmation, program
+    case completion, failure, stopped, publication, mention, reply, dm, account, update, updateFailure, updateInstalled, confirmation, program
 
     var category: AttentionCategory {
         switch self {
@@ -42,6 +43,7 @@ enum AttentionKind: String, Codable, Sendable {
         case .publication: return .publication
         case .mention: return .mentions
         case .reply: return .replies
+        case .dm: return .dm
         case .update, .updateFailure, .updateInstalled: return .updates
         case .program: return .program
         }
@@ -69,6 +71,7 @@ enum AttentionKind: String, Codable, Sendable {
         case .publication: return "An agent answer was published"
         case .mention: return "New mention in AgentPad"
         case .reply: return "New reply in a thread"
+        case .dm: return "New direct message in AgentPad"
         case .account: return "Your account or access changed"
         case .update: return "An AgentPad update is available"
         case .updateFailure: return "An AgentPad update operation failed"
@@ -98,8 +101,9 @@ enum AttentionDestination: Codable, Hashable, Sendable {
     case sheet(UUID)
     case tabAction(tabID: TabID, actionID: UUID)
     case linkFailure(windowID: UUID)
+    case directMessage(String, message: String = "", thread: String? = nil, sequence: Int = 0)
     // Reserved until these have real client sources.
-    case invitation(String), directMessage(String), publicationProposal(String)
+    case invitation(String), publicationProposal(String)
 }
 
 struct AttentionEvent: Identifiable, Equatable, Codable, Sendable {

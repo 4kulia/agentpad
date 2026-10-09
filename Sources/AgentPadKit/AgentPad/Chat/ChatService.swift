@@ -21,6 +21,7 @@ final class ChatOrgSession {
     private(set) var outbox: ChatOutbox?
     /// Follows the server (C8); nil until the feed starts.
     var sync: ChatSync?
+    var dmList: ChatDMListModel?
     /// The doubt of the user's rights could not be written to the cache
     /// (it is tried again): the window shows nothing of the organization
     /// meanwhile — no second place the doubt is kept (C6g).
@@ -48,6 +49,7 @@ final class ChatOrgSession {
         self.key = key
         do {
             let (store, recovered) = try ChatStore.open(files: files, key: key)
+            try files.restoreDMOutbox(key, store: store)
             self.store = store
             if recovered {
                 needsFullSnapshot = true
@@ -163,6 +165,7 @@ final class ChatService {
         didSet {
             if state != oldValue {
                 invalidateAttachments()
+                if state != .signedIn { onCloseConversations(connection?.orgKey) }
                 onStateChange()
                 // F4: signed out, another account, a session ended: notices that no longer apply go.
                 ChatNotifications.reconcile(self)
@@ -194,6 +197,7 @@ final class ChatService {
     private(set) var connection: ChatConnection? {
         didSet {
             if connection != oldValue {
+                if let oldKey = oldValue?.orgKey, oldKey != connection?.orgKey { onCloseConversations(oldKey) }
                 invalidateAttachments()
                 activateCalls()
                 // F4: another account or organization — notices that no longer apply go (review F4b-5).
@@ -237,6 +241,8 @@ final class ChatService {
     var makeAPI: @MainActor (ChatServerAddress) -> ChatAPI = { ChatAPI(server: $0) }
     /// After `disconnect`: team work is off.
     var onDisconnected: @MainActor () -> Void = {}
+    var onCloseConversations: @MainActor (ChatOrgKey?) -> Void = { _ in }
+    private(set) var disconnectedDMCount: Int?
     /// The organization's connection is ready now (its generation settled, its
     /// requests' states this connection's); replaced in tests.
     @ObservationIgnored
@@ -261,6 +267,7 @@ final class ChatService {
     init(files: ChatFiles, tokens: ChatTokenStore) {
         self.files = files
         self.tokens = tokens
+        disconnectedDMCount = files.savedDMCount
         self.isDevelopmentBuild = tokens is ChatDevTokenFile
         closeRemoteSession = { _, _ in }
         closeRemoteSession = { [unowned self] connection, token in
@@ -439,8 +446,12 @@ final class ChatService {
         orgSessions[key]?.outbox?.hold()
         reconcileChannelResults(revoked: key)
         clearB1PrivateState(key)
+        let archived = (try? files.saveDMOutbox(key, store: orgSessions[key]?.store)) != nil
+        if !archived { try? orgSessions[key]?.store?.dmWrite { try ChatDMStore.clear($0) } }
+        disconnectedDMCount = files.savedDMCount
+        onCloseConversations(key)
         dropSession(key)
-        files.removeCache(key)
+        if archived { files.removeCache(key) }
         if connection?.orgKey == key {
             state = .notMember(key, "You are no longer a member of \((name ?? nil) ?? "this organization").")
         }
@@ -575,6 +586,7 @@ final class ChatService {
     private func dropSession(_ key: ChatOrgKey) {
         guard let session = orgSessions.removeValue(forKey: key) else { return }
         session.sync?.stop()
+        session.dmList?.stop()
         // The runner stays; it has no cache until a new state hands one.
         session.actions?.attach(nil)
         session.outbox?.hold()
@@ -989,6 +1001,7 @@ final class ChatService {
     var commandOwners: [String: @MainActor (ChatOrgKey, ChatCommandRecord, ChatCommandOutcome) -> Void] = [:]
     /// F3: channel tabs open now, counted by their channel.
     var openChannelTabs: [ChannelRef: Int] = [:]
+    var openDMTabs: [ChatDMRef: Set<UUID>] = [:]
     /// The owner's side (D4), once installed by the app.
     var owner: ChatOwnerSide?
     /// A request waits for this owner's decision (`notify_decision`): told once.
@@ -1269,6 +1282,18 @@ final class ChatService {
         }
         if let token { try? await closeRemoteSession(connection, token) }
         token = nil
+        var keys = Set(orgSessions.keys.filter { $0.server == connection.server && $0.accountId == connection.accountId })
+        keys.formUnion(attachmentManagers.keys.filter { $0.server == connection.server && $0.accountId == connection.accountId })
+        if let key = connection.orgKey { keys.insert(key) }
+        // Include unopened caches, and keep the connection record until its
+        // queue is safe so a failed archive can be retried after a restart.
+        do {
+            for key in keys { try files.saveDMOutbox(key, store: orgSessions[key]?.store) }
+            disconnectedDMCount = files.savedDMCount
+        } catch {
+            state = .needsSignIn("Disconnect could not finish: unsent direct messages could not be saved. Try Disconnect again.")
+            return
+        }
         // Disconnect is done only once it is on disk: the token gone, the
         // server record gone. A step that fails is shown;
         // the connection stays so Disconnect can be pressed again, and each
@@ -1288,9 +1313,7 @@ final class ChatService {
                 return
             }
         }
-        var keys = Set(orgSessions.keys.filter { $0.server == connection.server && $0.accountId == connection.accountId })
-        keys.formUnion(attachmentManagers.keys.filter { $0.server == connection.server && $0.accountId == connection.accountId })
-        if let key = connection.orgKey { keys.insert(key) }
+        onCloseConversations(nil)
         for key in keys {
             attachmentManagers.removeValue(forKey: key)?.revoke()
             clearB1PrivateState(key)

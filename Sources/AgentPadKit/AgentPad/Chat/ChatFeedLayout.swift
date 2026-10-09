@@ -17,16 +17,8 @@ struct ChatAuthorIdentity: Hashable, Sendable {
     }
 
     var isBot: Bool { agent != nil || session != nil }
-    /// Swift's Hasher is randomized at launch. Use a fixed hash for avatar colors.
-    var colorIndex: Int {
-        let text = [account, agent ?? "", session ?? ""].joined(separator: "\u{0}")
-        return Int(text.utf8.reduce(UInt64(14695981039346656037)) { ($0 ^ UInt64($1)) &* 1099511628211 } % 4)
-    }
-
-    static func initials(_ name: String) -> String {
-        let words = name.split(whereSeparator: { $0.isWhitespace })
-        return words.prefix(2).compactMap(\.first).map(String.init).joined().uppercased()
-    }
+    /// Legacy session attribution has no agent ID; use the stable account then.
+    var avatarID: String { agent ?? account }
 }
 
 enum ChatFeedLayout {

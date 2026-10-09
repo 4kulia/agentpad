@@ -217,9 +217,14 @@ struct SidebarView: View {
             ChatSidebarView(store: store, navigation: store.chatNavigation, model: ChatOrgCurrent.shared.model)
         } else {
             VStack(spacing: 0) {
+                if !isCompact && store.sidebarContent == .workspaces {
+                    AttentionSidebarSection(store: store)
+                    AllSessionsSidebarLink(store: store)
+                }
                 ScrollViewReader { proxy in
                     list(isCompact: isCompact, proxy: proxy)
                 }
+                if !isCompact { ChatDisconnectedRow() }
                 NewWorkspaceDropZone(store: store, isCompact: isCompact)
             }
         }

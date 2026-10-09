@@ -45,6 +45,8 @@ struct ChatMentionMenu: View {
                                 ForEach(section.rows) { row in
                                     Button { content.choose(row.candidate) } label: {
                                         HStack(spacing: 8) {
+                                            ContactAvatar(stableID: row.candidate.agentId ?? row.candidate.id,
+                                                          name: row.candidate.label, kind: row.candidate.agentId == nil ? .person : .agent, size: 28)
                                             VStack(alignment: .leading, spacing: 2) {
                                                 HStack(spacing: 5) {
                                                     Text(row.candidate.label).lineLimit(1)

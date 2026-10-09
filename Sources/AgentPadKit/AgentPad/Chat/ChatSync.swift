@@ -15,6 +15,7 @@ final class ChatSync: ChatStreamSink {
         case failed(String)
     }
 
+    let dm: ChatDMSync
     let b1: ChatB1Sync
     let key: ChatOrgKey
     private let store: ChatStore
@@ -82,6 +83,7 @@ final class ChatSync: ChatStreamSink {
     private var readyFailures = 0
 
     init(key: ChatOrgKey, store: ChatStore, api: ChatAPI, socket: ChatSocket, outbox: ChatOutbox?, token: String) {
+        self.dm = ChatDMSync(key: key, store: store, api: api, token: token, socket: socket)
         self.b1 = ChatB1Sync(key: key, store: store, api: api, token: token, socket: socket)
         self.key = key
         self.store = store
@@ -89,6 +91,8 @@ final class ChatSync: ChatStreamSink {
         self.socket = socket
         self.outbox = outbox
         self.token = token
+        dm.onAccessRefused = { [weak self] in self?.rightsInDoubt(); self?.onMembershipInDoubt() }
+        dm.onBudgetChanged = { [weak self] in self?.followChannels(resubscribe: false) }
         b1.onAccessRefused = { [weak self] status in
             self?.rightsInDoubt()
             if status == 404 { self?.onMembershipInDoubt() }
@@ -140,6 +144,7 @@ final class ChatSync: ChatStreamSink {
 
     func stop() {
         stopped = true
+        dm.stop()
         b1.stop()
         snapshotting?.cancel()
         retrying?.cancel()
@@ -157,6 +162,7 @@ final class ChatSync: ChatStreamSink {
     }
 
     private func askSnapshot() {
+        dm.invalidate()
         notInStep()
         snapshotsAsked += 1
     }
@@ -310,6 +316,8 @@ final class ChatSync: ChatStreamSink {
             // The pages' cards and the cards gone: what is followed follows them (review F3b-p1-5).
             followChannels(resubscribe: false)
         }
+        try await dm.reloadCatalog { !self.stopped && self.socket?.epoch == epoch && self.revocations == revoked }
+        guard !stopped, socket.epoch == epoch, revocations == revoked else { throw ChatSyncError.readBeforeRevocation }
         // Requests the snapshot left out, a page at a time; the rule of
         // versions makes their order against events not matter.
         var next = state.requestsNext
@@ -473,6 +481,9 @@ final class ChatSync: ChatStreamSink {
         }
         guard applied == .applied || applied == .passedOver else { return true }
         if applied == .applied, !reading, socket?.syncing.contains(event.stream) == false { onLiveEvent(event) }
+        if applied == .applied, ChatDMStore.events.contains(event.type) {
+            dm.receive(event, live: !reading && socket?.syncing.contains(event.stream) == false)
+        }
         // F4: a post the live feed brought — not a catch-up, not during a snapshot — may owe a notice.
         if event.type == "message.post", event.stream.hasPrefix("channel:"), let id = event.body["message_id"]?.string {
             let channel = String(event.stream.dropFirst("channel:".count))
@@ -558,6 +569,7 @@ final class ChatSync: ChatStreamSink {
     /// The doubt is kept only in the cache; a write that fails is tried
     /// again after a pause until it works (review C6g p1-2).
     func rightsInDoubt(snapshot: Bool = true) {
+        dm.invalidate()
         revocations += 1
         doubtWrites += 1
         writeDoubt(doubtWrites, attempt: 1)
@@ -801,7 +813,8 @@ extension ChatSync {
         let kept = (try? store.queue.read { db in
             try String.fetchAll(db, sql: "SELECT substr(stream, 9) FROM cursors WHERE stream LIKE 'channel:%' ORDER BY seq DESC, stream")
         }) ?? []
-        let budget = max(0, Self.socketStreams - socket.followedCount(excludingPrefix: "channel:") - Self.streamsReserve)
+        let dmReservation = max(0, dm.openIDs.count - dm.followed.count)
+        let budget = max(0, Self.socketStreams - socket.followedCount(excludingPrefix: "channel:") - Self.streamsReserve - dmReservation)
         let open = kept.filter { openChannels.contains($0) }.sorted()
         let order = open + kept.filter { !openChannels.contains($0) }
         let wanted = Set(order.prefix(budget).map { "channel:\($0)" })
@@ -810,6 +823,7 @@ extension ChatSync {
         socket.unsubscribe(Array(before.subtracting(wanted)))
         socket.subscribe(Array(wanted.subtracting(before)), sink: self)
         if resubscribe { socket.resubscribe(Array(wanted.intersection(before))) }
+        dm.follow(resubscribe: resubscribe)
         channelsPausedChanged()
         onFollowed(Set(wanted.map { String($0.dropFirst("channel:".count)) }))
     }

@@ -763,9 +763,12 @@ extension ChatInboxTests {
         let service = ChatService(files: ChatFiles(directory: directory), tokens: FakeTokenStore())
         let unread = inbox(store, org)
         let mention = inbox(store, org, kind: .mentions)
+        // Fixed native click coordinates require an isolated attention source:
+        // earlier tests can leave local reasons in the app-wide ledger.
+        let attention = AttentionSidebarModel(ledger: AttentionLedger())
         func content(_ kind: ChatInboxKind) -> AnyView {
             AnyView(HStack(spacing: 0) {
-                ChatSidebarView(store: workspace, navigation: workspace.chatNavigation, model: org)
+                ChatSidebarView(store: workspace, navigation: workspace.chatNavigation, model: org, attention: attention)
                     .frame(width: 248).background(Theme.chromeBackground)
                 Divider()
                 VStack(spacing: 0) {

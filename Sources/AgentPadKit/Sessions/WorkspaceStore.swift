@@ -143,6 +143,7 @@ final class WorkspaceStore {
     var sidebarContent: SidebarContent = .files
     var chatSidebarPreferences = ChatSidebarPreferences()
     let chatNavigation = ChatSidebarNavigation()
+    var attentionExpanded = false
     var sidebarDisplayWidth: CGFloat {
         sidebarContent == .chat ? CGFloat(ChatSidebarPreferences.clampWidth(chatSidebarPreferences.width)) : sidebarWidth
     }
@@ -657,6 +658,7 @@ final class WorkspaceStore {
         sshRemoteHost: String? = nil,
         conversationId: String? = nil,
         forceResume: Bool = false,
+        claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil,
         rawLaunchCommand: String? = nil,
         customTitle: String? = nil,
         activate: Bool = true,
@@ -695,6 +697,7 @@ final class WorkspaceStore {
             initialCwd: dir,
             conversationId: conversationId,
             forceResume: forceResume,
+            claudeResolution: claudeResolution,
             sshRemoteHost: workspace.sshRemoteHost,
             rawLaunchCommand: rawLaunchCommand,
             customTitle: customTitle,
@@ -1091,6 +1094,7 @@ final class WorkspaceStore {
         initialCwd: URL? = nil,
         conversationId: String? = nil,
         forceResume: Bool = false,
+        claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil,
         initialPrompt: String? = nil,
         rawLaunchCommand: String? = nil,
         customTitle: String? = nil,
@@ -1121,7 +1125,7 @@ final class WorkspaceStore {
         case .local: nil
         case .ssh(let host): host
         }
-        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, initialPrompt: initialPrompt, sshRemoteHost: sshHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, spawnInBackground: spawnInBackground)
+        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, claudeResolution: claudeResolution, initialPrompt: initialPrompt, sshRemoteHost: sshHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, spawnInBackground: spawnInBackground)
         configureSession(session, in: workspace, codexRolloutId: session.resumedConversationId)
         target.tabs.append(session)
         // `activate: false` (CLI --no-focus) appends WITHOUT touching the
@@ -1160,9 +1164,9 @@ final class WorkspaceStore {
     /// has to survive far enough to be shown. Collapsing it to nil made a
     /// history click do nothing at all, with no way to find out why.
     @discardableResult
-    func resumeAgentSession(_ record: AgentSessionRecord) -> Result<Session, ResumeRefusal> {
+    func resumeAgentSession(_ record: AgentSessionRecord, claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil) -> Result<Session, ResumeRefusal> {
         resumeAgentSession(
-            agentId: record.agentId, conversationId: record.conversationId, cwd: record.cwd
+            agentId: record.agentId, conversationId: record.conversationId, cwd: record.cwd, claudeResolution: claudeResolution
         )
     }
 
@@ -1175,10 +1179,17 @@ final class WorkspaceStore {
     /// explicit asks — the `agents.resumeConversations` setting only governs
     /// automatic relaunch-time resume.
     @discardableResult
-    func resumeAgentSession(agentId: String, conversationId: String, cwd: URL) -> Result<Session, ResumeRefusal> {
+    func resumeAgentSession(agentId: String, conversationId: String, cwd: URL,
+                            claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil) -> Result<Session, ResumeRefusal> {
+        let visibility = conversationVisibility()
+        // All sessions resolves off-main. Synchronous callers also resolve only
+        // once, then carry that same result through validation and command building.
+        let resolution = agentId == AgentTemplate.claudeCodeID
+            ? claudeResolution ?? ClaudeSessionResume.resolve(conversationId, root: claudeProjectsRoot, visibility: visibility)
+            : nil
         if let refusal = Self.resumeRefusal(
             agentId: agentId, conversationId: conversationId, options: optionsProvider,
-            visibility: conversationVisibility(), claudeProjectsRoot: claudeProjectsRoot
+            visibility: visibility, claudeProjectsRoot: claudeProjectsRoot, claudeResolution: resolution
         ) {
             return .failure(refusal)
         }
@@ -1189,7 +1200,8 @@ final class WorkspaceStore {
             template: template,
             cwd: cwd,
             conversationId: conversationId,
-            forceResume: true
+            forceResume: true,
+            claudeResolution: resolution
         )
         activateWorkspace(spawned.workspace)
         return .success(spawned.session)
@@ -1215,7 +1227,8 @@ final class WorkspaceStore {
         conversationId: String,
         options: @MainActor (String) -> String? = { AgentPadSettingsModel.shared.agentOptions[$0] },
         visibility: ChannelConversationFilter = .current(),
-        claudeProjectsRoot: URL = ClaudeSessionResume.projectsRoot()
+        claudeProjectsRoot: URL = ClaudeSessionResume.projectsRoot(),
+        claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil
     ) -> ResumeRefusal? {
         guard visibility.allows(agentId: agentId, conversationId: conversationId) else { return .channelConversation }
         guard let template = AgentTemplate.builtin(id: agentId), template.supportsResume else {
@@ -1228,7 +1241,7 @@ final class WorkspaceStore {
             return .unusableConversationId
         }
         if agentId == AgentTemplate.claudeCodeID,
-           case .failure(let refusal) = ClaudeSessionResume.resolve(conversationId, root: claudeProjectsRoot, visibility: visibility) {
+           case .failure(let refusal) = claudeResolution ?? ClaudeSessionResume.resolve(conversationId, root: claudeProjectsRoot, visibility: visibility) {
             return .claudeResume(refusal)
         }
         return nil
@@ -1286,6 +1299,7 @@ final class WorkspaceStore {
         cwdIsConfirmed: Bool = false,
         conversationId: String? = nil,
         forceResume: Bool = false,
+        claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil,
         rawLaunchCommand: String? = nil,
         customTitle: String? = nil,
         activate: Bool = true,
@@ -1300,6 +1314,7 @@ final class WorkspaceStore {
                 initialCwd: dir,
                 conversationId: conversationId,
                 forceResume: forceResume,
+                claudeResolution: claudeResolution,
                 rawLaunchCommand: rawLaunchCommand,
                 customTitle: customTitle,
                 activate: activate,
@@ -1321,6 +1336,7 @@ final class WorkspaceStore {
             template: template,
             conversationId: conversationId,
             forceResume: forceResume,
+            claudeResolution: claudeResolution,
             rawLaunchCommand: rawLaunchCommand,
             customTitle: customTitle,
             activate: activate,
@@ -1334,6 +1350,7 @@ final class WorkspaceStore {
             initialCwd: dir,
             conversationId: conversationId,
             forceResume: forceResume,
+            claudeResolution: claudeResolution,
             rawLaunchCommand: rawLaunchCommand,
             customTitle: customTitle,
             activate: activate,
@@ -2521,7 +2538,7 @@ final class WorkspaceStore {
     /// Spawns the engine + Session. Caller wires `onPwdChange` / `onFocus`
     /// after a workspace ref is available — `restore` builds sessions before
     /// the workspace exists, so callbacks can't capture it here.
-    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, customTitle: String? = nil, spawnInBackground: Bool = false) -> Session {
+    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, customTitle: String? = nil, spawnInBackground: Bool = false) -> Session {
         let engine = engineFactory()
         // Before `engine.start` (and before any view mounts): the flag is
         // what lets the surface come up under a hidden mount (issue #59).
@@ -2542,8 +2559,10 @@ final class WorkspaceStore {
             : nil
         let resumeId = (forceResume || resumeProvider()) ? normalizedConversationId : nil
         var checkedResumeId = resumeId
+        var resolution = claudeResolution
         if template.rosterId == AgentTemplate.claudeCodeID, let id = resumeId {
-            checkedResumeId = try? ClaudeSessionResume.resolve(id, root: claudeProjectsRoot, visibility: visibility).get()
+            resolution = resolution ?? ClaudeSessionResume.resolve(id, root: claudeProjectsRoot, visibility: visibility)
+            checkedResumeId = try? resolution?.get()
             normalizedConversationId = checkedResumeId
         }
         // Grok accepts a caller-assigned UUID for a fresh session. Generate it
@@ -2571,7 +2590,8 @@ final class WorkspaceStore {
             sshHost: sshHost,
             rawLaunchCommand: rawLaunchCommand,
             claudeProjectsRoot: claudeProjectsRoot,
-            visibility: visibility
+            visibility: visibility,
+            claudeResolution: resolution
         )
         config.workingDirectory = initialCwd.path
         // A Claude-Code-based custom agent with an env block hands `claude`

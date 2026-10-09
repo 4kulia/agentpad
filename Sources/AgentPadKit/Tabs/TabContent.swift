@@ -34,6 +34,9 @@ enum SettingsTabSection: String, CaseIterable, Codable, Sendable {
 enum ToolRoute: Codable, Hashable, Sendable {
     case settings
     case notifications
+    case allSessions
+    case directMessage(ChatDMRef)
+    case newDM(OrgKey)
     case linkFailure
     case organization(OrgKey)
     case agent(OrgKey, agentID: String)
@@ -57,7 +60,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
     case unavailable(UUID)
 
     var isWindowScoped: Bool {
-        switch self { case .settings, .notifications, .linkFailure: true; default: false }
+        switch self { case .settings, .notifications, .allSessions, .linkFailure: true; default: false }
     }
     func key(windowID: UUID) -> TabKey {
         // Source metadata is pinned on the route but is not a second identity.
@@ -75,6 +78,9 @@ enum ToolRoute: Codable, Hashable, Sendable {
         switch self {
         case .settings: "Settings"
         case .notifications: "Notifications"
+        case .allSessions: "All sessions"
+        case .directMessage: "Direct message"
+        case .newDM: "New message"
         case .linkFailure: "Link could not be opened"
         case .organization: "Organization"
         case .agent: "Agent"
@@ -102,6 +108,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         switch self {
         case .settings: "gearshape"
         case .notifications: "bell"
+        case .allSessions: "clock"
         case .linkFailure, .unavailable: "exclamationmark.triangle"
         default: "rectangle.on.rectangle"
         }
@@ -129,6 +136,7 @@ struct TabNavigation: Codable, Equatable {
     var fileTransfer: FileTransferSnapshot?
     var draftID: UUID?
     var settingsScrollOffsets: [String: Double]?
+    var allSessions: AllSessionsFilterState?
 }
 
 @MainActor @Observable
@@ -149,6 +157,10 @@ final class TabState {
     @ObservationIgnored var discardEdits: (() -> Void)?
     @ObservationIgnored var canShowConfirmation: () -> Bool = { true }
     let settingsScreen = SettingsScreenState()
+    var allSessionsModel: AllSessionsModel?
+    var dmPendingThread: String?
+    var dmModel: ChatDMModel?
+    var newDMModel: ChatDMNewModel?
     var localForm: LocalFormState?
     var organizationForm: OrganizationFormState?
     var publicationForm: PublicationFormState?
@@ -192,5 +204,5 @@ final class TabState {
         // input even when the last window and its TabState remain alive.
         if !moving { connectionForm?.close(); connectionForm = nil }
     }
-    func close() { leave(); files?.cancel(); viewerForm?.invalidate(); transient.removeAll(); isClosed = true }
+    func close() { dmModel?.stop(); dmModel = nil; newDMModel?.stop(); newDMModel = nil; allSessionsModel?.stop(); allSessionsModel = nil; leave(); files?.cancel(); viewerForm?.invalidate(); transient.removeAll(); isClosed = true }
 }
