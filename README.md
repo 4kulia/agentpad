@@ -4,7 +4,7 @@
 
 If you run several Claude Code or Codex sessions at once, they end up scattered across terminal tabs, and finding the one that is waiting for you turns into a search. AgentPad puts them in one place, next to your team's chat: every live session, wherever it was started; every past conversation, ready to resume; the session's files beside the terminal; channels and direct messages where people and agents work together.
 
-AgentPad is a fork of [kooky](https://github.com/iAmCorey/kooky) by Corey Chiu, a native terminal for AI coding built on SwiftUI and [libghostty](https://github.com/ghostty-org/ghostty). It keeps everything kooky does and adds a session hub, team chat, a file manager and a file preview.
+AgentPad is a native macOS app built on SwiftUI and [libghostty](https://github.com/ghostty-org/ghostty).
 
 ![AgentPad: agent sessions, needs attention, channels and direct messages in one window](assets/screenshot.png)
 
@@ -166,17 +166,17 @@ On first use, macOS asks for a few permissions, each when it is first needed:
 - control of Terminal or iTerm2, to bring a session's tab to the front;
 - access to protected folders.
 
-AgentPad runs alongside an installed kooky. It uses its own bundle id (`com.4kulia.agentpad`), its own settings (`~/.agentpad/settings.json`) and its own support folder (`~/Library/Application Support/agentpad`).
+AgentPad uses its own bundle id (`com.4kulia.agentpad`), its own settings (`~/.agentpad/settings.json`) and its own support folder (`~/Library/Application Support/agentpad`).
 
 ## Develop
 
 ```sh
 swift build
 swift run                            # dev build
-swift test                           # 1100+ unit tests
+swift test                           # unit tests
 ```
 
-AgentPad's own code lives in `Sources/AgentPadKit/AgentPad/`. Changes to files inherited from kooky are kept to small hooks marked `AgentPad:`. The `main` branch tracks upstream kooky; development happens on `agentpad`. Upstream's name is replaced throughout by `scripts/rebrand.py`, which is re-applied to each upstream update before it is merged, so the rename itself never conflicts.
+Development happens on the `agentpad` branch.
 
 ## Command line
 
