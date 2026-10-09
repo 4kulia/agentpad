@@ -42,7 +42,7 @@ import SwiftUI
 struct ChatDMOutboxArchive: Codable {
     var scope: ChatDMRef
     var commands: [ChatCommandRecord]
-    var count: Int { Set(commands.filter { $0.type == "dm.message.post" }.compactMap { record -> String? in
+    var count: Int { Set(commands.filter { $0.type == "dm.message.post" && $0.state != .sent }.compactMap { record -> String? in
         guard let args = try? JSONDecoder().decode(ChatCommandEnvelope.self, from: record.bodyBytes).args,
               let id = args["message_id"]?.string else { return nil }
         return (args["peer_account_id"]?.string ?? args["dm_id"]?.string ?? "") + ":" + id
@@ -79,9 +79,9 @@ extension ChatFiles {
             let args = (try? JSONDecoder().decode(ChatCommandEnvelope.self, from: command.bodyBytes).args) ?? .object([:])
             return command.type + ":" + (args["peer_account_id"]?.string ?? args["dm_id"]?.string ?? "") + ":" + (args["message_id"]?.string ?? command.commandId)
         }
-        let finished = Set(commands.filter { $0.state == .sent || $0.error == "dismissed" }.map(address))
+        let finished = Set(commands.filter { !$0.isSessionDM && ($0.state == .sent || $0.error == "dismissed") }.map(address))
         var saved = Dictionary(uniqueKeysWithValues: (try savedDMOutbox(key)?.commands ?? []).map { ($0.commandId, $0) })
-        for command in commands where command.state != .sent && command.error != "dismissed" { saved[command.commandId] = command }
+        for command in commands where command.isSessionDM || (command.state != .sent && command.error != "dismissed") { saved[command.commandId] = command }
         var latest: [String: ChatCommandRecord] = [:]
         for command in saved.values.sorted(by: { $0.seq < $1.seq }) where !finished.contains(address(command)) {
             latest[address(command)] = command
@@ -96,7 +96,7 @@ extension ChatFiles {
         try store.dmWrite { db in
             for var command in archive.commands {
                 guard try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM outbox WHERE command_id = ?)", arguments: [command.commandId]) != true else { continue }
-                command.state = .unconfirmed; command.error = "unconfirmed"; command.nextAttemptAt = nil
+                if !command.isSessionDM { command.state = .unconfirmed; command.error = "unconfirmed"; command.nextAttemptAt = nil }
                 _ = try store.outbox.insert(db, command)
             }
         }
@@ -126,7 +126,8 @@ extension ChatDMStore {
                   try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM dm_messages WHERE dm_id = ? AND message_id = ?)", arguments: [dm, id]) != true,
                   try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM dm_revisions WHERE dm_id = ? AND message_id = ?)", arguments: [dm, id]) != true else { continue }
             let m = ChatDMMessageWire(messageId: id, dmId: dm, threadRootId: args["thread_root_id"]?.string,
-                authorAccountId: me, text: text, mentions: [], revision: 0, seq: 0, createdAt: ISO8601DateFormatter().string(from: command.createdAt))
+                authorAccountId: me, text: text, mentions: [], revision: 0, seq: 0, createdAt: ISO8601DateFormatter().string(from: command.createdAt),
+                authorSessionName: args["author_session_name"]?.string)
             try db.execute(sql: "INSERT INTO dm_messages (dm_id, message_id, body, seq, root, revision, deleted, local_state, local_error, command_id) VALUES (?, ?, ?, 0, ?, 0, 0, ?, ?, ?)",
                 arguments: [dm, id, try JSONEncoder().encode(m), m.threadRootId, command.state == .pending ? "sending" : "failed", command.error, command.commandId])
             try db.execute(sql: "UPDATE dm_cards SET last_activity = MAX(last_activity, ?) WHERE dm_id = ?", arguments: [m.createdAt, dm])

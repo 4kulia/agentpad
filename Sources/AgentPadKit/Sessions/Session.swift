@@ -172,6 +172,9 @@ final class Session: Identifiable {
     /// drops, so `configureSession` consumers (Codex usage monitor)
     /// don't have to re-derive any gate. Runtime-only.
     var resumedConversationId: String?
+    /// The ID AgentPad put on this tab's launch/resume command line, if any.
+    /// Personal-access checks retain it across hook changes and agent restarts.
+    let launchedConversationId: String?
     /// AgentPad: runtime export binding, separate from persisted/monitored IDs.
     var answerBinding: AgentAnswerSource.Binding?
     var answerBindingProblem: AgentAnswerTranscript.Problem?
@@ -516,7 +519,8 @@ final class Session: Identifiable {
         currentDirectory: URL,
         agent: AgentTemplate,
         customTitle: String? = nil,
-        conversationId: String? = nil
+        conversationId: String? = nil,
+        launchedConversationId: String? = nil
     ) {
         self.id = id
         self.engine = engine
@@ -524,6 +528,7 @@ final class Session: Identifiable {
         self.agent = agent
         self.customTitle = customTitle
         self.conversationId = conversationId
+        self.launchedConversationId = launchedConversationId
     }
 }
 

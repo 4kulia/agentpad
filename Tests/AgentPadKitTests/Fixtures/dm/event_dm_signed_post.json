@@ -1,0 +1,40 @@
+{
+  "stream": "dm:2c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+  "seq": 2,
+  "id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01",
+  "type": "dm.message.post",
+  "actor": {
+    "account_id": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+    "session_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01"
+  },
+  "body": {
+    "dm_id": "2c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+    "message_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01",
+    "revision": 1,
+    "message_seq": 2
+  },
+  "command_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01",
+  "at": "2026-10-08T09:00:00.123456Z",
+  "sig": null,
+  "sig_alg": null,
+  "enc": null,
+  "message": {
+    "message_id": "0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5b01",
+    "dm_id": "2c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+    "thread_root_id": null,
+    "author_account_id": "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40",
+    "text": "Sent by agent session `“Review [private]”`:\n\nHello privately.",
+    "mentions": [
+      {
+        "account_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+      }
+    ],
+    "revision": 1,
+    "seq": 2,
+    "created_at": "2026-10-08T09:00:00.123456Z",
+    "edited_at": null,
+    "deleted_at": null,
+    "author_session_name": "Review [private]",
+    "canonical_text": "Hello privately."
+  }
+}

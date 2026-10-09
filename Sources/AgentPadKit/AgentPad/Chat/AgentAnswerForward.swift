@@ -231,7 +231,7 @@ final class AgentAnswerForward {
     }
 
     private func call(_ args: [String: ChatJSON], revision: Int? = nil,
-                      preparePost: @MainActor (String) throws -> ChatSessionAuthor? = { _ in nil }) async throws -> ChatJSON {
+                      preparePost: @escaping @MainActor (String) throws -> ChatSessionAuthor? = { _ in nil }) async throws -> ChatJSON {
         guard online, let caller else { throw ChatSessionTools.Failure(code: "not_connected") }
         let destinationVersion: String?
         if args["tool"]?.string == "chat_post", let key, let store = service.orgSessions[key]?.store {

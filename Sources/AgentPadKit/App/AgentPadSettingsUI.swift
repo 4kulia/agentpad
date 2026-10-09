@@ -237,6 +237,7 @@ final class AgentPadSettingsModel {
     /// false, every agent tab starts fresh — but the persisted conversation
     /// id stays on disk so turning the toggle back on can resume it later.
     var resumeConversations: Bool = true
+    var agentsDirectMessages = true
     var agentPadPrompt = true
     // AgentPad: Codex's CLI instructions can override its cloud configuration.
     var codexAgentPadPrompt = false
@@ -447,6 +448,7 @@ final class AgentPadSettingsModel {
         agentOptions = (agents["options"] as? [String: String]) ?? [:]
         defaultAgentId = agents["default"] as? String
         resumeConversations = (agents["resumeConversations"] as? Bool) ?? true
+        agentsDirectMessages = ChatDMSettings.enabled(in: parsed)
         agentPadPrompt = AgentPadAgentPrompt.isEnabled(in: parsed)
         codexAgentPadPrompt = AgentPadAgentPrompt.isCodexEnabled(in: parsed)
         agentPadPromptAdditionalInstruction = AgentPadAgentPrompt.additionalInstruction(in: parsed)
@@ -683,6 +685,7 @@ final class AgentPadSettingsModel {
             && serialisedCustom.isEmpty
             && resumeConversations  // default-true is the no-op case
             && agentPadPrompt
+            && agentsDirectMessages
             && !codexAgentPadPrompt
             && agentPadPromptAdditionalInstruction.isEmpty
             && lastAskAgentId == nil
@@ -697,6 +700,7 @@ final class AgentPadSettingsModel {
             agents["custom"] = serialisedCustom.isEmpty ? nil : serialisedCustom
             // Only serialise when non-default to keep settings.json lean.
             agents["resumeConversations"] = resumeConversations ? nil : false
+            agents["directMessages"] = agentsDirectMessages ? nil : false
             agents["agentPadPrompt"] = agentPadPrompt ? nil : false
             agents["codexAgentPadPrompt"] = codexAgentPadPrompt ? true : nil
             agents["agentPadPromptAdditionalInstruction"] = agentPadPromptAdditionalInstruction.isEmpty ? nil : agentPadPromptAdditionalInstruction
@@ -1585,6 +1589,13 @@ struct AgentPadSettingsView: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                 }
+                SettingsRow(label: "Agents in my tabs can read and send direct messages") {
+                    Toggle("", isOn: $model.agentsDirectMessages)
+                        .labelsHidden()
+                        .onChange(of: model.agentsDirectMessages) { _, _ in model.flushSave() }
+                }
+                Text("Only at your request. Colleagues get a fresh session if this session has used direct messages.")
+                    .font(.caption).foregroundStyle(.secondary)
                 SettingsRow(label: "AgentPad context") {
                     Toggle("", isOn: $model.agentPadPrompt)
                         .labelsHidden()

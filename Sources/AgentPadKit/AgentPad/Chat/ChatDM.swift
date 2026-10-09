@@ -46,7 +46,8 @@ struct ChatDMCard: Codable, Equatable, Sendable, Identifiable {
 struct ChatDMPage: Codable, Equatable, Sendable { var dms: [ChatDMCard]; var next: String? }
 struct ChatDMMessagesPage: Codable, Equatable, Sendable { var messages: [ChatDMMessageWire]; var next: Int?; var head: Int? }
 
-/// Deliberately distinct from channel wire decoding: no agent or file attribution.
+/// Deliberately distinct from channel wire decoding: a session signature is
+/// allowed, but published-agent/run attribution and files are absent.
 struct ChatDMMessageWire: Codable, Equatable, Sendable {
     var messageId: String
     var dmId: String
@@ -59,9 +60,12 @@ struct ChatDMMessageWire: Codable, Equatable, Sendable {
     var createdAt: String
     var editedAt: String?
     var deletedAt: String?
+    var authorSessionName: String? = nil
+    var canonicalText: String? = nil
     enum CodingKeys: String, CodingKey {
         case messageId = "message_id", dmId = "dm_id", threadRootId = "thread_root_id", authorAccountId = "author_account_id"
         case text, mentions, revision, seq, createdAt = "created_at", editedAt = "edited_at", deletedAt = "deleted_at"
+        case authorSessionName = "author_session_name", canonicalText = "canonical_text"
     }
 }
 
@@ -69,7 +73,8 @@ extension ChatMessage {
     init(dm m: ChatDMMessageWire) {
         messageId = m.messageId; channelId = ""; dmId = m.dmId; threadRootId = m.threadRootId
         authorAccountId = m.authorAccountId; seq = m.seq > 0 ? m.seq : nil; createdAt = m.createdAt
-        hasFixed = m.seq > 0; hasMutable = true; text = m.deletedAt == nil ? m.text : ""
+        authorSessionName = m.authorSessionName
+        hasFixed = m.seq > 0; hasMutable = true; text = m.deletedAt == nil ? (m.canonicalText ?? m.text) : ""
         mentions = m.deletedAt == nil ? m.mentions.map(\.accountId) : []
         revision = m.revision; editedAt = m.editedAt; deletedAt = m.deletedAt
     }

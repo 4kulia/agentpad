@@ -52,6 +52,7 @@ extension ChatService {
               try store.dmRead({ try ChatOrgView.Member.read($0, account: peer).first }) != nil,
               try store.dmRead({ try ChatDMStore.cardForPeer($0, peer)?.writable }) != false,
               let original = try store.outbox.commands().first(where: { $0.commandId == command }),
+              !original.isSessionDM,
               original.type == "dm.message.post", Self.args(original)["peer_account_id"]?.string == peer,
               original.state != .pending, original.state != .sent, !["dismissed", "retried"].contains(original.error ?? "") else { return }
         var args = Self.args(original)
@@ -106,6 +107,10 @@ extension ChatService {
         }
         var args: [String: ChatJSON] = ["dm_id": .string(dm), "message_id": .string(message), "expected_revision": .number(Double(revision))]
         if let text {
+            if current.authorSessionName != nil {
+                guard supports("chat.dm.session_signature", key: key) else { throw ChatSessionTools.Failure(code: "unsupported") }
+                args["text_format"] = .string("canonical")
+            }
             args["text"] = .string(text)
             args["mentions"] = .array(Set(mentions).intersection([key.accountId, card.peer.accountId]).sorted().map { .object(["account_id": .string($0)]) })
         }
@@ -123,7 +128,7 @@ extension ChatService {
                   let args = Self.args($0)
                   return $0.type == "dm.message.post" && args["message_id"]?.string == row.id
                       && (args["dm_id"]?.string == dm || args["peer_account_id"]?.string == card.peer.accountId)
-              }) else { return }
+              }), !original.isSessionDM else { return }
         var args = Self.args(original)
         if args["dm_id"] == nil { args["open_command_id"] = .string(ChatUUID.v7()) }
         let prepared = try prepareCommand(key, type: original.type, args: .object(args))

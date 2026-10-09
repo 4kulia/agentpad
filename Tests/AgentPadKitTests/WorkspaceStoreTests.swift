@@ -1720,6 +1720,35 @@ final class WorkspaceStoreTests: XCTestCase {
         )
     }
 
+    func testLaunchConversationIDIsFixedAndOnlyRecordsTheActualLaunch() throws {
+        let fixture = try ClaudeResumeFixture()
+        var resume = true
+        let store = WorkspaceStore(persistence: InMemoryPersistence(), engineFactory: { TestEngine() },
+                                   optionsProvider: { _ in nil }, resumeProvider: { resume })
+        defer { store.terminate() }
+        store.claudeProjectsRoot = fixture.root
+        let ws = store.addWorkspace(workingDirectory: projectA)
+        XCTAssertNil(store.addTab(in: ws, template: .claudeCode).launchedConversationId)
+        let resumed = store.addTab(in: ws, template: .claudeCode, conversationId: fixture.id)
+        XCTAssertEqual(resumed.launchedConversationId, fixture.id)
+        store.applyConversationId(conversationId: UUID().uuidString, sessionId: resumed.id)
+        store.applyHookEvent(agent: .claudeCode, event: .ended, sessionId: resumed.id)
+        store.applyHookEvent(agent: .claudeCode, event: .running, sessionId: resumed.id)
+        XCTAssertNil(resumed.resumedConversationId)
+        XCTAssertEqual(resumed.launchedConversationId, fixture.id, "Hooks cannot replace or clear the launch ID")
+
+        let prompted = store.addTab(in: ws, template: .claudeCode, conversationId: fixture.id, initialPrompt: "new question")
+        XCTAssertNil(prompted.launchedConversationId)
+        let blankPrompt = store.addTab(in: ws, template: .claudeCode, conversationId: fixture.id, initialPrompt: " \n ")
+        XCTAssertEqual(blankPrompt.launchedConversationId, fixture.id)
+        let shell = store.addTab(in: ws, template: .terminal, conversationId: fixture.id, rawLaunchCommand: "claude")
+        XCTAssertNil(shell.launchedConversationId)
+        resume = false
+        let fresh = store.addTab(in: ws, template: .claudeCode, conversationId: fixture.id)
+        XCTAssertEqual(fresh.conversationId, fixture.id, "A persisted ID alone is not a launch ID")
+        XCTAssertNil(fresh.launchedConversationId)
+    }
+
     func testFreshGrokSessionPreallocatesAndPersistsExactId() throws {
         let store = makeStore()
         let ws = store.addWorkspace(workingDirectory: projectA)
@@ -1727,6 +1756,7 @@ final class WorkspaceStoreTests: XCTestCase {
 
         let id = try XCTUnwrap(tab.conversationId)
         XCTAssertNotNil(UUID(uuidString: id))
+        XCTAssertEqual(tab.launchedConversationId, id)
         XCTAssertEqual(
             engine(tab).startedConfigs.last?.environment["AGENTPAD_AGENT"],
             "grok --session-id \(id)"
@@ -1758,6 +1788,7 @@ final class WorkspaceStoreTests: XCTestCase {
 
         XCTAssertNotEqual(id, "old-id")
         XCTAssertNotNil(UUID(uuidString: id))
+        XCTAssertEqual(tab.launchedConversationId, id)
         XCTAssertEqual(
             engine(tab).startedConfigs.last?.environment["AGENTPAD_AGENT"],
             "grok --session-id \(id)"
@@ -2222,6 +2253,7 @@ final class WorkspaceStoreTests: XCTestCase {
         let launch = engine(session).startedConfigs.last?.environment["AGENTPAD_AGENT"] ?? ""
         XCTAssertFalse(launch.contains("--resume"), "local conversation ids must not ride to the remote: \(launch)")
         XCTAssertFalse(launch.contains("abc-123"))
+        XCTAssertNil(session.launchedConversationId)
     }
 
     func testSSHWorkspaceSplitInheritsHost() {

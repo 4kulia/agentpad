@@ -196,6 +196,14 @@ final class TeamLauncher {
                 params.conversationRestarted = true
             }
         }
+        // Choose the new ID before journaling it. A resumed personal tab may
+        // have read DMs since the previous call; colleagues get a clean run.
+        let dmHistory = ChatDMHistory(files: ChatFiles(directory: journal.url.deletingLastPathComponent()))
+        if params.resumes == true, dmHistory.needsFreshSession(params.conversationId) {
+            params.conversationId = UUID().uuidString.lowercased()
+            params.resumes = false
+            params.conversationRestarted = true
+        }
         let row = ChatRunRecord(
             runId: params.runId, requestId: approval.requestId, approvalId: approval.id, agentId: approval.agentId,
             conversationId: params.conversationId, startedAt: now(), kind: params.channelId == nil ? "personal" : "channel",
@@ -276,6 +284,8 @@ final class TeamLauncher {
         defer { attachmentFiles?.remove() }
         do {
             request = try params.runRequest(logURL: logURL(runId))
+            request.dmHistoryFiles = ChatFiles(directory: journal.url.deletingLastPathComponent())
+            if params.conversationRestarted == true, params.resumes != true { request.agent.sessionId = nil }
             attachmentFiles = try await prepareAttachmentFiles(params, row)
             try attachmentFiles?.apply(to: &request)
         } catch {

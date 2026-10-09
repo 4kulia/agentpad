@@ -109,7 +109,10 @@ enum ChatDMStore {
         let guardRow = try Row.fetchOne(db, sql: "SELECT revision, deleted FROM dm_revisions WHERE dm_id = ? AND message_id = ?", arguments: [incoming.dmId, incoming.messageId])
         if let guardRow, (guardRow["revision"] as Int) > incoming.revision || ((guardRow["deleted"] as Bool) && incoming.deletedAt == nil) { return }
         var m = incoming
-        if m.deletedAt != nil { m.text = ""; m.mentions = [] }
+        if m.deletedAt != nil {
+            m.text = ""; m.mentions = []
+            if m.canonicalText != nil { m.canonicalText = "" }
+        }
         try db.execute(sql: """
             INSERT INTO dm_revisions (dm_id, message_id, revision, deleted) VALUES (?, ?, ?, ?)
             ON CONFLICT(dm_id, message_id) DO UPDATE SET revision = MAX(revision, excluded.revision), deleted = MAX(deleted, excluded.deleted)

@@ -111,11 +111,22 @@ final class ChatService {
     /// Opens the event feed when signed in (C3, C8); off in tests that do not
     /// stand up a server.
     var followsFeed = false
+    var dmToolsEnabled: @MainActor () -> Bool = { ChatDMSettings.enabled(in: AgentPadSettings.loadParsed() ?? [:]) }
+    var dmToolCursors: [String: ChatDMToolCursor] = [:]
+    var dmToolSending = Set<String>()
     /// Negotiated on each connection; never inferred from cached data.
-    var serverCapabilities: [ChatServerAddress: Set<String>] = [:]
+    var serverCapabilities: [ChatServerAddress: Set<String>] = [:] {
+        didSet {
+            if oldValue.contains(where: { $0.value.contains("chat.attachments") && serverCapabilities[$0.key]?.contains("chat.attachments") != true }) {
+                mcpDownloads.removeAll()
+            }
+        }
+    }
     var serverAttachmentLimits: [ChatServerAddress: ChatAttachmentLimits] = [:]
     @ObservationIgnored var attachmentManagers: [ChatOrgKey: ChatAttachmentManager] = [:]
     var attachmentEpoch = 0
+    @ObservationIgnored let mcpDownloads: ChatMCPDownloads
+    var mcpDownloadDeadline: TimeInterval = 180
     @ObservationIgnored var attachmentCalls: [String: ChatAttachmentCallFiles] = [:]
     var serverB1Limits: [ChatServerAddress: ChatB1.Limits] = [:]
     // TTL refreshes are bookkeeping, not SwiftUI changes. The display revision
@@ -267,6 +278,7 @@ final class ChatService {
 
     init(files: ChatFiles, tokens: ChatTokenStore) {
         self.files = files
+        self.mcpDownloads = ChatMCPDownloads(root: files.mcpDownloadsRoot)
         self.tokens = tokens
         disconnectedDMCount = files.savedDMCount
         self.isDevelopmentBuild = tokens is ChatDevTokenFile

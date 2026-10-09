@@ -15,6 +15,10 @@ struct TeamPublicationEditor: View {
                 if let source = form.fields.sourceConversationID {
                     Text("Source conversation: \(source)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
+                if let source = form.fields.sessionID ?? form.fields.sourceConversationID,
+                   ChatDMHistory(files: ChatService.shared.files).needsFreshSession(source) {
+                    Text(ChatDMHistory.publicationNote).font(.caption).foregroundStyle(.secondary)
+                }
                 Form {
                     if form.fields.mode != nil {
                         Picker("Publish", selection: Binding(get: { form.fields.mode ?? .session }, set: { form.fields.mode = $0 })) {

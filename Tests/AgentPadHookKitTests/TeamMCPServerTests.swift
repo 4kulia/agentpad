@@ -127,6 +127,41 @@ final class TeamMCPServerTests: XCTestCase {
         XCTAssertEqual(content["error"] as? String, "session_process_unavailable")
     }
 
+    func testDMOpenOnlyDoesNotManufactureMessageIDAndHasDistinctUnknownOutcome() throws {
+        let app = FakeApp(), out = Output(), dm = UUID().uuidString.lowercased()
+        app.answer = { request in
+            let args = try! JSONSerialization.jsonObject(with: Data(request.chatArguments!.utf8)) as! [String: Any]
+            XCTAssertNil(args["message_id"])
+            XCTAssertEqual(args["open_only"] as? Bool, true)
+            var result = AgentPadCLIResponse(ok: true)
+            result.chatResult = "{\"status\":\"opened\",\"dm_id\":\"\(dm)\"}"
+            return result
+        }
+        let args: [String: Any] = ["org_id": UUID().uuidString, "kind": "dm", "peer_account_id": UUID().uuidString, "open_only": true]
+        let response = makeServer(app, out).callTool("chat_post", arguments: args, requestKey: "open", progressToken: nil)
+        XCTAssertFalse(response.1)
+        XCTAssertTrue(response.0.contains(dm))
+        let timeout = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { _, _, _ in .failure(.init("timeout")) }, write: { _ in })
+        let unknown = timeout.callTool("chat_post", arguments: args, requestKey: "open", progressToken: nil)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(unknown.0.utf8)) as? [String: Any])
+        XCTAssertEqual(json["status"] as? String, "unknown")
+        XCTAssertEqual(json["operation"] as? String, "open")
+        XCTAssertNil(json["message_id"])
+        for invalid in ["text", "message_id", "thread_root_id", "channel_id", "author_session_name"] {
+            var bad = args; bad[invalid] = UUID().uuidString
+            XCTAssertFalse(AgentPadChatToolArguments.valid("chat_post", bad))
+        }
+    }
+
+    func testAttachmentDownloadUsesItsOwnIPCDeadline() {
+        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { _, seconds, _ in
+            XCTAssertEqual(seconds, 190)
+            return .failure(.init("cancelled"))
+        }, write: { _ in })
+        _ = server.callTool("chat_read", arguments: ["org_id": UUID().uuidString, "channel_id": UUID().uuidString,
+                                                     "attachment_id": UUID().uuidString], requestKey: "download", progressToken: nil)
+    }
+
     func testChatPostImmediatelyForwardsCanonicalArgumentsAndPendingResult() throws {
         let app = FakeApp(), out = Output()
         app.answer = { request in
@@ -138,7 +173,7 @@ final class TeamMCPServerTests: XCTestCase {
         let server = makeServer(app, out)
         call(server, id: 1, method: "initialize")
         let message = "ABCDEF00-0000-4000-8000-000000000001"
-        call(server, id: 2, method: "tools/call", params: ["name": "chat_post", "arguments": ["org_id": "o1", "channel_id": "c1", "text": "@agent@owner hello", "message_id": message]])
+        call(server, id: 2, method: "tools/call", params: ["name": "chat_post", "arguments": ["org_id": "00000000-0000-4000-8000-000000000001", "channel_id": "00000000-0000-4000-8000-000000000002", "text": "@agent@owner hello", "message_id": message]])
         let result = try XCTUnwrap(try wait(out, for: 2)["result"] as? [String: Any])
         XCTAssertEqual((result["structuredContent"] as? [String: Any])?["status"] as? String, "pending")
         XCTAssertEqual(result["isError"] as? Bool, false)
@@ -148,7 +183,7 @@ final class TeamMCPServerTests: XCTestCase {
         XCTAssertTrue(app.requests[0].chatArguments?.contains("chat_post") == true)
         XCTAssertNil(app.requests[0].teamPrompt, "never use team_ask")
         for field in ["author_agent_id", "author_account_id", "author_session_name", "surface_id", "pid", "session_id"] {
-            XCTAssertTrue(server.callTool("chat_post", arguments: ["org_id": "o1", "channel_id": "c1", "text": "hi", field: "forged"], requestKey: field, progressToken: nil).1)
+            XCTAssertTrue(server.callTool("chat_post", arguments: ["org_id": "00000000-0000-4000-8000-000000000001", "channel_id": "00000000-0000-4000-8000-000000000002", "text": "hi", field: "forged"], requestKey: field, progressToken: nil).1)
         }
         XCTAssertEqual(app.requests.count, 1, "model-provided author/provenance never reaches the app")
     }
@@ -160,7 +195,7 @@ final class TeamMCPServerTests: XCTestCase {
             _ = app.send(request)
             return .failure(.init("timeout"))
         }, write: { out.append($0) })
-        let args: [String: Any] = ["org_id": "o1", "channel_id": "c1", "text": "hello"]
+        let args: [String: Any] = ["org_id": "00000000-0000-4000-8000-000000000001", "channel_id": "00000000-0000-4000-8000-000000000002", "text": "hello"]
         func invoke(_ key: String, _ arguments: [String: Any]) throws -> [String: Any] {
             let (raw, failed) = server.callTool("chat_post", arguments: arguments, requestKey: key, progressToken: nil)
             XCTAssertTrue(failed)
@@ -194,7 +229,7 @@ final class TeamMCPServerTests: XCTestCase {
         }, write: { out.append($0) })
         call(server, id: 1, method: "initialize")
         let id = UUID().uuidString.lowercased()
-        call(server, id: 2, method: "tools/call", params: ["name": "chat_post", "arguments": ["org_id": "o", "channel_id": "c", "text": "private text", "message_id": id]])
+        call(server, id: 2, method: "tools/call", params: ["name": "chat_post", "arguments": ["org_id": "00000000-0000-4000-8000-000000000001", "channel_id": "00000000-0000-4000-8000-000000000002", "text": "private text", "message_id": id]])
         XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
         server.handle(line: try JSONSerialization.data(withJSONObject: ["method": "notifications/cancelled", "params": ["requestId": 2]]))
         proceed.signal()
@@ -228,7 +263,7 @@ final class TeamMCPServerTests: XCTestCase {
                 return response
             }
             let server = makeServer(app, out)
-            let (raw, failed) = server.callTool("chat_post", arguments: ["org_id": "o1", "channel_id": "c1", "text": "hi"], requestKey: invalid, progressToken: nil)
+            let (raw, failed) = server.callTool("chat_post", arguments: ["org_id": "00000000-0000-4000-8000-000000000001", "channel_id": "00000000-0000-4000-8000-000000000002", "text": "hi"], requestKey: invalid, progressToken: nil)
             XCTAssertTrue(failed, invalid)
             let result = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
             XCTAssertEqual(result["status"] as? String, "unknown")

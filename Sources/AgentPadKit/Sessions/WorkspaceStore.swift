@@ -2606,23 +2606,22 @@ final class WorkspaceStore {
         let launchID = sshHost == nil && config.environment["AGENTPAD_AGENT"] != nil ? UUID() : nil
         config.environment["AGENTPAD_LAUNCH_ID"] = launchID?.uuidString
         engine.start(config: config)
+        // Mirror the command-line gates: SSH/raw commands carry no local
+        // resume ID, and a non-empty prompt starts a fresh conversation.
+        let promptSuppressesResume = !(initialPrompt?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let resumedConversationId = (sshHost == nil && rawLaunchCommand == nil && !promptSuppressesResume && template.supportsResume)
+            ? checkedResumeId : nil
         let session = Session(
             id: sessionId,
             engine: engine,
             currentDirectory: initialCwd,
             agent: template,
             customTitle: customTitle,
-            conversationId: normalizedConversationId
+            conversationId: normalizedConversationId,
+            launchedConversationId: (sshHost == nil && rawLaunchCommand == nil) ? resumedConversationId ?? newSessionId : nil
         )
         session.pendingAgentLaunch = launchID.map { ($0, !template.isShell) }
-        // Mirror the drops `makeSessionConfig` applies downstream, so the
-        // field records what actually reached the command line: an SSH host
-        // never carries the LOCAL resume id (M5.rrrr), a non-empty initial
-        // prompt suppresses the resume fragment (M5.hh), and a template
-        // without a resume strategy never emits one at all.
-        let promptSuppressesResume = !(initialPrompt?.isEmpty ?? true)
-        session.resumedConversationId = (sshHost == nil && !promptSuppressesResume && template.supportsResume)
-            ? checkedResumeId : nil
+        session.resumedConversationId = resumedConversationId
         session.spawnsInBackground = spawnInBackground
         if let sshHost {
             session.sshWorkspaceHost = sshHost
@@ -3161,7 +3160,10 @@ final class WorkspaceStore {
     /// the engine stays alive and agent records survive.
     private func teardownSessionMonitors(_ session: Session, keepForTransfer: Bool = false) {
         session.terminalConfirmation.invalidate()
-        if !keepForTransfer { onSessionWaitingEnded(session.id) }
+        if !keepForTransfer {
+            onSessionWaitingEnded(session.id)
+            ChatService.shared.mcpDownloads.remove(surface: session.id.uuidString.lowercased())
+        }
         removeGitWatch(sessionId: session.id)
         codexUsageMonitor.stop(sessionId: session.id)
         kiroConversationMonitor.stop(sessionId: session.id, removeRecord: !keepForTransfer)

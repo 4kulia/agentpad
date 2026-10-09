@@ -307,7 +307,10 @@ extension ChatService {
             }
         }
         outbox.maySendCommand = { [weak self] record in
-            if ChatDMStore.commands.contains(record.type) { return self?.supports("chat.dm", key: key) == true }
+            if ChatDMStore.commands.contains(record.type) {
+                return self?.supports("chat.dm", key: key) == true
+                    && (!record.requiresDMSignature || self?.supports("chat.dm.session_signature", key: key) == true)
+            }
             if let capability = attachmentCapability(record.type) {
                 return self?.supports(capability, key: key) == true && self?.attachments(key)?.limits != nil
                     && self?.attachments(key)?.postReady(record) == true
@@ -315,7 +318,10 @@ extension ChatService {
             return !ChatB1.commands.contains(record.type) || self?.supports(ChatB1.capability(for: record.type), key: key) == true
         }
         outbox.isSuspended = { [weak self] record in
-            if ChatDMStore.commands.contains(record.type) { return self?.supports("chat.dm", key: key) != true }
+            if ChatDMStore.commands.contains(record.type) {
+                return self?.supports("chat.dm", key: key) != true
+                    || (record.requiresDMSignature && self?.supports("chat.dm.session_signature", key: key) != true)
+            }
             guard let capability = attachmentCapability(record.type) else { return false }
             return self?.supports(capability, key: key) != true || self?.attachments(key)?.limits == nil
         }

@@ -31,6 +31,7 @@ struct TeamRunRequest: Sendable {
     /// Set only by the channel approval gateway. Ordinary resume and session
     /// agents cannot use a channel transcript as a source.
     var isChannelConversation = false
+    var dmHistoryFiles: ChatFiles = .standard
 }
 
 struct TeamRunResult: Codable, Equatable, Sendable {
@@ -193,14 +194,19 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         guard request.isChannelConversation || visibility.allows(conversationId: request.sessionId) else {
             throw ClaudeSessionResume.Refusal.channelConversation
         }
+        let history = ChatDMHistory(files: request.dmHistoryFiles)
+        let privateResume = request.resume && history.needsFreshSession(request.sessionId)
+        let privateSource = agent.sessionId.map(history.needsFreshSession) ?? false
         let sessionArguments: [String]
-        if request.resume {
+        if privateResume {
+            sessionArguments = ["--session-id", UUID().uuidString.lowercased()]
+        } else if request.resume {
             // Continuing an approved channel run stays within its gateway;
             // opening/forking it as a personal session remains forbidden.
             let policy = request.isChannelConversation ? ChannelConversationFilter(channelIds: []) : visibility
             let id = try ClaudeSessionResume.resolve(request.sessionId, root: sessionFilesRoot, visibility: policy).get()
             sessionArguments = ["--resume", id]
-        } else if let source = agent.sessionId {
+        } else if let source = agent.sessionId, !privateSource {
             let id = try ClaudeSessionResume.resolve(source, root: sessionFilesRoot, visibility: visibility).get()
             sessionArguments = ["--resume", id, "--fork-session", "--session-id", request.sessionId]
         } else {
@@ -258,7 +264,9 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         args += ["--max-turns", String(max(1, agent.maxTurns))]
         if let model = agent.model, !model.isEmpty { args += ["--model", model] }
         if let budget = agent.maxBudgetUSD, budget > 0 { args += ["--max-budget-usd", String(budget)] }
-        args += ["--append-system-prompt", systemPrompt(for: request)]
+        var promptRequest = request
+        if privateSource || privateResume { promptRequest.agent.sessionId = nil }
+        args += ["--append-system-prompt", systemPrompt(for: promptRequest)]
         return args
     }
 

@@ -58,6 +58,16 @@ final class ChatDMPeerModel: ChatDMComposing {
             }) { [weak self] value in self?.accept(value) }
     }
     var outgoing: [ChatCommandRecord] { readable ? content.outgoing : [] }
+    func attribution(_ command: ChatCommandRecord) -> ChatMessageAttribution? {
+        let args = ChatService.args(command)
+        guard readable, let store, let signature = args["author_session_name"]?.string else { return nil }
+        let owner = (try? store.dmRead { try ChatOrgView.Member.read($0, account: key.accountId).first?.name }) ?? "You"
+        var message = ChatMessage(dm: .init(messageId: args["message_id"]?.string ?? command.commandId,
+            dmId: args["dm_id"]?.string ?? "", authorAccountId: key.accountId, text: args["text"]?.string ?? "",
+            mentions: [], revision: 0, seq: 0, createdAt: "", authorSessionName: signature))
+        message.localState = .failed
+        return ChatMessageAttribution(message, ownerName: owner, ownerHandle: nil)
+    }
     private func accept(_ value: Snapshot) {
         content = value
         if value.card?.dmId != result { result = nil }
@@ -145,11 +155,19 @@ struct ChatDMPeerTab: View {
                             ScrollView {
                                 VStack(alignment: .trailing, spacing: 12) {
                                     ForEach(model.outgoing, id: \.commandId) { command in
+                                        if let attribution = model.attribution(command) {
+                                            HStack {
+                                                Text(verbatim: attribution.title).font(Theme.display(13, weight: .semibold))
+                                                ChatBotBadge()
+                                            }
+                                        }
                                         Text(ChatService.args(command)["text"]?.string ?? "")
                                         if command.state == .pending {
                                             Label("Sending…", systemImage: "clock").foregroundStyle(ChatAppearance.secondary)
                                         } else if command.state == .sent {
                                             Text("Sent").foregroundStyle(ChatAppearance.secondary)
+                                        } else if command.isSessionDM {
+                                            Text("Delivery unknown. Retry from the originating agent tab.").foregroundStyle(ChatAppearance.secondary)
                                         } else {
                                             Button("Retry sending") { model.retry(command.commandId) }
                                         }

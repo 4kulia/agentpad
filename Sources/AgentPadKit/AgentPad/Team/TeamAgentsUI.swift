@@ -87,6 +87,10 @@ struct TeamAgentsView: View {
                     .font(Theme.display(11))
                     .foregroundStyle(Theme.chromeMuted)
                     .lineLimit(2)
+                if let source = agent.sessionId,
+                   ChatDMHistory(files: ChatService.shared.files).needsFreshSession(source) {
+                    Text(ChatDMHistory.publicationNote).font(.caption).foregroundStyle(.secondary)
+                }
                 Text(agent.folder)
                     .font(Theme.mono(10))
                     .foregroundStyle(Theme.chromeMuted.opacity(0.8))

@@ -1,0 +1,128 @@
+import Foundation
+import GRDB
+
+enum ChatDMSettings {
+    static func enabled(in parsed: [String: Any]) -> Bool {
+        (parsed["agents"] as? [String: Any])?["directMessages"] as? Bool ?? true
+    }
+}
+
+struct ChatDMToolCursor {
+    var key: ChatOrgKey
+    var scope: String
+    var session: String
+    var generation: String
+    var epoch: Int
+    var after: String
+}
+
+extension ChatSessionTools {
+    static func callDM(_ args: [String: ChatJSON], caller: ChatLocalCaller, service: ChatService,
+                       isCallerWaiting: @escaping @MainActor () -> Bool,
+                       personalConversation: @escaping @MainActor () throws -> ChatPersonalAccess.Conversation,
+                       revalidate: @escaping @MainActor () throws -> Bool) async throws -> ChatJSON {
+        guard service.state == .signedIn, let connection = service.connection else { throw Failure(code: "not_connected") }
+        let org = args["org_id"]?.string?.lowercased() ?? connection.orgId
+        guard let org else { throw Failure(code: "not_connected") }
+        let key = ChatOrgKey(server: connection.server, accountId: connection.accountId, orgId: org)
+        guard service.supports("chat.dm", key: key), service.supports("chat.dm.session_signature", key: key) else { throw Failure(code: "unsupported") }
+        guard service.dmToolsEnabled() else { throw Failure(code: "dm_access_disabled") }
+        func personal() throws -> ChatPersonalAccess.Conversation {
+            do {
+                guard try revalidate() else { throw Failure(code: "dm_not_allowed") }
+                let conversation = try personalConversation()
+                try ChatPersonalAccess.require(conversation, caller: caller, service: service)
+                return conversation
+            } catch { throw Failure(code: "dm_not_allowed") }
+        }
+        let conversation = try personal()
+        guard args["attachment_id"] == nil else { throw Failure(code: "unsupported") }
+        guard isCallerWaiting(), !Task.isCancelled, service.dmAllowed(key), let sync = service.dmSync(key),
+              let store = service.orgSessions[key]?.store, let token = service.token else { throw Failure(code: "not_connected") }
+        let epoch = sync.epoch
+        let stamp = try store.dmRead { db in
+            (try String.fetchOne(db, sql: "SELECT generation FROM meta WHERE id = 1"),
+             try Int.fetchOne(db, sql: "SELECT epoch FROM dm_meta") ?? -1)
+        }
+        guard let generation = stamp.0 else { throw Failure(code: "not_connected") }
+        func current() throws {
+            guard service.dmToolsEnabled() else { throw Failure(code: "dm_access_disabled") }
+            guard service.supports("chat.dm", key: key), service.supports("chat.dm.session_signature", key: key) else { throw Failure(code: "unsupported") }
+            guard isCallerWaiting(), !Task.isCancelled, service.state == .signedIn, let now = service.connection,
+                  now.server == connection.server, now.accountId == connection.accountId, now.orgId == connection.orgId,
+                  now.sessionId == connection.sessionId, service.dmSync(key) === sync, sync.epoch == epoch, service.dmAllowed(key),
+                  try store.dmRead({ db in
+                      try String.fetchOne(db, sql: "SELECT generation FROM meta WHERE id = 1") == generation
+                          && Int.fetchOne(db, sql: "SELECT epoch FROM dm_meta") == stamp.1
+                  }) else { throw Failure(code: "not_found") }
+            guard try personal() == conversation else { throw Failure(code: "dm_not_allowed") }
+        }
+        func recordUse() throws {
+            try current()
+            do { try ChatDMHistory(files: service.files).record(conversation.ids) }
+            catch { throw Failure(code: "dm_not_allowed") }
+        }
+        try current()
+        let api = service.makeAPI(connection.server)
+        var result: ChatJSON
+        let tool = args["tool"]?.string ?? ""
+        let dm = args["dm_id"]?.string?.lowercased(), root = args["thread_root_id"]?.string?.lowercased()
+        switch tool {
+        case "chat_channels":
+            let scope = args["scope"]?.string ?? "dms"
+            var after: String?
+            if let cursor = args["after"]?.string {
+                guard let saved = service.dmToolCursors[cursor], saved.key == key, saved.scope == scope,
+                      saved.session == connection.sessionId, saved.generation == generation, saved.epoch == stamp.1 else { throw Failure(code: "invalid_args") }
+                after = saved.after
+            }
+            var next: String?
+            if scope == "members" {
+                let people = try store.dmRead { try ChatOrgView.Member.read($0) }.filter { $0.accountId != key.accountId }.sorted { $0.accountId < $1.accountId }
+                let page = Array(people.filter { after == nil || $0.accountId > after! }.prefix(100))
+                if let last = page.last, people.contains(where: { $0.accountId > last.accountId }) { next = last.accountId }
+                result = .object(["org_id": .string(org), "members": .array(page.map {
+                    .object(["account_id": .string($0.accountId), "name": .string($0.name), "handle": .string($0.handle)])
+                })])
+            } else {
+                let page = try await api.dmPage(org, after: after, token: token)
+                try current()
+                next = page.next
+                result = .object(["org_id": .string(org), "dms": .array(page.dms.map { card in
+                    .object(["kind": .string("dm"), "dm_id": .string(card.dmId), "state": .string(card.state), "can_post": .bool(card.writable),
+                        "peer": .object(["account_id": .string(card.peer.accountId), "name": .string(card.peer.name), "handle": .string(card.peer.handle)])])
+                })])
+            }
+            var cursor: ChatJSON = .null
+            if let next {
+                let id = UUID().uuidString.lowercased()
+                if service.dmToolCursors.count >= 256 { service.dmToolCursors.removeAll() }
+                service.dmToolCursors[id] = .init(key: key, scope: scope, session: connection.sessionId, generation: generation, epoch: stamp.1, after: next)
+                cursor = .string(id)
+            }
+            if case .object(var fields) = result { fields["next"] = cursor; result = .object(fields) }
+        case "chat_read":
+            guard let dm else { throw Failure(code: "invalid_args") }
+            let page = try await api.dmMessages(org, id: dm, root: root, before: args["before"]?.int, token: token)
+            try current()
+            guard page.messages.count <= 100, page.messages.allSatisfy({ $0.dmId == dm && (root == nil || $0.messageId == root || $0.threadRootId == root) }) else { throw Failure(code: "not_found") }
+            result = .object(["org_id": .string(org), "kind": .string("dm"), "dm_id": .string(dm),
+                "thread_root_id": root.map(ChatJSON.string) ?? .null,
+                "messages": .array(try page.messages.map { message in
+                    let json = try JSONDecoder().decode(ChatJSON.self, from: JSONEncoder().encode(message))
+                    guard case .object(var fields) = json else { throw Failure(code: "not_found") }
+                    fields["text"] = .string(message.deletedAt == nil ? (message.canonicalText ?? message.text) : "")
+                    fields["canonical_text"] = nil
+                    fields["attachments"] = .array([])
+                    return .object(fields)
+                }), "next": page.next.map { .number(Double($0)) } ?? .null])
+        default:
+            result = try await postDM(args, key: key, caller: caller, conversation: conversation, generation: generation,
+                                      service: service, store: store, api: api, token: token, current: current, recordUse: recordUse)
+        }
+        try current()
+        guard try JSONEncoder().encode(result).count <= 1024 * 1024 else { throw Failure(code: "too_large") }
+        try recordUse()
+        return result
+    }
+}

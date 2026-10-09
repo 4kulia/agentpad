@@ -1242,6 +1242,87 @@ final class ChatDMTests: XCTestCase {
         XCTAssertEqual(ChatService(files: service.files, tokens: FakeTokenStore()).disconnectedDMCount, 0)
     }
 
+    func testSignedDMFixturesUseCanonicalTextAndSessionAttributionAcrossHTTPAndEvents() async throws {
+        try await ready()
+        let wire: ChatDMMessageWire = try decode("dm_signed_message", as: ChatDMMessageWire.self)
+        let page = ChatDMMessagesPage(messages: [wire], next: nil, head: wire.seq)
+        routes.set("/v1/orgs/\(org)/dms/\(dm)/messages", String(decoding: try JSONEncoder().encode(page), as: UTF8.self))
+        _ = try await sync.page(dm, before: nil)
+        let message = try XCTUnwrap(try read { try ChatDMStore.messages($0, dm).first { $0.id == wire.messageId } })
+        XCTAssertEqual(message.text, "Hello privately.")
+        XCTAssertEqual(message.authorSessionName, "Review [private]")
+        XCTAssertNil(message.authorAgentId)
+        let attribution = ChatMessageAttribution(message, ownerName: "Anna", ownerHandle: "anna")
+        XCTAssertEqual(attribution.title, "Review [private] (Anna's agent)")
+        XCTAssertNil(attribution.publishedAgentId)
+        XCTAssertTrue(ChatAuthorIdentity(message).isBot)
+        let event = try decode("event_dm_signed_post", as: ChatEvent.self)
+        try write { _ = try ChatDMStore.apply($0, event) }
+        XCTAssertEqual(try read { try ChatDMStore.messages($0, dm).first { $0.id == wire.messageId }?.text }, message.text)
+        let legacy = try decode("dm_message", as: ChatDMMessageWire.self)
+        XCTAssertNil(legacy.authorSessionName); XCTAssertNil(legacy.canonicalText)
+        XCTAssertEqual(ChatMessage(dm: legacy).text, legacy.text)
+    }
+
+    func testSignedDMEditUsesCanonicalContractAndRollbackPausesOnlySignedChanges() async throws {
+        try await ready()
+        service.serverCapabilities[server] = ["chat.dm", "chat.dm.session_signature"]
+        let wire = try decode("dm_signed_message", as: ChatDMMessageWire.self)
+        try write { try ChatDMStore.write($0, wire) }
+        let model = ChatDMModel(key: key, dm: dm, service: service); defer { model.stop() }
+        let message = try XCTUnwrap(model.feed.messages.first { $0.id == wire.messageId })
+        XCTAssertTrue(model.beginEditing(message, root: nil))
+        XCTAssertEqual(model.editing?.text, wire.canonicalText)
+        try service.changeDM(key, dm: dm, message: wire.messageId, text: "Edited privately.", revision: wire.revision)
+        let edit = try XCTUnwrap(store.outbox.commands().last)
+        let expected: ChatCommandEnvelope = try decode("dm_signed_edit_request", as: ChatCommandEnvelope.self)
+        XCTAssertEqual(ChatService.args(edit)["text_format"], expected.args["text_format"])
+        XCTAssertEqual(ChatService.args(edit)["text"]?.string, "Edited privately.")
+        XCTAssertNil(ChatService.args(edit)["author_session_name"])
+        let outbox = ChatOutbox(queues: [store.outbox], api: ChatAPI(server: server), token: "test-only", sessionId: "s-me", held: true)
+        service.configureCommandCapabilities(outbox, key: key)
+        XCTAssertFalse(outbox.isSuspended(edit))
+        service.serverCapabilities[server] = ["chat.dm"]
+        XCTAssertTrue(outbox.isSuspended(edit)); XCTAssertFalse(outbox.maySendCommand(edit))
+        XCTAssertFalse(model.canEdit(message)); XCTAssertTrue(model.canDelete(message))
+        try write { try $0.execute(sql: "DELETE FROM dm_changes") }
+        try service.changeDM(key, dm: dm, message: wire.messageId, text: nil, revision: wire.revision)
+        let deletion = try XCTUnwrap(store.outbox.commands().last)
+        XCTAssertFalse(outbox.isSuspended(deletion))
+        XCTAssertNil(ChatService.args(deletion)["text_format"])
+    }
+
+    func testSignedPendingProjectionAndTombstoneRetainSignatureButEraseBothBodies() async throws {
+        try await ready()
+        let id = UUID().uuidString.lowercased()
+        let prepared = try service.prepareCommand(key, type: "dm.message.post", args: .object([
+            "dm_id": .string(dm), "message_id": .string(id), "text": .string("pending canonical"),
+            "author_session_name": .string("Original tab"), "_mcp": .object([:])]))
+        var record = prepared.record; record.state = .unconfirmed
+        try write { db in
+            _ = try store.outbox.insert(db, record)
+            try ChatDMStore.restoreOutgoing(db, dm: dm, me: me)
+        }
+        let pending = try XCTUnwrap(try read { try ChatDMStore.messages($0, dm).first { $0.id == id } })
+        XCTAssertEqual(pending.text, "pending canonical"); XCTAssertEqual(pending.authorSessionName, "Original tab")
+        XCTAssertEqual(ChatMessageAttribution(pending, ownerName: "Me", ownerHandle: nil).title, "Original tab (Me's agent)")
+        let peerModel = ChatDMPeerModel(key: key, peer: peer, service: service)
+        defer { peerModel.stop() }
+        XCTAssertEqual(peerModel.attribution(record)?.title, "Original tab (Me's agent)")
+        let wire = try decode("dm_signed_message", as: ChatDMMessageWire.self)
+        try write { try ChatDMStore.write($0, wire) }
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture("event_dm_signed_post")) as? [String: Any])
+        object["message"] = nil; object["type"] = "dm.message.delete"
+        var body = object["body"] as! [String: Any]; body["revision"] = 2; object["body"] = body
+        let deletion = try JSONDecoder().decode(ChatEvent.self, from: JSONSerialization.data(withJSONObject: object))
+        try write { _ = try ChatDMStore.apply($0, deletion) }
+        let bytes = try XCTUnwrap(try read { try Data.fetchOne($0, sql: "SELECT body FROM dm_messages WHERE message_id = ?", arguments: [wire.messageId]) })
+        let erased = try JSONDecoder().decode(ChatDMMessageWire.self, from: bytes)
+        XCTAssertEqual(erased.text, ""); XCTAssertEqual(erased.canonicalText, "")
+        XCTAssertEqual(erased.authorSessionName, wire.authorSessionName)
+        XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("Hello privately"))
+    }
+
     func testUnreadableDMQueueCannotBeDeletedByDisconnect() async throws {
         try await ready()
         _ = try service.postDM(key, dm: dm, root: nil, text: "keep this command", mentions: [])

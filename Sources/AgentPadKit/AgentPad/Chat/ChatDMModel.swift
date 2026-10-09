@@ -204,10 +204,12 @@ final class ChatDMModel: ChatConversationPresentation {
         } catch { problem = error.localizedDescription; return false }
     }
     func canEdit(_ message: ChatMessage) -> Bool {
+        canDelete(message) && (message.authorSessionName == nil || service.supports("chat.dm.session_signature", key: key))
+    }
+    func canDelete(_ message: ChatMessage) -> Bool {
         writable && message.authorAccountId == key.accountId && message.hasFixed && !message.deleted && !message.loading && !message.changing && message.localState == nil
     }
-    func canDelete(_ message: ChatMessage) -> Bool { canEdit(message) }
-    func canRetry(_ message: ChatMessage) -> Bool { writable && message.localState == .failed }
+    func canRetry(_ message: ChatMessage) -> Bool { writable && message.localState == .failed && message.authorSessionName == nil }
     @discardableResult func beginEditing(_ message: ChatMessage, root: String?, recovering: Bool = false) -> Bool {
         guard readable, recovering || canEdit(message), let current = self.message(message.id), !current.deleted else { return false }
         editing = .init(messageId: current.id, root: root, text: recovering ? current.localEdit?.text ?? current.text : current.text,

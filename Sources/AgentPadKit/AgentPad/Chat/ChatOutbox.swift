@@ -255,7 +255,7 @@ final class ChatOutbox {
         let state = Dictionary(all.map { ($0.0.commandId, $0.0.state) }, uniquingKeysWith: { a, _ in a })
         let at = now()
         var earliest: Date?
-        var suspended = Set(all.filter { $0.0.state == .pending && isSuspended($0.0) }.map(\.0.commandId))
+        var suspended = Set(all.filter { $0.0.state == .pending && ($0.0.isSessionDM || isSuspended($0.0)) }.map(\.0.commandId))
         var added = true
         while added {
             added = false
@@ -316,7 +316,7 @@ final class ChatOutbox {
             fail(&record, in: queue, code: code)
             return
         }
-        guard !isSuspended(original), maySendCommand(original) else { return }
+        guard !original.isSessionDM, !isSuspended(original), maySendCommand(original) else { return }
         // A button or revocation may have replaced/deleted a prepared send
         // before this task ran. Re-read the durable intent at the send boundary.
         let started: ChatCommandTable.SendStart

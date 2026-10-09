@@ -531,6 +531,7 @@ extension ChatService {
     }
     func invalidateAttachments() {
         attachmentEpoch += 1
+        mcpDownloads.removeAll()
         for manager in attachmentManagers.values { manager.suspend() }
         for files in attachmentCalls.values { files.remove() }; attachmentCalls = [:]
     }
