@@ -128,11 +128,27 @@ struct ChatDMView: View {
     }
 }
 
+@MainActor
+protocol ChatDMComposing: AnyObject {
+    var writable: Bool { get }
+    var problem: String? { get }
+    func draft(root: String?) -> ChatDMContent.Draft?
+    @discardableResult func saveDraft(_ text: String, root: String?) -> String?
+    func send(_ text: String, root: String?, members: [(account: String, handle: String)], version: String?) -> Bool
+    func openThread(_ id: String?)
+    func conversationMessages(root: String?) -> [ChatMessage]
+    func canEdit(_ message: ChatMessage) -> Bool
+    @discardableResult func beginEditing(_ message: ChatMessage, root: String?, recovering: Bool) -> Bool
+}
+
+extension ChatDMModel: ChatDMComposing {}
+
 struct ChatDMComposer: View {
-    let model: ChatDMModel
+    let model: any ChatDMComposing
     let root: String?
     let members: [ChatOrgView.Member]
     let peer: String
+    var isActive: () -> Bool = { true }
     @State private var text = ""
     @State private var version: String?
     @State private var selection = NSRange(location: 0, length: 0)
@@ -145,7 +161,7 @@ struct ChatDMComposer: View {
     private var token: (range: NSRange, query: String)? { ChatMentionCandidate.token(text, caret: selection.location) }
     private var matches: [ChatMentionCandidate] { dismissed ? [] : token.map { ChatMentionCandidate.filtered(candidates, query: $0.query) } ?? [] }
     private var mentionable: [(account: String, handle: String)] { members.map { ($0.accountId, $0.handle) } }
-    private var canSend: Bool { model.writable && version != nil && ChatChannelModel.textProblem(text) == nil }
+    private var canSend: Bool { isActive() && model.writable && version != nil && ChatChannelModel.textProblem(text) == nil }
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             if let problem = model.problem { Text(problem).font(Theme.display(11)).foregroundStyle(ChatAppearance.failure) }
@@ -186,11 +202,13 @@ struct ChatDMComposer: View {
                 if draft?.version != version { text = draft?.text ?? ""; version = draft?.version }
             }
             .onChange(of: text) { _, value in
+                guard isActive() else { return }
                 dismissed = false; candidateIndex = 0
                 if model.draft(root: root)?.text != value { version = model.saveDraft(value, root: root) }
             }
     }
     private func loadDraft() {
+        guard isActive() else { return }
         let draft = model.draft(root: root); text = draft?.text ?? ""
         version = draft?.version ?? model.saveDraft(text, root: root)
     }
@@ -217,7 +235,7 @@ struct ChatDMComposer: View {
         case .closeThread: model.openThread(nil); return true
         case .editLast:
             guard let message = model.conversationMessages(root: root).last(where: model.canEdit) else { return false }
-            return model.beginEditing(message, root: root)
+            return model.beginEditing(message, root: root, recovering: false)
         case .native: return false
         }
     }

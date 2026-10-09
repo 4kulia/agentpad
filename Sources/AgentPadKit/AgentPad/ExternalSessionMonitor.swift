@@ -170,6 +170,19 @@ final class ExternalSessionMonitor {
 
     // MARK: Actions
 
+    var focusTerminal: (ExternalAgentSession) async -> TerminalFocuser.Outcome = { await TerminalFocuser.focus($0) }
+
+    func focus(_ session: ExternalAgentSession, ledger: AttentionLedger = .shared) async -> TerminalFocuser.Outcome {
+        let outcome = await focusTerminal(session)
+        if outcome == .focusedTab, session.monitorState == .attention {
+            // Only a confirmed tab switch counts as viewing; activating the app
+            // alone may leave the waiting tab hidden. Capture the clicked
+            // episode: a new wait may arrive while focus is still running.
+            ledger.markAttentionViewed(AttentionCoordinator.waitingEvent(session))
+        }
+        return outcome
+    }
+
     enum TakeOverError: Error, Equatable {
         case notIdle
         case stillRunning

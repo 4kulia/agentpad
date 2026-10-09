@@ -23,6 +23,13 @@ struct ChatOrgView: Equatable, Sendable {
     struct Member: Equatable, Sendable, Identifiable {
         var accountId, handle, name, role: String
         var id: String { accountId }
+        static func read(_ db: Database, account: String? = nil) throws -> [Self] {
+            try Row.fetchAll(db, sql: "SELECT account_id, handle, name, role FROM members"
+                + (account == nil ? " ORDER BY name COLLATE NOCASE, handle" : " WHERE account_id = ?"),
+                arguments: account.map { [$0] } ?? []).map {
+                    Self(accountId: $0["account_id"], handle: $0["handle"], name: $0["name"], role: $0["role"])
+                }
+        }
     }
 
     struct Team: Equatable, Sendable, Identifiable {
@@ -119,9 +126,7 @@ struct ChatOrgView: Equatable, Sendable {
         let mentions = try ChatUnread.unreadMentionsByChannel(db)
         return ChatOrgView(
             orgName: try String.fetchOne(db, sql: "SELECT org_name FROM meta WHERE id = 1"),
-            members: try Row.fetchAll(db, sql: "SELECT account_id, handle, name, role FROM members ORDER BY name COLLATE NOCASE, handle").map {
-                Member(accountId: $0["account_id"], handle: $0["handle"], name: $0["name"], role: $0["role"])
-            },
+            members: try Member.read(db),
             teams: try Row.fetchAll(db, sql: "SELECT team_id, name, is_general, archived_at, mine FROM teams ORDER BY is_general DESC, name COLLATE NOCASE").map {
                 let id: String = $0["team_id"]
                 return Team(teamId: id, name: $0["name"], isGeneral: $0["is_general"], archived: ($0["archived_at"] as String?) != nil,
@@ -405,10 +410,10 @@ final class ChatOrgModel {
     /// A channel's name, only while its card may be seen.
     func channelName(_ id: String) -> String? { visibleChannel(id)?.name }
 
-    /// F4: a channel's unread, while it may be seen.
+    /// Only top-level messages make a channel unread. Replies stay in the inbox
+    /// and the root's "new" marker, with their own read marks.
     func unread(_ channel: String) -> ChatUnread.Count? {
         guard visibleChannel(channel) != nil, var count = view.unread[channel] else { return nil }
-        count.count += view.unreadRepliesByChannel[channel, default: 0]
         // "•" says "not counted": only for a channel not followed (review F4-C).
         if isFollowed(channel) { count.something = false }
         return count

@@ -88,7 +88,8 @@ final class ChatInboxTests: XCTestCase {
             }
             try post(store, "private", seq: 15, channel: "hidden")
             try refresh(store, org)
-            XCTAssertEqual(org.unread("alpha")?.count, 1, "a cold cache already has a badge, but no message text")
+            XCTAssertEqual(org.unread("alpha")?.count, 0, "a cold placeholder is not a counted message")
+            XCTAssertTrue(org.unread("alpha")?.more == true, "the window gap still triggers history loading")
             XCTAssertTrue(try entries(store, kind).allSatisfy { $0.message.loading })
             XCTAssertEqual(try read(store) { try ChatInboxLoading.snapshot($0, ref: ChatInboxRef(key, kind: kind), session: "s").targets.map(\.channel) }, ["alpha"])
             let model = ChatInboxModel(ref: ChatInboxRef(key, kind: kind))
@@ -445,7 +446,7 @@ final class ChatInboxTests: XCTestCase {
         XCTAssertTrue(hidden.isEmpty)
     }
 
-    func testUnreadGroupsIncludeRepliesAndMatchSidebarWithoutReadingOnOpen() throws {
+    func testUnreadGroupsIncludeRepliesWhileSidebarCountsOnlyRootsWithoutReadingOnOpen() throws {
         let (store, org) = try fixture()
         try post(store, "self", seq: 1, author: me)
         try post(store, "root", seq: 2)
@@ -457,12 +458,56 @@ final class ChatInboxTests: XCTestCase {
         XCTAssertEqual(model.entries(org).map(\.id), ["root", "reply", "second"])
         try refresh(store, org)
         let sidebar = ChatSidebarSnapshot(model: org, active: nil)
-        XCTAssertEqual(sidebar.unread.count, 3)
-        XCTAssertEqual(sidebar.teams.flatMap(\.channels).map { $0.unread.count }, [2, 1])
+        XCTAssertEqual(sidebar.unread.count, 2)
+        XCTAssertEqual(sidebar.teams.flatMap(\.channels).map { $0.unread.count }, [1, 1])
         XCTAssertEqual(try read(store) { try ChatUnread.count($0, channel: "alpha", me: me).count }, 1, "F4 root count retains its meaning")
         XCTAssertEqual(try read(store) { try ChatUnread.readSequence($0, channel: "alpha") }, 1, "opening a list does not read it")
         var changed = org.view; changed.unreadRepliesByChannel = [:]
-        XCTAssertNotEqual(changed, org.view, "reply-only changes invalidate the sidebar")
+        XCTAssertNotEqual(changed, org.view, "reply-only changes update the inbox's missing-history count")
+    }
+
+    func testReadChannelWithFiveUnreadRepliesKeepsInboxAndNewMarkersAtZeroBadge() throws {
+        let (store, org) = try fixture()
+        try post(store, "root", seq: 1, mentions: [])
+        for seq in 2...6 {
+            try post(store, "reply-\(seq)", seq: seq, root: "root", mentions: seq == 2 ? [me] : [])
+        }
+        try write(store) { try ChatUnread.markRead($0, channel: "alpha", upTo: 6) }
+        try refresh(store, org)
+        let sidebar = ChatSidebarSnapshot(model: org, active: nil)
+        let channel = try XCTUnwrap(sidebar.teams.flatMap(\.channels).first { $0.id == "alpha" })
+        XCTAssertEqual(channel.unread.count, 0)
+        XCTAssertNil(channel.unreadLabel)
+        XCTAssertFalse(channel.isUnread, "a thread mention must not make the channel bold")
+        XCTAssertEqual(sidebar.unread.count, 0)
+        XCTAssertNil(ChatSidebarSnapshot.unreadLabel(sidebar.unread))
+        XCTAssertEqual(sidebar.mentions, 1, "thread mentions remain in Mentions")
+        let replies = try entries(store)
+        XCTAssertEqual(replies.map(\.id), (2...6).map { "reply-\($0)" })
+        let presentation = ChatInboxPresentation(kind: .unread, entries: replies, sidebar: sidebar)
+        XCTAssertFalse(presentation.isEmpty)
+        XCTAssertEqual(presentation.entries.map(\.id), replies.map(\.id))
+        XCTAssertTrue(presentation.missing.isEmpty)
+        XCTAssertEqual(try read(store) { try ChatUnread.unreadRepliesByRoot($0, channel: "alpha").map(\.count) }, [5])
+        let loading = try read(store) { try ChatInboxLoading.snapshot($0, ref: ChatInboxRef(key, kind: .unread), session: "s") }
+        XCTAssertEqual(loading.targets.map(\.channel), ["alpha"])
+        XCTAssertFalse(try XCTUnwrap(loading.targets.first).unfollowedOnly)
+    }
+
+    func testReplyOnlyInboxHasNoCountedRemainderForPlaceholders() throws {
+        let (store, org) = try fixture()
+        try post(store, "reply", seq: 2, root: "old-root", mentions: [])
+        try write(store) { db in
+            try db.execute(sql: "INSERT INTO messages (message_id, channel_id, seq, thread_root_id) VALUES ('placeholder', 'alpha', 3, 'old-root')")
+            try ChatUnread.markRead(db, channel: "alpha", upTo: 3)
+        }
+        try refresh(store, org)
+        let sidebar = ChatSidebarSnapshot(model: org, active: nil)
+        XCTAssertEqual(sidebar.unread.count, 0)
+        let presentation = ChatInboxPresentation(kind: .unread, entries: try entries(store), sidebar: sidebar)
+        XCTAssertEqual(presentation.entries.map(\.id), ["reply"])
+        XCTAssertEqual(presentation.groups.map(\.id), ["alpha"])
+        XCTAssertTrue(presentation.missing.isEmpty)
     }
 
     func testMentionHistoryUsesExactRecipientsNewestFirstAndF4ReadStatus() throws {
@@ -616,7 +661,7 @@ final class ChatInboxTests: XCTestCase {
         XCTAssertNil(try write(store) { try ChatUnread.owe($0, messageId: "self", me: me) })
     }
 
-    func testPlaceholderAndDeletedRootsKeepF4CountAndMoreIndicator() throws {
+    func testPlaceholderAndDeletedRootsLeaveOnlyTheMoreIndicator() throws {
         let (store, org) = try fixture()
         try post(store, "deleted", seq: 10, deleted: true)
         try write(store) { db in
@@ -626,11 +671,41 @@ final class ChatInboxTests: XCTestCase {
             try db.execute(sql: "INSERT INTO cursors (stream, seq) VALUES ('channel:beta', 20)")
         }
         org.isFollowed = { _ in false }; try refresh(store, org)
-        XCTAssertEqual(try entries(store).map(\.id), ["deleted", "unknown", "unknown-reply"])
+        XCTAssertTrue(try entries(store).isEmpty)
         let sidebar = ChatSidebarSnapshot(model: org, active: nil)
-        XCTAssertEqual(sidebar.unread.count, 3); XCTAssertTrue(sidebar.incomplete)
+        XCTAssertEqual(sidebar.unread.count, 0); XCTAssertTrue(sidebar.incomplete)
         XCTAssertTrue(sidebar.teams.flatMap(\.channels).first { $0.id == "beta" }!.unread.something)
         XCTAssertTrue(try entries(store, .mentions).isEmpty)
+    }
+
+    func testDeletedMessagesNeverCountWithOrWithoutNotificationRows() throws {
+        let (store, org) = try fixture()
+        try post(store, "live-root", seq: 1, mentions: [])
+        try post(store, "live-reply", seq: 2, root: "live-root", mentions: [])
+        for (offset, root) in [nil, "live-root"].enumerated() {
+            try post(store, "deleted-\(offset)", seq: 3 + offset, root: root, deleted: true)
+            try post(store, "notified-\(offset)", seq: 5 + offset, root: root, deleted: true)
+            try write(store) { db in
+                try db.execute(sql: """
+                    INSERT INTO notified (object_id, kind, channel_id, seq, read, thread_root_id)
+                    VALUES (?, 'mention', 'alpha', ?, 0, ?)
+                    """, arguments: ["notified-\(offset)", 5 + offset, root])
+            }
+        }
+        // Revision 2 alone is an edit, not a deletion.
+        try write(store) { try $0.execute(sql: "UPDATE messages SET revision = 2 WHERE message_id = 'live-root'") }
+        try refresh(store, org)
+        XCTAssertEqual(try entries(store).map(\.id), ["live-root", "live-reply"])
+        XCTAssertTrue(try entries(store, .mentions).isEmpty)
+        let sidebar = ChatSidebarSnapshot(model: org, active: nil)
+        XCTAssertEqual(sidebar.unread.count, 1)
+        XCTAssertEqual(org.unread("alpha")?.count, 1)
+        XCTAssertEqual(try read(store) { try ChatUnread.unreadRepliesByChannel($0) }, ["alpha": 1])
+        XCTAssertEqual(try read(store) { try ChatUnread.unreadRepliesByRoot($0, channel: "alpha").map(\.count) }, [1])
+        let channel = ChatChannelModel(key: key, channel: "alpha"); channel.follow(store)
+        try write(store) { try ChatUnread.markRead($0, channel: "alpha", upTo: 2) }
+        channel.beginReading(root: nil)
+        XCTAssertNil(channel.feed.unreadID, "a deleted root cannot start an unread divider")
     }
 
     func testMarkAllFailureRollsBackAndDoesNotDismissDivider() throws {

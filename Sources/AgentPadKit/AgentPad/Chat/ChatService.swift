@@ -80,6 +80,7 @@ final class ChatOrgSession {
         if let journal { queues.append(journal.runCommands(key)) }
         let made = ChatOutbox(queues: queues, api: api, token: token, sessionId: sessionId, held: true)
         made.onUnauthorized = onUnauthorized
+        made.onDMOpened = { [weak self] dm in self?.sync?.dm.opened(dm) }
         outbox = made
         made.adoptSession(sessionId, token: token)
     }

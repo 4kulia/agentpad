@@ -36,6 +36,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
     case notifications
     case allSessions
     case directMessage(ChatDMRef)
+    case directMessageDraft(OrgKey, peer: String)
     case newDM(OrgKey)
     case linkFailure
     case organization(OrgKey)
@@ -79,7 +80,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         case .settings: "Settings"
         case .notifications: "Notifications"
         case .allSessions: "All sessions"
-        case .directMessage: "Direct message"
+        case .directMessage, .directMessageDraft: "Direct message"
         case .newDM: "New message"
         case .linkFailure: "Link could not be opened"
         case .organization: "Organization"
@@ -160,6 +161,7 @@ final class TabState {
     var allSessionsModel: AllSessionsModel?
     var dmPendingThread: String?
     var dmModel: ChatDMModel?
+    var dmPeerModel: ChatDMPeerModel?
     var newDMModel: ChatDMNewModel?
     var localForm: LocalFormState?
     var organizationForm: OrganizationFormState?
@@ -204,5 +206,5 @@ final class TabState {
         // input even when the last window and its TabState remain alive.
         if !moving { connectionForm?.close(); connectionForm = nil }
     }
-    func close() { dmModel?.stop(); dmModel = nil; newDMModel?.stop(); newDMModel = nil; allSessionsModel?.stop(); allSessionsModel = nil; leave(); files?.cancel(); viewerForm?.invalidate(); transient.removeAll(); isClosed = true }
+    func close() { dmPeerModel?.stop(); dmPeerModel = nil; dmModel?.stop(); dmModel = nil; newDMModel?.stop(); newDMModel = nil; allSessionsModel?.stop(); allSessionsModel = nil; leave(); files?.cancel(); viewerForm?.invalidate(); transient.removeAll(); isClosed = true }
 }

@@ -30,6 +30,7 @@ final class ChatChannelModel {
 
     let key: ChatOrgKey
     let channel: String
+    @ObservationIgnored var log: (String) -> Void = { NSLog("%@", $0) }
     weak var confirmation: ConfirmationCoordinator?
     var tabID: UUID?
     var channelAsk: ChannelAskModel?
@@ -854,29 +855,37 @@ final class ChatChannelModel {
     /// root; notices of what is read go.
     func markRead(clearingBoundary: Bool = true) {
         MainThreadWatchdog.shared.checkpoint()
-        if clearingBoundary { clearReadBoundary(root: nil) }
         // Automatic reading stops before a placeholder (review F4c-1).
+        // completeShown hydrates it; the timeline retries when messages change.
         // Explicit Mark as read also acknowledges history not loaded yet.
         let known = feed.messages.filter { $0.seq != nil }
         let firstUnknown = known.filter { !$0.hasFixed }.compactMap(\.seq).min()
         let wholly = known.filter { m in m.hasFixed && (firstUnknown.map { (m.seq ?? 0) < $0 } ?? true) }
-        guard let last = clearingBoundary ? readHead() : wholly.compactMap(\.seq).max(), let store else { return }
-        let channel = channel
-        let ids = (try? store.queue.write { db in try ChatUnread.markRead(db, channel: channel, upTo: last) }) ?? []
-        if !ids.isEmpty { ChatNotifications.reconcile(service) }
+        guard let last = clearingBoundary ? readHead() : wholly.compactMap(\.seq).max() else { return }
+        saveReadMark(upTo: last, root: nil, clearingBoundary: clearingBoundary)
     }
 
     /// The thread's panel is open: its notices are read.
     func markThreadRead(_ root: String, clearingBoundary: Bool = true) {
-        guard let store else { return }
         guard root == threadRoot else { return }
-        if clearingBoundary { clearReadBoundary(root: root) }
-        let channel = channel
         let known = thread.filter { $0.seq != nil }
         let firstUnknown = known.filter { !$0.hasFixed }.compactMap(\.seq).min() ?? Int.max
         let last = (clearingBoundary ? readHead() : known.filter { $0.hasFixed && ($0.seq ?? 0) < firstUnknown }.compactMap(\.seq).max()) ?? 0
-        let ids = (try? store.queue.write { db in try ChatUnread.markRead(db, channel: channel, upTo: last, thread: root) }) ?? []
-        if !ids.isEmpty { ChatNotifications.reconcile(service) }
+        saveReadMark(upTo: last, root: root, clearingBoundary: clearingBoundary)
+    }
+
+    private func saveReadMark(upTo last: Int, root: String?, clearingBoundary: Bool) {
+        guard let store else { return }
+        let channel = channel
+        do {
+            let ids = try store.queue.write { db in try ChatUnread.markRead(db, channel: channel, upTo: last, thread: root) }
+            if clearingBoundary { clearReadBoundary(root: root) }
+            if !ids.isEmpty { ChatNotifications.reconcile(service) }
+        } catch {
+            // No successful mark is cached: the next automatic read retries
+            // this same sequence even when no new message has arrived.
+            log("[ChatUnread] Could not save read mark channel=\(channel) thread=\(root ?? "channel") seq=\(last): \(error)")
+        }
     }
 
     // MARK: Drafts

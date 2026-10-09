@@ -104,8 +104,10 @@ struct ChatSidebarSnapshot {
         var card: ChatChannelCard
         var unread: ChatUnread.Count
         var mentions: Int
+        /// Included in the inbox's missing-history count, never the channel badge.
+        var unreadReplies = 0
         var id: String { card.channelId }
-        var isUnread: Bool { unread.count > 0 || unread.more || unread.something || mentions > 0 }
+        var isUnread: Bool { unread.count > 0 || unread.more || unread.something }
         var unreadLabel: String? { ChatSidebarSnapshot.unreadLabel(unread) }
         var mentionLabel: String? { mentions > 0 ? "@\(mentions)" + (unread.more || unread.something ? "+" : "") : nil }
     }
@@ -146,10 +148,12 @@ struct ChatSidebarSnapshot {
             Team(card: team, channels: model.channels(of: team).compactMap { card in
                 guard model.visibleChannel(card.channelId) != nil else { return nil }
                 return Channel(card: card, unread: model.unread(card.channelId) ?? .init(),
-                               mentions: model.unreadMentions(card.channelId))
+                               mentions: model.unreadMentions(card.channelId),
+                               unreadReplies: model.view.unreadRepliesByChannel[card.channelId, default: 0])
             }, creating: model.creatingChannels(in: team))
         }
         for channel in teams.flatMap(\.channels) {
+            // The Unread navigation badge is the sum of channel badges; its list also contains replies.
             unread.count += channel.unread.count
             unread.more = unread.more || channel.unread.more
             unread.something = unread.something || channel.unread.something

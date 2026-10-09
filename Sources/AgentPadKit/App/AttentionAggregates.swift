@@ -104,7 +104,7 @@ final class AttentionSidebarModel {
         _ = dismissalRevision
         return AttentionList.items(ledger: ledger.events, current: current,
             mentions: aggregates.mentions, dms: aggregates.dms, settings: AgentPadSettingsModel.shared.attentionSettings,
-            dismissed: Set(ledger.metadata.markers.filter { $0.value.hidden }.keys))
+            dismissed: Set(ledger.metadata.markers.filter { $0.value.hidden }.keys), viewed: ledger.viewedAttentionIDs)
     }
 
     func refresh(service: ChatService = .shared, ledger: AttentionLedger? = nil) {

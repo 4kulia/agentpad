@@ -15,8 +15,11 @@ enum ChatUnread {
         CASE WHEN m.thread_root_id IS NULL THEN MAX(IFNULL(r.last_read_seq, 0), 0)
         ELSE MAX(IFNULL(r.thread_read_seq, 0), IFNULL(seen.last_read_seq, 0), 0) END
         """
-    static let unreadSQL = "m.seq > (\(readSequenceSQL)) AND (m.thread_root_id IS NULL OR IFNULL(n.read, 0) = 0)"
-    static let unreadMentionSQL = "m.seq > (\(readSequenceSQL)) AND IFNULL(n.read, 0) = 0"
+    static let unreadSQL = """
+        m.has_fixed = 1 AND m.deleted_at IS NULL
+        AND m.seq > (\(readSequenceSQL)) AND IFNULL(n.read, 0) = 0
+        """
+    static let unreadMentionSQL = unreadSQL
     static let mentionSQL = """
         m.has_fixed = 1 AND m.has_mutable = 1 AND m.deleted_at IS NULL
         AND m.author_account_id != (SELECT me FROM meta WHERE id = 1)
@@ -40,7 +43,7 @@ enum ChatUnread {
         return Dictionary(uniqueKeysWithValues: rows.map { ($0["channel_id"] as String, $0["count"] as Int) })
     }
 
-    /// The channel badge's replies, grouped even when their roots are outside the cache.
+    /// Unread replies for each root's "new" marker, including roots outside the cache.
     static func unreadRepliesByRoot(_ db: Database, channel: String) throws -> [(root: String, count: Int)] {
         try Row.fetchAll(db, sql: """
             SELECT m.thread_root_id AS root_id, COUNT(*) AS count \(unreadRepliesSQL) AND m.channel_id = ?
@@ -70,7 +73,7 @@ enum ChatUnread {
         // channel already knew, including posts whose conversation is not loaded.
         let last = try Int.fetchOne(db, sql: "SELECT MAX(seq) FROM messages WHERE channel_id = ?", arguments: [channel]) ?? 0
         let head = try Int.fetchOne(db, sql: "SELECT seq FROM cursors WHERE stream = ?", arguments: ["channel:\(channel)"]) ?? 0
-        let read = try String.fetchAll(db, sql: "SELECT object_id FROM notified WHERE channel_id = ? AND thread_root_id = ? AND read = 1",
+        let read = try String.fetchAll(db, sql: "SELECT object_id FROM notified WHERE channel_id = ? AND thread_root_id IS ? AND read = 1",
                                       arguments: [channel, root])
         return try Boundary(after: readSequence(db, channel: channel, thread: root), through: max(last, head),
                             pending: pendingPosts(db, channel: channel, thread: root), readIDs: Set(read))
@@ -100,7 +103,7 @@ enum ChatUnread {
         arguments += StatementArguments(readIDs)
         return try String.fetchOne(db, sql: """
             SELECT message_id FROM messages WHERE channel_id = ? AND thread_root_id IS ?
-                AND has_fixed = 1 AND author_account_id != (SELECT me FROM meta WHERE id = 1)
+                AND has_fixed = 1 AND deleted_at IS NULL AND author_account_id != (SELECT me FROM meta WHERE id = 1)
                 AND seq > MAX(?, IFNULL((SELECT MAX(seq) FROM messages WHERE channel_id = ? AND thread_root_id IS ?
                     AND author_account_id = (SELECT me FROM meta WHERE id = 1)), 0))
                 AND seq <= ? \(readFilter) ORDER BY seq LIMIT 1
@@ -125,16 +128,16 @@ enum ChatUnread {
         var muted = false
     }
 
-    /// Root messages of others above the channel's mark.
+    /// Known, undeleted roots of others above the channel's mark, excluding
+    /// roots already viewed in their thread panel.
     static func count(_ db: Database, channel: String, me: String) throws -> Count {
         let mark = try Row.fetchOne(db, sql: "SELECT last_read_seq, muted FROM read_marks WHERE channel_id = ?", arguments: [channel])
         let last = max(0, (mark?["last_read_seq"] as Int?) ?? 0)
-        // A placeholder (a post without its message) counts as another's root
-        // until its read shows otherwise (review F4b-2).
         let n = try Int.fetchOne(db, sql: """
-            SELECT COUNT(*) FROM messages WHERE channel_id = ? AND thread_root_id IS NULL AND seq > ?
-                AND (author_account_id IS NULL OR author_account_id != ?)
-            """, arguments: [channel, last, me]) ?? 0
+            SELECT COUNT(*) FROM messages m \(readJoins)
+            WHERE m.channel_id = ? AND m.thread_root_id IS NULL AND \(unreadSQL)
+                AND (m.author_account_id IS NULL OR m.author_account_id != ?)
+            """, arguments: [channel, me]) ?? 0
         let bottom = try Int.fetchOne(db, sql: "SELECT bottom_seq FROM channel_windows WHERE channel_id = ?", arguments: [channel]) ?? 0
         let head = try Int.fetchOne(db, sql: "SELECT seq FROM cursors WHERE stream = ?", arguments: ["channel:\(channel)"]) ?? 0
         // The window starts above the mark: unread may lie below it, counted or

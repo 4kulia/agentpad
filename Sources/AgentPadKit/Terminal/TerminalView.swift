@@ -28,6 +28,30 @@ struct TerminalTabHost: NSViewRepresentable {
 final class TerminalTabHostView: NSView {
     private var mountedViews: [UUID: NSView] = [:]
     private var focusedTabID: UUID?
+    private var viewCheckScheduled = false
+    var onVisibilityChange: () -> Void = { AttentionLedger.shared.markFocusedAttentionViewed() }
+
+    // Check after AppKit/SwiftUI has applied the tab or workspace switch.
+    // Selecting a model in a hidden workspace must never acknowledge a wait.
+    private func scheduleViewCheck() {
+        guard !viewCheckScheduled else { return }
+        viewCheckScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.viewCheckScheduled = false
+            self.onVisibilityChange()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        scheduleViewCheck()
+    }
+
+    override func viewDidUnhide() {
+        super.viewDidUnhide()
+        scheduleViewCheck()
+    }
 
     override func layout() {
         super.layout()
@@ -37,6 +61,7 @@ final class TerminalTabHostView: NSView {
         for view in mountedViews.values where view.superview === self {
             view.frame = bounds
         }
+        scheduleViewCheck()
     }
 
     func update(tabs: [Session], activeTabId: UUID?, grabsFocusOnMount: Bool) {
@@ -86,5 +111,6 @@ final class TerminalTabHostView: NSView {
             }
             mountedViews[id] = nil
         }
+        scheduleViewCheck()
     }
 }

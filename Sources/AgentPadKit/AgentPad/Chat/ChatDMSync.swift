@@ -146,6 +146,9 @@ final class ChatDMSync: ChatStreamSink {
             if let self, epoch == captured { work[name] = nil }
         }
     }
+    func opened(_ id: String) {
+        schedule("card:\(id)") { [weak self] in _ = try await self?.refresh(id) }
+    }
     @discardableResult func refresh(_ id: String) async throws -> ChatDMCard {
         let captured = epoch
         guard current(captured) else { throw CancellationError() }

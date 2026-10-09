@@ -2,7 +2,8 @@ import Foundation
 
 /// The send queue of one organization (docs/agentpad/CHAT-PLAN.md C2). A
 /// command gets its `command_id` and its bytes once; every repeat sends the
-/// same bytes. Commands with one `order_key` go one after another, except
+/// same bytes. A first DM keeps its two wire IDs in one durable queue row,
+/// resolving its peer address before posting. Commands with one `order_key` go one after another, except
 /// suspended protocol work; its dependents remain suspended as well.
 ///
 /// | Answer | What happens |
@@ -75,6 +76,9 @@ final class ChatOutbox {
     var onPermanentFailure: @MainActor (ChatCommandRecord, String) -> Void = { _, _ in }
     /// A command was accepted, with the server's answer.
     var onSent: @MainActor (ChatCommandRecord, ChatCommandAnswer?) -> Void = { _, _ in }
+    /// A first DM's durable address was resolved. Hydration is presentation
+    /// work; posting does not wait for it or depend on a DM snapshot epoch.
+    var onDMOpened: @MainActor (String) -> Void = { _ in }
     /// The server refused a command for good (4xx but 401 and 429), told as
     /// the answer comes, before its record is written.
     var onRefused: @MainActor (ChatCommandRecord, String) -> Void = { _, _ in }
@@ -332,8 +336,12 @@ final class ChatOutbox {
             return
         }
         let answer: ChatAPI.Response
+        let request: ChatCommandEnvelope?
         do {
-            answer = try await api.postCommand(record.bodyBytes, token: token)
+            request = try ChatDMFirstSend.request(record)
+            // Ordinary queue entries retain their exact stored bytes.
+            let bytes = try request?.encoded() ?? record.bodyBytes
+            answer = try await api.postCommand(bytes, token: token)
         } catch ChatAPIError.redirect(let status) {
             guard epoch == sentIn else { return }
             fail(&record, in: queue, code: "redirect_\(status)")
@@ -349,6 +357,16 @@ final class ChatOutbox {
             // (the same bytes; the server answers it from its record) once a
             // hello confirmed the generation (review C2-2, C3-1).
             guard generationEpoch == generationSentIn, epoch == sentIn else { return }
+            if request?.type == "dm.open" {
+                guard let opened = try? JSONDecoder().decode(ChatCommandAnswer.self, from: answer.body),
+                      let dm = opened.result["dm_id"]?.string else {
+                    retry(&record, in: queue, after: nil); return
+                }
+                do {
+                    if try ChatDMFirstSend.opened(record, dm: dm, in: queue) { onDMOpened(dm) }
+                } catch { storageFailed(error) }
+                return // The next pump posts the same message, from disk.
+            }
             // Accepted is accepted, whatever else was decided meanwhile.
             var sent = record
             sent.state = .sent

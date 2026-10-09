@@ -136,20 +136,25 @@ final class AttentionCoordinator {
         "\(session.id)|\(session.statusSince?.timeIntervalSince1970 ?? 0)"
     }
 
+    static func waitingEvent(_ session: ExternalAgentSession) -> AttentionEvent {
+        var event = AttentionEvent(source: "external", object: session.id, episode: episodeKey(session),
+                                   kind: .input, destination: .external(session.id), timestamp: session.statusSince ?? Date())
+        event.localTitle = session.displayTitle
+        event.localBody = "Claude Code · Needs your input"
+        return event
+    }
+
     private func externalSessionsRefreshed(_ sessions: [ExternalAgentSession]) {
         let waiting = sessions.filter { $0.monitorState == .attention }
         let keys = Set(waiting.map(Self.episodeKey))
         let first = seenWaitingEpisodes == nil
         for session in waiting {
-            var event = AttentionEvent(source: "external", object: session.id, episode: Self.episodeKey(session),
-                                       kind: .input, destination: .external(session.id), timestamp: session.statusSince ?? Date())
-            event.localTitle = session.displayTitle
-            event.localBody = "Claude Code · Needs your input"
+            var event = Self.waitingEvent(session)
             event.isRead = first
             if first { AttentionLedger.shared.metadata.update(event.id) { $0.delivered = true } }
             AttentionLedger.shared.upsert(event)
         }
-        let ids = Set(waiting.map { AttentionEvent(source: "external", object: $0.id, episode: Self.episodeKey($0), kind: .input, destination: .external($0.id)).id })
+        let ids = Set(waiting.map { Self.waitingEvent($0).id })
         AttentionLedger.shared.reconcile(source: "external", keeping: ids)
         seenWaitingEpisodes = keys
         refreshBadge()

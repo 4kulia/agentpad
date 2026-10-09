@@ -136,6 +136,15 @@ struct AttentionEvent: Identifiable, Equatable, Codable, Sendable {
     }
     var title: String { source == "link-failure" ? "Link could not be opened" : scope == nil ? (localTitle ?? kind.title) : kind.title }
     var body: String { scope == nil ? (localBody ?? "") : "" }
+    /// Viewing acknowledges this sidebar episode, without resolving its source
+    /// or changing the notification history/read state.
+    var clearsAttentionOnView: Bool {
+        switch (source, destination) {
+        case ("terminal", .terminal): return kind == .input || kind == .failure
+        case ("external", .external): return kind == .input
+        default: return false
+        }
+    }
 }
 
 struct AttentionPreferences: Equatable, Sendable {
@@ -165,7 +174,12 @@ enum AttentionPolicy {
 /// Durable metadata, never a second source of requests, commands or message text.
 @MainActor
 final class NotificationDeliveryStore {
-    struct Marker: Codable { var delivered = false; var read = false; var consumed = false; var hidden = false; var locator: AttentionEvent? }
+    struct Marker: Codable {
+        var delivered = false; var read = false; var consumed = false; var hidden = false
+        // Optional so metadata written before this field still decodes.
+        var attentionViewed: Bool?
+        var locator: AttentionEvent?
+    }
     private let defaults: UserDefaults?
     private let key = "AgentPad.notificationMetadata.v1"
     private(set) var markers: [String: Marker]
@@ -188,6 +202,7 @@ final class NotificationDeliveryStore {
 final class AttentionLedger {
     static let shared = AttentionLedger(metadata: NotificationDeliveryStore(defaults: .standard))
     private(set) var events: [AttentionEvent] = []
+    private var attentionViewRevision = 0
     @ObservationIgnored let metadata: NotificationDeliveryStore
     @ObservationIgnored var delivery: NotificationManager?
     @ObservationIgnored var preferences: () -> AttentionPreferences = { AttentionPreferences() }
@@ -198,6 +213,23 @@ final class AttentionLedger {
 
     var pendingCount: Int { events.filter { $0.kind.needsDecision }.count }
     var unreadCount: Int { events.filter { !$0.isRead }.count }
+    var viewedAttentionIDs: Set<String> {
+        _ = attentionViewRevision
+        return Set(metadata.markers.filter { $0.value.attentionViewed == true }.keys)
+    }
+
+    func markAttentionViewed(_ event: AttentionEvent) {
+        guard event.clearsAttentionOnView, metadata.markers[event.id]?.attentionViewed != true else { return }
+        metadata.update(event.id) { $0.attentionViewed = true }
+        attentionViewRevision += 1
+    }
+
+    func markFocusedAttentionViewed() {
+        for event in events where event.clearsAttentionOnView
+            && metadata.markers[event.id]?.attentionViewed != true && isFocused(event) {
+            markAttentionViewed(event)
+        }
+    }
 
     private static func newestFirst(_ lhs: AttentionEvent, _ rhs: AttentionEvent) -> Bool {
         lhs.timestamp == rhs.timestamp ? lhs.id < rhs.id : lhs.timestamp > rhs.timestamp
@@ -225,7 +257,10 @@ final class AttentionLedger {
             let old = events[index]
             guard old.kind.priority <= event.kind.priority else { return }
             next.timestamp = old.timestamp; next.isRead = old.isRead || event.isRead || focused
-            if next == old { return }
+            if next == old {
+                if focused { markAttentionViewed(next) }
+                return
+            }
             events[index] = next
         } else {
             if !event.kind.needsDecision {
@@ -246,6 +281,7 @@ final class AttentionLedger {
         if next.isRead { metadata.update(event.id) { $0.read = true } }
         if case .tabAction = next.destination { /* runtime-only consent */ }
         else { metadata.update(next.id) { $0.locator = next } }
+        if focused { markAttentionViewed(next) }
         deliver(next.id)
         if !next.kind.needsDecision { metadata.update(next.id) { $0.consumed = true } }
         onChange()
@@ -289,6 +325,7 @@ final class AttentionLedger {
     func validateAll() {
         for event in events where !isValid(event) { resolve(event.id) }
         for event in events where isFocused(event) { markRead(event.id) }
+        markFocusedAttentionViewed()
     }
     func markRead(_ id: String) {
         guard let index = events.firstIndex(where: { $0.id == id }), !events[index].isRead else { return }

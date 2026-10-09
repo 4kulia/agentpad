@@ -103,6 +103,9 @@ final class TerminalLinkInteraction {
     }
 
     func mouseDown(_ event: NSEvent) -> Bool {
+        // The previous release may have gone to a preview, menu, or another
+        // tab. This press owns a new gesture even when it is not on a link.
+        cancelClick()
         let point = view.convert(event.locationInWindow, from: nil)
         move(to: point, modifiers: event.modifierFlags, force: true)
         guard let hovered else { return false }
@@ -125,6 +128,14 @@ final class TerminalLinkInteraction {
     }
 
     var isHandlingClick: Bool { pressed != nil }
+
+    /// Hover invalidation alone must retain a live gesture (e.g. scrolling),
+    /// but a lost release / focus change must stop owning future mouseUp's.
+    func cancelClick() {
+        pressed = nil
+        pressPoint = nil
+        dragged = false
+    }
 
     private func hit(column: Int, row: Int, grid: ghostty_surface_grid_metrics_s) -> Hit? {
         // Bounded read around the pointer. Ghostty preserves hard newlines and

@@ -69,7 +69,7 @@ final class ChatThreadUnreadTests: XCTestCase {
         }
     }
 
-    func testReadingChannelKeepsReplyCountAndViewingThreadClearsItInBothWindows() async throws {
+    func testReadingChannelClearsBadgeButKeepsRepliesUntilThreadViewedInBothWindows() async throws {
         let (store, org) = try fixture()
         try post(store, "root", seq: 1)
         try post(store, "reply-1", seq: 2, root: "root")
@@ -77,7 +77,14 @@ final class ChatThreadUnreadTests: XCTestCase {
         try post(store, "tail", seq: 5)
         let first = model(store), second = model(store)
         first.readIfLooking(root: nil, appActive: true, shown: true, atBottom: true)
-        try await wait { org.unread("c")?.count == 2 }
+        try await wait { org.unread("c")?.count == 0 && first.feed.unreadReplyCounts["root"] == 2 }
+        let sidebar = ChatSidebarSnapshot(model: org, active: nil)
+        XCTAssertEqual(sidebar.unread.count, 0)
+        XCTAssertNil(ChatSidebarSnapshot.unreadLabel(sidebar.unread))
+        let channel = try XCTUnwrap(sidebar.teams.flatMap(\.channels).first { $0.id == "c" })
+        XCTAssertFalse(channel.isUnread)
+        XCTAssertNil(channel.unreadLabel)
+        XCTAssertEqual(try read(store) { try ChatInbox.read($0, kind: .unread, account: "me", session: "s").map(\.id) }, ["reply-1", "reply-2"])
         XCTAssertEqual(first.feed.unreadReplyCounts, ["root": 2])
         XCTAssertEqual(first.feed.replySummaries["root"]?.label, "2 replies")
         XCTAssertEqual(first.feed.unloadedUnreadReplyCount, 0)
@@ -89,14 +96,23 @@ final class ChatThreadUnreadTests: XCTestCase {
         try await wait { first.feed.unreadReplyCounts.isEmpty && second.feed.unreadReplyCounts.isEmpty && org.unread("c")?.count == 0 }
         try post(store, "late-history", seq: 3, root: "root")
         try post(store, "new-reply", seq: 6, root: "root")
-        try await wait { first.feed.unreadReplyCounts["root"] == 1 && second.feed.unreadReplyCounts["root"] == 1 && org.unread("c")?.count == 1 }
+        try await wait { first.feed.unreadReplyCounts["root"] == 1 && second.feed.unreadReplyCounts["root"] == 1 && org.unread("c")?.count == 0 }
+        try post(store, "new-root", seq: 7)
+        try await wait { org.unread("c")?.count == 1 && first.feed.messages.contains { $0.id == "new-root" } }
+        let newPost = ChatSidebarSnapshot(model: org, active: nil)
+        XCTAssertEqual(newPost.unread.count, 1)
+        XCTAssertEqual(ChatSidebarSnapshot.unreadLabel(newPost.unread), "1")
+        XCTAssertTrue(try XCTUnwrap(newPost.teams.flatMap(\.channels).first { $0.id == "c" }).isUnread)
+        first.readIfLooking(root: nil, appActive: true, shown: true, atBottom: true)
+        try await wait { org.unread("c")?.count == 0 }
+        XCTAssertEqual(try read(store) { try ChatInbox.read($0, kind: .unread, account: "me", session: "s").map(\.id) }, ["new-reply"])
         try write(store) { db in
             try db.execute(sql: "INSERT INTO notified (object_id, kind, channel_id, seq, read, thread_root_id) VALUES ('new-reply', 'reply', 'c', 6, 1, 'root')")
         }
         try await wait { first.feed.unreadReplyCounts.isEmpty && second.feed.unreadReplyCounts.isEmpty && org.unread("c")?.count == 0 }
     }
 
-    func testRootCountsUseTheChannelBadgesExactReadAndVisibilityRules() throws {
+    func testRootReplyCountsUseTheInboxesExactReadAndVisibilityRules() throws {
         let (store, _) = try fixture()
         try post(store, "below-baseline", seq: 2, root: "r")
         try post(store, "below-thread-mark", seq: 4, root: "r")
@@ -118,8 +134,8 @@ final class ChatThreadUnreadTests: XCTestCase {
         }
         try read(store) { db in
             let roots = try ChatUnread.unreadRepliesByRoot(db, channel: "c")
-            XCTAssertEqual(roots.map(\.root), ["r", "sibling", "third"])
-            XCTAssertEqual(roots.map(\.count), [1, 1, 2])
+            XCTAssertEqual(roots.map(\.root), ["r", "sibling"])
+            XCTAssertEqual(roots.map(\.count), [1, 1])
             XCTAssertEqual(roots.reduce(0) { $0 + $1.count }, try ChatUnread.unreadRepliesByChannel(db)["c"])
             XCTAssertEqual(try ChatUnread.unreadRepliesByRoot(db, channel: "other").map(\.count), [1])
             XCTAssertTrue(try ChatUnread.unreadRepliesByRoot(db, channel: "hidden").isEmpty)
@@ -128,7 +144,7 @@ final class ChatThreadUnreadTests: XCTestCase {
         model.openThread("r")
         model.readIfLooking(root: "r", appActive: true, shown: true, atBottom: true)
         try read(store) { db in
-            XCTAssertEqual(try ChatUnread.unreadRepliesByRoot(db, channel: "c").map(\.root), ["sibling", "third"], "Reading one thread preserves its siblings")
+            XCTAssertEqual(try ChatUnread.unreadRepliesByRoot(db, channel: "c").map(\.root), ["sibling"], "Reading one thread preserves its siblings")
         }
     }
 
@@ -212,7 +228,7 @@ final class ChatThreadUnreadTests: XCTestCase {
         defer { window.contentView = nil; window.close() }
         let text = try await renderedText(host, name: "channel-hint")
         let hint = try XCTUnwrap(text.first { $0.text.contains("Unread thread replies: 2") }, text.map(\.text).joined(separator: " "))
-        try await wait { host.layoutSubtreeIfNeeded(); return org.unread("c")?.count == 2 }
+        try await wait { host.layoutSubtreeIfNeeded(); return org.unread("c")?.count == 0 && model.feed.unloadedUnreadReplyCount == 2 }
         let point = NSPoint(x: hint.box.midX * host.bounds.width,
                            y: (host.isFlipped ? 1 - hint.box.midY : hint.box.midY) * host.bounds.height)
         try click(window, at: host.convert(point, to: nil))

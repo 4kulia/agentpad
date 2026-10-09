@@ -410,7 +410,13 @@ private let agentPadActionCb: ghostty_runtime_action_cb = { _, target, action in
         guard let cstr = urlAction.url, urlAction.len > 0 else { return false }
         let buffer = UnsafeRawBufferPointer(start: cstr, count: Int(urlAction.len))
         let rawTarget = String(decoding: buffer, as: UTF8.self)
-        dispatchToView(userdata) { $0.open(target: rawTarget) }
+        // A synthetic release must clear the core's latched link click without
+        // opening it. Inspect cancellation synchronously; keep real opens
+        // deferred so they cannot reparent/free a surface inside its C call.
+        dispatchClipboardToView(userdata) { view in
+            guard !view.isCancellingMousePress else { return }
+            DispatchQueue.main.async { [weak view] in view?.open(target: rawTarget) }
+        }
         return true
     case GHOSTTY_ACTION_MOUSE_SHAPE:
         let shape = action.action.mouse_shape
@@ -855,7 +861,10 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     }
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        sender.draggingPasteboard.availableType(from: [.fileURL]) != nil ? .copy : []
+        // An AppKit drag session owns the mouse now; it cannot complete a
+        // terminal press whose release was missed before this file drag.
+        cancelMouseInteraction()
+        return sender.draggingPasteboard.availableType(from: [.fileURL]) != nil ? .copy : []
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
@@ -944,6 +953,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     // `LibghosttyEngine.terminate()` when a session is closed.
 
     func releaseSurface() {
+        cancelMousePresses()
         confirmationSession?.terminalConfirmation.invalidate()
         guard let dying = surface else { return }
         // Despite the C API's `foreground_pid` name, libghostty returns the
@@ -1017,6 +1027,16 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         }
     }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if window !== newWindow { cancelMouseInteraction() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    override func viewWillMove(toSuperview newSuperview: NSView?) {
+        if superview !== newSuperview { cancelMouseInteraction() }
+        super.viewWillMove(toSuperview: newSuperview)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         // Re-subscribe key-window transitions for the CURRENT window: a
@@ -1026,13 +1046,23 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         keyWindowObservers.forEach(NotificationCenter.default.removeObserver)
         keyWindowObservers = []
         if let window {
-            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+                         NSWindow.willMiniaturizeNotification, NSWindow.willCloseNotification] {
                 keyWindowObservers.append(NotificationCenter.default.addObserver(
                     forName: name, object: window, queue: .main
                 ) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.syncSecureInputHolding() }
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        if name != NSWindow.didBecomeKeyNotification { self.cancelMouseInteraction() }
+                        self.syncSecureInputHolding()
+                    }
                 })
             }
+            keyWindowObservers.append(NotificationCenter.default.addObserver(
+                forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.cancelMouseInteraction() }
+            })
         }
         syncSecureInputHolding()
         if window != nil {
@@ -1087,7 +1117,12 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     /// leaves the view in the window with no hidden ancestor, so without this
     /// the render link would keep presenting frames nobody can see.
     var isOffScreen = false {
-        didSet { if oldValue != isOffScreen { updateRenderLink() } }
+        didSet {
+            if oldValue != isOffScreen {
+                if isOffScreen { cancelMouseInteraction() }
+                updateRenderLink()
+            }
+        }
     }
 
     /// Present the active surface immediately instead of waiting for the next vsync.
@@ -1114,6 +1149,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
 
     override func viewDidHide() {
         super.viewDidHide()
+        cancelMouseInteraction()
         updateRenderLink()
     }
 
@@ -1358,7 +1394,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
         if resigned {
-            fileLinks.clear()
+            cancelMouseInteraction()
             if let surface {
                 ghostty_surface_set_focus(surface, false)
                 setNeedsRender()
@@ -1405,6 +1441,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     }
 
     override func keyDown(with event: NSEvent) {
+        reconcileMousePresses()
         guard let surface else {
             super.keyDown(with: event)
             return
@@ -1780,6 +1817,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     }
 
     override func flagsChanged(with event: NSEvent) {
+        reconcileMousePresses()
         guard let surface else {
             super.flagsChanged(with: event)
             return
@@ -1808,7 +1846,91 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     /// unmatched drag/release to the TUI or abandon the terminal selection.
     private var optionSelectionDrag = false
 
+    /// Track only presses this view accepted. Local link / Option selection
+    /// clicks have no core button; their release must never be sent to a TUI.
+    private struct MousePress {
+        let id = UUID()
+        let modifiers: NSEvent.ModifierFlags
+        var surfaceButton: ghostty_input_mouse_button_e?
+    }
+    private var mousePresses: [Int: MousePress] = [:]
+    private var mouseReleaseMonitor: Any?
+    private(set) var isCancellingMousePress = false
+    /// Injectable OS snapshot: synthesized test events do not change HID state.
+    var pressedMouseButtons: () -> Int = { NSEvent.pressedMouseButtons }
+
+    private func beginMousePress(_ event: NSEvent) {
+        // A new down proves the previous press of this button ended, even if
+        // AppKit delivered its up to an overlay/menu/drag session instead.
+        reconcileMousePresses(pressed: pressedMouseButtons() & ~(1 << event.buttonNumber))
+        mousePresses[event.buttonNumber] = MousePress(modifiers: event.modifierFlags)
+        updateMouseReleaseMonitor()
+    }
+
+    private func reconcileMousePresses(pressed: Int? = nil) {
+        let pressed = pressed ?? pressedMouseButtons()
+        for number in Array(mousePresses.keys) where pressed & (1 << number) == 0 {
+            cancelMousePress(number)
+        }
+    }
+
+    private func cancelMousePress(_ number: Int) {
+        guard let press = mousePresses.removeValue(forKey: number) else { return }
+        if number == 0 {
+            fileLinks.cancelClick()
+            optionSelectionDrag = false
+        }
+        if let surface, let button = press.surfaceButton {
+            // Release at the LAST core position, before hover invalidation or
+            // new coordinates: moving first would extend the stuck selection.
+            isCancellingMousePress = true
+            _ = ghostty_surface_mouse_button(surface, .RELEASE, button, Self.mapModifiers(press.modifiers))
+            isCancellingMousePress = false
+        }
+        updateMouseReleaseMonitor()
+    }
+
+    private func cancelMousePresses() {
+        for number in Array(mousePresses.keys) { cancelMousePress(number) }
+        fileLinks.cancelClick()
+        optionSelectionDrag = false
+    }
+
+    private func cancelMouseInteraction() {
+        cancelMousePresses()
+        fileLinks.clear()
+    }
+
+    private func updateMouseReleaseMonitor() {
+        if mousePresses.isEmpty {
+            if let mouseReleaseMonitor { NSEvent.removeMonitor(mouseReleaseMonitor) }
+            mouseReleaseMonitor = nil
+        } else if mouseReleaseMonitor == nil {
+            mouseReleaseMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseUp, .otherMouseUp]
+            ) { [weak self] event in
+                guard let self else { return event }
+                if event.type == .leftMouseDown || event.type == .rightMouseDown || event.type == .otherMouseDown {
+                    // This also repairs stale presses when the next down goes
+                    // to chrome/another view instead of this terminal.
+                    self.reconcileMousePresses(pressed: self.pressedMouseButtons() & ~(1 << event.buttonNumber))
+                    return event
+                }
+                guard let press = self.mousePresses[event.buttonNumber] else { return event }
+                let number = event.buttonNumber
+                // Let the real receiver handle the event first. If it was
+                // another view, cancel only this gesture, never a newer press.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.mousePresses[number]?.id == press.id else { return }
+                    self.cancelMousePress(number)
+                }
+                return event
+            }
+        }
+    }
+
     override func scrollWheel(with event: NSEvent) {
+        reconcileMousePresses()
         // AgentPad: invalidate link hover without leaving the core's mouse outside the surface.
         fileLinks.prepareForScroll(event)
         guard let surface else {
@@ -1838,12 +1960,25 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        reconcileMousePresses()
         fileLinks.move(to: convert(event.locationInWindow, from: nil), modifiers: event.modifierFlags)
     }
 
-    override func mouseExited(with event: NSEvent) { fileLinks.clear() }
+    override func mouseEntered(with event: NSEvent) {
+        reconcileMousePresses()
+        fileLinks.move(to: convert(event.locationInWindow, from: nil), modifiers: event.modifierFlags)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        let pressed = pressedMouseButtons()
+        reconcileMousePresses(pressed: pressed)
+        // Like Ghostty's AppKit host, preserve out-of-bounds selection drags.
+        // Reporting (-1, -1) with LEFT still pressed changes the selection.
+        if pressed == 0 { fileLinks.clear() }
+    }
 
     override func mouseDragged(with event: NSEvent) {
+        guard mousePresses[0] != nil else { return }
         if fileLinks.isHandlingClick {
             fileLinks.move(to: convert(event.locationInWindow, from: nil), modifiers: event.modifierFlags)
             return
@@ -1866,6 +2001,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         if window?.firstResponder !== self {
             window?.makeFirstResponder(self)
         }
+        beginMousePress(event)
         if fileLinks.mouseDown(event) { return }
         optionSelectionDrag = surface.map { ghostty_surface_mouse_captured($0) } == true
             && event.modifierFlags.contains(.option)
@@ -1878,14 +2014,22 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     }
 
     override func mouseUp(with event: NSEvent) {
-        if fileLinks.mouseUp(event) { return }
-        if optionSelectionDrag {
+        guard let press = mousePresses[0] else { return }
+        defer {
+            mousePresses[0] = nil
+            updateMouseReleaseMonitor()
+        }
+        // Route up to whoever accepted down. A stale file-link gesture must
+        // never swallow a release owed to libghostty.
+        if press.surfaceButton != nil {
+            forwardMouseEvent(event, button: (.RELEASE, .LEFT))
+            fileLinks.move(to: convert(event.locationInWindow, from: nil), modifiers: event.modifierFlags, force: true)
+        } else if optionSelectionDrag {
             updateOptionSelection(with: event, starting: false)
             optionSelectionDrag = false
-            return
+        } else {
+            _ = fileLinks.mouseUp(event)
         }
-        forwardMouseEvent(event, button: (.RELEASE, .LEFT))
-        fileLinks.move(to: convert(event.locationInWindow, from: nil), modifiers: event.modifierFlags, force: true)
     }
 
     /// The pinned core exposes tracked selection endpoints. Use those instead
@@ -1918,6 +2062,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     // AppKit — the core has no bindings for them.
     override func otherMouseDown(with event: NSEvent) {
         guard event.buttonNumber == 2 else { return super.otherMouseDown(with: event) }
+        beginMousePress(event)
         // Middle-click usually pastes (the start of the next command) — clear
         // a stale failure dot like every other paste path (Codex review).
         // Fired unconditionally: with mouse reporting on this is a TUI event
@@ -1929,7 +2074,14 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
 
     override func otherMouseUp(with event: NSEvent) {
         guard event.buttonNumber == 2 else { return super.otherMouseUp(with: event) }
+        guard mousePresses[2]?.surfaceButton != nil else { return }
         forwardMouseEvent(event, button: (.RELEASE, .MIDDLE))
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        guard event.buttonNumber == 2 else { return super.otherMouseDragged(with: event) }
+        guard mousePresses[2]?.surfaceButton != nil else { return }
+        forwardMouseEvent(event)
     }
 
     /// A named pasteboard lets embedded/manual surfaces use their own clipboard.
@@ -2135,6 +2287,15 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         let p = convert(event.locationInWindow, from: nil)
         ghostty_surface_mouse_pos(surface, p.x, bounds.height - p.y, mods)
         if let button {
+            // A synchronous hover/input callback can cancel the interaction.
+            // Never send a down after its tracking entry was removed.
+            guard mousePresses[event.buttonNumber] != nil else { return }
+            if button.state == .PRESS {
+                mousePresses[event.buttonNumber]?.surfaceButton = button.code
+            } else {
+                mousePresses[event.buttonNumber] = nil
+                updateMouseReleaseMonitor()
+            }
             _ = ghostty_surface_mouse_button(surface, button.state, button.code, mods)
         }
     }

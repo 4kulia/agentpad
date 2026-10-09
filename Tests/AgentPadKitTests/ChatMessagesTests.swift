@@ -505,7 +505,8 @@ final class ChatMessagesTests: XCTestCase {
             try db.execute(sql: "INSERT INTO messages (message_id, channel_id, seq) VALUES ('new', ?, 12)", arguments: [channel])
         }
         let orgModel = try XCTUnwrap(ChatOrgModel.current(service))
-        XCTAssertEqual(orgModel.unread(channel)?.count, 1)
+        XCTAssertEqual(orgModel.unread(channel)?.count, 0, "the unopened channel still has only a placeholder")
+        XCTAssertTrue(orgModel.unread(channel)?.more == true)
         let followed = service.orgSessions[key]?.followedChannels
         let model = ChatInboxModel(ref: ChatInboxRef(key, kind: .mentions))
         defer { model.stop() }
@@ -1110,6 +1111,10 @@ final class ChatMessagesTests: XCTestCase {
     /// quiet, mentions not (F4, review F4-4).
     func testWhatCountsAndWhatTells() async throws {
         noticesHere()
+        let keptEmit = ChatNotifications.emit
+        var events: [AttentionEvent] = []
+        ChatNotifications.emit = { events.append($0) }
+        defer { ChatNotifications.emit = keptEmit }
         let answers = Answers()
         answers.set("/v1/orgs/\(org)/state", state([message("mine", seq: 10, author: me)], head: 10))
         let (service, transport) = try await started(answers)
@@ -1121,13 +1126,27 @@ final class ChatMessagesTests: XCTestCase {
         try await waitUntil("two notices") { self.notices.count == 2 }
         XCTAssertEqual(notices.map(\.title), ["New reply in a thread", "New mention in AgentPad"])
         XCTAssertEqual(try unread(store).count, 0, "replies and my own are not root unread")
+        XCTAssertEqual(events.map(\.kind), [.reply, .mention])
+        let orgModel = ChatOrgModel(me: me) { _, _ in XCTFail("No commands expected"); return "unexpected" }
+        orgModel.key = key; orgModel.session = service.connection?.sessionId; orgModel.isFollowed = { _ in true }
+        let channelID = channel
+        try await store.queue.write { try ChatUnread.markRead($0, channel: channelID, upTo: 13) }
+        orgModel.set(try readDB(store) { try ChatOrgView.read($0) })
+        XCTAssertEqual(orgModel.unread(channel)?.count, 0)
+        XCTAssertFalse(try XCTUnwrap(ChatSidebarSnapshot(model: orgModel, active: nil).teams.flatMap(\.channels).first).isUnread)
+        for id in ["r1", "r2"] {
+            XCTAssertTrue(ChatNotifications.stillDue(ChatNotifications.messageId(key, channel: channel, message: id), service),
+                          "reading the channel preserves participating-thread replies and mentions")
+        }
         transport.frame(post(14, "root2", mentions: [me]))
         try await waitUntil("counted") { (try? self.unread(store).count) == 1 && self.notices.count == 3 }
+        orgModel.set(try readDB(store) { try ChatOrgView.read($0) })
+        XCTAssertEqual(orgModel.unread(channel)?.count, 1)
         transport.frame(#"{"frame":"event","stream":"\#(channelStream)","seq":15,"id":"e15","type":"message.delete","actor":null,"body":{"message_id":"root2","revision":2,"message_seq":14},"command_id":null,"at":"x","sig":null,"sig_alg":null,"enc":null,"message":\#(message("root2", seq: 14, revision: 2, deleted: true))}"#)
         // The deleted mention's notice is taken back, and it leaves the Dock's count (review F4-C).
         let gone = ChatNotifications.messageId(key, channel: channel, message: "root2")
         try await waitUntil("taken back") { !self.shown.contains(gone) }
-        XCTAssertEqual(try unread(store).count, 1, "a deletion changes no count")
+        XCTAssertEqual(try unread(store).count, 0, "a deleted root leaves the badge")
         XCTAssertEqual(try int(store, "SELECT read FROM notified WHERE object_id = 'root2'"), 1)
         let channel = channel
         try await store.queue.write { db in try ChatUnread.setMuted(db, channel: channel, true) }
@@ -1318,12 +1337,12 @@ final class ChatMessagesTests: XCTestCase {
         XCTAssertTrue(ChatNotifications.isLooking("t:r"), "the other view's entry stays")
     }
 
-    /// A placeholder counts as unread until read; a window above the mark
+    /// A placeholder is not counted until hydrated; a window above the mark
     /// keeps at least "•"; a message read already owes no notice (review F4b-2, -3, -4).
     func testPlaceholdersGapsAndReadMessages() throws {
         let store = try store([message("m3", seq: 3)], head: 3)
         _ = try store.apply(event(4, "message.post", body: #"{"message_id":"ph","revision":1,"message_seq":4}"#, message: nil))
-        XCTAssertEqual(try unread(store).count, 1, "a placeholder counts")
+        XCTAssertEqual(try unread(store).count, 0, "a placeholder's author and conversation are not yet known")
         try newWindow(store, head: 40, [wire(message("own", seq: 40, author: me))], before: 40)
         let gap = try unread(store)
         XCTAssertEqual(gap.count, 0)

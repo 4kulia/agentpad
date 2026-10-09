@@ -4,6 +4,15 @@ import GRDB
 
 @MainActor
 enum ChatDMTabs {
+    static func route(_ key: ChatOrgKey, peer: String, service: ChatService = .shared) -> ToolRoute? {
+        guard service.dmAllowed(key) else { return nil }
+        return service.dmList(key)?.people.first { $0.id == peer }?.route(key)
+    }
+    @discardableResult static func open(_ key: ChatOrgKey, peer: String, from store: WorkspaceStore? = nil,
+                                       service: ChatService = .shared, navigation: SupportTabNavigation = SupportTabs.shared.navigation) -> Session? {
+        guard let route = route(key, peer: peer, service: service) else { return nil }
+        return navigation.open(route, from: store)
+    }
     static func title(_ ref: ChatDMRef, service: ChatService = .shared) -> String {
         guard let key = ref.key, service.dmAllowed(key, ref.dm) else { return "Direct message" }
         return service.orgSessions[key]?.dmList?.entries.first { $0.id == ref.dm }?.card.peer.name ?? "Direct message"
@@ -29,14 +38,10 @@ final class ChatDMNewModel {
     let service: ChatService
     weak var state: TabState?
     var query = ""
-    private(set) var pending: String?
-    private(set) var problem: String?
-    private(set) var result: String?
+    private(set) var result: ToolRoute?
     private var stopped = false
-    private var chosen: String?
     private var members: [ChatOrgView.Member] = []
     @ObservationIgnored private var memberObservation: AnyDatabaseCancellable?
-    @ObservationIgnored private var observation: AnyDatabaseCancellable?
     var readable: Bool { !stopped && state?.isClosed != true && service.dmAllowed(key) }
     var people: [ChatOrgView.Member] {
         guard readable else { return [] }
@@ -49,31 +54,16 @@ final class ChatDMNewModel {
     init(key: ChatOrgKey, state: TabState?, service: ChatService = .shared) {
         self.key = key; self.state = state; self.service = service
         guard let store = service.orgSessions[key]?.store else { return }
-        memberObservation = ValueObservation.tracking { try ChatOrgView.read($0).members }.removeDuplicates()
+        memberObservation = ValueObservation.tracking { try ChatOrgView.Member.read($0) }.removeDuplicates()
             .start(in: store.queue, scheduling: .immediate, onError: { [weak self] _ in self?.members = [] }) { [weak self] members in
                 guard let self, !stopped else { return }; self.members = members
             }
     }
     func choose(_ peer: String) {
-        guard readable, pending == nil, people.contains(where: { $0.accountId == peer }) else { return }
-        if let known = service.dmList(key)?.entries.first(where: { $0.card.peer.accountId == peer }) { result = known.id; return }
-        do {
-            chosen = peer; problem = nil
-            pending = try service.beginDM(key, peer: peer)
-            guard let store = service.orgSessions[key]?.store, let command = pending else { return }
-            observation = ValueObservation.tracking { db in
-                let id = try String.fetchOne(db, sql: "SELECT dm_id FROM dm_open_results WHERE command_id = ?", arguments: [command])
-                let card = try id.flatMap { try ChatDMStore.card(db, $0) }
-                let failure = try String.fetchOne(db, sql: "SELECT COALESCE(error, state) FROM outbox WHERE command_id = ? AND state IN ('failed', 'dropped', 'unconfirmed')", arguments: [command])
-                return (id, card, failure)
-            }.start(in: store.queue, scheduling: .immediate, onError: { [weak self] _ in self?.problem = "The conversation could not be opened." }) { [weak self] id, card, failure in
-                guard let self, readable, chosen == peer else { return }
-                if let id, card?.peer.accountId == peer, service.dmAllowed(key, id) { result = id; pending = nil; observation = nil }
-                else if failure != nil { problem = "The conversation could not be opened. Check the connection and try again."; pending = nil; observation = nil }
-            }
-        } catch { problem = "The conversation could not be opened. Check the connection and try again."; pending = nil }
+        guard readable, people.contains(where: { $0.accountId == peer }) else { return }
+        result = ChatDMTabs.route(key, peer: peer, service: service)
     }
-    func stop() { stopped = true; memberObservation = nil; members = []; observation = nil; query = ""; chosen = nil; result = nil; pending = nil }
+    func stop() { stopped = true; memberObservation = nil; members = []; query = ""; result = nil }
 }
 
 struct ChatDMNewView: View {
@@ -84,13 +74,10 @@ struct ChatDMNewView: View {
     var body: some View {
         Group {
             if let model = state.newDMModel, model.readable {
-                ChatDMPeoplePicker(model: model) { dm in
-                    guard !state.isClosed, service.dmAllowed(key, dm), let owner = SupportTabs.shared.owner(state) else { return }
-                    let ref = ChatDMRef(key, dm: dm)
-                    ChatDMTabs.used(ref, service: service)
-                    _ = service.dmList(key)
+                ChatDMPeoplePicker(model: model) { route in
+                    guard !state.isClosed, service.dmAllowed(key), let owner = SupportTabs.shared.owner(state) else { return }
                     model.stop(); state.newDMModel = nil
-                    _ = SupportTabs.shared.navigation.router.rekey(owner.session.id, to: .directMessage(ref))
+                    _ = SupportTabs.shared.navigation.router.rekey(owner.session.id, to: route)
                 }
             } else { Text(service.connection?.orgKey == key ? "Checking access…" : "Not connected").foregroundStyle(ChatAppearance.secondary) }
         }.frame(maxWidth: .infinity, maxHeight: .infinity).background(ChatAppearance.surface)
@@ -103,7 +90,7 @@ struct ChatDMNewView: View {
 
 struct ChatDMPeoplePicker: View {
     @Bindable var model: ChatDMNewModel
-    let open: (String) -> Void
+    let open: (ToolRoute) -> Void
     @FocusState private var search: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -112,8 +99,6 @@ struct ChatDMPeoplePicker: View {
                 .font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary)
             TextField("Find a person by name or handle", text: $model.query).textFieldStyle(.roundedBorder).focused($search)
                 .accessibilityLabel("Find a person")
-            if let problem = model.problem { Text(problem).font(.caption).foregroundStyle(ChatAppearance.failure) }
-            if model.pending != nil { ProgressView("Opening conversation…").controlSize(.small) }
             ScrollView {
                 LazyVStack(spacing: 2) {
                     ForEach(model.people) { person in
@@ -126,7 +111,7 @@ struct ChatDMPeoplePicker: View {
                                 }
                                 Spacer(); Image(systemName: "chevron.right").font(.caption).foregroundStyle(ChatAppearance.secondary)
                             }.padding(10).contentShape(Rectangle())
-                        }.buttonStyle(.plain).chatFocusRing().disabled(model.pending != nil)
+                        }.buttonStyle(.plain).chatFocusRing()
                     }
                     if model.people.isEmpty { Text("No people found").foregroundStyle(ChatAppearance.secondary).padding(24) }
                 }

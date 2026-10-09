@@ -65,6 +65,10 @@ final class ChatUnreadBoundaryTests: XCTestCase {
         try store.queue.write(body)
     }
 
+    private func read<T>(_ store: ChatStore, _ body: (Database) throws -> T) throws -> T {
+        try store.queue.read(body)
+    }
+
     private func count(_ store: ChatStore) throws -> Int {
         try store.queue.read { try ChatUnread.count($0, channel: channel, me: me).count }
     }
@@ -112,8 +116,8 @@ final class ChatUnreadBoundaryTests: XCTestCase {
         XCTAssertNil(model(store).feed.unreadID)
         try post(store, "foreign", seq: 3)
         XCTAssertEqual(model(store).feed.unreadID, "foreign")
-        XCTAssertEqual(try count(store), 2,
-                       "an unresolved author remains unread, but cannot put a line above my message")
+        XCTAssertEqual(try count(store), 1,
+                       "an unresolved placeholder is neither unread nor a divider")
     }
 
     func testPendingSendReadsImmediatelyAndAckAdvancesThroughOwnSequence() async throws {
@@ -218,6 +222,93 @@ final class ChatUnreadBoundaryTests: XCTestCase {
             XCTAssertEqual(try mentions(store), 0)
             try post(store, "placeholder", seq: 2, root: root)
             XCTAssertEqual(try mentions(store), 0, "a late body cannot resurrect explicitly acknowledged history")
+        }
+    }
+
+    func testPlaceholderIsExcludedUntilHydrationAndAutomaticReadingResumes() async throws {
+        // A WS placeholder initially looks like a root; its body may reveal a reply or our own post.
+        for (root, own) in [(nil as String?, false), ("root", false), (nil, true)] {
+            let store = try storeForConversation(root)
+            try write(store) { db in
+                try ChatMessages.apply(db, ChatEvent(stream: "channel:\(channel)", seq: 2, id: "event", type: "message.post", actor: nil,
+                    body: .object(["message_id": .string("placeholder"), "revision": .number(1)]), commandId: nil, at: "now"))
+                try db.execute(sql: "UPDATE meta SET channels_served = 1")
+            }
+            try post(store, "tail", seq: 3)
+            let model = model(store, root: root)
+            XCTAssertEqual(try count(store), 1, "only the fully known tail belongs in the badge")
+            XCTAssertEqual(try read(store) { try ChatInbox.read($0, kind: .unread, account: me, session: nil).map(\.id) }, ["tail"])
+            model.readIfLooking(root: nil, appActive: true, shown: true, atBottom: true)
+            XCTAssertEqual(try mark(store), 1, "do not mark an unknown message read before its body arrives")
+            try post(store, "placeholder", seq: 2, root: root, own: own)
+            try await wait {
+                model.feed.messages.allSatisfy(\.hasFixed)
+                    && (root == nil || model.thread.contains { $0.id == "placeholder" && $0.hasFixed })
+            }
+            XCTAssertEqual(try count(store), root == nil && !own ? 2 : 1, "hydrated foreign roots count until viewed")
+            model.readIfLooking(root: nil, appActive: true, shown: true, atBottom: true)
+            XCTAssertEqual(try mark(store), 3, "hydration must release the channel read mark")
+            XCTAssertEqual(try count(store), 0)
+            if let root {
+                XCTAssertEqual(try read(store) { try ChatUnread.unreadRepliesByChannel($0)[channel] }, 1)
+                model.readIfLooking(root: root, appActive: true, shown: true, atBottom: true)
+                XCTAssertEqual(try mark(store, root: root), 2)
+            }
+            XCTAssertTrue(try read(store) { try ChatInbox.read($0, kind: .unread, account: me, session: nil).isEmpty })
+        }
+    }
+
+    func testThreadReadRemovesRootFromBadgeWithoutReadingOtherRoots() throws {
+        let store = try store()
+        try post(store, "earlier", seq: 1)
+        try post(store, "root", seq: 2)
+        try post(store, "reply", seq: 3, root: "root")
+        try post(store, "later", seq: 4)
+        try write(store) { try $0.execute(sql: "UPDATE meta SET channels_served = 1") }
+        let model = model(store, root: "root")
+        model.readIfLooking(root: "root", appActive: true, shown: true, atBottom: true)
+        XCTAssertEqual(try mark(store), 0, "the channel's other roots have not been viewed")
+        XCTAssertEqual(try count(store), 2)
+        XCTAssertEqual(try store.queue.read { try ChatInbox.read($0, kind: .unread, account: me, session: nil).map(\.id) }, ["earlier", "later"])
+        XCTAssertEqual(try store.queue.read { try Int.fetchOne($0, sql: "SELECT read FROM notified WHERE object_id = 'root'") }, 1)
+        try write(store) { try ChatUnread.markRead($0, channel: channel, upTo: 1) }
+        let revisited = self.model(store)
+        XCTAssertEqual(revisited.feed.unreadID, "later", "a root already viewed in its thread cannot start the next visit's divider")
+        XCTAssertEqual(try count(store), 1)
+    }
+
+    func testReadMarkFailureIsLoggedAndNextAutomaticReadRetries() throws {
+        for root: String? in [nil, "root"] {
+            let store = try storeForConversation(root)
+            try post(store, "foreign", seq: 2, root: root)
+            try write(store) { db in
+                try db.execute(sql: "INSERT INTO notified (object_id, kind, channel_id, seq, thread_root_id) VALUES ('foreign', 'mention', ?, 2, ?)",
+                               arguments: [channel, root])
+                // Fail after the mark was written: the entire transaction must roll back.
+                try db.execute(sql: "CREATE TRIGGER fail_read BEFORE UPDATE OF read ON notified BEGIN SELECT RAISE(ABORT, 'read mark test failure'); END")
+            }
+            let model = model(store, root: root)
+            var logs: [String] = []
+            model.log = { logs.append($0) }
+            let before = try mark(store, root: root)
+            model.readIfLooking(root: root, appActive: true, shown: true, atBottom: true)
+            XCTAssertEqual(try mark(store, root: root), before)
+            XCTAssertEqual(try mentions(store), 1)
+            XCTAssertEqual(logs.count, 1)
+            XCTAssertTrue(logs.first?.contains("read mark test failure") == true)
+            XCTAssertTrue(logs.first?.contains(channel) == true)
+            if let root { XCTAssertTrue(logs.first?.contains(root) == true) }
+            XCTAssertEqual(root == nil ? model.feed.unreadID : model.threadUnreadID, "foreign")
+            model.markConversationRead(root: root)
+            XCTAssertEqual(try mark(store, root: root), before)
+            XCTAssertEqual(root == nil ? model.feed.unreadID : model.threadUnreadID, "foreign",
+                           "a failed explicit read must not dismiss the visit boundary either")
+            XCTAssertEqual(logs.count, 2)
+            try write(store) { try $0.execute(sql: "DROP TRIGGER fail_read") }
+            model.readIfLooking(root: root, appActive: true, shown: true, atBottom: true)
+            XCTAssertEqual(try mark(store, root: root), 2)
+            XCTAssertEqual(try mentions(store), 0)
+            XCTAssertEqual(logs.count, 2, "retry the same mark without another message or an error on success")
         }
     }
 
@@ -367,7 +458,7 @@ final class ChatUnreadBoundaryTests: XCTestCase {
         XCTAssertEqual(try mark(store), 0)
         XCTAssertEqual(try mark(store, root: "root"), 5)
         XCTAssertEqual(try mentions(store), 1, "the visible root is read; the sibling thread remains unread")
-        XCTAssertEqual(try count(store), 1, "a reply does not advance the channel's root cursor")
+        XCTAssertEqual(try count(store), 0, "the thread read receipt clears its root without advancing the channel cursor")
         try post(store, "late", seq: 4, root: "root")
         try write(store) { db in
             XCTAssertNil(try ChatUnread.owe(db, messageId: "late", me: me))
@@ -377,7 +468,7 @@ final class ChatUnreadBoundaryTests: XCTestCase {
         let reopened = try ChatStore.open(files: ChatFiles(directory: directory), key: key).store
         XCTAssertEqual(try mark(reopened, root: "root"), 5, "thread read progress survives cache eviction and reopening")
         XCTAssertNil(self.model(reopened, root: "root").threadUnreadID)
-        XCTAssertEqual(self.model(reopened).feed.unreadID, "root", "the channel boundary agrees with its unchanged root cursor")
+        XCTAssertNil(self.model(reopened).feed.unreadID, "the root's read receipt survives reopening too")
     }
 
     func testOwnDeliveryThroughSnapshotHistoryAndSingleReadIsMonotonic() throws {

@@ -496,6 +496,10 @@ final class Session: Identifiable {
     var title: String {
         // AgentPad: a channel tab shows its channel's name while it may be seen (DESIGN-F2).
         if case .directMessage(let ref) = toolRoute { return ChatDMTabs.title(ref) }
+        if case .directMessageDraft(let scope, let peer) = toolRoute {
+            let key = ChatOrgKey(server: scope.server, accountId: scope.accountID, orgId: scope.orgID)
+            return ChatService.shared.dmList(key)?.people.first { $0.id == peer }?.peer.name ?? "Direct message"
+        }
         if let toolRoute { return toolRoute.title }
         if let channel { return ChannelTabs.title(channel) }
         if let inbox { return inbox.kind.title }
@@ -531,6 +535,6 @@ enum SessionAttentionReason: String, Sendable, Equatable {
 
 extension Session {
     var isDirectMessageTab: Bool {
-        switch toolRoute { case .directMessage, .newDM: return true; default: return false }
+        switch toolRoute { case .directMessage, .directMessageDraft, .newDM: return true; default: return false }
     }
 }

@@ -5,6 +5,22 @@ import GRDB
 import XCTest
 @testable import AgentPadKit
 
+private final class DMQueryLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var statements: [String] = []
+    func append(_ event: Database.TraceEvent) {
+        if case .statement(let statement) = event {
+            lock.lock(); defer { lock.unlock() }
+            statements.append(statement.sql.lowercased())
+        }
+    }
+    var selects: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return statements.filter { $0.hasPrefix("select") }
+    }
+    func reset() { lock.lock(); defer { lock.unlock() }; statements = [] }
+}
+
 @MainActor
 final class ChatDMTests: XCTestCase {
     private var root: URL!
@@ -68,6 +84,205 @@ final class ChatDMTests: XCTestCase {
     private func wait(_ condition: () -> Bool) async throws {
         for _ in 0..<300 { if condition() { return }; try await Task.sleep(for: .milliseconds(10)) }
         XCTFail("DM work did not settle")
+    }
+
+    // Review regressions: sending belongs to the durable queue, and observers
+    // must not make typing or closed tabs read unrelated history.
+    func testFirstSendIsArchivedBeforeOpenReturns() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        routes.set("/v1/commands", #"{"events":[],"result":{"dm_id":"\#(dm)"}}"#)
+        try await ready()
+        let beforeDisconnect = try sendingQueue()
+        let gate = Gate(); self.gate = gate; routes.gate = gate
+        routes.gated = "/v1/commands"; gate.close()
+        let model = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        let version = try XCTUnwrap(model.saveDraft("durable first hello", root: nil))
+        _ = model.send("durable first hello", root: nil, members: [], version: version)
+        let commands = try store.outbox.commands()
+        XCTAssertEqual(commands.count, 1)
+        XCTAssertEqual(ChatService.args(try XCTUnwrap(commands.first))["text"]?.string, "durable first hello")
+        XCTAssertNil(try read { try ChatDMStore.draft($0, "peer:\(peer)", root: nil) })
+        beforeDisconnect.allow(connection: 1, generation: "g1")
+        try await wait { ChatStubProtocol.seen.contains { $0.request.url?.path == "/v1/commands" } }
+        let outcome = await service.disconnect(expecting: service.connection)
+        XCTAssertEqual(outcome, .done)
+        XCTAssertEqual(service.disconnectedDMCount, 1)
+        let archive = try XCTUnwrap(service.files.savedDMOutbox(key))
+        XCTAssertEqual(archive.count, 1)
+        let original = try XCTUnwrap(archive.commands.first)
+        XCTAssertEqual(ChatService.args(original)["peer_account_id"]?.string, peer)
+        XCTAssertEqual(ChatService.args(original)["text"]?.string, "durable first hello")
+        XCTAssertNotNil(ChatService.args(original)["message_id"]?.string)
+        gate.open()
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(try service.files.savedDMOutbox(key)?.commands.first?.bodyBytes, original.bodyBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: service.files.cacheURL(key).path), "The late open must not recreate the disconnected cache")
+        let restored = ChatOrgSession(key: key, files: service.files)
+        let record = try XCTUnwrap(restored.store?.outbox.commands().first)
+        XCTAssertEqual(record.bodyBytes, original.bodyBytes)
+        XCTAssertEqual(record.state, .unconfirmed)
+        restored.startSending(api: ChatAPI(server: server, protocolClasses: [ChatStubProtocol.self]), token: "new-token", sessionId: "s-new", journal: nil, onUnauthorized: {})
+        let queue = try XCTUnwrap(restored.outbox)
+        defer { queue.hold() }
+        queue.allow(connection: 2, generation: "g1")
+        XCTAssertEqual(ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/commands" }.count, 1)
+        let repeated = try queue.resendUnconfirmed()
+        XCTAssertEqual(repeated.count, 1)
+        queue.pump()
+        try await wait { (try? restored.store?.outbox.commands().last?.state) == .sent }
+        let sent = try ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/commands" }
+            .map { try JSONDecoder().decode(ChatCommandEnvelope.self, from: $0.body) }
+        XCTAssertEqual(sent.map(\.type), ["dm.open", "dm.open", "dm.message.post"])
+        XCTAssertEqual(sent.first?.commandId, sent.dropFirst().first?.commandId)
+        XCTAssertEqual(sent.last?.args["message_id"], ChatService.args(original)["message_id"])
+        XCTAssertNil(sent.last?.args["peer_account_id"])
+        XCTAssertNil(sent.last?.args["open_command_id"])
+    }
+
+    func testFirstSendRestoresResolvedAddressWithoutOpeningAgain() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        routes.set("/v1/commands", #"{"events":[],"result":{"dm_id":"\#(dm)"}}"#)
+        try await ready()
+        let queue = try sendingQueue()
+        queue.onDMOpened = { [weak queue] _ in queue?.hold() }
+        let model = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        let version = try XCTUnwrap(model.saveDraft("resume after open", root: nil))
+        XCTAssertTrue(model.send("resume after open", root: nil, members: [], version: version))
+        let original = try XCTUnwrap(store.outbox.commands().first)
+        queue.allow(connection: 1, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().first.map { ChatService.args($0)["dm_id"]?.string }) == self.dm }
+        XCTAssertNil(try read { try ChatDMStore.card($0, dm) })
+        let outcome = await service.disconnect(expecting: service.connection)
+        XCTAssertEqual(outcome, .done)
+        XCTAssertEqual(service.disconnectedDMCount, 1)
+        let restored = ChatOrgSession(key: key, files: service.files)
+        restored.startSending(api: ChatAPI(server: server, protocolClasses: [ChatStubProtocol.self]), token: "new-token", sessionId: "s-new", journal: nil, onUnauthorized: {})
+        let resumed = try XCTUnwrap(restored.outbox), cache = try XCTUnwrap(restored.store)
+        defer { resumed.hold() }
+        XCTAssertEqual(try resumed.resendUnconfirmed().count, 1)
+        try service.files.saveDMOutbox(key, store: cache)
+        XCTAssertEqual(try service.files.savedDMOutbox(key)?.count, 1)
+        resumed.allow(connection: 2, generation: "g1")
+        try await wait { (try? cache.outbox.commands().last?.state) == .sent }
+        let sent = try ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/commands" }
+            .map { try JSONDecoder().decode(ChatCommandEnvelope.self, from: $0.body) }
+        XCTAssertEqual(sent.map(\.type), ["dm.open", "dm.message.post"])
+        XCTAssertEqual(sent.last?.args["message_id"], ChatService.args(original)["message_id"])
+        try service.files.saveDMOutbox(key, store: cache)
+        XCTAssertEqual(try service.files.savedDMOutbox(key)?.count, 0)
+    }
+
+    func testFirstSendRetriesBothStepsWithIdenticalWireIDsAndOneMessage() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        try await ready()
+        var card = try decode("dm_response", as: ChatDMCard.self); card.messages = []; card.head = 0
+        routes.set("/v1/orgs/\(org)/dms/\(dm)", String(decoding: try JSONEncoder().encode(card), as: UTF8.self))
+        routes.set("dm.open", #"{"error":"temporary"}"#, status: 503)
+        routes.set("dm.message.post", #"{"error":"temporary"}"#, status: 503)
+        let routes = routes
+        ChatStubProtocol.reset { request, body in
+            let type = (try? JSONDecoder().decode(ChatCommandEnvelope.self, from: body))?.type
+            let response = routes.answer(type ?? request.url!.path)
+            return .success(.init(status: response?.0 ?? 404, body: response?.1 ?? Data()))
+        }
+        let queue = try sendingQueue()
+        let model = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        let version = try XCTUnwrap(model.saveDraft("retry exactly once", root: nil))
+        XCTAssertTrue(model.send("retry exactly once", root: nil, members: [], version: version))
+        let original = try XCTUnwrap(store.outbox.commands().first)
+        queue.allow(connection: 1, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().first?.attempts) == 1 }
+        routes.set("dm.open", #"{"events":[],"result":{"dm_id":"\#(dm)"}}"#)
+        try write { try $0.execute(sql: "UPDATE outbox SET next_attempt_at = NULL") }; queue.pump()
+        try await wait {
+            guard let row = try? self.store.outbox.commands().first else { return false }
+            return ChatService.args(row)["dm_id"]?.string == self.dm && row.attempts == 1
+        }
+        routes.set("dm.message.post", #"{"events":[],"result":{"dm_id":"\#(dm)"}}"#)
+        try write { try $0.execute(sql: "UPDATE outbox SET next_attempt_at = NULL") }; queue.pump()
+        try await wait { (try? self.store.outbox.commands().first?.state) == .sent }
+        let bodies = ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/commands" }.map(\.body)
+        XCTAssertEqual(bodies.count, 4)
+        guard bodies.count == 4 else { return }
+        XCTAssertEqual(bodies[0], bodies[1]); XCTAssertEqual(bodies[2], bodies[3])
+        let post = try JSONDecoder().decode(ChatCommandEnvelope.self, from: bodies[3])
+        XCTAssertEqual(post.commandId, original.commandId)
+        XCTAssertEqual(post.args["message_id"], ChatService.args(original)["message_id"])
+        XCTAssertEqual(try store.outbox.commands().count, 1)
+        XCTAssertEqual(try read { try ChatDMStore.messages($0, dm).count }, 1)
+    }
+
+    func testFirstSendSurvivesDMEpochAndSnapshot() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        routes.set("/v1/commands", #"{"events":[],"result":{"dm_id":"\#(dm)"}}"#)
+        try await ready()
+        let outbox = try sendingQueue()
+        let model = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        let version = try XCTUnwrap(model.saveDraft("send across snapshot", root: nil))
+        _ = model.send("send across snapshot", root: nil, members: [], version: version)
+        let messageID = try store.outbox.commands().first.flatMap { ChatService.args($0)["message_id"]?.string }
+        let gate = Gate(); self.gate = gate; routes.gate = gate
+        routes.gated = "/v1/commands"; gate.close()
+        outbox.allow(connection: 1, generation: "g1")
+        try await wait { ChatStubProtocol.seen.contains { $0.request.url?.path == "/v1/commands" } }
+        sync.invalidate() // requestSnapshot's DM fence after team.add_member.
+        try store.apply(ChatSnapshot(cursors: [:], members: [
+            .init(accountId: me, handle: "me", name: "Me", role: "member"),
+            .init(accountId: peer, handle: "boris", name: "Boris", role: "member")]), confirmsRights: "s-me")
+        try await ready()
+        gate.open()
+        try await wait { (try? self.store.outbox.commands().contains { $0.type == "dm.message.post" && $0.state == .sent }) == true }
+        let sent = try ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/commands" }
+            .map { try JSONDecoder().decode(ChatCommandEnvelope.self, from: $0.body) }
+        XCTAssertEqual(sent.map(\.type), ["dm.open", "dm.message.post"])
+        XCTAssertEqual(sent.last?.args["text"]?.string, "send across snapshot")
+        XCTAssertEqual(sent.last?.args["message_id"]?.string, messageID)
+    }
+
+    func testDMListUsesStoredActivityWithoutReadingDrafts() async throws {
+        try await ready()
+        let activity = "2020-01-01T00:00:00Z"
+        try write { try $0.execute(sql: "UPDATE dm_cards SET last_activity = ?", arguments: [activity]) }
+        let list = try XCTUnwrap(service.dmList(key))
+        XCTAssertEqual(list.entries.first?.lastUsed, ChatFeedLayout.date(activity))
+        let queries = DMQueryLog()
+        try write { db in db.trace { queries.append($0) } }
+        defer { try? write { $0.trace(nil) } }
+        _ = try store.dmWrite { try ChatDMStore.saveDraft($0, dm, root: nil, text: "typing") }
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertFalse(queries.selects.contains { $0.contains("dm_messages") }, "Saving a draft must not refetch list history: \(queries.selects)")
+    }
+
+    func testPeerObservationReadsOnlyMembershipAndOwnDM() async throws {
+        try await ready()
+        let queries = DMQueryLog()
+        try write { db in db.trace { queries.append($0) } }
+        defer { try? write { $0.trace(nil) } }
+        let model = ChatDMPeerModel(key: key, peer: peer, service: service)
+        defer { model.stop() }
+        XCTAssertEqual(model.person?.name, "Boris")
+        for table in ["teams", "team_members", "channels", "messages", "agents", "channel_agents"] {
+            XCTAssertFalse(queries.selects.contains { $0.contains("from \(table)") || $0.contains("join \(table)") }, "Peer observation read \(table)")
+        }
+        XCTAssertFalse(queries.selects.contains { $0.contains("order by last_activity") })
+        queries.reset()
+        try write { try $0.execute(sql: "UPDATE meta SET channels_served = 1") }
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertTrue(queries.selects.isEmpty, "Channel metadata must not wake the peer observation")
+        let plan = try read { try Row.fetchAll($0, sql: "EXPLAIN QUERY PLAN SELECT dm_id FROM dm_cards WHERE json_extract(CAST(body AS TEXT), '$.peer.account_id') = ? LIMIT 1", arguments: [peer]) }
+        XCTAssertTrue(plan.contains { ($0["detail"] as String).contains("dm_card_peer") })
+    }
+
+    func testClosedPeerModelIsReleased() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        try await ready()
+        let state = TabState(route: .directMessageDraft(OrgKey(key), peer: peer))
+        var model = service.dmPeer(key, peer: peer)
+        weak var released = model
+        XCTAssertNotNil(released)
+        state.close()
+        model = nil
+        XCTAssertNil(released, "The organization must not retain a closed peer composer")
     }
     func testProductionFixturesDecodeAndChannelDecoderRejectsDM() throws {
         let card = try decode("dm_response", as: ChatDMCard.self)
@@ -160,7 +375,7 @@ final class ChatDMTests: XCTestCase {
         XCTAssertEqual(try read { try ChatDMStore.cards($0).map(\.dmId) }, [dm])
         let before = ChatStubProtocol.seen.count
         try await sync.reloadCatalog(valid: { true })
-        XCTAssertThrowsError(try service.beginDM(key, peer: peer))
+        XCTAssertThrowsError(try service.postDMToPeer(key, peer: peer, text: "private", mentions: [], draftVersion: "offline"))
         XCTAssertThrowsError(try service.postDM(key, dm: dm, root: nil, text: "private", mentions: []))
         XCTAssertEqual(ChatStubProtocol.seen.count, before)
         XCTAssertFalse(sync.readable())
@@ -383,26 +598,56 @@ final class ChatDMTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(read { try ChatDMStore.card($0, dm) }).writable)
     }
 
-    func testRecentEmptyConversationsAndUnreadAlwaysSurviveCollapse() async throws {
+    func testAllMembersSortByConversationActivityThenNameAndKeepUnreadVisible() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
         try await ready()
         let original = try decode("dm_response", as: ChatDMCard.self)
         try write { db in
+            try db.execute(sql: "DELETE FROM members WHERE account_id != ?", arguments: [me])
             for number in 0..<18 {
-                var card = original; card.dmId = "dm-\(number)"; card.messages = []; card.head = 0
+                let id = "person-\(number)", name = String(format: "Person %02d", number)
+                try db.execute(sql: "INSERT INTO members (account_id, name, handle, role) VALUES (?, ?, ?, 'member')", arguments: [id, name, id])
+                guard number < 10 || number == 12 else { continue }
+                var card = original; card.dmId = "dm-\(number)"; card.peer.accountId = id; card.messages = []; card.head = 0
                 card.createdAt = String(format: "2026-10-01T00:00:%02dZ", number)
+                if number < 10 {
+                    var message = original.messages![0]; message.dmId = card.dmId; message.createdAt = card.createdAt
+                    message.authorAccountId = id; card.messages = [message]; card.head = message.seq
+                }
                 try ChatDMStore.writeCard(db, card)
             }
-            var message = original.messages![0]; message.dmId = "dm-0"; message.authorAccountId = peer; message.createdAt = "2026-10-01T00:00:00Z"
-            try ChatDMStore.write(db, message)
-            try db.execute(sql: "INSERT INTO dm_preferences (dm_id, muted, opened) VALUES ('dm-1', 0, '2026-10-09T12:00:00Z'), ('dm-0', 1, NULL)")
+            var former = original; former.dmId = "former-dm"; former.peer.accountId = "former"; former.peer.name = "Former"
+            former.peer.active = false; former.state = "closed"; former.messages = []; former.head = 0
+            try ChatDMStore.writeCard(db, former)
+            try db.execute(sql: "UPDATE dm_marks SET seq = 0 WHERE dm_id = 'dm-0'")
+            try db.execute(sql: "INSERT INTO dm_preferences (dm_id, muted, opened) VALUES ('dm-12', 0, '2026-10-09T12:00:00Z'), ('dm-0', 1, NULL)")
         }
-        let entries = try read { try ChatDMEntry.read($0, me: me) }
-        XCTAssertEqual(entries.first?.id, "dm-1")
-        XCTAssertFalse(try XCTUnwrap(entries.first { $0.id == "dm-1" }).hasMessages)
-        let compact = ChatDMEntry.visible(entries, limit: 8)
-        XCTAssertTrue(compact.contains { $0.id == "dm-0" && $0.roots.count == 1 && $0.roots.muted })
+        let before = ChatStubProtocol.seen.count
+        let list = try XCTUnwrap(service.dmList(key)), entries = list.people
+        XCTAssertEqual(entries.prefix(10).map(\.id), (0..<10).reversed().map { "person-\($0)" })
+        XCTAssertEqual(entries.dropFirst(10).map(\.id), ["former"] + (10..<18).map { "person-\($0)" })
+        XCTAssertFalse(try XCTUnwrap(entries.first { $0.id == "person-12" }).hasMessages)
+        XCTAssertFalse(try XCTUnwrap(entries.first { $0.id == "former" }).writable)
+        XCTAssertFalse(entries.contains { $0.id == me || $0.id == peer })
+        let compact = ChatDMPerson.visible(entries, limit: 8)
+        XCTAssertTrue(compact.contains { $0.id == "person-0" && $0.roots.count == 1 && $0.roots.muted })
         XCTAssertEqual(compact.count, 9)
-        XCTAssertEqual(ChatDMEntry.visible(entries, limit: 24).count, 19)
+        XCTAssertEqual(ChatDMPerson.visible(entries, limit: 24).count, 19)
+        XCTAssertEqual(ChatDMPerson.visible(entries, limit: 8).map(\.id), compact.map(\.id))
+        XCTAssertEqual(ChatDMPerson.visible(entries, limit: 8, expanded: false).map(\.id), ["person-0"])
+        for kind in 0..<3 {
+            var unread = entries
+            unread[0].conversation?.roots = .init(count: 0, more: kind == 0, something: kind == 1, muted: true)
+            unread[0].conversation?.replies = kind == 2 ? 1 : 0
+            XCTAssertTrue(ChatDMPerson.visible(unread, limit: 0, expanded: false).contains { $0.id == unread[0].id })
+        }
+        try write { try $0.execute(sql: "DELETE FROM members WHERE account_id = 'person-17'") }
+        try await wait { !list.people.contains { $0.id == "person-17" } }
+        try write { try $0.execute(sql: "UPDATE members SET name = 'Aaron' WHERE account_id = 'person-16'") }
+        try await wait { list.people.dropFirst(10).first?.id == "person-16" }
+        _ = try service.postDM(key, dm: "dm-12", root: nil, text: "new activity", mentions: [])
+        try await wait { list.people.first?.id == "person-12" }
+        XCTAssertEqual(ChatStubProtocol.seen.count, before)
     }
     func testSharedTimelineUsesIndependentThreadReadsAndSharedDrafts() async throws {
         try await ready()
@@ -447,22 +692,244 @@ final class ChatDMTests: XCTestCase {
         XCTAssertNil(state.dmModel)
         XCTAssertNil(ChatMessageLink(key: key, message: message).url)
     }
-    func testNewDMPickerFiltersPeopleAndIgnoresLateResultAfterClose() async throws {
+    func testNewDMPickerFiltersPeopleWithoutOpeningOnServer() async throws {
         try await ready()
         let other = ChatOrgView.Member(accountId: "new-peer", handle: "vera", name: "Вера", role: "member")
         XCTAssertEqual(ChatDMNewModel.filter([.init(accountId: me, handle: "me", name: "Me", role: "member"), other], me: me, query: "ВЕ"), [other])
         try write { try $0.execute(sql: "INSERT INTO members (account_id, name, handle, role) VALUES (?, ?, ?, ?)", arguments: [other.accountId, other.name, other.handle, other.role]) }
         let state = TabState(route: .newDM(OrgKey(key))), model = ChatDMNewModel(key: key, state: nil, service: service)
         model.state = state; state.newDMModel = model
+        let before = ChatStubProtocol.seen.count
         model.choose(other.accountId)
-        let command = try XCTUnwrap(store.outbox.commands().first { $0.type == "dm.open" })
+        XCTAssertEqual(model.result, .directMessageDraft(OrgKey(key), peer: other.accountId))
+        XCTAssertTrue(try store.outbox.commands().isEmpty)
+        model.choose(peer)
+        XCTAssertEqual(model.result, .directMessage(ChatDMRef(key, dm: dm)))
         state.close()
-        let answer = ChatCommandAnswer(events: [], result: .object(["dm_id": .string(dm)]))
-        service.commandAnswered(key, command, .taken(answer))
+        model.choose(other.accountId)
         XCTAssertNil(model.result); XCTAssertFalse(model.readable)
         XCTAssertNil(state.newDMModel)
+        XCTAssertEqual(ChatStubProtocol.seen.count, before)
     }
 
+    func testPersonClickOpensOnePrivateLocalTabWithoutCommandsOrSubscriptions() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        try await ready()
+        let host = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: {
+            XCTFail("A DM created a terminal"); return TestEngine()
+        })
+        defer { host.terminate() }
+        let router = TabRouter(); router.stores = { [host] }; router.ensureHost = { host }
+        let navigation = SupportTabNavigation(router: router); navigation.finishStartup()
+        let before = ChatStubProtocol.seen.count
+        let tab = try XCTUnwrap(ChatDMTabs.open(key, peer: peer, from: host, service: service, navigation: navigation))
+        XCTAssertEqual(tab.toolRoute, .directMessageDraft(OrgKey(key), peer: peer))
+        XCTAssertTrue(tab.isDirectMessageTab)
+        XCTAssertTrue(ChatDMTabs.open(key, peer: peer, from: host, service: service, navigation: navigation) === tab)
+        let model = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        XCTAssertTrue(model.readable); XCTAssertTrue(model.writable)
+        XCTAssertTrue(model.conversationMessages(root: nil).isEmpty)
+        XCTAssertEqual(model.person?.name, "Boris")
+        _ = model.saveDraft("private draft", root: nil)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(try store.outbox.commands().isEmpty)
+        XCTAssertTrue(sync.openIDs.isEmpty); XCTAssertTrue(sync.followed.isEmpty)
+        XCTAssertEqual(ChatStubProtocol.seen.count, before)
+        let encoded = String(decoding: try JSONEncoder().encode(tab.toolRoute), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("Boris")); XCTAssertFalse(encoded.contains("private draft"))
+
+        let card = try decode("dm_response", as: ChatDMCard.self)
+        try write { try ChatDMStore.writeCard($0, card) }
+        try await wait { model.result == self.dm && self.service.dmList(self.key)?.people.first?.conversation != nil }
+        XCTAssertEqual(try read { try ChatDMStore.draft($0, dm, root: nil)?.text }, "private draft")
+        XCTAssertEqual(ChatDMTabs.open(key, peer: peer, from: host, service: service, navigation: navigation)?.toolRoute, .directMessage(ChatDMRef(key, dm: dm)))
+        XCTAssertTrue(try store.outbox.commands().isEmpty)
+        ChatConversationTabs.close(key, stores: [host])
+        XCTAssertTrue(host.allSessions.isEmpty)
+    }
+
+    func testFirstSendCreatesOneDMAndOneMessageAcrossWindowsAndFeedRace() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        try await ready()
+        let outbox = try sendingQueue()
+        routes.set("/v1/commands", #"{"events":[],"result":{"dm_id":"\#(dm)"}}"#)
+        let first = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        // Also exercise independent observers, as can happen during tab restoration.
+        let second = ChatDMPeerModel(key: key, peer: peer, service: service); defer { second.stop() }
+        let version = try XCTUnwrap(first.saveDraft("first hello @boris", root: nil))
+        try await wait { second.draft(root: nil)?.version == version }
+        for model in [first, first, second] {
+            XCTAssertTrue(model.send("first hello @boris", root: nil, members: [(peer, "boris")], version: version))
+        }
+        XCTAssertEqual(try store.outbox.commands().map(\.type), ["dm.message.post"])
+        var card = try decode("dm_response", as: ChatDMCard.self); card.messages = []; card.head = 0
+        routes.set("/v1/orgs/\(org)/dms/\(dm)", String(decoding: try JSONEncoder().encode(card), as: UTF8.self))
+        // The member feed discovers the DM before the open response returns.
+        try write { try ChatDMStore.writeCard($0, card) }
+        try await wait { first.result == self.dm && second.result == self.dm }
+        for model in [first, second] {
+            XCTAssertTrue(model.send("first hello @boris", root: nil, members: [(peer, "boris")], version: version))
+        }
+        outbox.allow(connection: 1, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().first?.state) == .sent }
+        let commands = try store.outbox.commands()
+        XCTAssertEqual(commands.map(\.type), ["dm.message.post"])
+        let post = try XCTUnwrap(commands.last)
+        XCTAssertEqual(ChatService.args(post)["dm_id"]?.string, dm)
+        XCTAssertEqual(ChatService.args(post)["text"]?.string, "first hello @boris")
+        XCTAssertEqual(try read { try ChatDMStore.messages($0, dm).count }, 1)
+        XCTAssertNil(try read { try ChatDMStore.draft($0, "peer:\(peer)", root: nil) })
+        XCTAssertEqual(try read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM dm_sends") }, 1)
+    }
+
+    func testFirstSendDoesNotWaitForCardAndSurvivesClosingTab() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        routes.set("/v1/commands", #"{"events":[],"result":{"dm_id":"\#(dm)"}}"#)
+        try await ready()
+        let outbox = try sendingQueue()
+        let state = TabState(route: .directMessageDraft(OrgKey(key), peer: peer))
+        state.dmPeerModel = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        let version = try XCTUnwrap(state.dmPeerModel?.saveDraft("send after close", root: nil))
+        XCTAssertTrue(state.dmPeerModel?.send("send after close", root: nil, members: [], version: version) == true)
+        state.close()
+        XCTAssertNil(state.dmPeerModel)
+        let gate = Gate(); self.gate = gate; routes.gate = gate
+        routes.gated = "/v1/orgs/\(org)/dms/\(dm)"; gate.close()
+        outbox.allow(connection: 1, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().first?.state) == .sent }
+        XCTAssertNil(try read { try ChatDMStore.card($0, dm) })
+        XCTAssertEqual(try store.outbox.commands().count, 1)
+        gate.open()
+        try await wait { self.sync.readable(self.dm) }
+    }
+
+    func testFirstSendRejectsStaleDraftAndCanRetryOpenFailure() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        try await ready()
+        let model = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        let old = try XCTUnwrap(model.saveDraft("old", root: nil))
+        let version = try XCTUnwrap(model.saveDraft("current", root: nil))
+        XCTAssertFalse(model.send("old", root: nil, members: [], version: old))
+        XCTAssertTrue(try store.outbox.commands().isEmpty)
+        XCTAssertTrue(model.send("current", root: nil, members: [], version: version))
+        let command = try XCTUnwrap(store.outbox.commands().first)
+        try write { try $0.execute(sql: "UPDATE outbox SET state = 'failed', error = 'temporary' WHERE command_id = ?", arguments: [command.commandId]) }
+        try await wait { model.outgoing.first?.state == .failed }
+        XCTAssertNil(model.draft(root: nil))
+        XCTAssertEqual(ChatService.args(try XCTUnwrap(model.outgoing.first))["text"]?.string, "current")
+        model.retry(command.commandId)
+        let retry = try XCTUnwrap(store.outbox.commands().last)
+        XCTAssertEqual(retry.state, .pending)
+        XCTAssertNotEqual(retry.commandId, command.commandId)
+        XCTAssertEqual(ChatService.args(retry)["message_id"], ChatService.args(command)["message_id"])
+    }
+
+    func testFirstSendReusesDMDiscoveredBeforeSendAndMovedDraftVersion() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        try await ready()
+        let model = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        let version = try XCTUnwrap(model.saveDraft("send during discovery", root: nil))
+        let card = try decode("dm_response", as: ChatDMCard.self)
+        try write { try ChatDMStore.writeCard($0, card) }
+        try await wait { model.result == self.dm }
+        XCTAssertTrue(model.send("send during discovery", root: nil, members: [], version: version))
+        XCTAssertTrue(model.send("send during discovery", root: nil, members: [], version: version))
+        XCTAssertEqual(try store.outbox.commands().map(\.type), ["dm.message.post"])
+        XCTAssertNil(try read { try ChatDMStore.draft($0, dm, root: nil) })
+    }
+
+    func testFirstSendPostsEvenWhenCardHydrationFails() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        try await ready()
+        let outbox = try sendingQueue()
+        routes.set("/v1/commands", #"{"events":[],"result":{"dm_id":"\#(dm)"}}"#)
+        routes.set("/v1/orgs/\(org)/dms/\(dm)", #"{"error":"temporary"}"#, status: 503)
+        let model = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        let version = try XCTUnwrap(model.saveDraft("retry hydration", root: nil))
+        XCTAssertTrue(model.send("retry hydration", root: nil, members: [], version: version))
+        outbox.allow(connection: 1, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().first?.state) == .sent }
+        XCTAssertNil(model.draft(root: nil))
+        routes.set("/v1/orgs/\(org)/dms/\(dm)", String(decoding: try fixture("dm_response"), as: UTF8.self))
+        try await wait { model.result == self.dm }
+        let sent = try ChatStubProtocol.seen.filter { $0.request.url?.path == "/v1/commands" }
+            .map { try JSONDecoder().decode(ChatCommandEnvelope.self, from: $0.body).type }
+        XCTAssertEqual(sent, ["dm.open", "dm.message.post"])
+    }
+
+    func testRemovedMemberAndRevokedAccessCannotSendPendingFirstMessage() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        try await ready()
+        let list = try XCTUnwrap(service.dmList(key)), model = try XCTUnwrap(service.dmPeer(key, peer: peer))
+        let version = try XCTUnwrap(model.saveDraft("must not send", root: nil))
+        try write { try $0.execute(sql: "DELETE FROM members WHERE account_id = ?", arguments: [peer]) }
+        XCTAssertFalse(model.send("must not send", root: nil, members: [], version: version))
+        try await wait { list.people.isEmpty && !model.readable }
+        XCTAssertNil(ChatDMTabs.route(key, peer: peer, service: service))
+        XCTAssertTrue(try store.outbox.commands().isEmpty)
+        try write { try $0.execute(sql: "INSERT INTO members (account_id, name, handle, role) VALUES (?, 'Boris', 'boris', 'member')", arguments: [peer]) }
+        try await wait { model.readable }
+        XCTAssertTrue(model.send("must not send", root: nil, members: [], version: version))
+        sync.invalidate()
+        let card = try decode("dm_response", as: ChatDMCard.self)
+        try write { try ChatDMStore.writeCard($0, card) }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(model.readable); XCTAssertNil(model.person); XCTAssertNil(model.draft(root: nil))
+        XCTAssertTrue(list.people.isEmpty)
+        XCTAssertEqual(try store.outbox.commands().map(\.type), ["dm.message.post"])
+    }
+
+
+    func testRenderedMemberSidebarAndEmptyConversationUsePrivateComposerWithoutNetwork() async throws {
+        routes.set("/v1/orgs/\(org)/dms", #"{"dms":[],"next":null}"#)
+        try await ready()
+        try write { db in
+            for number in 0..<12 {
+                try db.execute(sql: "INSERT INTO members (account_id, name, handle, role) VALUES (?, ?, ?, 'member')",
+                               arguments: ["person-\(number)", String(format: "Person %02d", number), "person\(number)"])
+            }
+        }
+        _ = NSApplication.shared
+        let workspace = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: { TestEngine() })
+        defer { workspace.terminate() }
+        let state = TabState(route: .directMessageDraft(OrgKey(key), peer: peer))
+        let before = ChatStubProtocol.seen.count
+        let host = NSHostingView(rootView: AnyView(HStack(spacing: 0) {
+            VStack { ChatDMSidebarSection(store: workspace, key: key, service: service); Spacer() }
+                .frame(width: 230).foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground)
+            Divider()
+            ChatDMPeerTab(state: state, scope: OrgKey(key), peer: peer, service: service)
+        }.frame(width: 960, height: 700)))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(200))
+        func editors(_ view: NSView) -> [ChatMentionEditor.Editor] {
+            (view as? ChatMentionEditor.Editor).map { [$0] } ?? view.subviews.flatMap(editors)
+        }
+        let editor = try XCTUnwrap(editors(host).first)
+        XCTAssertEqual(editors(host).count, 1)
+        XCTAssertEqual(editor.placeholder, "Message Boris")
+        XCTAssertNil(editor.navigationTarget)
+        XCTAssertTrue(try store.outbox.commands().isEmpty)
+        XCTAssertTrue(sync.followed.isEmpty)
+        XCTAssertEqual(ChatStubProtocol.seen.count, before)
+        if let directory = ProcessInfo.processInfo.environment["AGENTPAD_DM_RENDER"],
+           let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: directory).appendingPathComponent("dm-members.png"))
+        }
+        let model = try XCTUnwrap(state.dmPeerModel)
+        _ = model.saveDraft("late return after close", root: nil)
+        try await wait { editor.string == "late return after close" }
+        state.close()
+        XCTAssertNil(state.dmPeerModel)
+        XCTAssertFalse(model.readable)
+        XCTAssertTrue(editor.consume?(36, []) == true)
+        XCTAssertTrue(try store.outbox.commands().isEmpty)
+        XCTAssertEqual(ChatStubProtocol.seen.count, before)
+    }
 
     func testRenderedDMFeedAndThreadKeepSeparateHumanComposers() async throws {
         try await ready()
@@ -635,13 +1102,17 @@ final class ChatDMTests: XCTestCase {
         let before = ChatStubProtocol.seen.count
         let picker = ChatDMNewModel(key: key, state: nil, service: offline)
         let conversation = ChatDMModel(key: key, dm: dm, service: offline)
+        let person = ChatDMPeerModel(key: key, peer: peer, service: offline)
         let source = ChatDMAttentionSource(service: offline)
         source.start(scope: ChatAttention.scope(key, offline)) { XCTAssertTrue($0.isEmpty) }
         picker.choose(peer); conversation.loadOlder(); conversation.openThread("root")
         XCTAssertTrue(picker.people.isEmpty); XCTAssertNil(offline.dmList(key)); XCTAssertNil(ChatDMTabs.open(ChatDMRef(key, dm: dm), service: offline))
+        XCTAssertNil(offline.dmPeer(key, peer: peer)); XCTAssertNil(ChatDMTabs.open(key, peer: peer, service: offline))
+        XCTAssertFalse(person.readable); XCTAssertNil(person.person); XCTAssertNil(person.saveDraft("offline", root: nil))
+        XCTAssertFalse(person.send("offline", root: nil, members: [], version: "offline"))
         XCTAssertEqual(apiCalls, 0); XCTAssertEqual(ChatStubProtocol.seen.count, before)
         XCTAssertFalse(FileManager.default.fileExists(atPath: files.directory.path))
-        picker.stop(); conversation.stop(); source.stop()
+        picker.stop(); conversation.stop(); person.stop(); source.stop()
     }
 
     func testSessionToolsRejectDMArgumentsAndCannotReadDMAsChannel() async throws {

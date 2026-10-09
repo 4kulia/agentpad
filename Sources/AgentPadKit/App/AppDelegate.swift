@@ -353,7 +353,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         persistence.frameProvider = { [weak controller] in controller?.persistableFrame }
         controller.onShouldClose = { [weak self] in self?.shouldCloseWindow($0) ?? true }
         controller.onWillClose = { [weak self] in self?.handleWindowWillClose($0) }
-        controller.onDidBecomeKey = { [weak self] in self?.lastKeyController = $0 }
+        controller.onDidBecomeKey = { [weak self] in
+            self?.lastKeyController = $0
+            AttentionLedger.shared.markFocusedAttentionViewed()
+        }
         // The window a frame-less newcomer copies its size from: the key
         // window for ⌘⇧N / "Move to New Window", the previous one at launch.
         let reference = activeController?.persistableFrame
@@ -975,17 +978,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// it. A backgrounded app, a non-key window, a different workspace/tab, or
     /// a zoom hiding this pane all read as not-visible (→ worth a notification).
     private func isSessionVisible(_ sessionId: UUID) -> Bool {
-        guard NSApp.isActive,
-              let controller = windowControllers.first(where: { $0.window?.isKeyWindow == true && $0.window?.isVisible == true && $0.window?.isMiniaturized == false }),
-              let workspace = controller.store.workspaces.first(where: { $0.id == controller.store.activeWorkspaceId }),
-              let pane = workspace.root.pane(containingSessionId: sessionId),
-              pane.activeTabId == sessionId
-        else { return false }
-        // Zoom hides every pane but the zoomed one.
-        if let zoomed = workspace.zoomedPaneId, zoomed != pane.id { return false }
-        guard let location = dockTabLocation(for: sessionId) else { return false }
-        let view = location.session.engine.view
-        return view.window === controller.window && !view.isHiddenOrHasHiddenAncestor && !view.visibleRect.isEmpty
+        windowControllers.contains {
+            AttentionFocus.terminalVisible(sessionId, in: $0.store, window: $0.window, appActive: NSApp.isActive)
+        }
     }
 
     /// Mark the currently-visible tab's notifications read — called when AgentPad
@@ -993,6 +988,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// a notification that arrived while the (unchanged) active tab was hidden
     /// would otherwise keep the bell lit after the user is plainly looking at it.
     private func markVisibleSessionRead() {
+        AttentionLedger.shared.markFocusedAttentionViewed()
         guard NSApp.isActive,
               let controller = windowControllers.first(where: { $0.window?.isKeyWindow == true && $0.window?.isVisible == true && $0.window?.isMiniaturized == false }),
               let workspace = controller.store.workspaces.first(where: { $0.id == controller.store.activeWorkspaceId }),

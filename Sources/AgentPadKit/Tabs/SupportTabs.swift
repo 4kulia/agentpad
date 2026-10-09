@@ -75,6 +75,7 @@ final class SupportTabs {
     func content(_ state: TabState) -> AnyView {
         switch state.route {
         case .directMessage(let ref): return AnyView(ChatDMTab(state: state, ref: ref))
+        case .directMessageDraft(let key, let peer): return AnyView(ChatDMPeerTab(state: state, scope: key, peer: peer))
         case .newDM(let key): return AnyView(ChatDMNewView(state: state, scope: key))
         case .allSessions:
             if state.allSessionsModel == nil { state.allSessionsModel = AllSessionsModel(state: state) }
@@ -255,7 +256,7 @@ struct NotificationTabView: View {
 extension ToolRoute {
     var organizationScope: OrgKey? {
         switch self {
-        case .newDM(let key), .organization(let key), .agent(let key, _), .ask(let key, _), .newChannel(let key, _, _), .viewer(let key, _, _, _): return key
+        case .directMessageDraft(let key, _), .newDM(let key), .organization(let key), .agent(let key, _), .ask(let key, _), .newChannel(let key, _, _), .viewer(let key, _, _, _): return key
         case .directMessage(let ref): return ref.key.map(OrgKey.init)
         case .request(let scope, _), .publishedAgents(let scope), .teamActivity(let scope), .publication(let scope, _), .publish(let scope, _, _, _):
             if case .server(let key) = scope { return key }; return nil

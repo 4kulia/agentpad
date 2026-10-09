@@ -101,9 +101,11 @@ enum AttentionList {
     }
     static func items(ledger: [AttentionEvent], current: AttentionCurrent,
                       mentions: [AttentionConversation] = [], dms: [AttentionConversation] = [],
-                      settings: AttentionListSettings = .init(), dismissed: Set<String> = []) -> [AttentionItem] {
+                      settings: AttentionListSettings = .init(), dismissed: Set<String> = [],
+                      viewed: Set<String> = []) -> [AttentionItem] {
         var result: [AttentionItem] = ledger.compactMap { event in
             if event.scope != nil && !current.serverEvents.contains(event.id) { return nil }
+            if event.clearsAttentionOnView && viewed.contains(event.id) { return nil }
             let tier: Int
             switch event.kind {
             case .decision, .folder, .publicationReview:

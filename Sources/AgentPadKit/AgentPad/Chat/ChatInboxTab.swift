@@ -160,7 +160,7 @@ struct ChatInboxPresentation {
         let byChannel = Dictionary(grouping: self.entries, by: { $0.message.channelId })
         missing = channels.compactMap { channel in
             let shown = byChannel[channel.id, default: []].filter(\.unread).count
-            let expected = kind == .unread ? channel.unread.count : channel.mentions
+            let expected = kind == .unread ? channel.unread.count + channel.unreadReplies : channel.mentions
             let remaining = max(0, expected - shown)
             guard remaining > 0 || channel.unread.more || channel.unread.something else { return nil }
             return Missing(channel: channel, count: remaining, kind: kind)

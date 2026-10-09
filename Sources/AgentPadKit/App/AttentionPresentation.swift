@@ -29,6 +29,7 @@ final class NotificationNavigation {
             ledger.resolve(id); unavailable(); return
         }
         ledger.markRead(id)
+        ledger.markFocusedAttentionViewed()
     }
     func finishStartup() {
         ready = true
@@ -43,6 +44,16 @@ final class NotificationNavigation {
 
 @MainActor
 enum AttentionFocus {
+    static func terminalVisible(_ id: UUID, in store: WorkspaceStore, window: NSWindow?, appActive: Bool) -> Bool {
+        guard appActive, let window, window.isKeyWindow, window.isVisible, !window.isMiniaturized,
+              let workspace = store.active, let pane = workspace.root.pane(containingSessionId: id),
+              pane.activeTabId == id, let session = pane.activeTab else { return false }
+        if let zoomed = workspace.zoomedPaneId, zoomed != pane.id { return false }
+        let view = session.engine.view
+        return view.window === window && !view.isHiddenOrHasHiddenAncestor
+            && !view.frame.isEmpty && !view.visibleRect.isEmpty
+    }
+
     static var places: [UUID: (destinations: Set<AttentionDestination>, view: WeakView)] = [:]
     final class WeakView { weak var view: NSView?; init(_ view: NSView) { self.view = view } }
     static func window(for destination: AttentionDestination) -> NSWindow? {

@@ -275,7 +275,7 @@ final class LinkTerminal {
     let output = LinkTerminalOutput()
     var surface: ghostty_surface_t { view.surface! }
 
-    init() throws {
+    init(view suppliedView: GhosttySurfaceView? = nil) throws {
         _ = NSApplication.shared
         _ = try XCTUnwrap(LibghosttyApp.shared.app)
         let config = try XCTUnwrap(ghostty_config_new())
@@ -288,7 +288,7 @@ final class LinkTerminal {
         app = try XCTUnwrap(ghostty_app_new(&runtime, config))
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 550),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        view = GhosttySurfaceView(frame: NSRect(x: 0, y: 0, width: 900, height: 550))
+        view = suppliedView ?? GhosttySurfaceView(frame: NSRect(x: 0, y: 0, width: 900, height: 550))
         window.contentView = view
         var sc = ghostty_surface_config_new()
         sc.scale_factor = Double(window.backingScaleFactor)

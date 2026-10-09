@@ -7,7 +7,7 @@ import SwiftUI
 enum ExternalSessionActions {
     static func focus(_ session: ExternalAgentSession) {
         Task { @MainActor in
-            if await TerminalFocuser.focus(session) == .noTerminalFound {
+            if await ExternalSessionMonitor.shared.focus(session) == .noTerminalFound {
                 showFailure(
                     title: "Couldn't find this session's window",
                     message: "It isn't running in a terminal app this Mac can bring forward (for example, it runs inside tmux or over SSH).", session: session

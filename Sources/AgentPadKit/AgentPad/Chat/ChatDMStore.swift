@@ -60,6 +60,10 @@ enum ChatDMStore {
     static func cards(_ db: Database) throws -> [ChatDMCard] {
         try String.fetchAll(db, sql: "SELECT dm_id FROM dm_cards ORDER BY last_activity DESC, dm_id").compactMap { try card(db, $0) }
     }
+    static func cardForPeer(_ db: Database, _ peer: String) throws -> ChatDMCard? {
+        guard let id = try String.fetchOne(db, sql: "SELECT dm_id FROM dm_cards WHERE json_extract(CAST(body AS TEXT), '$.peer.account_id') = ? LIMIT 1", arguments: [peer]) else { return nil }
+        return try card(db, id)
+    }
     static func windowEpoch(_ db: Database, _ id: String) throws -> Int? {
         try Int.fetchOne(db, sql: "SELECT epoch FROM dm_cards WHERE dm_id = ?", arguments: [id])
     }
