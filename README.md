@@ -2,7 +2,7 @@
 
 **Your coding agents and your team in one macOS window.**
 
-If you run several Claude Code or Codex sessions at once, they end up scattered across terminal tabs, and finding the one that is waiting for you turns into a search. AgentPad puts them in one place, next to your team's chat: every live session, wherever it was started; every past conversation, ready to resume; the session's files beside the terminal; channels and direct messages where people and agents work together.
+When you run several Claude Code or Codex sessions, finding the one waiting for you can take time. AgentPad brings its own agent tabs, live Claude Code sessions in other terminals and available local history into one window. Files sit beside the terminal, with team chat close by.
 
 AgentPad is a native macOS app built on SwiftUI and [libghostty](https://github.com/ghostty-org/ghostty).
 
@@ -17,7 +17,7 @@ AgentPad is a native macOS app built on SwiftUI and [libghostty](https://github.
 - **Tabs and splits** in the middle: agent sessions, terminals, channels, conversations and settings all open as tabs. Split a pane side by side or top and bottom, drag a tab to another pane or workspace; the session keeps running.
 - **Sessions** on the right, hidden by default: everything that is running or recently ran.
 
-Nothing opens as a blocking pop-up window: connecting a team, publishing an agent, requests and confirmations open as tabs or inline.
+Team connections, agent publishing and request reviews open in tabs, with inline confirmations. Native file pickers and first-launch setup can still open modal dialogs.
 
 ## Needs attention
 
@@ -27,15 +27,15 @@ One list at the top of the sidebar for everything waiting for you:
 - a run that failed;
 - with a team connected: mentions, unread direct messages and calls from colleagues waiting for your approval.
 
-Click a row to go there. A row clears once you have opened the tab, and comes back if the agent asks again. Muting a conversation removes it from the list. Which reasons are shown is set in Settings.
+Click a row to open it. Opening a session clears its current input or error entry. Approvals stay until resolved. Muting a DM hides its unread entry; channel mentions remain. Settings can hide approvals, mentions and DMs. Input and error entries are always enabled.
 
 ## Sessions
 
 - **One list for all sessions.** It shows agent tabs inside AgentPad, live Claude Code sessions running in other terminals (Terminal.app, iTerm2 and others), and recent conversations from disk.
-- **All sessions** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>H</kbd>): every past session of every supported agent on this Mac, titled by its first request. Search by title, first request or folder, rename a session, and resume it in a tab. Sessions started automatically are hidden unless they are waiting for you or failed. Works fully offline.
+- **All sessions** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>H</kbd>): browse available local history. Claude Code and Codex have no record-count limit; other agents show up to 150 recent records each. Titles use a saved name, then the first request or a default title. Search by title, first request or folder, rename a session, and resume it in a tab. Sessions started automatically are hidden unless they are waiting for you or failed. Browsing works offline.
 - **Sessions in other terminals.** Click one to bring its Terminal.app or iTerm2 tab to the front. **Move Here** closes an idle session in its terminal and resumes the same conversation in an AgentPad tab, so nothing in the conversation is lost. **Show Files** points the file tree at that session's folder.
-- **Tabs survive restarts.** After quitting, restarting or updating AgentPad, agent tabs come back as agents and continue their conversations.
-- **Attention outside the window:** a Dock badge counts the sessions waiting for you; <kbd>⌘</kbd><kbd>⇧</kbd><kbd>U</kbd> cycles through them; notifications name the session and the reason, and clicking one takes you there.
+- **Tabs survive restarts.** Tabs and layouts return after a restart or update. Conversations resume when automatic resume is on and a valid, supported conversation ID is available. Running processes and terminal scrollback are not restored.
+- **Attention outside the window:** the Dock badge counts pending attention events and unread channel mentions. <kbd>⌘</kbd><kbd>⇧</kbd><kbd>U</kbd> cycles through waiting agent tabs and external Claude Code sessions. Notifications name the session and the reason; clicking one takes you there.
 - **Share an answer:** right-click a Claude Code tab → **Forward…** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>F</kbd>) sends the agent's last answer to a channel, or **Copy as Markdown** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>C</kbd>).
 - <kbd>⌘</kbd>-click a file path in the terminal to open it in the preview (`path:line` jumps to the line).
 
@@ -59,7 +59,7 @@ Click a row to go there. A row clears once you have opened the tab, and comes ba
 | Kiro CLI | `kiro-cli` | ✗ | ✗ | ✓ |
 | Droid | `droid` | ✓ | ✗ | ✓ |
 
-- **Waiting dot:** the agent stopped and needs an answer, including a pending tool approval.
+- **Waiting dot:** marks reported input requests or completed turns, depending on the agent. Tool approvals appear only where the integration supports them.
 - **Tool pill:** shows the tool running right now.
 - **Session history:** past conversations can be browsed and resumed.
 
@@ -68,11 +68,11 @@ Sessions running in *other* terminals are detected for Claude Code only for now.
 ## Files
 
 - **File tree** of the session's folder. It updates live as the agent creates, changes or deletes files, and shows git line counts on changed files.
-- **Copy, Cut and Paste** through the system clipboard, so they work with Finder in both directions.
+- **Copy and Paste** work with Finder in both directions. **Cut** marks files to move on the next paste inside AgentPad.
 - **New File, New Folder, Rename, Duplicate.**
 - **Move to Trash.** Nothing is ever deleted outright.
-- **Name clashes** ask whether to *Keep Both*, *Replace* or *Skip*, with *Apply to all* for batches. Replace is staged: if anything fails, the original stays where it was.
-- **Drag and drop.** Within the tree it moves, from Finder it copies. Dragging a file onto the terminal inserts its path.
+- **Name clashes** ask whether to *Keep Both*, *Replace* or *Skip*, with *Apply to all* for batches. Replace is staged. If the final step fails, AgentPad tries to restore the original. If that also fails, the original stays in the Trash and an error appears.
+- **Drag and drop.** Files dropped from inside the tree's root folder are moved; files from outside it are copied. Dragging a file onto the terminal inserts its path.
 - **Find a file by name** in the session's folder. Tooling folders such as `.git` and `node_modules` are skipped.
 - **Show or hide dotfiles**, and **Quick Look** any file.
 
@@ -82,51 +82,53 @@ Click a file to preview it under the terminal. Drag the divider to resize the pr
 
 - **Code and text:** syntax highlighting, line numbers, find with <kbd>⌘</kbd><kbd>F</kbd>.
 - **Markdown:** rendered, with a toggle to the source. JavaScript is off, images load only from inside the project, and links never launch local files.
-- **Everything else** goes through Quick Look: images, PDF, office documents, audio and video.
+- **Images:** supported static images use the built-in preview.
+- **Other binary files**, including PDFs, office documents, audio and video, use Quick Look.
 - **Live reload:** the preview follows the file as the agent rewrites it.
 - **Large files:** text files over 5 MB show their first 5 MB.
 
 ## Team
 
-Team features need an AgentPad server your team shares. Without one, AgentPad is a local app: no account, and no network requests beyond update checks.
+Team features need an AgentPad server your team shares. Local session browsing needs no account and works offline.
 
 **Connect:** the server's address and your email; enter the code the server mails you. An organization has members and teams; channels belong to teams.
 
 ### Chat
 
 - **Channels** with threads, mentions, reactions, pinned messages and Markdown.
-- **Attachments:** paste a screenshot (<kbd>⌘</kbd><kbd>V</kbd>) or drop files into a message; images show in the feed. Photo location and camera data are removed before upload.
+- **Attachments:** channels and threads accept supported images, PDFs and UTF-8 text files. Paste a screenshot (<kbd>⌘</kbd><kbd>V</kbd>) or drop files; images show in the feed. The server sets size and count limits. Image location and camera metadata are removed before upload. DMs do not support attachments.
 - **Direct messages** with anyone in the organization: threads, editing and deleting. Everyone is listed under *Direct messages*; people you talked to recently are on top. Notifications for direct messages show neither the name nor the text.
 - **Unread** and **Mentions** list the messages themselves, including thread replies. A channel's counter counts messages in the channel itself; thread replies are marked "new" on the thread.
-- Unsent messages are kept if you disconnect, and sent when you reconnect.
+- Queued messages retry after a temporary network outage. Choosing **Disconnect** clears the local channel cache. Unsent DMs stay on your Mac and need confirmation before resending after sign-in.
 
 ### Agents in the team
 
-- **Publish an agent** so colleagues' agents can ask yours: a name, what to ask it about, a project folder and its rights — *Read*, *Read and git*, or *Edit*. Files with secrets (`.env`, keys) are excluded from reading by default. You can publish a fresh agent in a folder or a Claude Code session itself (each call works on a copy of the conversation).
-- **Every call waits for the owner.** It shows up in *Needs attention* with its full text; nothing runs until the owner clicks **Allow**. Then Claude Code runs in the agent's folder with those rights only — the owner's own Claude Code settings and MCP servers are not used — and the answer goes back. **Watch** shows live what the agent does; **Continue…** opens its conversation for you to carry on.
-- **Agents in channels:** add a published agent to a channel and mention it; the call still waits for its owner's approval.
-- **From your own sessions:** while connected, agent sessions in AgentPad get tools to find colleagues' agents and ask them (`team_agents`, `team_ask`, `team_check`, `team_cancel`) and to read and post in your channels (`chat_channels`, `chat_read`, `chat_post`). These are passed at launch; your configuration is not changed. Posts from a session are signed with its name. From the command line: `agentpad-cli team agents`, `agentpad-cli team ask backend@masha "How does auth work in your branch?"`.
+- **Publish an agent** so colleagues' agents can ask yours. Give it a name, a description and a project folder. You can publish a fresh agent or a Claude Code session; calls to a published session use a copy of its conversation.
+- **Permissions:** choose *Read*, *Edit files (no shell)*, *Read and git*, or *Edit*. File tools block common secret paths by default. Shell commands in *Read and git* and *Edit* can access files outside the project and read environment variables.
+- **Personal calls** need the owner's approval. Open the request tab from *Needs attention* to review the full prompt before choosing **Allow**. Claude Code runs in the agent's folder without the owner's Claude Code settings or MCP servers. The answer goes back to the caller. **Watch** shows live what the agent does; **Continue…** opens its conversation for you to carry on.
+- **Agents in channels:** add a published agent to a channel and mention it. Calls can run and publish automatically with the owner's consent to their own request, or with channel trust for an agent without a shell. Otherwise, the owner reviews the request before it runs and the result before publication.
+- **From your own sessions:** while connected, new Claude Code sessions in AgentPad get team and channel MCP tools at launch, unless launch options prevent adding them. Codex does not get them automatically. The tools find and ask colleagues' agents (`team_agents`, `team_ask`, `team_check`, `team_cancel`), and read and post in your channels (`chat_channels`, `chat_read`, `chat_post`). Posts use the linked published agent's identity, or otherwise the session's signature. From the command line: `agentpad-cli team agents`, `agentpad-cli team ask backend@masha "How does auth work in your branch?"`.
 
-AgentPad connects only to the server you chose, over HTTPS; the sign-in is kept in the macOS keychain. Disconnecting closes the connection.
+Team connections use your chosen server over HTTPS. Local servers at `localhost` or `127.0.0.1` may use HTTP. The sign-in token is stored in the macOS keychain. Disconnecting closes the connection.
 
 ## Where the data comes from
 
-AgentPad reads what the agents already write; it doesn't install hooks into your configuration.
+AgentPad reads local session stores and uses status integrations for each agent.
 
 | What | Source |
 | --- | --- |
 | Live Claude Code sessions in other terminals | `~/.claude/sessions/<pid>.json`, falling back to `claude agents --json` |
 | Past conversations | each agent's own session store, e.g. `~/.claude/projects`, `~/.codex/sessions` |
-| Status of AgentPad's own agent tabs | hooks passed per launch with `claude --settings`. Your `~/.claude/settings.json` is never modified |
+| Status of AgentPad's own agent tabs | Claude Code gets hooks at launch without changes to `~/.claude/settings.json`. Some other integrations install managed hooks or plugins in the agent's configuration |
 
-Claude Code's session files are an internal format. AgentPad treats them defensively, ignoring unknown fields and dropping records it can't verify. Before **Move Here** signals a process, it checks that the process is still the same Claude Code instance that was listed, so a reused PID is never hit.
+Claude Code's session files are an internal format. AgentPad treats them defensively, ignoring unknown fields and dropping records it can't verify. Before **Move Here** sends SIGTERM, AgentPad rechecks the session, process ID and start time. This reduces the risk of signalling a different process.
 
 ## Privacy
 
-There is no telemetry. Conversations and files stay on your Mac. AgentPad makes no network requests on its own, with two exceptions:
+There is no telemetry. Local session browsing needs no account. Shared team content and files sent to SSH workspaces leave your Mac. Agents and terminal commands may also use the network independently.
 
-- **Updates.** Once a day, and when you choose **Check for Updates…**, AgentPad reads the list of releases (`appcast.xml`) from this repository's latest GitHub release. Nothing about you or your Mac is sent.
-- **Team**, while connected, talks to the AgentPad server you connected to, and to nothing else. Your agent conversations are not uploaded; only what you or your agents post to the chat, and the questions and answers of calls between agents, go to the server.
+- **Updates.** AgentPad checks GitHub's release feed every six hours by default, and when you choose **Check for Updates…**. GitHub receives your IP address, AgentPad and Sparkle versions, and other normal request metadata.
+- **Team.** Your chosen server receives account and device information, including your email and device name. It also receives published agent profiles, messages and attachments, call requests and results, and collaboration metadata such as run activity. AgentPad does not automatically upload local transcripts. Shared answers may include content from conversations and project files.
 
 ## Roadmap
 
