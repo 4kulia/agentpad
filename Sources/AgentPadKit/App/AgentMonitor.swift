@@ -92,8 +92,7 @@ final class AgentMonitor {
         /// AgentPad: the agent's conversation id, so the unified list can keep
         /// a live session from also appearing under "recent".
         var conversationId: String? = nil
-        /// AgentPad: work the agent left running in the background after its
-        /// turn; the row then reads "running · background".
+        /// Work left in the background, independent of the foreground state.
         var backgroundWork: Session.BackgroundWork? = nil
 
         /// AgentPad: the state word, saying when the running is background work.
@@ -134,7 +133,7 @@ final class AgentMonitor {
         func hoverText(tag: WorkspaceTag?) -> String {
             var head = "\(singleLine(agent.title)) · \(singleLine(tabTitle)) · \(state.help)"
             // AgentPad: say what is running in the background.
-            if state == .running, let work = backgroundWork {
+            if let work = backgroundWork {
                 var parts: [String] = []
                 if work.subagents > 0 { parts.append(work.subagents == 1 ? "1 subagent" : "\(work.subagents) subagents") }
                 if work.shells > 0 { parts.append(work.shells == 1 ? "1 shell command" : "\(work.shells) shell commands") }

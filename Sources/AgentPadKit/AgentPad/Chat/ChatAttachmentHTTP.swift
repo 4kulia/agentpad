@@ -1,8 +1,9 @@
 import Foundation
 
 /// A bounded, cancellable binary lane, separate from the JSON timeout and cache.
-/// Each transfer owns its ephemeral session. URLProtocol is injected by tests.
-private final class ChatAttachmentTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+/// Attachments own a session; avatars reuse their scope's ephemeral session.
+/// URLProtocol is injected by tests.
+final class ChatAttachmentTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var task: URLSessionTask?
     private var continuation: CheckedContinuation<ChatAPI.Response, Error>?
@@ -12,25 +13,38 @@ private final class ChatAttachmentTransfer: NSObject, URLSessionDataDelegate, @u
     private let limit: Int
     private let progress: @Sendable (Double) -> Void
     init(limit: Int, progress: @escaping @Sendable (Double) -> Void) { self.limit = limit; self.progress = progress }
-    func run(_ request: URLRequest, upload: Data?, protocols: [AnyClass]?) async throws -> ChatAPI.Response {
-        try await withTaskCancellationHandler {
+    func run(_ request: URLRequest, upload: Data?, protocols: [AnyClass]?, session shared: URLSession? = nil) async throws -> ChatAPI.Response {
+        // A shared session cannot set a resource timeout separately for each
+        // task. Preserve the dedicated lane's total deadline as well as its
+        // per-request inactivity timeout.
+        let deadline: Task<Void, Never>? = shared == nil ? nil : Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(request.timeoutInterval)) } catch { return }
+            self?.cancel()
+        }
+        defer { deadline?.cancel() }
+        return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let config = URLSessionConfiguration.ephemeral
-                config.httpCookieAcceptPolicy = .never; config.httpShouldSetCookies = false
-                config.urlCache = nil; config.requestCachePolicy = .reloadIgnoringLocalCacheData
-                config.timeoutIntervalForRequest = request.timeoutInterval
-                config.timeoutIntervalForResource = request.timeoutInterval
-                if let protocols { config.protocolClasses = protocols }
-                let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+                let session: URLSession
+                if let shared { session = shared }
+                else {
+                    let config = URLSessionConfiguration.ephemeral
+                    config.httpCookieAcceptPolicy = .never; config.httpShouldSetCookies = false
+                    config.urlCache = nil; config.requestCachePolicy = .reloadIgnoringLocalCacheData
+                    config.timeoutIntervalForRequest = request.timeoutInterval
+                    config.timeoutIntervalForResource = request.timeoutInterval
+                    if let protocols { config.protocolClasses = protocols }
+                    session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+                }
                 lock.lock()
                 self.continuation = continuation
                 let task = upload.map { session.uploadTask(with: request, from: $0) } ?? session.dataTask(with: request)
+                if shared != nil { task.delegate = self }
                 self.task = task
                 let cancel = cancelled
                 lock.unlock()
                 if cancel { task.cancel() }
                 task.resume()
-                session.finishTasksAndInvalidate()
+                if shared == nil { session.finishTasksAndInvalidate() }
             }
         } onCancel: { self.cancel() }
     }
@@ -58,13 +72,20 @@ private final class ChatAttachmentTransfer: NSObject, URLSessionDataDelegate, @u
         if totalBytesExpectedToSend > 0 { progress(min(1, Double(totalBytesSent) / Double(totalBytesExpectedToSend))) }
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        lock.lock(); let continuation = continuation; self.continuation = nil; let cancelled = cancelled; lock.unlock()
+        lock.lock(); let continuation = continuation; self.continuation = nil; self.task = nil; let cancelled = cancelled; lock.unlock()
         if cancelled { continuation?.resume(throwing: CancellationError()) }
         else if let response, (300..<400).contains(response.statusCode) { continuation?.resume(throwing: ChatAPIError.redirect(response.statusCode)) }
-        else if error != nil { continuation?.resume(throwing: ChatAPIError.network("File transfer failed")) }
+        // A received refusal remains definitive even if its error body was
+        // truncated by our bound (notably a proxy's explicit HTTP 413).
+        else if error != nil, response.map({ (200..<300).contains($0.statusCode) }) ?? true {
+            continuation?.resume(throwing: ChatAPIError.network("File transfer failed"))
+        }
         else if let response {
             continuation?.resume(returning: .init(status: response.statusCode, body: bytes,
-                retryAfter: ChatAPI.retryAfter(response.value(forHTTPHeaderField: "Retry-After"))))
+                retryAfter: ChatAPI.retryAfter(response.value(forHTTPHeaderField: "Retry-After")),
+                headers: Dictionary(response.allHeaderFields.compactMap { key, value in
+                    (key as? String).map { ($0.lowercased(), String(describing: value)) }
+                }, uniquingKeysWith: { _, last in last })))
         } else { continuation?.resume(throwing: ChatAPIError.unexpectedAnswer("not HTTP")) }
     }
 }

@@ -3,8 +3,9 @@ import SwiftUI
 struct AttentionSidebarSection: View {
     @Bindable var store: WorkspaceStore
     var model = AttentionSidebarModel.shared
+    var title = "Needs attention"
     var body: some View {
-        AttentionSectionContent(items: model.items,
+        AttentionSectionContent(title: title, items: model.items,
             collapsed: Binding(get: { store.chatSidebarPreferences.attentionCollapsed ?? false },
                                set: { store.chatSidebarPreferences.attentionCollapsed = $0; store.scheduleSave() }),
             expanded: $store.attentionExpanded,
@@ -14,6 +15,7 @@ struct AttentionSidebarSection: View {
 }
 
 struct AttentionSectionContent: View {
+    var title = "Needs attention"
     var items: [AttentionItem]
     @Binding var collapsed: Bool
     @Binding var expanded: Bool
@@ -31,7 +33,7 @@ struct AttentionSectionContent: View {
                     Button { collapsed.toggle() } label: {
                         HStack(spacing: 5) {
                             Image(systemName: collapsed ? "chevron.right" : "chevron.down").font(.system(size: 9))
-                            Text("Needs attention").font(Theme.display(11, weight: .semibold))
+                            Text(title).font(Theme.display(11, weight: .semibold))
                             Text("\(items.count)").monospacedDigit().font(Theme.display(10))
                         }
                     }.buttonStyle(.plain).accessibilityValue(collapsed ? "Collapsed" : "Expanded")
@@ -45,7 +47,7 @@ struct AttentionSectionContent: View {
                             HStack(spacing: 8) {
                                 if let id = item.subjectID, !id.isEmpty {
                                     ContactAvatar(stableID: id, name: item.subjectName ?? item.title,
-                                                  kind: item.subjectIsAgent ? .agent : .person, size: 24)
+                                                  kind: item.subjectIsAgent ? .agent : .person, size: 24, localProfileID: item.localProfileID, remote: item.remoteAvatar)
                                 } else {
                                     Image(systemName: item.tier == 3 ? "at" : item.tier == 2 ? "exclamationmark.triangle" : "hand.raised")
                                         .font(.system(size: 14)).frame(width: 24)

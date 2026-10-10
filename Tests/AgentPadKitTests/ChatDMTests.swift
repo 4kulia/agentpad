@@ -1373,3 +1373,681 @@ final class ChatDMTests: XCTestCase {
         XCTAssertEqual(ChatService.args(own)["text"]?.string, "keep this command")
     }
 }
+
+extension ChatDMTests {
+    private func attachmentDraft(owner: ChatAttachmentOwner, queued: Bool = false) throws -> ChatAttachmentDraft {
+        let bytes = Data("private draft".utf8)
+        let limits = try JSONDecoder().decode(ChatAttachmentLimits.self, from: Data(ChatAttachmentsTests.limitsJSON.utf8))
+        var draft = ChatAttachmentDraft(file: try ChatAttachmentStorage.descriptor(data: bytes, name: "private.txt", limits: limits),
+            messageId: UUID().uuidString.lowercased(), owner: owner, root: "", session: "s-me", generation: "g1",
+            sha256: ChatAttachments.digest(bytes), createdAt: Date(), expiresAt: Date().addingTimeInterval(3600))
+        draft.queued = queued
+        try service.files.attachmentStorage.save(bytes, key: key, id: draft.id)
+        return draft
+    }
+
+    func testDMAttachmentWireDefaultsAndDeletionCannotReviveDescriptors() async throws {
+        try await ready()
+        let legacy = try decode("dm_message", as: ChatDMMessageWire.self)
+        XCTAssertEqual(legacy.attachments, []); XCTAssertFalse(legacy.attachmentOnly)
+        let message = try decode("dm_attachment_message", as: ChatDMMessageWire.self)
+        try write { try ChatDMStore.write($0, message) }
+        XCTAssertEqual(try read { try ChatDMStore.messages($0, dm).first { $0.id == message.messageId }?.attachments }, message.attachments)
+        var deleted = message; deleted.revision += 1; deleted.deletedAt = "2026-10-09T10:00:00Z"
+        try write { try ChatDMStore.write($0, deleted); try ChatDMStore.write($0, message) }
+        let saved = try XCTUnwrap(try read { try ChatDMStore.messages($0, dm).first { $0.id == message.messageId } })
+        XCTAssertTrue(saved.deleted); XCTAssertTrue(saved.attachments.isEmpty); XCTAssertFalse(saved.attachmentOnly)
+    }
+
+    func testDMAttachmentOwnersSeparateCollidingChannelIDsAndLegacyJSON() async throws {
+        try await ready()
+        let channel = try attachmentDraft(owner: .channel(dm)), personal = try attachmentDraft(owner: .dm(dm))
+        try write { try ChatAttachments.put($0, channel); try ChatAttachments.put($0, personal) }
+        XCTAssertEqual(try read { try ChatAttachments.drafts($0, channel: dm).map(\.id) }, [channel.id])
+        XCTAssertEqual(personal.prepareArgs["dm_id"]?.string, dm)
+        XCTAssertNil(personal.prepareArgs["channel_id"])
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(channel)) as? [String: Any])
+        json["owner"] = nil; json["channel"] = dm
+        XCTAssertEqual(try JSONDecoder().decode(ChatAttachmentDraft.self, from: JSONSerialization.data(withJSONObject: json)).owner, .channel(dm))
+        try write { try ChatDMStore.remove($0, dm) }
+        XCTAssertEqual(try read { try ChatAttachments.drafts($0).map(\.id) }, [channel.id], "DM revocation must not delete a colliding channel draft")
+    }
+
+    func testDMAttachmentClosureKeepsDraftAndRequiresExplicitFreshRetry() async throws {
+        try await ready()
+        let file = try attachmentDraft(owner: .dm(dm))
+        try write { db in
+            try ChatAttachments.put(db, file)
+            try ChatAttachments.bumpDraft(db, owner: file.owner, root: "")
+            var card = try XCTUnwrap(ChatDMStore.card(db, dm)); card.state = "read_only"; card.version += 1
+            try ChatDMStore.writeCard(db, card, window: false)
+            _ = try ChatAttachments.reconcileOwnership(db)
+        }
+        let closed = try XCTUnwrap(try read { try ChatAttachments.drafts($0, owner: .dm(dm)).first })
+        XCTAssertEqual(closed.state, .failed); XCTAssertLessThan(closed.expiresAt, Date())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try service.files.attachmentStorage.url(key, id: file.id).path))
+        try write { db in
+            var card = try XCTUnwrap(ChatDMStore.card(db, dm)); card.state = "active"; card.version += 1
+            try ChatDMStore.writeCard(db, card, window: false)
+            _ = try ChatAttachments.reconcileOwnership(db)
+        }
+        XCTAssertEqual(try read { try ChatAttachments.drafts($0, owner: .dm(dm)).first?.state }, .failed)
+    }
+
+    func testDMAttachmentArchivePreservesOwnBytesAndRevocationPurgesThem() async throws {
+        try await ready()
+        let file = try attachmentDraft(owner: .dm(dm))
+        try write { db in
+            try ChatAttachments.put(db, file)
+            _ = try ChatDMStore.saveDraft(db, dm, root: nil, text: "my unsent text")
+        }
+        try service.files.saveDMOutbox(key, store: store)
+        let archive = try XCTUnwrap(service.files.savedDMOutbox(key))
+        XCTAssertEqual(archive.attachments?.map(\.id), [file.id]); XCTAssertEqual(archive.drafts?.first?.text, "my unsent text")
+        let files = service.files
+        sync.stop(); service.orgSessions[key]?.sync = nil
+        files.removeCache(key)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try files.attachmentStorage.url(key, id: file.id).path))
+        let fresh = try ChatStore.open(files: files, key: key).store
+        try files.restoreDMOutbox(key, store: fresh)
+        XCTAssertEqual(try fresh.dmRead { try ChatAttachments.drafts($0).map(\.id) }, [file.id])
+        try files.saveDMOutbox(key, store: fresh, preservingFiles: false)
+        files.removeCache(key)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try files.attachmentStorage.url(key, id: file.id).path))
+    }
+}
+
+extension ChatDMTests {
+    private func attachmentManager() async throws -> (ChatAttachmentManager, AttachmentTestServer) {
+        try await ready(); try store.setGeneration("g1")
+        var limits = try JSONDecoder().decode(ChatAttachmentLimits.self, from: Data(ChatAttachmentsTests.limitsJSON.utf8))
+        limits.dmSenderBytes = 5 * 1024 * 1024 * 1024
+        service.serverAttachmentLimits[server] = limits
+        service.isServerKnown = { _, _ in true }
+        service.serverCapabilities[server] = ["chat.dm", "chat.attachments", "chat.dm.attachments"]
+        service.makeAPI = { ChatAPI(server: $0, protocolClasses: [ChatStubProtocol.self]) }
+        let remote = AttachmentTestServer()
+        ChatStubProtocol.reset { remote.answer($0, $1) }
+        let manager = try XCTUnwrap(service.attachments(key)); manager.pollDelay = { _ in .milliseconds(10) }
+        return (manager, remote)
+    }
+
+    func testDMAttachmentFirstPeerCanOpenPairAndSendOnlyAFile() async throws {
+        let (manager, remote) = try await attachmentManager()
+        try write { try ChatDMStore.remove($0, dm) }
+        var opened = try decode("dm_response", as: ChatDMCard.self)
+        opened.head = 0; opened.messages = []; opened.messagesBefore = nil
+        let card = try JSONEncoder().encode(opened), dm = dm
+        ChatStubProtocol.reset { request, bytes in
+            if request.url!.path.hasSuffix("/dms/\(dm)") { return .success(.init(status: 200, body: card)) }
+            if request.httpMethod == "POST", let command = try? JSONDecoder().decode(ChatCommandEnvelope.self, from: bytes), command.type == "dm.open" {
+                return .success(.init(status: 200, body: try! JSONEncoder().encode(ChatCommandAnswer(events: [], result: .object(["dm_id": .string(dm)])))))
+            }
+            return remote.answer(request, bytes)
+        }
+        let model = try XCTUnwrap(service.dmPeer(key, peer: peer)); defer { model.stop() }
+        XCTAssertNil(model.attachmentOwner)
+        _ = model.saveDraft("", root: nil)
+        let owner = try await model.prepareAttachments()
+        XCTAssertEqual(owner, .dm(dm))
+        try manager.add(data: Data("first file".utf8), name: "hello.txt", owner: owner, root: nil)
+        try await wait { manager.files(owner: owner, root: nil).first?.state == .ready }
+        let file = try XCTUnwrap(manager.files(owner: owner, root: nil).first)
+        let version = try XCTUnwrap(try read { try ChatDMStore.draft($0, dm, root: nil)?.version })
+        let message = try service.postDM(key, dm: dm, root: nil, text: "", mentions: [], draftVersion: version)
+        XCTAssertEqual(message, file.messageId)
+        let commands = try store.outbox.commands()
+        XCTAssertEqual(commands.map(\.type), ["dm.message.post_with_attachments"])
+        XCTAssertEqual(ChatService.args(try XCTUnwrap(commands.first))["text"], .string(""))
+    }
+
+    func testDMAttachmentLostReceiptReplaysExactCommandAfterClosure() async throws {
+        let (manager, remote) = try await attachmentManager()
+        let owner = ChatAttachmentOwner.dm(dm)
+        try manager.add(data: Data("receipt".utf8), name: "receipt.txt", owner: owner, root: nil)
+        try await wait { manager.files(owner: owner, root: nil).first?.state == .ready }
+        let file = try XCTUnwrap(manager.files(owner: owner, root: nil).first)
+        let version = try XCTUnwrap(try read { try ChatDMStore.draft($0, dm, root: nil)?.version })
+        _ = try service.postDM(key, dm: dm, root: nil, text: "", mentions: [], draftVersion: version)
+        let command = try XCTUnwrap(try store.outbox.commands().last)
+        let sender = ChatOutbox(queues: [store.outbox], api: service.makeAPI(server), token: "test-only", sessionId: "s-me", held: true)
+        defer { sender.hold() }
+        sender.retryDelay = { _ in 300 }
+        service.configureCommandCapabilities(sender, key: key)
+        ChatStubProtocol.reset { _, _ in .failure(URLError(.networkConnectionLost)) }
+        sender.allow(connection: 1, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().last?.attempts) == 1 }
+        XCTAssertEqual(ChatStubProtocol.seen.first?.body, command.bodyBytes)
+        var closed = try XCTUnwrap(try read { try ChatDMStore.card($0, dm) })
+        closed.state = "read_only"; closed.version += 1; closed.peer.active = false
+        try write { try ChatDMStore.writeCard($0, closed, window: false) }
+        manager.reconcile()
+        XCTAssertEqual(try store.outbox.commands().last?.state, .pending)
+        XCTAssertNil(try read { try ChatAttachments.postFailure($0, command) })
+        ChatStubProtocol.reset { remote.answer($0, $1) }
+        sender.now = { Date().addingTimeInterval(301) }; sender.pump()
+        try await wait { (try? self.store.outbox.commands().last?.state) == .sent }
+        XCTAssertEqual(ChatStubProtocol.seen.first?.body, command.bodyBytes)
+        XCTAssertEqual(ChatStubProtocol.seen.count, 1, "No new upload or replacement message")
+        manager.reconcile()
+        XCTAssertTrue(manager.queued.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try manager.storage.url(key, id: file.id).path))
+    }
+
+    func testDMAttachmentUnknownRetryKeepsIDsAndOnlyDefinitiveRefusalRenews() async throws {
+        let (manager, _) = try await attachmentManager()
+        let owner = ChatAttachmentOwner.dm(dm)
+        try manager.add(data: Data("retry".utf8), name: "retry.txt", owner: owner, root: nil)
+        try await wait { manager.files(owner: owner, root: nil).first?.state == .ready }
+        let file = try XCTUnwrap(manager.files(owner: owner, root: nil).first)
+        let version = try XCTUnwrap(try read { try ChatDMStore.draft($0, dm, root: nil)?.version })
+        let message = try service.postDM(key, dm: dm, root: nil, text: "", mentions: [], draftVersion: version)
+        var original = try XCTUnwrap(try store.outbox.commands().last)
+        original.state = .unconfirmed; original.error = "unconfirmed"
+        try write { try original.update($0) }; manager.reconcile()
+        try service.retryDM(key, dm: dm, message: message)
+        var retry = try XCTUnwrap(try store.outbox.commands().last)
+        XCTAssertEqual(ChatService.args(retry)["message_id"], .string(message))
+        XCTAssertEqual(ChatService.args(retry)["attachment_ids"], .array([.string(file.id)]))
+        XCTAssertEqual(manager.queued.map(\.id), [file.id])
+        retry.state = .failed; retry.error = "attachment_expired"
+        try write { try retry.update($0) }; manager.reconcile()
+        try service.retryDM(key, dm: dm, message: message)
+        try await wait { manager.queued.first?.state == .ready }
+        let renewed = try XCTUnwrap(manager.queued.first)
+        XCTAssertNotEqual(renewed.id, file.id)
+        XCTAssertEqual(renewed.messageId, message)
+        XCTAssertEqual(try store.outbox.commands().count, 3)
+        XCTAssertEqual(ChatService.args(try XCTUnwrap(try store.outbox.commands().last))["attachment_ids"], .array([.string(renewed.id)]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try manager.storage.url(key, id: file.id).path))
+    }
+
+    func testDMAttachmentRetryMissingReservationAfterReconnectPreservesDraftsAndReuploads() async throws {
+        let (oldManager, remote) = try await attachmentManager()
+        let bytes = Data("retry after reconnect".utf8), owner = ChatAttachmentOwner.dm(dm)
+        try oldManager.add(data: bytes, name: "retry.txt", owner: owner, root: nil)
+        try await wait { oldManager.files(owner: owner, root: nil).first?.state == .ready }
+        let originalFile = try XCTUnwrap(oldManager.files(owner: owner, root: nil).first)
+        let version = try XCTUnwrap(try read { try ChatDMStore.draft($0, dm, root: nil)?.version })
+        let message = try service.postDM(key, dm: dm, root: nil, text: "", mentions: [], draftVersion: version)
+        let original = try XCTUnwrap(try store.outbox.commands().last)
+
+        let disconnected = await service.disconnect(expecting: service.connection)
+        XCTAssertEqual(disconnected, .done)
+        try service.saveSignIn(.init(server: server, accountId: me, sessionId: "s-reconnected", deviceName: "Mac", orgId: org), token: "test-only")
+        try await service.start(mode: .server)
+        store = try XCTUnwrap(service.orgSessions[key]?.store)
+        try store.setGeneration("g1")
+        try write { try $0.execute(sql: "UPDATE meta SET rights_in_doubt = 0, rights_session = 's-reconnected'") }
+        service.orgSessions[key]?.snapshotOwed = false
+        let api = service.makeAPI(server)
+        let syncOwner = ChatSync(key: key, store: store, api: api, socket: socket, outbox: nil, token: "test-only")
+        service.orgSessions[key]?.sync = syncOwner; sync = syncOwner.dm
+        sync.sessionId = "s-reconnected"; sync.configure(true)
+        service.serverCapabilities[server] = ["chat.dm", "chat.attachments", "chat.dm.attachments"]
+        let catalog = try fixture("dms_response"), card = try fixture("dm_response"), dm = dm
+        ChatStubProtocol.reset { request, body in
+            if request.url!.path.hasSuffix("/dms") { return .success(.init(status: 200, body: catalog)) }
+            if request.url!.path.hasSuffix("/dms/\(dm)") { return .success(.init(status: 200, body: card)) }
+            return remote.answer(request, body)
+        }
+        try await ready()
+        let manager = try XCTUnwrap(service.attachments(key))
+        manager.pollDelay = { _ in .milliseconds(10) }
+        let restored = try XCTUnwrap(try store.outbox.commands().last)
+        XCTAssertEqual(restored.commandId, original.commandId)
+        XCTAssertEqual(restored.state, .unconfirmed)
+
+        // A separate composer draft must survive the old reservation's refusal too.
+        try manager.add(data: Data("next draft".utf8), name: "next.txt", owner: owner, root: nil)
+        try await wait { manager.files(owner: owner, root: nil).first?.state == .ready }
+        let draft = try XCTUnwrap(manager.files(owner: owner, root: nil).first)
+        let draftVersion = try store.dmWrite { try ChatDMStore.saveDraft($0, dm, root: nil, text: "keep my next draft") }
+        let replyRoot = UUID().uuidString.lowercased()
+        let replyVersion = try store.dmWrite { try ChatDMStore.saveDraft($0, dm, root: replyRoot, text: "keep my reply draft") }
+        remote.change { $0.rows[originalFile.id] = nil; $0.bytes[originalFile.id] = nil }
+        ChatStubProtocol.reset { request, body in
+            if let command = try? JSONDecoder().decode(ChatCommandEnvelope.self, from: body),
+               command.type == "dm.message.post_with_attachments",
+               command.args["attachment_ids"] == .array([.string(originalFile.id)]) {
+                return .success(.init(status: 404, body: Data(#"{"error":"not_found"}"#.utf8)))
+            }
+            if request.url!.path.hasSuffix("/dms/\(dm)") { return .success(.init(status: 200, body: card)) }
+            return remote.answer(request, body)
+        }
+        let sender = ChatOutbox(queues: [store.outbox], api: api, token: "test-only", sessionId: "s-reconnected", held: true)
+        defer { sender.hold() }
+        let service = self.service!, key = self.key
+        sender.onPermanentFailure = { [weak service] record, code in service?.commandAnswered(key, record, .refused(code)) }
+        sender.onSent = { [weak service] record, answer in service?.commandAnswered(key, record, .taken(answer)) }
+        service.configureCommandCapabilities(sender, key: key)
+        try service.retryDM(key, dm: dm, message: message)
+        let retry = try XCTUnwrap(try store.outbox.commands().last)
+        XCTAssertEqual(ChatService.args(retry)["attachment_ids"], .array([.string(originalFile.id)]))
+        sender.allow(connection: 1, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().last?.state) == .failed }
+        sender.hold()
+        XCTAssertEqual(try store.outbox.commands().last?.error, "not_found")
+        XCTAssertTrue(service.dmAllowed(key, dm))
+        XCTAssertNotNil(try read { try ChatDMStore.card($0, dm) })
+        XCTAssertEqual(try read { try ChatDMStore.draft($0, dm, root: nil)?.version }, draftVersion)
+        XCTAssertEqual(try read { try ChatDMStore.draft($0, dm, root: nil)?.text }, "keep my next draft")
+        XCTAssertEqual(try read { try ChatDMStore.draft($0, dm, root: replyRoot)?.version }, replyVersion)
+        XCTAssertEqual(Set(manager.queued.map(\.id)), [originalFile.id])
+        XCTAssertEqual(try Data(contentsOf: manager.storage.url(key, id: originalFile.id)), bytes)
+        XCTAssertEqual(try Data(contentsOf: manager.storage.url(key, id: draft.id)), Data("next draft".utf8))
+
+        remote.change { $0.validatePosts = true }
+        try service.retryDM(key, dm: dm, message: message)
+        try await wait { manager.queued.first?.state == .ready }
+        let renewed = try XCTUnwrap(manager.queued.first)
+        XCTAssertNotEqual(renewed.id, originalFile.id)
+        XCTAssertNotEqual(renewed.prepareCommand, originalFile.prepareCommand)
+        XCTAssertEqual(renewed.session, "s-reconnected")
+        XCTAssertEqual(renewed.messageId, message)
+        XCTAssertEqual(try Data(contentsOf: manager.storage.url(key, id: renewed.id)), bytes)
+        let posts = ChatStubProtocol.seen.compactMap { try? JSONDecoder().decode(ChatCommandEnvelope.self, from: $0.body) }
+        XCTAssertTrue(posts.contains { $0.type == "dm.attachment.prepare" && $0.args["attachment_id"]?.string == renewed.id })
+        XCTAssertEqual(ChatService.args(try XCTUnwrap(try store.outbox.commands().last))["attachment_ids"], .array([.string(renewed.id)]))
+        sender.allow(connection: 2, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().last?.state) == .sent }
+        sender.hold()
+        XCTAssertEqual(try read { try ChatDMStore.draft($0, dm, root: nil)?.text }, "keep my next draft")
+        XCTAssertEqual(try Data(contentsOf: manager.storage.url(key, id: draft.id)), Data("next draft".utf8))
+
+        // Only a refusal of the DM itself uses the existing revocation cleanup.
+        ChatStubProtocol.reset { _, _ in .success(.init(status: 404, body: Data(#"{"error":"not_found"}"#.utf8))) }
+        do { _ = try await sync.refresh(dm); XCTFail("The DM read must confirm access loss") }
+        catch let ChatAPIError.server(status, code, _) { XCTAssertEqual(status, 404); XCTAssertEqual(code, "not_found") }
+        manager.reconcile()
+        XCTAssertNil(try read { try ChatDMStore.card($0, dm) })
+        XCTAssertNil(try read { try ChatDMStore.draft($0, dm, root: nil) })
+        XCTAssertNil(try read { try ChatDMStore.draft($0, dm, root: replyRoot) })
+        XCTAssertTrue(try read { try ChatAttachments.drafts($0, owner: owner, includingQueued: true).isEmpty })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try manager.storage.url(key, id: draft.id).path))
+    }
+
+    func testChannelCleanupPreservesDMAttachmentDraftAndOutboxBytesWithNoChannels() async throws {
+        try await ready()
+        var draft = try attachmentDraft(owner: .dm(dm))
+        var reply = try attachmentDraft(owner: .dm(dm))
+        var queued = try attachmentDraft(owner: .dm(dm), queued: true)
+        draft.state = .ready; reply.state = .ready; queued.state = .ready
+        reply.root = UUID().uuidString.lowercased()
+        let files = [draft, reply, queued], bytes = Data("private draft".utf8)
+        try write { db in
+            for file in files { try ChatAttachments.put(db, file) }
+            _ = try ChatDMStore.saveDraft(db, dm, root: nil, text: "composer")
+            _ = try ChatDMStore.saveDraft(db, dm, root: reply.root, text: "reply")
+            try db.execute(sql: "INSERT INTO teams (team_id, name, is_general, mine) VALUES ('team', 'Team', 0, 1)")
+            try ChatChannels.write(db, .init(channelId: dm, teamId: "team", name: "colliding", archived: false, version: 1))
+        }
+        _ = try service.enqueue(key, type: "dm.message.post_with_attachments", args: .object([
+            "dm_id": .string(dm), "message_id": .string(queued.messageId), "text": .string(""),
+            "attachment_ids": .array([.string(queued.id)])]))
+        let versions = try read { db in
+            try [ChatDMStore.draft(db, dm, root: nil)?.version, ChatDMStore.draft(db, dm, root: reply.root)?.version]
+        }
+        for hasChannels in [true, false] {
+            if !hasChannels { try write { try $0.execute(sql: "DELETE FROM channels") } }
+            let channel = try attachmentDraft(owner: .channel(dm))
+            let orphan = try attachmentDraft(owner: .channel(UUID().uuidString.lowercased()))
+            try write { db in
+                try ChatAttachments.put(db, channel); try ChatAttachments.put(db, orphan)
+                try ChatMessages.dropOrphans(db)
+            }
+            let kept = try read { try ChatAttachments.drafts($0, includingQueued: true) }
+            XCTAssertEqual(Set(kept.filter { $0.owner.dmID != nil }.map(\.id)), Set(files.map(\.id)))
+            XCTAssertEqual(kept.filter { $0.owner.channelID != nil }.map(\.id), hasChannels ? [channel.id] : [])
+            XCTAssertEqual(try read { db in
+                try [ChatDMStore.draft(db, dm, root: nil)?.version, ChatDMStore.draft(db, dm, root: reply.root)?.version]
+            }, versions)
+            XCTAssertNil(service.attachmentManagers[key])
+            service.reconcileDMAttachments(key)
+            for file in files { XCTAssertEqual(try Data(contentsOf: service.files.attachmentStorage.url(key, id: file.id)), bytes) }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: try service.files.attachmentStorage.url(key, id: orphan.id).path))
+            XCTAssertEqual(FileManager.default.fileExists(atPath: try service.files.attachmentStorage.url(key, id: channel.id).path), hasChannels)
+        }
+        let manager = try XCTUnwrap(service.attachments(key))
+        manager.reconcile()
+        XCTAssertEqual(Set(manager.drafts.map(\.id)), [draft.id, reply.id])
+        XCTAssertEqual(manager.queued.map(\.id), [queued.id])
+        for file in files { XCTAssertEqual(try Data(contentsOf: manager.storage.url(key, id: file.id)), bytes) }
+    }
+
+    func testDMAttachmentGenerationRestoreDoesNotReviveFailureAfterSentRetry() async throws {
+        let (manager, remote) = try await attachmentManager()
+        let owner = ChatAttachmentOwner.dm(dm)
+        remote.change { $0.postError = "attachment_expired"; $0.validatePosts = true }
+        try manager.add(data: Data("retry".utf8), name: "retry.txt", owner: owner, root: nil)
+        try await wait { manager.files(owner: owner, root: nil).first?.state == .ready }
+        let originalFile = try XCTUnwrap(manager.files(owner: owner, root: nil).first)
+        let version = try XCTUnwrap(try read { try ChatDMStore.draft($0, dm, root: nil)?.version })
+        let message = try service.postDM(key, dm: dm, root: nil, text: "", mentions: [], draftVersion: version)
+        let sender = try sendingQueue()
+        service.configureCommandCapabilities(sender, key: key)
+        defer { sender.hold() }
+        sender.allow(connection: 1, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().last?.state) == .failed }
+        sender.hold()
+        XCTAssertEqual(try store.outbox.commands().last?.error, "attachment_expired")
+
+        remote.change { $0.postError = nil }
+        try service.retryDM(key, dm: dm, message: message)
+        try await wait { manager.queued.first?.state == .ready }
+        let retryFile = try XCTUnwrap(manager.queued.first)
+        XCTAssertNotEqual(retryFile.id, originalFile.id)
+        sender.allow(connection: 2, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().last?.state) == .sent }
+        sender.hold()
+        let attempts = try store.outbox.commands()
+        XCTAssertEqual(attempts.map(\.state), [.failed, .sent])
+        XCTAssertEqual(attempts.map { ChatService.args($0)["message_id"]?.string }, [message, message])
+        XCTAssertTrue(manager.queued.isEmpty)
+        for file in [originalFile, retryFile] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: try manager.storage.url(key, id: file.id).path))
+        }
+
+        let catalog = try decode("dms_response", as: ChatDMPage.self)
+        XCTAssertFalse(catalog.dms.flatMap { $0.messages ?? [] }.contains { $0.messageId == message })
+        let catalogBytes = try JSONEncoder().encode(catalog)
+        ChatStubProtocol.reset { request, body in
+            if request.url!.path.hasSuffix("/dms") { return .success(.init(status: 200, body: catalogBytes)) }
+            return remote.answer(request, body)
+        }
+        try store.beginGeneration("g2")
+        try store.finishGeneration("g2")
+        try write { try $0.execute(sql: "UPDATE meta SET rights_in_doubt = 0, rights_session = 's-me'") }
+        try await ready()
+
+        XCTAssertTrue(sync.readable(dm))
+        let messages = try read { try ChatDMStore.messages($0, dm) }
+        XCTAssertFalse(messages.contains { $0.id == message }, "A sent retry must suppress the older failed attempt outside the history window")
+        XCTAssertTrue(messages.allSatisfy { $0.localState == nil })
+        XCTAssertEqual(try store.outbox.commands().map(\.state), [.failed, .sent])
+    }
+
+    func testDMAttachmentGenerationRestoreUsesLatestAttemptAndItsAttachmentOrder() async throws {
+        let (manager, remote) = try await attachmentManager()
+        let owner = ChatAttachmentOwner.dm(dm)
+        try manager.add(data: Data("first".utf8), name: "first.txt", owner: owner, root: nil)
+        try manager.add(data: Data("second".utf8), name: "second.txt", owner: owner, root: nil)
+        try await wait { manager.files(owner: owner, root: nil).count == 2 && manager.files(owner: owner, root: nil).allSatisfy { $0.state == .ready } }
+        let originalFiles = manager.files(owner: owner, root: nil)
+        let version = try XCTUnwrap(try read { try ChatDMStore.draft($0, dm, root: nil)?.version })
+        let message = try service.postDM(key, dm: dm, root: nil, text: "", mentions: [], draftVersion: version)
+        var original = try XCTUnwrap(try store.outbox.commands().last)
+        original.state = .failed; original.error = "attachment_expired"
+        try write { try original.update($0) }
+        service.commandAnswered(key, original, .refused("attachment_expired"))
+        try service.retryDM(key, dm: dm, message: message)
+        try await wait { manager.queued.count == 2 && manager.queued.allSatisfy { $0.state == .ready } }
+        let latest = try XCTUnwrap(try store.outbox.commands().last)
+        let expected = try XCTUnwrap(try read { try ChatDMStore.messages($0, dm).first { $0.id == message } }).attachments
+        XCTAssertEqual(expected.map(\.name), ["first.txt", "second.txt"])
+        XCTAssertTrue(Set(expected.map(\.id)).isDisjoint(with: originalFiles.map(\.id)))
+        let card = try XCTUnwrap(try read { try ChatDMStore.card($0, dm) })
+
+        try store.beginGeneration("g2")
+        try store.setGeneration("g2"); try store.setPendingGeneration(nil)
+        try write { db in
+            try db.execute(sql: "UPDATE meta SET rights_in_doubt = 0, rights_session = 's-me'")
+            try ChatDMStore.writeCard(db, card)
+            try ChatDMStore.restoreOutgoing(db, dm: dm, me: me)
+            try ChatDMStore.endRead(db, since: 0, seen: [dm])
+        }
+        let restored = try XCTUnwrap(try read { try ChatDMStore.messages($0, dm).first { $0.id == message } })
+        XCTAssertEqual(restored.attachments, expected)
+        XCTAssertTrue(restored.attachmentOnly)
+        XCTAssertEqual(restored.localState, .failed)
+        XCTAssertEqual(try read { try String.fetchOne($0, sql: "SELECT command_id FROM dm_messages WHERE dm_id = ? AND message_id = ?", arguments: [dm, message]) }, latest.commandId)
+        manager.reconcile()
+        try service.retryDM(key, dm: dm, message: message)
+        let retried = try XCTUnwrap(try store.outbox.commands().last)
+        XCTAssertNotEqual(retried.commandId, latest.commandId)
+        XCTAssertEqual(ChatService.args(retried)["attachment_ids"], .array(expected.map { .string($0.id) }))
+        remote.change { $0.validatePosts = true }
+        let sender = try sendingQueue()
+        service.configureCommandCapabilities(sender, key: key)
+        defer { sender.hold() }
+        sender.allow(connection: 1, generation: "g2")
+        try await wait { (try? self.store.outbox.commands().last?.state) == .sent }
+    }
+
+    func testDMAttachmentCapabilitySuspendsOnlyFilePostInSharedQueue() async throws {
+        let (manager, remote) = try await attachmentManager()
+        let owner = ChatAttachmentOwner.dm(dm)
+        try manager.add(data: Data("paused".utf8), name: "paused.txt", owner: owner, root: nil)
+        try await wait { manager.files(owner: owner, root: nil).first?.state == .ready }
+        let version = try store.dmWrite { try ChatDMStore.saveDraft($0, dm, root: nil, text: "caption") }
+        _ = try service.postDM(key, dm: dm, root: nil, text: "caption", mentions: [], draftVersion: version)
+        let filePost = try XCTUnwrap(try store.outbox.commands().last)
+        service.serverCapabilities[server]?.remove("chat.dm.attachments")
+        let textVersion = try store.dmWrite { try ChatDMStore.saveDraft($0, dm, root: nil, text: "next text") }
+        _ = try service.postDM(key, dm: dm, root: nil, text: "next text", mentions: [], draftVersion: textVersion)
+        _ = try service.enqueue(key, type: "message.post", args: .object([
+            "channel_id": .string(UUID().uuidString.lowercased()), "message_id": .string(UUID().uuidString.lowercased()), "text": .string("channel text")]))
+        let sender = ChatOutbox(queues: [store.outbox], api: service.makeAPI(server), token: "test-only", sessionId: "s-me", held: true)
+        defer { sender.hold() }
+        service.configureCommandCapabilities(sender, key: key)
+        ChatStubProtocol.reset { remote.answer($0, $1) }
+        sender.allow(connection: 1, generation: "g1")
+        try await wait { (try? self.store.outbox.commands().filter { $0.state == .sent }.count) == 2 }
+        XCTAssertEqual(try store.outbox.commands().first { $0.commandId == filePost.commandId }?.state, .pending)
+        XCTAssertFalse(ChatStubProtocol.seen.contains { $0.body == filePost.bodyBytes })
+        service.serverCapabilities[server]?.insert("chat.dm.attachments")
+        sender.pump()
+        try await wait { (try? self.store.outbox.commands().first { $0.commandId == filePost.commandId }?.state) == .sent }
+        XCTAssertTrue(ChatStubProtocol.seen.contains { $0.body == filePost.bodyBytes })
+    }
+
+    func testDMAttachmentFileOnlySendUsesSharedPipelineAndStableDraftVersion() async throws {
+        let (manager, _) = try await attachmentManager()
+        let owner = ChatAttachmentOwner.dm(dm)
+        try manager.add(data: Data("only a file".utf8), name: "notes.txt", owner: owner, root: nil)
+        try await wait { manager.files(owner: owner, root: nil).first?.state == .ready }
+        let file = try XCTUnwrap(manager.files(owner: owner, root: nil).first)
+        let version = try XCTUnwrap(try read { try ChatDMStore.draft($0, dm, root: nil)?.version })
+        let id = try service.postDM(key, dm: dm, root: nil, text: "", mentions: [], draftVersion: version)
+        XCTAssertEqual(id, file.messageId)
+        XCTAssertEqual(try service.postDM(key, dm: dm, root: nil, text: "", mentions: [], draftVersion: version), id)
+        let command = try XCTUnwrap(try store.outbox.commands().last)
+        XCTAssertEqual(command.type, "dm.message.post_with_attachments")
+        let args = ChatService.args(command)
+        XCTAssertEqual(args["attachment_ids"], .array([.string(file.id)])); XCTAssertNil(args["channel_id"])
+        XCTAssertEqual(manager.queued.map(\.id), [file.id]); XCTAssertTrue(manager.files(owner: owner, root: nil).isEmpty)
+        let posted = try XCTUnwrap(try read { try ChatDMStore.messages($0, dm).first { $0.id == id } })
+        XCTAssertTrue(posted.attachmentOnly); XCTAssertEqual(posted.attachments.map(\.id), [file.id])
+        let prepare = ChatStubProtocol.seen.compactMap { try? JSONDecoder().decode(ChatCommandEnvelope.self, from: $0.body) }.first { $0.type == "dm.attachment.prepare" }
+        XCTAssertEqual(prepare?.args, file.prepareArgs)
+    }
+
+    func testDMAttachmentCapabilityLossNeverSendsCaptionWithoutFilesAndThreadIsSeparate() async throws {
+        let (manager, _) = try await attachmentManager()
+        let owner = ChatAttachmentOwner.dm(dm)
+        let root = try XCTUnwrap(try read { try ChatDMStore.messages($0, dm).first { $0.threadRootId == nil }?.id })
+        try manager.add(data: Data("thread".utf8), name: "reply.txt", owner: owner, root: root)
+        try await wait { manager.files(owner: owner, root: root).first?.state == .ready }
+        XCTAssertTrue(manager.files(owner: owner, root: nil).isEmpty)
+        XCTAssertTrue(manager.files(channel: dm, root: root).isEmpty)
+        let version = try store.dmWrite { try ChatDMStore.saveDraft($0, dm, root: root, text: "caption") }
+        service.serverCapabilities[server]?.remove("chat.dm.attachments")
+        XCTAssertNil(manager.uploadStamp(owner: owner))
+        XCTAssertThrowsError(try service.postDM(key, dm: dm, root: root, text: "caption", mentions: [], draftVersion: version))
+        XCTAssertTrue(try store.outbox.commands().isEmpty)
+        XCTAssertEqual(manager.files(owner: owner, root: root).count, 1)
+        service.serverCapabilities[server]?.insert("chat.dm.attachments")
+        let id = try service.postDM(key, dm: dm, root: root, text: "caption", mentions: [], draftVersion: version)
+        XCTAssertEqual(try read { try ChatDMStore.messages($0, dm).first { $0.id == id }?.threadRootId }, root)
+    }
+
+    func testDMAttachmentImportRejectsDraftChangeAndExecutorStampAndClosedWrites() async throws {
+        let (manager, _) = try await attachmentManager()
+        let owner = ChatAttachmentOwner.dm(dm), capture = try XCTUnwrap(manager.stamp(owner: .dm(dm)))
+        XCTAssertFalse(manager.currentExecution(capture, manifest: []))
+        XCTAssertNil(manager.stamp(owner: .dm(UUID().uuidString)))
+        let input = self.root.appendingPathComponent("late.txt")
+        try Data("late file".utf8).write(to: input)
+        var finished = false, refused = false
+        try manager.importFiles(count: 1, owner: owner, root: nil, load: {
+            try await Task.sleep(for: .milliseconds(80))
+            return [.file(input)]
+        }, completion: { error in finished = true; refused = error != nil })
+        _ = try store.dmWrite { try ChatDMStore.saveDraft($0, dm, root: nil, text: "changed while importing") }
+        try await wait { finished }
+        XCTAssertTrue(refused); XCTAssertTrue(manager.files(owner: owner, root: nil).isEmpty)
+        try write { db in
+            var card = try XCTUnwrap(ChatDMStore.card(db, dm)); card.state = "read_only"; card.version += 1
+            try ChatDMStore.writeCard(db, card, window: false)
+        }
+        XCTAssertNil(manager.uploadStamp(owner: owner)); XCTAssertNotNil(manager.stamp(owner: owner))
+        XCTAssertThrowsError(try manager.add(data: Data("no".utf8), name: "no.txt", owner: owner, root: nil))
+    }
+}
+
+extension ChatDMTests {
+    func testDMAttachmentReadGuardKeepsClosedHistoryAndFencesDeletionBeforeObserver() async throws {
+        let (manager, _) = try await attachmentManager()
+        let wire = try decode("dm_attachment_message", as: ChatDMMessageWire.self)
+        var reply = wire; reply.messageId = UUID().uuidString.lowercased(); reply.threadRootId = wire.messageId; reply.seq += 1
+        reply.attachments[0].attachmentId = UUID().uuidString.lowercased()
+        try write { try ChatDMStore.write($0, wire); try ChatDMStore.write($0, reply) }
+        let message = ChatMessage(dm: wire), response = ChatMessage(dm: reply), file = wire.attachments[0]
+        let capture = try XCTUnwrap(manager.stamp(owner: .dm(dm), message: message, file: file))
+        XCTAssertNil(manager.stamp(channel: dm, message: message, file: file))
+        let replyCapture = try XCTUnwrap(manager.stamp(owner: .dm(dm), message: response, file: reply.attachments[0]))
+        try write { _ = try ChatDMStore.advance($0) }
+        XCTAssertTrue(manager.current(capture), "Ordinary DM reads are not access epochs")
+        XCTAssertEqual(message.attachmentDisplayText(available: true), "")
+        XCTAssertEqual(message.attachmentDisplayText(available: false), "Attachments")
+        let event = ChatEvent(stream: "member:\(me)", seq: 1, id: "file-delete", type: "dm.message.delete", actor: nil, body: .object([
+            "dm_id": .string(dm), "message_id": .string(wire.messageId), "message_seq": .number(Double(wire.seq)), "revision": .number(2)]), commandId: nil, at: "2026-10-09T10:00:00Z")
+        try write { _ = try ChatDMStore.apply($0, event) }
+        XCTAssertFalse(manager.current(capture)); XCTAssertTrue(manager.current(replyCapture), "Deleting a root must preserve reply files")
+        try write { db in
+            var card = try XCTUnwrap(ChatDMStore.card(db, dm)); card.state = "read_only"; card.peer.active = false; card.version += 1
+            try ChatDMStore.writeCard(db, card, window: false)
+        }
+        XCTAssertNotNil(manager.stamp(owner: .dm(dm), message: response, file: reply.attachments[0]))
+        XCTAssertNil(manager.uploadStamp(owner: .dm(dm)))
+        try write { try ChatDMStore.remove($0, dm) }
+        XCTAssertNil(manager.stamp(owner: .dm(dm), message: response, file: reply.attachments[0]))
+    }
+
+    func testDMAttachmentViewerUsesTypedRouteAndRejectsLateBytesOnRevoke() async throws {
+        let (manager, remote) = try await attachmentManager()
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        var wire = try decode("dm_attachment_message", as: ChatDMMessageWire.self)
+        wire.attachments[0].mime = "image/png"; wire.attachments[0].name = "picture.png"; wire.attachments[0].size = png.count
+        try write { try ChatDMStore.write($0, wire) }
+        remote.change { $0.downloads = png }
+        let router = TabRouter(), tabs = CompositionTabs(router: router, chat: service)
+        let state = TabState(route: .dmViewer(OrgKey(key), dmID: dm, messageID: wire.messageId, attachmentID: wire.attachments[0].id))
+        let viewer = tabs.viewerModel(state)
+        await viewer.load()
+        XCTAssertEqual(viewer.preview?.data, png)
+        XCTAssertNotEqual(state.route, .viewer(OrgKey(key), channelID: dm, messageID: wire.messageId, attachmentID: wire.attachments[0].id))
+        let message = ChatMessage(dm: wire), file = wire.attachments[0]
+        let gate = Gate(); self.gate = gate; gate.close()
+        ChatStubProtocol.reset { request, bytes in
+            if request.url?.path.hasSuffix("/original") == true { gate.pass() }
+            return remote.answer(request, bytes)
+        }
+        let task = Task { try await manager.load(message, file: file, preview: false) }
+        try await wait { ChatStubProtocol.seen.contains { $0.request.url?.path.hasSuffix("/original") == true } }
+        try write { try ChatDMStore.remove($0, dm) }
+        XCTAssertNil(viewer.preview, "A synchronous guard must precede the coalesced observer")
+        manager.reconcile(); gate.open()
+        do { _ = try await task.value; XCTFail("A revoked transfer returned bytes") } catch {}
+        state.close()
+    }
+
+    func testDMAttachmentRenderedThreadAndClosedDraftReuseCardsInBothThemes() async throws {
+        let (manager, remote) = try await attachmentManager()
+        let wire = try decode("dm_attachment_message", as: ChatDMMessageWire.self)
+        try write { try ChatDMStore.write($0, wire) }
+        let page = try JSONEncoder().encode(ChatDMMessagesPage(messages: [wire], next: nil))
+        ChatStubProtocol.reset { request, bytes in
+            if request.url?.path.contains("/threads/") == true { return .success(.init(status: 200, body: page)) }
+            return remote.answer(request, bytes)
+        }
+        try manager.add(data: Data("saved reply".utf8), name: "saved-reply.txt", owner: .dm(dm), root: wire.messageId)
+        try await wait { manager.files(owner: .dm(dm), root: wire.messageId).first?.state == .ready }
+        let model = ChatDMModel(key: key, dm: dm, service: service); defer { model.stop() }
+        model.openThread(wire.messageId)
+        try await wait { !model.threadHasEarlier }
+        let settings = AgentPadSettingsModel.shared, appearance = AgentPadSettingsModel.shared.appearanceMode
+        defer { settings.appearanceMode = appearance }
+        for closed in [false, true] {
+            if closed {
+                try write { db in
+                    var card = try XCTUnwrap(ChatDMStore.card(db, dm)); card.state = "read_only"; card.peer.active = false; card.version += 1
+                    try ChatDMStore.writeCard(db, card, window: false)
+                }
+                manager.reconcile()
+                try await wait { model.card?.writable == false }
+            }
+            let card = try XCTUnwrap(model.card)
+            for dark in [false, true] {
+                settings.appearanceMode = dark ? .dark : .light
+                let host = NSHostingView(rootView: ChatDMView(model: model, card: card).frame(width: 1040, height: 760)
+                    .background(ChatAppearance.surface).foregroundStyle(Theme.chromeForeground).environment(\.colorScheme, dark ? .dark : .light))
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 760), styleMask: [.titled], backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false; window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua); window.contentView = host; window.orderFront(nil)
+                defer { window.contentView = nil; window.close() }
+                host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(150))
+                func editors(_ view: NSView) -> [ChatMentionEditor.Editor] { (view as? ChatMentionEditor.Editor).map { [$0] } ?? view.subviews.flatMap(editors) }
+                XCTAssertEqual(editors(host).count, closed ? 0 : 2)
+                if !closed { XCTAssertTrue(editors(host).allSatisfy { $0.consume?(36, []) == false }) }
+                if let directory = ProcessInfo.processInfo.environment["AGENTPAD_DM_RENDER"], let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                    host.cacheDisplay(in: host.bounds, to: bitmap)
+                    try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: directory).appendingPathComponent("attachments-\(closed ? "closed" : "active")-\(dark ? "dark" : "light").png"))
+                }
+            }
+        }
+        let draft = try XCTUnwrap(manager.files(owner: .dm(dm), root: wire.messageId).first)
+        XCTAssertFalse(manager.canRetry(draft))
+        model.deleteDraft(root: wire.messageId)
+        XCTAssertTrue(manager.files(owner: .dm(dm), root: wire.messageId).isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try service.files.attachmentStorage.url(key, id: draft.id).path))
+    }
+}
+
+extension ChatDMTests {
+    func testDMAttachmentGenerationAndOrphanReplyRetainReachableOwnedDraft() async throws {
+        let (manager, _) = try await attachmentManager()
+        let lostRoot = UUID().uuidString.lowercased()
+        try manager.add(data: Data("orphan".utf8), name: "orphan.txt", owner: .dm(dm), root: lostRoot)
+        let file = try XCTUnwrap(manager.files(owner: .dm(dm), root: lostRoot).first)
+        let model = ChatDMModel(key: key, dm: dm, service: service); defer { model.stop() }
+        XCTAssertEqual(model.orphanedFileDraftRoots, [lostRoot])
+        let card = try XCTUnwrap(try read { try ChatDMStore.card($0, dm) })
+        try store.beginGeneration("g2")
+        XCTAssertEqual(try read { try ChatAttachments.drafts($0, owner: .dm(dm), root: lostRoot).map(\.id) }, [file.id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try manager.storage.url(key, id: file.id).path))
+        try write { db in try ChatDMStore.writeCard(db, card); try ChatDMStore.endRead(db, since: 0, seen: [dm]) }
+        XCTAssertEqual(try read { try ChatAttachments.drafts($0, owner: .dm(dm), root: lostRoot).map(\.id) }, [file.id])
+    }
+
+    func testDMAttachmentRevocationCleansUnopenedScopeAndArchiveAfterRestart() async throws {
+        try await ready()
+        let other = ChatOrgKey(server: server, accountId: me, orgId: UUID().uuidString.lowercased())
+        let otherStore = try ChatStore.open(files: service.files, key: other).store
+        let draft = try attachmentDraft(owner: .dm(dm))
+        let bytes = Data("private draft".utf8)
+        try service.files.attachmentStorage.save(bytes, key: other, id: draft.id)
+        try otherStore.dmWrite { try ChatAttachments.put($0, draft) }
+        XCTAssertTrue(service.files.attachmentScopes(server: server, account: me).contains(other))
+        service.reconcileDMScopes(.init(accountId: me, sessionId: "s-me", orgs: [], streams: [:]), connection: try XCTUnwrap(service.connection))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try service.files.attachmentStorage.url(other, id: draft.id).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: service.files.cacheURL(other).path))
+        let archive = ChatDMOutboxArchive(scope: .init(other, dm: ""), commands: [], attachments: [draft])
+        try service.files.writePrivate(JSONEncoder().encode(archive), to: service.files.dmOutboxURL(other))
+        try service.files.attachmentStorage.save(bytes, key: other, id: draft.id)
+        service.reconcileDMScopes(.init(accountId: me, sessionId: "s-me", orgs: [], streams: [:]), connection: try XCTUnwrap(service.connection))
+        XCTAssertNil(try service.files.savedDMOutbox(other)?.attachments)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try service.files.attachmentStorage.url(other, id: draft.id).path))
+    }
+}

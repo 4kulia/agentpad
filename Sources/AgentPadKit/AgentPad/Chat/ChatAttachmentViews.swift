@@ -17,22 +17,30 @@ import UniformTypeIdentifiers
     /// and one handled paste never reaches NSTextView's ordinary text insertion.
     static func take(_ pasteboard: NSPasteboard, manager: ChatAttachmentManager, channel: String, root: String?, fromDrop: Bool = false,
                      completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws -> Bool {
-        if pasteboard.availableType(from: [.fileURL]) != nil {
-            guard let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty else { throw ChatAttachmentError.source }
-            try manager.importFiles(urls.map(ChatAttachmentWorker.Input.file), channel: channel, root: root, completion: completion); return true
-        }
-        if fromDrop, let receivers = pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self]) as? [NSFilePromiseReceiver], !receivers.isEmpty {
-            try takePromises(receivers, manager: manager, channel: channel, root: root, completion: completion)
-            return true
-        }
-        guard let source = imageTypes.lazy.compactMap({ pasteboard.data(forType: $0) }).first else { return false }
-        try manager.importFiles([.clipboard(source)], channel: channel, root: root, completion: completion)
-        return true
+        try take(pasteboard, manager: manager, owner: .channel(channel), root: root, fromDrop: fromDrop, completion: completion)
     }
     static func takePromises(_ receivers: [NSFilePromiseReceiver], manager: ChatAttachmentManager, channel: String, root: String?,
                              completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws {
+        try takePromises(receivers, manager: manager, owner: .channel(channel), root: root, completion: completion)
+    }
+    static func take(_ pasteboard: NSPasteboard, manager: ChatAttachmentManager, owner: ChatAttachmentOwner, root: String?, fromDrop: Bool = false,
+                     completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws -> Bool {
+        if pasteboard.availableType(from: [.fileURL]) != nil {
+            guard let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty else { throw ChatAttachmentError.source }
+            try manager.importFiles(urls.map(ChatAttachmentWorker.Input.file), owner: owner, root: root, completion: completion); return true
+        }
+        if fromDrop, let receivers = pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self]) as? [NSFilePromiseReceiver], !receivers.isEmpty {
+            try takePromises(receivers, manager: manager, owner: owner, root: root, completion: completion)
+            return true
+        }
+        guard let source = imageTypes.lazy.compactMap({ pasteboard.data(forType: $0) }).first else { return false }
+        try manager.importFiles([.clipboard(source)], owner: owner, root: root, completion: completion)
+        return true
+    }
+    static func takePromises(_ receivers: [NSFilePromiseReceiver], manager: ChatAttachmentManager, owner: ChatAttachmentOwner, root: String?,
+                             completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws {
         let promises = ChatAttachmentFilePromises(receivers)
-        try manager.importFiles(count: receivers.reduce(0) { $0 + max(1, $1.fileTypes.count) }, channel: channel, root: root,
+        try manager.importFiles(count: receivers.reduce(0) { $0 + max(1, $1.fileTypes.count) }, owner: owner, root: root,
             start: { try promises.start() }, load: { try await promises.receive() }, cleanup: { promises.remove() }, completion: completion)
     }
 }
@@ -81,14 +89,19 @@ import UniformTypeIdentifiers
 
 struct ChatAttachmentDraftStrip: View {
     let manager: ChatAttachmentManager
-    let channel: String
+    let owner: ChatAttachmentOwner
     let root: String?
+    var allowsRetry = true
+    init(manager: ChatAttachmentManager, owner: ChatAttachmentOwner, root: String?, allowsRetry: Bool = true) {
+        self.manager = manager; self.owner = owner; self.root = root; self.allowsRetry = allowsRetry
+    }
+    init(manager: ChatAttachmentManager, channel: String, root: String?) { self.init(manager: manager, owner: .channel(channel), root: root) }
     var body: some View {
         VStack(spacing: 6) {
-            if manager.isImporting(channel: channel, root: root) {
+            if manager.isImporting(owner: owner, root: root) {
                 HStack { ProgressView().controlSize(.small); Text("Preparing files…").font(Theme.display(11)); Spacer() }.padding(7)
             }
-            ForEach(manager.files(channel: channel, root: root)) { draft in
+            ForEach(manager.files(owner: owner, root: root)) { draft in
                 HStack(spacing: 9) {
                     if let image = manager.draftImage(draft) {
                         Image(decorative: image, scale: 2).resizable().scaledToFit().frame(width: 42, height: 38).clipShape(RoundedRectangle(cornerRadius: 4))
@@ -99,7 +112,7 @@ struct ChatAttachmentDraftStrip: View {
                             Text(draft.file.sizeText)
                             Text("·")
                             Text(status(draft))
-                            if manager.canRetry(draft) { Button("Retry") { manager.retry(draft) }.buttonStyle(.link) }
+                            if allowsRetry && manager.canRetry(draft) { Button("Retry") { manager.retry(draft) }.buttonStyle(.link) }
                         }.font(Theme.display(10)).foregroundStyle(draft.state == .failed ? ChatAppearance.failure : ChatAppearance.secondary)
                         if draft.state == .uploading { ProgressView(value: draft.progress).progressViewStyle(.linear).frame(maxWidth: 230) }
                         if let problem = draft.problem { Text(problem).font(Theme.display(10)).foregroundStyle(ChatAppearance.failure) }
@@ -110,11 +123,11 @@ struct ChatAttachmentDraftStrip: View {
                 }.padding(7).background(Theme.chromeHover, in: RoundedRectangle(cornerRadius: 6))
                     .accessibilityElement(children: .contain).accessibilityLabel("\(draft.file.mime), \(draft.file.name), \(draft.file.sizeText), \(status(draft))")
             }
-        }.padding(.horizontal, 8).padding(.top, manager.files(channel: channel, root: root).isEmpty ? 0 : 8)
+        }.padding(.horizontal, 8).padding(.top, manager.files(owner: owner, root: root).isEmpty ? 0 : 8)
     }
     private func status(_ draft: ChatAttachmentDraft) -> String {
         if draft.state == .failed { return "Not sent" }
-        if let reason = manager.pauseReason { return reason }
+        if let reason = manager.pauseReason(owner: owner) { return reason }
         return switch draft.state {
         case .waiting: "Waiting to upload"
         case .uploading: "Uploading · \(Int(draft.progress * 100))%"
@@ -130,7 +143,7 @@ struct ChatMessageAttachments: View {
     let message: ChatMessage
     var inThread = false
     var body: some View {
-        if !message.deleted, manager.stamp(channel: message.channelId) != nil {
+        if !message.deleted, manager.stamp(owner: message.attachmentOwner) != nil {
             VStack(alignment: .leading, spacing: 8) {
                 let images = message.attachments.filter(\.isImage)
                 if images.count > 1 {
@@ -162,7 +175,7 @@ struct ChatAttachmentCard: View {
         var stamp: ChatAttachmentManager.Stamp?
         var retry: Int
     }
-    private var available: Bool { manager.stamp(channel: message.channelId, message: message, file: file) != nil }
+    private var available: Bool { manager.stamp(owner: message.attachmentOwner, message: message, file: file) != nil }
     private var imageHeight: CGFloat {
         guard let w = file.width, let h = file.height, w > 0, h > 0 else { return height }
         return max(44, min(height, width * CGFloat(h) / CGFloat(w)))
@@ -202,7 +215,7 @@ struct ChatAttachmentCard: View {
         }
         .background(ChatSidebarWindowReader(reference: host))
         .accessibilityElement(children: .contain).accessibilityLabel("\(file.mime), \(file.name), \(file.sizeText)")
-        .task(id: PreviewTask(stamp: manager.stamp(channel: message.channelId, message: message, file: file), retry: retry)) {
+        .task(id: PreviewTask(stamp: manager.stamp(owner: message.attachmentOwner, message: message, file: file), retry: retry)) {
             guard file.isImage, file.hasPreview, available, manager.image(message, file: file) == nil else { return }
             problem = nil
             do { _ = try await manager.load(message, file: file, preview: true) }

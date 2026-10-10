@@ -5,7 +5,7 @@ import SwiftUI
 @MainActor @Observable
 final class AttachmentViewerModel {
     let key: ChatOrgKey
-    let channel: String
+    let owner: ChatAttachmentOwner
     let messageID: String
     let attachmentID: String
     let tabs: CompositionTabs
@@ -15,22 +15,25 @@ final class AttachmentViewerModel {
     var loading = false
     var problem: String?
     init(state: TabState, tabs: CompositionTabs) {
-        guard case .viewer(let key, let channel, let message, let file) = state.route else { preconditionFailure("Viewer route required") }
-        self.key = key.chatKey; self.channel = channel; messageID = message; attachmentID = file
+        switch state.route {
+        case .viewer(let key, let channel, let message, let file):
+            self.key = key.chatKey; owner = .channel(channel); messageID = message; attachmentID = file
+        case .dmViewer(let key, let dm, let message, let file):
+            self.key = key.chatKey; owner = .dm(dm); messageID = message; attachmentID = file
+        default: preconditionFailure("Viewer route required")
+        }
         self.state = state; self.tabs = tabs
     }
     var manager: ChatAttachmentManager? { tabs.chat.attachments(key) }
     var message: ChatMessage? {
         guard state?.isClosed == false, let manager else { return nil }
         _ = manager.revision
-        return try? manager.store.queue.read {
-            try Row.fetchOne($0, sql: "SELECT * FROM messages WHERE message_id = ? AND channel_id = ?", arguments: [messageID, channel]).map(ChatMessage.init(row:))
-        }
+        return manager.message(owner: owner, id: messageID)
     }
     var file: ChatAttachment? { message?.attachments.first { $0.id == attachmentID } }
     var stamp: ChatAttachmentManager.Stamp? {
         guard let message, let file else { return nil }
-        return manager?.stamp(channel: channel, message: message, file: file)
+        return manager?.stamp(owner: owner, message: message, file: file)
     }
     var preview: ChatAttachmentManager.Preview? {
         guard state?.isClosed == false, let loaded, manager?.current(loaded.stamp) == true, stamp == loaded.stamp else { return nil }

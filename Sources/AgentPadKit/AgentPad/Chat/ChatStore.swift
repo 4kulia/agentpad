@@ -455,11 +455,13 @@ final class ChatStore: Sendable {
     let queue: DatabaseQueue
     /// The signed-in account the cache is of: what it may hold follows its rights.
     let accountId: String
+    let avatarAccess: ChatAvatarAccessEpoch
 
     private init(url: URL, queue: DatabaseQueue, accountId: String) {
         self.url = url
         self.queue = queue
         self.accountId = accountId
+        self.avatarAccess = ChatAvatarAccessEpoch(queue: queue)
         // F4: the cache knows whose it is, for what its triggers keep (`my_threads`).
         try? queue.write { db in
             try db.execute(sql: "UPDATE meta SET me = ? WHERE id = 1 AND IFNULL(me, '') != ?", arguments: [accountId, accountId])
@@ -481,11 +483,16 @@ final class ChatStore: Sendable {
     static func open(files: ChatFiles, key: ChatOrgKey) throws -> (store: ChatStore, recovered: Bool) {
         try files.prepareDirectory()
         let url = files.cacheURL(key)
+        func opened(_ recovered: Bool) throws -> (ChatStore, Bool) {
+            let queue = try ChatDatabase.open(url, migrator: ChatStoreMigrations.cache)
+            try queue.write { try $0.execute(sql: "INSERT OR REPLACE INTO attachment_scope (id, body) VALUES (1, ?)", arguments: [try JSONEncoder().encode(ChatDMRef(key, dm: ""))]) }
+            return (ChatStore(url: url, queue: queue, accountId: key.accountId), recovered)
+        }
         do {
-            return (ChatStore(url: url, queue: try ChatDatabase.open(url, migrator: ChatStoreMigrations.cache), accountId: key.accountId), false)
+            return try opened(false)
         } catch ChatStoreError.corrupt {
             try ChatDatabase.setAside(url)
-            return (ChatStore(url: url, queue: try ChatDatabase.open(url, migrator: ChatStoreMigrations.cache), accountId: key.accountId), true)
+            return try opened(true)
         }
     }
 
@@ -586,7 +593,7 @@ final class ChatStore: Sendable {
             // told as "gone" before its snapshot (F2).
             try db.execute(sql: "UPDATE meta SET rights_in_doubt = 1 WHERE id = 1")
             try ChatB1.reset(db)
-            try ChatDMStore.clear(db)
+            try ChatDMStore.clear(db, preservingAttachments: true)
             // A restore must never replay an unsent private message implicitly.
             try db.execute(sql: "UPDATE outbox SET state = 'unconfirmed' WHERE type LIKE 'dm.%' AND state = 'pending'")
             try db.execute(sql: "DELETE FROM my_threads")

@@ -547,6 +547,7 @@ enum ChatStoreMigrations {
             try db.execute(sql: "CREATE INDEX dm_card_peer ON dm_cards(json_extract(CAST(body AS TEXT), '$.peer.account_id'))")
             try db.execute(sql: "CREATE INDEX dm_outbox_peer ON outbox(json_extract(CAST(body_bytes AS TEXT), '$.args.peer_account_id')) WHERE type = 'dm.message.post'")
         }
+        migrator.registerMigration("release-27-dm-attachments", migrate: ChatAttachments.migrateDM)
         return migrator
     }
 

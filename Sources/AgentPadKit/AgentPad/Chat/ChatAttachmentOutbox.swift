@@ -44,14 +44,14 @@ extension ChatAttachmentManager {
         try db.execute(sql: "UPDATE attachment_drafts SET attachment_id = ?, body = ? WHERE attachment_id = ?",
             arguments: [next.id, String(decoding: try JSONEncoder().encode(next), as: UTF8.self), draft.id])
         guard db.changesCount == 1 else { throw ChatAttachmentError.changed }
-        if draft.queued != true { try ChatAttachments.bumpDraft(db, channel: draft.channel, root: draft.root) }
+        if draft.queued != true { try ChatAttachments.bumpDraft(db, owner: draft.owner, root: draft.root) }
     }
 
     func postReady(_ record: ChatCommandRecord) -> Bool {
-        guard record.type == "message.post_with_attachments" else { return true }
+        guard ChatAttachments.postCommands.contains(record.type) else { return true }
         return (try? store.queue.read { db in
             try ChatAttachments.drafts(db, includingQueued: true)
-                .filter { $0.queued == true && $0.messageId == ChatService.args(record)["message_id"]?.string }
+                .filter { $0.queued == true && $0.messageId == ChatService.args(record)["message_id"]?.string && $0.owner == ChatAttachmentOwner(args: .object(ChatService.args(record))) }
                 .allSatisfy { $0.state == .ready }
         }) == true
     }
@@ -93,5 +93,45 @@ extension ChatService {
         committed = true
         manager.reconcile()
         prepared.sent()
+    }
+}
+
+extension ChatService {
+    func retryDMAttachmentPost(_ key: ChatOrgKey, row: ChatMessage, original: ChatCommandRecord) throws {
+        guard let dm = row.dmId, let manager = attachments(key), let capture = manager.uploadStamp(owner: .dm(dm)),
+              original.state != .sent, original.state != .pending, original.error != "dismissed" else { throw ChatAttachmentError.unavailable }
+        let owned = try manager.store.dmRead { try ChatAttachments.drafts($0, includingQueued: true).filter { $0.owner == .dm(dm) && $0.messageId == row.id && $0.queued == true } }
+        guard !owned.isEmpty, Set(owned.map(\.id)) == Set(row.attachments.map(\.id)) else { throw ChatAttachmentError.unavailable }
+        let renew = original.state == .failed && ["attachment_expired", "attachment_not_ready", "not_found", "attachment_upload_failed", "dm_read_only"].contains(original.error ?? "")
+        var next: [ChatAttachmentDraft] = []
+        var committed = false
+        defer { if !committed && renew { for draft in next { manager.storage.remove(key, id: draft.id) } } }
+        for var draft in owned {
+            if renew { draft = try manager.renewed(draft, capture: capture) }
+            else {
+                // Unknown outcome: first replay the original IDs, including after
+                // reconnect. Never upload replacement bytes before this resolves.
+                draft.state = .ready; draft.problem = nil
+            }
+            next.append(draft)
+        }
+        var args = Self.args(original)
+        let files = row.attachments.compactMap { file in owned.firstIndex { $0.id == file.id }.map { next[$0].file } }
+        args["attachment_ids"] = .array(files.map { .string($0.id) })
+        let command = try prepareCommand(key, type: original.type, args: .object(args))
+        try manager.store.dmWrite { db in
+            for (old, new) in zip(owned, next) {
+                if renew { try manager.replace(db, draft: old, with: new) }
+                else { try ChatAttachments.put(db, new) }
+            }
+            guard let data = try Data.fetchOne(db, sql: "SELECT body FROM dm_messages WHERE dm_id = ? AND message_id = ? AND seq = 0", arguments: [dm, row.id]) else { throw ChatAttachmentError.changed }
+            var message = try JSONDecoder().decode(ChatDMMessageWire.self, from: data); message.attachments = files
+            try db.execute(sql: "UPDATE dm_messages SET body = ?, local_state = 'sending', local_error = NULL, command_id = ? WHERE dm_id = ? AND message_id = ?",
+                arguments: [try JSONEncoder().encode(message), command.record.commandId, dm, row.id])
+            _ = try command.table.insert(db, command.record, seq: command.record.seq)
+        }
+        committed = true
+        if renew { for file in owned { manager.storage.remove(key, id: file.id) } }
+        manager.reconcile(); command.sent()
     }
 }

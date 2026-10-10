@@ -11,6 +11,7 @@ final class ChatDMPeerModel: ChatDMComposing {
     let peer: String
     private weak var service: ChatService?
     private var stopped = false
+    @ObservationIgnored private var openingAttachments: Task<Void, Never>?
     private var content = Snapshot()
     private(set) var result: String?
     private(set) var problem: String?
@@ -56,6 +57,30 @@ final class ChatDMPeerModel: ChatDMComposing {
             .start(in: store.queue, scheduling: .immediate, onError: { [weak self] _ in
                 self?.content = .init()
             }) { [weak self] value in self?.accept(value) }
+    }
+    var attachmentManager: ChatAttachmentManager? { service?.attachments(key) }
+    var attachmentOwner: ChatAttachmentOwner? { content.card.map { .dm($0.dmId) } }
+    func attachmentProblem(_ error: Error) { problem = error.localizedDescription }
+    func prepareAttachments() async throws -> ChatAttachmentOwner {
+        guard readable, let service, attachmentManager?.limits(for: .dm("")) != nil,
+              let sync = service.dmSync(key), let token = service.token else { throw ChatAttachmentError.unavailable }
+        if let id = content.card?.dmId { return .dm(id) }
+        let epoch = sync.epoch
+        let api = service.makeAPI(key.server)
+        let command = ChatCommandEnvelope(commandId: ChatUUID.v7(), org: key.orgId, type: "dm.open", args: .object(["peer_account_id": .string(peer)]))
+        let answer = try await api.call(ChatCommandAnswer.self, "POST", "/v1/commands", token: token, body: command.encoded())
+        guard readable, !Task.isCancelled, sync.epoch == epoch, let dm = answer.result["dm_id"]?.string else { throw ChatAttachmentError.unavailable }
+        _ = try await sync.refresh(dm)
+        guard !Task.isCancelled, service.dmAllowed(key, dm) else { throw ChatAttachmentError.unavailable }
+        return .dm(dm)
+    }
+    func openForAttachments() {
+        guard openingAttachments == nil, attachmentManager?.limits(for: .dm("")) != nil else { return }
+        openingAttachments = Task { [weak self] in
+            do { _ = try await self?.prepareAttachments() }
+            catch { if self?.stopped == false { self?.problem = "The conversation could not be opened for files. Try again when connected." } }
+            self?.openingAttachments = nil
+        }
     }
     var outgoing: [ChatCommandRecord] { readable ? content.outgoing : [] }
     func attribution(_ command: ChatCommandRecord) -> ChatMessageAttribution? {
@@ -113,7 +138,7 @@ final class ChatDMPeerModel: ChatDMComposing {
         }
         result = dm
     }
-    func stop() { stopped = true; observation = nil; content = .init(); result = nil; problem = nil }
+    func stop() { stopped = true; openingAttachments?.cancel(); openingAttachments = nil; observation = nil; content = .init(); result = nil; problem = nil }
     func openThread(_ id: String?) {}
     func conversationMessages(root: String?) -> [ChatMessage] { [] }
     func canEdit(_ message: ChatMessage) -> Bool { false }
@@ -140,7 +165,7 @@ struct ChatDMPeerTab: View {
                 VStack(spacing: 0) {
                     if let person = model.person {
                         HStack(spacing: 10) {
-                            ContactAvatar(stableID: peer, name: person.name, kind: .person, size: 34)
+                            ContactAvatar(stableID: peer, name: person.name, kind: .person, size: 34, remote: .account(peer, key))
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(person.name).font(Theme.display(15, weight: .semibold))
                                 Label("Only the two of you", systemImage: "lock").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
@@ -179,7 +204,8 @@ struct ChatDMPeerTab: View {
                         ChatDMComposer(model: model, root: nil, members: [person], peer: person.name,
                                        isActive: { !state.isClosed && state.route == .directMessageDraft(scope, peer: peer) })
                     }
-                }.onChange(of: model.result, initial: true) { _, dm in
+                }.task(id: service.supports("chat.dm.attachments", key: key)) { model.openForAttachments() }
+                .onChange(of: model.result, initial: true) { _, dm in
                     guard let dm, !state.isClosed, service.dmAllowed(key, dm), let owner = SupportTabs.shared.owner(state) else { return }
                     model.stop(); state.dmPeerModel = nil
                     _ = SupportTabs.shared.navigation.router.rekey(owner.session.id, to: .directMessage(ChatDMRef(key, dm: dm)))

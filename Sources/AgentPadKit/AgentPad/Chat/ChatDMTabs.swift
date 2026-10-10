@@ -104,7 +104,7 @@ struct ChatDMPeoplePicker: View {
                     ForEach(model.people) { person in
                         Button { model.choose(person.accountId) } label: {
                             HStack(spacing: 12) {
-                                ContactAvatar(stableID: person.accountId, name: person.name, kind: .person, size: 34)
+                                ContactAvatar(stableID: person.accountId, name: person.name, kind: .person, size: 34, remote: .account(person.accountId, model.key))
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(person.name).font(Theme.display(13, weight: .medium))
                                     Text("@\(person.handle)").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)

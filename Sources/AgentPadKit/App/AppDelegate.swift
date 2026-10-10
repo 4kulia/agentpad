@@ -1603,7 +1603,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         revealHiddenWindow()
         guard let store = activeStore else { return }
         prepareSearch(in: store)
-        store.search.begin()
+        store.search.toggle()
     }
 
     func prepareSearch(in store: WorkspaceStore) {

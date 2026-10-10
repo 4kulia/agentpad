@@ -11,7 +11,8 @@ final class TestEngine: TerminalEngine {
         override var acceptsFirstResponder: Bool { true }
     }
 
-    let view: NSView = FocusableView()
+    let view: NSView
+    init(view: NSView? = nil) { self.view = view ?? FocusableView() }
     func renderNowIfNeeded() {}
     var backgroundColor: NSColor { .black }
     var onPwdChange: ((String) -> Void)?

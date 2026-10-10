@@ -73,9 +73,10 @@ struct ChatAgentCard: Codable, Equatable, Sendable {
     var available: Bool
     /// In the snapshot: the caller's teams among the agent's audience.
     var teamIds: [String]?
+    var avatar: ChatAvatarMetadata? = nil
 
     enum CodingKeys: String, CodingKey {
-        case name, description, access, enabled, available
+        case name, description, access, enabled, available, avatar
         case agentId = "agent_id", ownerAccountId = "owner_account_id", executorSessionId = "executor_session_id"
         case executorDeviceName = "executor_device_name", teamIds = "team_ids"
     }

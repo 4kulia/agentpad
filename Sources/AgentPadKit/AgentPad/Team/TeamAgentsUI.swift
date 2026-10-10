@@ -75,7 +75,8 @@ struct TeamAgentsView: View {
     private func row(_ agent: TeamPublishedAgent) -> some View {
         let published = key != nil && ChatService.shared.isAssigned(agent.id)
         return HStack(alignment: .top, spacing: 8) {
-            ContactAvatar(stableID: agent.id.uuidString.lowercased(), name: agent.name, kind: .agent, size: 28)
+            ContactAvatar(stableID: agent.id.uuidString.lowercased(), name: agent.name, kind: .agent, size: 28,
+                          localProfileID: key == nil ? AgentProfileStore.shared.details.archive.publications[agent.id.uuidString] : nil, remote: .agent(agent.id.uuidString.lowercased(), key))
             Circle()
                 .fill(agent.enabled ? Color.green : Color.secondary.opacity(0.4))
                 .frame(width: 8, height: 8)

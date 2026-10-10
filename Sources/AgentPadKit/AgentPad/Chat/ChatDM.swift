@@ -47,7 +47,7 @@ struct ChatDMPage: Codable, Equatable, Sendable { var dms: [ChatDMCard]; var nex
 struct ChatDMMessagesPage: Codable, Equatable, Sendable { var messages: [ChatDMMessageWire]; var next: Int?; var head: Int? }
 
 /// Deliberately distinct from channel wire decoding: a session signature is
-/// allowed, but published-agent/run attribution and files are absent.
+/// allowed, but published-agent/run attribution is absent.
 struct ChatDMMessageWire: Codable, Equatable, Sendable {
     var messageId: String
     var dmId: String
@@ -62,10 +62,29 @@ struct ChatDMMessageWire: Codable, Equatable, Sendable {
     var deletedAt: String?
     var authorSessionName: String? = nil
     var canonicalText: String? = nil
+    var attachments: [ChatAttachment] = []
+    var attachmentOnly = false
     enum CodingKeys: String, CodingKey {
+        case attachments, attachmentOnly = "attachment_only"
         case messageId = "message_id", dmId = "dm_id", threadRootId = "thread_root_id", authorAccountId = "author_account_id"
         case text, mentions, revision, seq, createdAt = "created_at", editedAt = "edited_at", deletedAt = "deleted_at"
         case authorSessionName = "author_session_name", canonicalText = "canonical_text"
+    }
+}
+
+extension ChatDMMessageWire {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(messageId: try c.decode(String.self, forKey: .messageId), dmId: try c.decode(String.self, forKey: .dmId),
+            threadRootId: try c.decodeIfPresent(String.self, forKey: .threadRootId),
+            authorAccountId: try c.decode(String.self, forKey: .authorAccountId), text: try c.decode(String.self, forKey: .text),
+            mentions: try c.decode([ChatMessageWire.Mention].self, forKey: .mentions), revision: try c.decode(Int.self, forKey: .revision),
+            seq: try c.decode(Int.self, forKey: .seq), createdAt: try c.decode(String.self, forKey: .createdAt),
+            editedAt: try c.decodeIfPresent(String.self, forKey: .editedAt), deletedAt: try c.decodeIfPresent(String.self, forKey: .deletedAt),
+            authorSessionName: try c.decodeIfPresent(String.self, forKey: .authorSessionName),
+            canonicalText: try c.decodeIfPresent(String.self, forKey: .canonicalText),
+            attachments: try c.decodeIfPresent([ChatAttachment].self, forKey: .attachments) ?? [],
+            attachmentOnly: try c.decodeIfPresent(Bool.self, forKey: .attachmentOnly) ?? false)
     }
 }
 
@@ -76,6 +95,7 @@ extension ChatMessage {
         authorSessionName = m.authorSessionName
         hasFixed = m.seq > 0; hasMutable = true; text = m.deletedAt == nil ? (m.canonicalText ?? m.text) : ""
         mentions = m.deletedAt == nil ? m.mentions.map(\.accountId) : []
+        attachments = m.deletedAt == nil ? m.attachments : []; attachmentOnly = m.deletedAt == nil && m.attachmentOnly
         revision = m.revision; editedAt = m.editedAt; deletedAt = m.deletedAt
     }
 }

@@ -5,7 +5,7 @@ import GRDB
 /// Only the presentation value ChatMessage is shared with F3.
 enum ChatDMStore {
     static let events: Set<String> = ["dm.created", "dm.closed", "dm.reopened", "dm.message.post", "dm.message.edit", "dm.message.delete"]
-    static let commands: Set<String> = ["dm.open", "dm.message.post", "dm.message.edit", "dm.message.delete"]
+    static let commands: Set<String> = ["dm.open", "dm.message.post", "dm.message.post_with_attachments", "dm.message.edit", "dm.message.delete"]
     static let privateTables = ["dm_cards", "dm_states", "dm_messages", "dm_revisions", "dm_pending", "dm_marks", "dm_drafts", "dm_edits", "dm_changes", "dm_notified", "dm_preferences", "dm_open_results", "dm_sends"]
 
     static func migrate(_ db: Database) throws {
@@ -40,8 +40,15 @@ enum ChatDMStore {
         try db.execute(sql: "UPDATE dm_meta SET stamp = stamp + 1"); return try stamp(db)
     }
     static func invalidate(_ db: Database) throws { try db.execute(sql: "UPDATE dm_meta SET ready = 0, epoch = epoch + 1") }
-    static func clear(_ db: Database) throws {
+    static func clear(_ db: Database, preservingAttachments: Bool = false) throws {
+        let files = preservingAttachments ? try ChatAttachments.drafts(db, includingQueued: true).filter { $0.owner.dmID != nil } : []
+        let drafts = preservingAttachments ? try Row.fetchAll(db, sql: "SELECT * FROM dm_drafts WHERE dm_id IN (SELECT dm_id FROM attachment_drafts WHERE dm_id IS NOT NULL)") : []
+        try db.execute(sql: "DELETE FROM attachment_drafts WHERE dm_id IS NOT NULL")
         for table in privateTables { try db.execute(sql: "DELETE FROM \(table)") }
+        for file in files { try ChatAttachments.put(db, file) }
+        for draft in drafts {
+            try db.execute(sql: "INSERT INTO dm_drafts (dm_id, root, text, version) VALUES (?, ?, ?, ?)", arguments: [draft["dm_id"] as String, draft["root"] as String, draft["text"] as String, draft["version"] as String])
+        }
         try db.execute(sql: "DELETE FROM cursors WHERE stream LIKE 'dm:%'")
         try invalidate(db)
     }
@@ -98,6 +105,10 @@ enum ChatDMStore {
     }
     static func endRead(_ db: Database, since stamp: Int, seen: Set<String>) throws {
         for id in try String.fetchAll(db, sql: "SELECT dm_id FROM dm_cards WHERE stamp <= ?", arguments: [stamp]) where !seen.contains(id) { try remove(db, id) }
+        // Restored local files do not grant membership, including a scope whose
+        // old card was removed on disconnect before this catalog was read.
+        try db.execute(sql: "DELETE FROM attachment_drafts WHERE dm_id IS NOT NULL AND dm_id NOT IN (SELECT dm_id FROM dm_cards)")
+        try db.execute(sql: "DELETE FROM dm_drafts WHERE dm_id NOT LIKE 'peer:%' AND dm_id NOT IN (SELECT dm_id FROM dm_cards)")
         try db.execute(sql: "UPDATE dm_meta SET ready = 1")
     }
     static func liveBaseline(_ db: Database, _ id: String) throws {
@@ -110,7 +121,7 @@ enum ChatDMStore {
         if let guardRow, (guardRow["revision"] as Int) > incoming.revision || ((guardRow["deleted"] as Bool) && incoming.deletedAt == nil) { return }
         var m = incoming
         if m.deletedAt != nil {
-            m.text = ""; m.mentions = []
+            m.text = ""; m.mentions = []; m.attachments = []; m.attachmentOnly = false
             if m.canonicalText != nil { m.canonicalText = "" }
         }
         try db.execute(sql: """
@@ -168,7 +179,7 @@ enum ChatDMStore {
                     // Clear deleted text before any async hydration, including edit drafts.
                     if let data = try Data.fetchOne(db, sql: "SELECT body FROM dm_messages WHERE dm_id = ? AND message_id = ?", arguments: [id, message]) {
                         var m = try JSONDecoder().decode(ChatDMMessageWire.self, from: data)
-                        m.revision = revision; m.deletedAt = event.at; m.text = ""; m.mentions = []
+                        m.revision = revision; m.deletedAt = event.at; m.text = ""; m.mentions = []; m.attachments = []; m.attachmentOnly = false
                         try write(db, m)
                     }
                 }
@@ -198,7 +209,7 @@ enum ChatDMStore {
                 if let kind: String = row["edit_kind"] {
                     m.localEdit = .init(kind: kind, text: row["edit_text"], state: row["edit_state"] ?? "failed", error: row["edit_error"])
                 }
-                if m.stale != nil { m.text = ""; m.mentions = [] }
+                if m.stale != nil { m.text = ""; m.mentions = []; m.attachments = []; m.attachmentOnly = false }
                 return m
             }
     }

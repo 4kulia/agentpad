@@ -60,7 +60,8 @@ final class ChatPersonalLifecycleTests: XCTestCase {
         let opened = original.addTab(in: try XCTUnwrap(original.active), template: .claudeCode, conversationId: transcript.id)
         let saved = PersistedState(workspaces: original.workspaces.map(PersistedWorkspace.init), activeWorkspaceId: original.activeWorkspaceId)
         original.terminate()
-        let store = makeTestStore(persistence: InMemoryPersistence(initial: saved), claudeProjectsRoot: transcript.root)
+        let store = makeTestStore(persistence: InMemoryPersistence(initial: saved), claudeProjectsRoot: transcript.root,
+                                  agentProfiles: original.agentProfiles)
         defer { store.terminate() }
         let tab = try XCTUnwrap(store.active?.root.allPanes.flatMap(\.tabs).first { $0.id == opened.id })
         XCTAssertEqual((tab.engine as? TestEngine)?.startedConfigs.last?.environment["AGENTPAD_AGENT"], "claude --resume \(transcript.id)")

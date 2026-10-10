@@ -32,7 +32,12 @@ final class ChatFeed: ChatSocketLifecycle {
         socket.checkServer = { [weak service] in
             let info = try await api.serverInfo()
             guard service?.connection?.sessionId == connection.sessionId else { return }
+            let hadDMFiles = service?.serverCapabilities[connection.server]?.contains("chat.dm.attachments") == true
+            if !hadDMFiles, info.capabilities.contains("chat.dm.attachments"), let key = connection.orgKey {
+                service?.orgSessions[key]?.sync?.requestSnapshot()
+            }
             service?.serverCapabilities[connection.server] = Set(info.capabilities)
+            service?.configureAvatars(info, server: connection.server)
             service?.serverB1Limits[connection.server] = info.limits?.chatB1
             service?.serverAttachmentLimits[connection.server] = info.limits?.attachments
             service?.attachmentManagers.values.forEach { $0.reconcile() }
@@ -121,6 +126,10 @@ final class ChatFeed: ChatSocketLifecycle {
 
     func socketHello(_ context: ChatConnectionContext) async -> Bool {
         guard isCurrent else { return false }
+        if service?.avatarGenerations[connection.server] != context.generation {
+            service?.invalidateAvatars()
+            service?.avatarGenerations[connection.server] = context.generation
+        }
         // Before anything waits: a new server generation begins at once.
         if let sync = session?.sync, !sync.beginGeneration(context) { return false }
         // The account first: it may bring (or end) the organization.
@@ -160,7 +169,9 @@ final class ChatFeed: ChatSocketLifecycle {
     /// gone — its cache goes and the connection stays; back — a new session
     /// of it starts; still there — a snapshot (the event said something changed).
     private func membership(_ me: ChatMe) async {
-        guard let service, let key else { return }
+        guard let service else { return }
+        service.reconcileDMScopes(me, connection: connection)
+        guard let key else { return }
         let member = me.orgs.contains { $0.orgId == key.orgId }
         let existing = service.orgSessions[key]
         if !member {
@@ -207,6 +218,9 @@ final class ChatFeed: ChatSocketLifecycle {
         }
         let sync = ChatSync(key: key, store: store, api: api, socket: socket, outbox: fresh.outbox, token: token)
         if let delay = service.retryDelay { sync.retryDelay = delay }
+        sync.onAvatarSnapshot = { [weak service] in service?.receiveAvatars($0, key: key) }
+        sync.onAvatarEvent = { [weak service] in service?.avatarEvent($0, key: key) }
+        sync.onAvatarAccessChanged = { [weak service] in service?.invalidateAvatars() }
         sync.generationState = service.journal
         sync.runningRequests = { [weak service] in try service?.journal?.runningRequests(key) ?? [] }
         sync.localFacts = { [weak service] ids in service?.localFacts(key, ids) }
@@ -231,7 +245,11 @@ final class ChatFeed: ChatSocketLifecycle {
         sync.dm.onLiveMessage = { [weak service] dm, id in
             if let service { ChatDMNotices.live(service, key, dm: dm, id: id) }
         }
-        sync.dm.onChanged = { [weak service] in if let service { ChatNotifications.reconcile(service) } }
+        sync.dm.onChanged = { [weak service] in
+            guard let service else { return }
+            service.reconcileDMAttachments(key)
+            ChatNotifications.reconcile(service)
+        }
         sync.onLiveMessage = { [weak fresh, weak service] channel, id in
             guard let store = fresh?.store, let service else { return }
             ChatNotifications.live(service, key, store: store, channel: channel, messageId: id)
@@ -266,7 +284,10 @@ final class ChatFeed: ChatSocketLifecycle {
             try TeamApprovals.voidOtherGenerations(current: generation, key: key, journal: journal)
         }
         sync.b1.onCapabilities = { [weak service, weak fresh] info in
+            let hadDMFiles = service?.serverCapabilities[key.server]?.contains("chat.dm.attachments") == true
+            if !hadDMFiles, info.capabilities.contains("chat.dm.attachments") { fresh?.sync?.requestSnapshot() }
             service?.serverCapabilities[key.server] = Set(info.capabilities)
+            service?.configureAvatars(info, server: key.server)
             service?.serverB1Limits[key.server] = info.limits?.chatB1
             service?.serverAttachmentLimits[key.server] = info.limits?.attachments
             service?.attachmentManagers.values.forEach { $0.reconcile() }
@@ -307,6 +328,11 @@ extension ChatService {
             }
         }
         outbox.maySendCommand = { [weak self] record in
+            if record.type == "dm.message.post_with_attachments" {
+                return self?.dmAllowed(key, Self.args(record)["dm_id"]?.string) == true
+                    && self?.attachments(key)?.limits(for: .dm(Self.args(record)["dm_id"]?.string ?? "")) != nil
+                    && self?.attachments(key)?.postReady(record) == true
+            }
             if ChatDMStore.commands.contains(record.type) {
                 return self?.supports("chat.dm", key: key) == true
                     && (!record.requiresDMSignature || self?.supports("chat.dm.session_signature", key: key) == true)
@@ -318,6 +344,10 @@ extension ChatService {
             return !ChatB1.commands.contains(record.type) || self?.supports(ChatB1.capability(for: record.type), key: key) == true
         }
         outbox.isSuspended = { [weak self] record in
+            if record.type == "dm.message.post_with_attachments" {
+                return self?.attachments(key)?.limits(for: .dm(Self.args(record)["dm_id"]?.string ?? "")) == nil
+                    || self?.dmAllowed(key, Self.args(record)["dm_id"]?.string) != true
+            }
             if ChatDMStore.commands.contains(record.type) {
                 return self?.supports("chat.dm", key: key) != true
                     || (record.requiresDMSignature && self?.supports("chat.dm.session_signature", key: key) != true)
@@ -326,7 +356,7 @@ extension ChatService {
             return self?.supports(capability, key: key) != true || self?.attachments(key)?.limits == nil
         }
         outbox.permanentRejection = { [weak self] record in
-            guard record.type == "message.post_with_attachments", let store = self?.orgSessions[key]?.store else { return nil }
+            guard ChatAttachments.postCommands.contains(record.type), let store = self?.orgSessions[key]?.store else { return nil }
             return try? store.queue.read { try ChatAttachments.postFailure($0, record) }
         }
     }

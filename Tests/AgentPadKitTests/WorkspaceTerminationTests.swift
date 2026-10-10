@@ -67,7 +67,8 @@ final class WorkspaceTerminationTests: XCTestCase {
                 XCTAssertEqual(persistence.saved, before, "\(agent.id): \(event)")
 
                 let saved = try JSONDecoder().decode(PersistedState.self, from: JSONEncoder().encode(persistence.saved))
-                let restored = makeTestStore(persistence: InMemoryPersistence(initial: saved), claudeProjectsRoot: fixture.root)
+                let restored = makeTestStore(persistence: InMemoryPersistence(initial: saved), claudeProjectsRoot: fixture.root,
+                                             agentProfiles: store.agentProfiles)
                 defer { restored.terminate() }
                 let resumed = try XCTUnwrap(restored.allSessions.first { $0.id == tab.id })
                 XCTAssertEqual(resumed.agent.id, agent.id)

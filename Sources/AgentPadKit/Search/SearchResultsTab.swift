@@ -35,7 +35,7 @@ struct SearchResultsTab: View {
             }.font(.caption).foregroundStyle(ChatAppearance.secondary).padding(12)
         }.background(ChatAppearance.surface).foregroundStyle(Theme.chromeForeground).tint(ChatAppearance.accent)
             .onKeyPress(characters: CharacterSet(charactersIn: "f")) { press in
-                guard press.modifiers == .command else { return .ignored }; model.focusRequest += 1; return .handled
+                guard press.modifiers == .command else { return .ignored }; model.begin(); return .handled
             }
     }
     private var header: some View {

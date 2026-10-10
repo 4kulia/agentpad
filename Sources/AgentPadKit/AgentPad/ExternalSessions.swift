@@ -10,6 +10,8 @@ import Foundation
 struct ExternalAgentSession: Identifiable, Equatable, Sendable {
     enum Status: Equatable, Sendable {
         case busy
+        /// Background shells can outlive the foreground turn's Stop hook.
+        case shell
         case waiting(reason: String?)
         case idle
         /// A value this build doesn't know. Shown neutrally rather than guessed.
@@ -17,7 +19,8 @@ struct ExternalAgentSession: Identifiable, Equatable, Sendable {
 
         init(raw: String, waitingFor: String?) {
             switch raw {
-            case "busy", "shell": self = .busy
+            case "busy": self = .busy
+            case "shell": self = .shell
             case "waiting": self = .waiting(reason: waitingFor)
             case "idle": self = .idle
             default: self = .other(raw)
@@ -64,7 +67,7 @@ struct ExternalAgentSession: Identifiable, Equatable, Sendable {
     var monitorState: AgentMonitor.State {
         switch status {
         case .waiting: return .attention
-        case .busy: return .running
+        case .busy, .shell: return .running
         case .idle, .other: return .idle
         }
     }

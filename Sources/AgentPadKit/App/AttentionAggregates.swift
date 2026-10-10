@@ -82,30 +82,80 @@ final class AttentionSidebarModel {
     let aggregates = AttentionAggregates()
     var serverCurrent = AttentionCurrent()
     var dismissalRevision = 0
+    private struct Projection {
+        var items: [AttentionItem]
+        var terminals: [UUID: [AttentionItem]]
+        var profileCounts: [UUID: Int]
+        var terminalIDs: Set<UUID>
+    }
+    @ObservationIgnored private var cachedProjection: Projection?
+    private var projectionRevision = 0
     init(ledger: AttentionLedger = .shared) { self.ledger = ledger }
 
-    var items: [AttentionItem] {
+    var terminalIDsNeedingAttention: Set<UUID> { projection.terminalIDs }
+    var terminalAttention: [UUID: [AttentionItem]] { projection.terminals }
+    var profileAttentionCounts: [UUID: Int] { projection.profileCounts }
+    var items: [AttentionItem] { projection.items }
+
+    /// All consumers share one projection until an input changes. Invalidate
+    /// synchronously so another read in the same main-actor turn is fresh.
+    private var projection: Projection {
+        _ = projectionRevision
+        if let cachedProjection { return cachedProjection }
+        let next = withObservationTracking { buildProjection() } onChange: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.cachedProjection = nil
+                self.projectionRevision += 1
+            }
+        }
+        cachedProjection = next
+        return next
+    }
+
+    private func buildProjection() -> Projection {
         var current = serverCurrent
+        _ = AgentMonitor.shared.windowGeneration
+        var profilesByStore: [ObjectIdentifier: [UUID: AgentProfile]] = [:]
         // Reading live observable sessions removes old outcomes as soon as work resumes.
         for store in AgentMonitor.shared.storesProvider() {
+            let key = ObjectIdentifier(store.agentProfiles)
+            if profilesByStore[key] == nil {
+                profilesByStore[key] = Dictionary(store.agentProfiles.profiles.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            }
+            let profiles = profilesByStore[key] ?? [:]
             for session in store.workspaces.flatMap({ $0.root.allPanes.flatMap(\.tabs) }) {
                 current.terminals[session.id] = .init(episode: session.attentionEpisode,
                     failed: session.hasCurrentAttentionFailure,
                     finished: session.hasCurrentAttentionCompletion,
-                    title: session.title, agentID: session.displayAgent.id, agentName: session.displayAgent.title)
+                    title: session.title, agentID: session.profileID?.uuidString ?? session.id.uuidString,
+                    agentName: session.profileID.flatMap { profiles[$0]?.name } ?? session.displayAgent.title, profileID: session.profileID)
             }
         }
+        let external = Dictionary(ExternalSessionMonitor.shared.sessions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         for event in ledger.events {
             if case .external(let id) = event.destination,
-               let session = ExternalSessionMonitor.shared.sessions.first(where: { $0.id == id }) {
-                current.labels[event.id] = .init(title: session.displayTitle, subjectID: AgentTemplate.claudeCodeID,
+               let session = external[id] {
+                current.labels[event.id] = .init(title: session.displayTitle, subjectID: session.id,
                                                 subjectName: "Claude Code", subjectIsAgent: true)
             }
         }
         _ = dismissalRevision
-        return AttentionList.items(ledger: ledger.events, current: current,
+        let items = AttentionList.items(ledger: ledger.events, current: current,
             mentions: aggregates.mentions, dms: aggregates.dms, settings: AgentPadSettingsModel.shared.attentionSettings,
             dismissed: Set(ledger.metadata.markers.filter { $0.value.hidden }.keys), viewed: ledger.viewedAttentionIDs)
+        let byID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var terminals: [UUID: [AttentionItem]] = [:]
+        for event in ledger.events {
+            if case .terminal(let id) = event.destination, let item = byID[event.id] {
+                terminals[id, default: []].append(item)
+            }
+        }
+        var counts: [UUID: Int] = [:]
+        for id in terminals.keys {
+            if let profileID = current.terminals[id]?.profileID { counts[profileID, default: 0] += 1 }
+        }
+        return Projection(items: items, terminals: terminals, profileCounts: counts, terminalIDs: Set(terminals.keys))
     }
 
     func refresh(service: ChatService = .shared, ledger: AttentionLedger? = nil) {

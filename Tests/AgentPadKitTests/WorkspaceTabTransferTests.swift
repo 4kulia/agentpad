@@ -296,7 +296,7 @@ final class WorkspaceTabTransferTests: XCTestCase {
         let spare = try XCTUnwrap(store.splitPane(created.activePane!, orientation: .vertical, in: created))
         let saved = try snapshot(store, persistence)
         let restoredPersistence = InMemoryPersistence(initial: saved)
-        let restored = makeTestStore(persistence: restoredPersistence)
+        let restored = makeTestStore(persistence: restoredPersistence, agentProfiles: store.agentProfiles)
         defer { restored.terminate() }
         XCTAssertEqual(try snapshot(restored, restoredPersistence).workspaces, saved.workspaces)
         XCTAssertEqual(restored.activeWorkspaceId, created.id)

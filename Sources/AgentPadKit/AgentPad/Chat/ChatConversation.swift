@@ -112,7 +112,7 @@ extension ChatService {
         guard let store = orgSessions[key]?.store else { return }
         let removed = try store.queue.write { db -> [String] in
             guard try String.fetchOne(db, sql: "SELECT local_state FROM messages WHERE message_id = ?", arguments: [messageId]) == "failed" else { return [] }
-            let owned = try ChatAttachments.drafts(db, includingQueued: true).filter { $0.queued == true && $0.messageId == messageId }
+            let owned = try ChatAttachments.drafts(db, includingQueued: true).filter { $0.owner.channelID != nil && $0.queued == true && $0.messageId == messageId }
             for file in owned { try db.execute(sql: "DELETE FROM attachment_drafts WHERE attachment_id = ?", arguments: [file.id]) }
             try db.execute(sql: "DELETE FROM messages WHERE message_id = ? AND local_state = 'failed'", arguments: [messageId])
             return owned.map(\.id)

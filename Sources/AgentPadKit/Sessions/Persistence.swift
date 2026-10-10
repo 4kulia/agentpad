@@ -296,6 +296,7 @@ struct PersistedTab: Codable, Equatable {
     /// `decodeIfPresent` so state.json files written by pre-resume AgentPad
     /// versions still load.
     var conversationId: String?
+    var launchOrigin: AgentLaunchOrigin?
     var profileID: UUID?
     var profileOriginalCwd: URL?
     /// nil is legacy (inherit workspace host); empty explicitly means local.
@@ -309,7 +310,7 @@ struct PersistedTab: Codable, Equatable {
     var navigation: TabNavigation?
 
     private enum CodingKeys: String, CodingKey {
-        case id, agentId, currentDirectoryPath, customTitle, conversationId, profileID, profileOriginalCwd, sshWorkspaceHost, channel, inbox, content, navigation
+        case id, agentId, currentDirectoryPath, customTitle, conversationId, launchOrigin, profileID, profileOriginalCwd, sshWorkspaceHost, channel, inbox, content, navigation
     }
 
     init(from decoder: Decoder) throws {
@@ -327,6 +328,7 @@ struct PersistedTab: Codable, Equatable {
             currentDirectoryPath = try c.decode(String.self, forKey: .currentDirectoryPath)
             customTitle = try c.decodeIfPresent(String.self, forKey: .customTitle)
             conversationId = try c.decodeIfPresent(String.self, forKey: .conversationId)
+            launchOrigin = try c.decodeIfPresent(AgentLaunchOrigin.self, forKey: .launchOrigin)
             profileID = try c.decodeIfPresent(UUID.self, forKey: .profileID)
             profileOriginalCwd = try c.decodeIfPresent(URL.self, forKey: .profileOriginalCwd)
             sshWorkspaceHost = try c.decodeIfPresent(String.self, forKey: .sshWorkspaceHost)
@@ -348,6 +350,7 @@ struct PersistedTab: Codable, Equatable {
         // AgentPad: a channel tab keeps no title — its name is its card's (DESIGN-F2).
         self.customTitle = session.hasProcess ? session.customTitle : nil
         self.conversationId = session.conversationId
+        self.launchOrigin = session.launchOrigin
         self.profileID = session.profileID
         self.profileOriginalCwd = session.profileOriginalCwd
         self.sshWorkspaceHost = session.sshWorkspaceHost ?? ""

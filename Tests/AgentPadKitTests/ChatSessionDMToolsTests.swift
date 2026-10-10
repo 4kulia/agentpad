@@ -19,7 +19,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("dm-mcp-\(UUID())")
         f = try await ChatChannelExecutionTests.Fixture(root: root)
         f.service.dmToolsEnabled = { true }
-        f.service.serverCapabilities[f.key.server] = ["chat.dm", "chat.dm.session_signature"]
+        enableDMAttachments()
         socket = ChatSocket(server: f.key.server, token: "test-only", makeTransport: { FakeSocketTransport() })
         let owner = ChatSync(key: f.key, store: f.store, api: f.service.makeAPI(f.key.server), socket: socket, outbox: nil, token: "test-only")
         f.service.orgSessions[f.key]?.sync = owner
@@ -59,10 +59,12 @@ final class ChatSessionDMToolsTests: XCTestCase {
             scan: processes.inspector.scan, kernel: processes.inspector.kernel)
     }
 
-    private func serveDM(beforeResponse: @escaping @Sendable () -> Void = {}) {
+    private func serveDM(includeAttachment: Bool = false, beforeResponse: @escaping @Sendable () -> Void = {}) {
         let card = card(), dm = dm
+        let fileMessage = includeAttachment ? dmAttachmentMessage() : nil
         ChatStubProtocol.reset { request, bytes in
             beforeResponse()
+            if request.url!.path.hasSuffix("/original") { return .success(.init(status: 200, body: Data("notes".utf8))) }
             if request.httpMethod == "POST" {
                 let command = try! JSONDecoder().decode(ChatCommandEnvelope.self, from: bytes)
                 let result: ChatJSON = command.type == "dm.open" ? .object(["dm_id": .string(dm)]) :
@@ -74,7 +76,10 @@ final class ChatSessionDMToolsTests: XCTestCase {
             if request.url!.path.hasSuffix("/dms") {
                 body = Data("{\"dms\":[\(String(decoding: card, as: UTF8.self))],\"next\":null}".utf8)
             } else if request.url!.path.hasSuffix("/messages") || request.url!.path.contains("/threads/") {
-                body = Data(#"{"messages":[],"next":null}"#.utf8)
+                if var message = fileMessage {
+                    message.threadRootId = request.url!.path.contains("/threads/") ? request.url!.lastPathComponent : nil
+                    body = try! JSONEncoder().encode(ChatDMMessagesPage(messages: [message], next: nil, head: nil))
+                } else { body = Data(#"{"messages":[],"next":null}"#.utf8) }
             } else { body = card }
             return .success(.init(status: 200, body: body))
         }
@@ -169,6 +174,10 @@ final class ChatSessionDMToolsTests: XCTestCase {
              "dm_id": .string(dm), "thread_root_id": .string(UUID().uuidString)]
         ]
     }
+    private var guardedDMOperations: [[String: ChatJSON]] {
+        personalDMOperations + [["tool": .string("chat_read"), "org_id": .string(f.key.orgId),
+            "kind": .string("dm"), "dm_id": .string(dm), "attachment_id": .string(dmFile.id)]]
+    }
 
     func testEveryDMOperationAllowsPersonalConversationAlreadyInDMHistory() async throws {
         let processes = AnswerProcessFixture()
@@ -191,7 +200,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
         let tab = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode)
         try processes.bind(tab, conversation: conversation)
         tab.conversationId = conversation
-        for args in personalDMOperations where args["scope"] != .string("members") {
+        for args in guardedDMOperations where args["scope"] != .string("members") {
             let entered = expectation(description: "DM request awaiting response"), gate = Gate()
             entered.assertForOverFulfill = false
             gate.close()
@@ -223,7 +232,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
         tab.conversationId = conversation
         tab.answerBinding = nil // the personal binding must not weaken role checks
         func denyAll(_ origin: AgentPadCallerOrigin? = nil) async throws {
-            for args in personalDMOperations {
+            for args in guardedDMOperations {
                 let result = try await authenticatedCall(args, tab: tab, processes: processes, origin: origin)
                 XCTAssertEqual(result.error, "dm_not_allowed", "\(args)")
                 XCTAssertEqual(result.chatResult, "{\"error\":\"dm_not_allowed\"}")
@@ -270,19 +279,19 @@ final class ChatSessionDMToolsTests: XCTestCase {
         for code in ["dm_access_disabled", "unsupported"] {
             f.service.dmToolsEnabled = { code != "dm_access_disabled" }
             f.service.serverCapabilities[f.key.server] = code == "unsupported" ? ["chat.dm"] : ["chat.dm", "chat.dm.session_signature"]
-            for args in personalDMOperations {
+            for args in guardedDMOperations {
                 let result = try await authenticatedCall(args, tab: tab, processes: processes)
                 XCTAssertEqual(result.error, code, "\(args)")
             }
         }
         XCTAssertTrue(ChatStubProtocol.seen.isEmpty)
         f.service.dmToolsEnabled = { true }
-        f.service.serverCapabilities[f.key.server] = ["chat.dm", "chat.dm.session_signature"]
+        enableDMAttachments()
         // A broken taint ledger never releases private data or sends a command.
         let history = ChatDMHistory(files: f.service.files)
         try Data("broken".utf8).write(to: history.url)
-        serveDM()
-        for args in personalDMOperations {
+        serveDM(includeAttachment: true)
+        for args in guardedDMOperations {
             let result = try await authenticatedCall(args, tab: tab, processes: processes)
             XCTAssertEqual(result.error, "dm_not_allowed", "\(args)")
             XCTAssertEqual(result.chatResult, "{\"error\":\"dm_not_allowed\"}")
@@ -386,6 +395,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
         }
     }
     func testStrictArgumentsAndSpoofedAuthorRefusedBeforeNetwork() async throws {
+        f.service.serverCapabilities[f.key.server]?.remove("chat.dm.attachments")
         await refused("unsupported") {
             try await self.call("chat_read", ["kind": .string("dm"), "dm_id": .string(self.dm), "attachment_id": .string(UUID().uuidString)])
         }

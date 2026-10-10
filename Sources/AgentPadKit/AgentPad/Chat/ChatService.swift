@@ -111,17 +111,48 @@ final class ChatService {
     /// Opens the event feed when signed in (C3, C8); off in tests that do not
     /// stand up a server.
     var followsFeed = false
-    var dmToolsEnabled: @MainActor () -> Bool = { ChatDMSettings.enabled(in: AgentPadSettings.loadParsed() ?? [:]) }
+    var dmToolsEnabled: @MainActor () -> Bool = { ChatDMSettings.enabled(in: AgentPadSettings.loadParsed() ?? [:]) } {
+        didSet { if !dmToolsEnabled() { mcpDownloads.removeDM() } }
+    }
     var dmToolCursors: [String: ChatDMToolCursor] = [:]
     var dmToolSending = Set<String>()
     /// Negotiated on each connection; never inferred from cached data.
     var serverCapabilities: [ChatServerAddress: Set<String>] = [:] {
         didSet {
+            if oldValue.contains(where: { $0.value.contains("chat.avatars") && serverCapabilities[$0.key]?.contains("chat.avatars") != true }) { invalidateAvatars() }
+            for (ref, editor) in avatarEdits where ref.key == connection?.orgKey &&
+                oldValue[ref.key.server]?.contains("chat.avatars") != true && serverCapabilities[ref.key.server]?.contains("chat.avatars") == true {
+                editor.capabilityAvailable()
+            }
             if oldValue.contains(where: { $0.value.contains("chat.attachments") && serverCapabilities[$0.key]?.contains("chat.attachments") != true }) {
                 mcpDownloads.removeAll()
             }
+            for (server, previous) in oldValue where ["chat.dm", "chat.dm.session_signature", "chat.dm.attachments"].contains(where: {
+                previous.contains($0) && serverCapabilities[server]?.contains($0) != true
+            }) { mcpDownloads.removeDM(server: server) }
         }
     }
+    @ObservationIgnored var avatarProfiles: () -> AgentProfileStore = { .shared }
+    var avatarEdits: [ChatAvatarReference: ChatAvatarEditor] = [:]
+    var avatarUploads: [ChatAvatarReference: (UUID, Task<Void, Never>)] = [:]
+    var avatarInvalidations = 0
+    var avatarEpoch: Int {
+        avatarInvalidations + (connection?.orgKey.flatMap { orgSessions[$0]?.store?.avatarAccess.value } ?? 0)
+    }
+    var avatarGenerations: [ChatServerAddress: String] = [:]
+    var avatarLimits: [ChatServerAddress: ChatAvatarLimits] = [:]
+    @ObservationIgnored var avatarTransport: (ChatAvatarContext, ChatAPI)?
+    @ObservationIgnored lazy var avatars: ChatAvatarCache = {
+        let cache = ChatAvatarCache(isCurrent: { [weak self] in self?.avatarDownloadIsCurrent($0) == true },
+                                    validate: { [weak self] in await self?.avatarDownloadAllowed($0, context: $1) == true }) {
+            [weak self] ref in self?.avatarAuthorization(ref)
+        }
+        cache.onUnauthorized = { [weak self] context in
+            guard let self, self.avatarContext(context.key) == context else { return }
+            self.sessionEnded("Sign in again.")
+        }
+        return cache
+    }()
     var serverAttachmentLimits: [ChatServerAddress: ChatAttachmentLimits] = [:]
     @ObservationIgnored var attachmentManagers: [ChatOrgKey: ChatAttachmentManager] = [:]
     var attachmentEpoch = 0
@@ -177,6 +208,7 @@ final class ChatService {
         didSet {
             if state != oldValue {
                 invalidateAttachments()
+                invalidateAvatars()
                 if state != .signedIn { onCloseConversations(connection?.orgKey) }
                 onStateChange()
                 // F4: signed out, another account, a session ended: notices that no longer apply go.
@@ -211,6 +243,7 @@ final class ChatService {
             if connection != oldValue {
                 if let oldKey = oldValue?.orgKey, oldKey != connection?.orgKey { onCloseConversations(oldKey) }
                 invalidateAttachments()
+                invalidateAvatars()
                 activateCalls()
                 // F4: another account or organization — notices that no longer apply go (review F4b-5).
                 ChatNotifications.reconcile(self)
@@ -406,6 +439,7 @@ final class ChatService {
 
     /// Stops the live connection, if any.
     func stopFeed() {
+        invalidateAvatars()
         invalidateAttachments()
         feed?.stop()
         feed = nil
@@ -419,7 +453,7 @@ final class ChatService {
     /// sending held, the queues kept — and the user signs in again
     /// (review C6d: one path for every 401).
     func sessionEnded(_ reason: String) {
-        attachmentManagers.values.forEach { $0.revoke() }
+        attachmentManagers.values.forEach { $0.revoke(preservingDM: true) }
         stopFeed()
         // The server will not take this token again: it goes, so a restart
         // does not take the session for a live one (DESIGN-D6 §7.1). The
@@ -459,7 +493,7 @@ final class ChatService {
         orgSessions[key]?.outbox?.hold()
         reconcileChannelResults(revoked: key)
         clearB1PrivateState(key)
-        let archived = (try? files.saveDMOutbox(key, store: orgSessions[key]?.store)) != nil
+        let archived = (try? files.saveDMOutbox(key, store: orgSessions[key]?.store, preservingFiles: false)) != nil
         if !archived { try? orgSessions[key]?.store?.dmWrite { try ChatDMStore.clear($0) } }
         disconnectedDMCount = files.savedDMCount
         onCloseConversations(key)
@@ -1298,6 +1332,7 @@ final class ChatService {
         var keys = Set(orgSessions.keys.filter { $0.server == connection.server && $0.accountId == connection.accountId })
         keys.formUnion(attachmentManagers.keys.filter { $0.server == connection.server && $0.accountId == connection.accountId })
         if let key = connection.orgKey { keys.insert(key) }
+        keys.formUnion(files.attachmentScopes(server: connection.server, account: connection.accountId))
         // Include unopened caches, and keep the connection record until its
         // queue is safe so a failed archive can be retried after a restart.
         do {
@@ -1328,7 +1363,7 @@ final class ChatService {
         }
         onCloseConversations(nil)
         for key in keys {
-            attachmentManagers.removeValue(forKey: key)?.revoke()
+            attachmentManagers.removeValue(forKey: key)?.suspend()
             clearB1PrivateState(key)
             dropSession(key)
             files.removeCache(key)

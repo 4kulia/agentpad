@@ -11,6 +11,8 @@ struct ChatPublishRequest: Codable, Equatable, Sendable {
     /// Asked by the announce after a new session of this Mac (6.4), not by
     /// the owner's button: told with "available again".
     var auto = false
+    var avatarProfileID: UUID?
+    var avatarRevision: Int?
     /// The server generation it was asked under: a command lost with its
     /// session goes on by itself under the same generation only (lead's
     /// decision on review D3c-p2-2).
@@ -19,7 +21,7 @@ struct ChatPublishRequest: Codable, Equatable, Sendable {
     var unpublish = false
 
     enum CodingKeys: String, CodingKey {
-        case name, description, access, auto, generation, unpublish
+        case name, description, access, auto, generation, unpublish, avatarProfileID, avatarRevision
         case teamIds = "team_ids"
     }
 
@@ -41,6 +43,8 @@ struct ChatPublishRequest: Codable, Equatable, Sendable {
         description = try c.decode(String.self, forKey: .description)
         access = try c.decode(String.self, forKey: .access)
         teamIds = try c.decode([String].self, forKey: .teamIds).sorted()
+        avatarProfileID = try c.decodeIfPresent(UUID.self, forKey: .avatarProfileID)
+        avatarRevision = try c.decodeIfPresent(Int.self, forKey: .avatarRevision)
         auto = try c.decodeIfPresent(Bool.self, forKey: .auto) ?? false
         generation = try c.decodeIfPresent(String.self, forKey: .generation)
         unpublish = try c.decodeIfPresent(Bool.self, forKey: .unpublish) ?? false
@@ -160,6 +164,7 @@ extension ChatService: TeamPublishing {
         // The cards the server lists now: one it no longer lists, or lists
         // otherwise, is published again (review D3-p2-2, D3b-p2-3).
         let cards = (try? orgSessions[key]?.store?.calls.catalog()) ?? []
+        let avatarIntents = profileAvatarIntents(agents)
         try journal.queue.write { db in
             var seq = first
             for agent in agents {
@@ -174,6 +179,8 @@ extension ChatService: TeamPublishing {
                 }
                 var wasRemoving = false
                 var asked = ChatPublishRequest(agent: agent, teams: teams)
+                asked.avatarProfileID = avatarIntents[agent.id]?.0
+                asked.avatarRevision = avatarIntents[agent.id]?.1
                 asked.generation = try Self.generation(db, key)
                 var row = try Self.assignment(db, key, id)
                 if let current = row, let inFlight = ChatPublishRequest.decode(current.requested) {
@@ -410,6 +417,7 @@ extension ChatService: TeamPublishing {
         let session = connection?.orgKey == key ? connection?.sessionId : nil
         var again: [String] = []
         var gone: [String] = []
+        var avatarFollows: [(String, UUID, Int)] = []
         do {
             let first = try ChatCommandTable.maxSeq(commandTables(key)) + 1
             let now = Date()
@@ -462,6 +470,9 @@ extension ChatService: TeamPublishing {
                         row.lastError = nil
                         try row.update(db)
                         if asked.auto { again.append(row.name) }
+                        else if let profile = asked.avatarProfileID, let revision = asked.avatarRevision {
+                            avatarFollows.append((row.agentId, profile, revision))
+                        }
                     } else if commands.contains(where: { $0.state == .pending }) {
                         continue
                     } else if let refused = commands.last(where: { $0.state == .failed }) {
@@ -489,7 +500,16 @@ extension ChatService: TeamPublishing {
             onNotice(AttentionEvent(source: "publishing", object: "reannounced", kind: .publication,
                 destination: .recovery("publications"), scope: ChatAttention.scope(key, self)))
         }
-        for agentId in gone { onAgentUnpublished(agentId) }
+        for (agent, profile, revision) in avatarFollows {
+            beginProfileAvatar(profile, ref: .init(key: key, subject: .agent(agent)), profiles: avatarProfiles(), revision: revision)
+        }
+        if !gone.isEmpty { invalidateAvatars() }
+        for agentId in gone {
+            let ref = ChatAvatarReference(key: key, subject: .agent(agentId))
+            avatarUploads.removeValue(forKey: ref)?.1.cancel()
+            avatarEdits.removeValue(forKey: ref)?.invalidate()
+            onAgentUnpublished(agentId)
+        }
         settleAudiences(key)
     }
 

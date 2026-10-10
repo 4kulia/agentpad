@@ -71,7 +71,7 @@ final class LocalFormTabs {
         let draft = form(state).newAgent
         guard !draft.folder.isEmpty, let store = owner(state)?.store,
               let template = agentTemplates().first(where: { $0.id == draft.templateID }) else { return nil }
-        return store.agentProfiles.existing(rosterID: template.rosterId, folder: URL(fileURLWithPath: draft.folder))
+        return store.agentProfiles.existing(rosterID: template.rosterId, folder: URL(fileURLWithPath: draft.folder), templateID: template.id, launchOptions: agentOptions(template.id))
     }
 
     func addAgent(_ state: TabState) {

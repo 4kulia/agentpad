@@ -39,6 +39,8 @@ struct AttentionItem: Identifiable, Equatable, Sendable {
     var subjectID: String?
     var subjectName: String?
     var subjectIsAgent = false
+    var localProfileID: UUID?
+    var avatarScope: AttentionScope?
 }
 
 /// No message bodies. The future DM client supplies these through the same gate.
@@ -83,6 +85,7 @@ struct AttentionCurrent: Sendable {
         var title: String = ""
         var agentID: String = ""
         var agentName: String = ""
+        var profileID: UUID?
     }
     var terminals: [UUID: Terminal] = [:]
     /// IDs validated by the existing source gates. Closed gate = empty set.
@@ -140,12 +143,14 @@ enum AttentionList {
                 item.title = tab.title.isEmpty ? event.title : tab.title
                 item.subtitle = event.kind == .completion ? "Finished · waiting for you" : event.kind.title
                 item.subjectID = tab.agentID; item.subjectName = tab.agentName; item.subjectIsAgent = true
+                item.localProfileID = tab.profileID
             }
             if let label = current.labels[event.id] {
                 item.title = label.title
                 item.subtitle = event.actionInFlight ? "Decision is being sent" : event.kind.title
                 item.subjectID = label.subjectID; item.subjectName = label.subjectName; item.subjectIsAgent = label.subjectIsAgent
             }
+            item.avatarScope = event.scope
             return item
         }
         func append(_ conversations: [AttentionConversation], dm: Bool) {
@@ -158,7 +163,7 @@ enum AttentionList {
                     action: dm ? .dm(row.scope, conversation: row.id)
                         : .mention(row.scope, channel: row.id, message: row.firstMessage, sequence: row.firstSequence),
                     secondary: .markRead, subjectID: row.subjectID, subjectName: row.subjectName,
-                    subjectIsAgent: row.subjectIsAgent))
+                    subjectIsAgent: row.subjectIsAgent, avatarScope: row.scope))
             }
         }
         if settings.mentions { append(mentions, dm: false) }

@@ -70,7 +70,7 @@ final class SearchReviewModelTests: XCTestCase {
         for _ in 0..<10 { _ = model.quick; model.move(1); _ = model.choices }
         model.begin() // Focus callback for the same session.
         XCTAssertEqual(calls.value.0, 1); XCTAssertFalse(calls.value.1)
-        model.suggestions = false; model.begin()
+        model.dismiss(); model.begin()
         try await settle { calls.value.0 >= 2 }
         XCTAssertEqual(calls.value.0, 2)
     }
@@ -130,7 +130,7 @@ final class SearchReviewModelTests: XCTestCase {
             let store: WorkspaceStore
             @Bindable var model: EverywhereSearchModel
             var body: some View {
-                if model.suggestions { SearchEverywhereField(store: store, model: model) }
+                if model.focusRequest > 0 || model.fieldFocused { SearchEverywhereField(store: store, model: model) }
             }
         }
         for width in [CGFloat(800), 260] {
@@ -140,7 +140,7 @@ final class SearchReviewModelTests: XCTestCase {
                 drafts: DraftRepository(fileURL: root.appendingPathComponent("drafts.json")), engineFactory: { TestEngine() })
             defer { store.terminate() }
             let host = NSHostingView(rootView: DeferredField(store: store, model: model))
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
+            let window = SearchTestWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false; window.contentView = host; window.makeKeyAndOrderFront(nil)
             defer { window.close() }
             host.layoutSubtreeIfNeeded(); model.begin()
@@ -148,6 +148,16 @@ final class SearchReviewModelTests: XCTestCase {
             let editor = try XCTUnwrap(window.firstResponder as? NSTextView)
             editor.insertText("typed", replacementRange: NSRange(location: NSNotFound, length: 0))
             XCTAssertEqual(model.query, "typed")
+            editor.selectAll(nil); editor.insertText("", replacementRange: NSRange(location: NSNotFound, length: 0))
+            XCTAssertFalse(model.suggestions)
+            host.layoutSubtreeIfNeeded()
+            XCTAssertTrue(window.firstResponder === editor, "Clearing a hidden/narrow field keeps it mounted for typing")
+            editor.insertText("again", replacementRange: NSRange(location: NSNotFound, length: 0))
+            XCTAssertEqual(model.query, "again"); XCTAssertTrue(model.suggestions)
+            model.dismiss()
+            XCTAssertEqual(model.focusRequest, 0)
+            model.begin()
+            try await settle { host.layoutSubtreeIfNeeded(); return window.firstResponder is NSTextView }
         }
     }
 }

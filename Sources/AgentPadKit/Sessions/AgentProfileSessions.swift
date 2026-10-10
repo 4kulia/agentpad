@@ -27,7 +27,7 @@ enum AgentProfileSessions {
         for session in sessions where session.hasProcess && session.sshWorkspaceHost == nil {
             let conversation = session.conversationId ?? session.resumedConversationId
             let record = conversation.flatMap { byConversation[$0] }
-            guard session.profileID == profile.id || (session.agent.rosterId == profile.rosterID && record != nil),
+            guard session.profileID == profile.id || (session.launchOrigin?.templateID == profile.templateID && session.agent.rosterId == profile.rosterID && record != nil),
                   visibility.allows(agentId: profile.rosterID, conversationId: conversation) else { continue }
             if let conversation { liveConversations.insert(conversation) }
             let name = conversation.flatMap { names[SessionNameKey(profile.rosterID, $0)] }

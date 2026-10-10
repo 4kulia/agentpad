@@ -54,7 +54,9 @@ final class ExternalSessionsTests: XCTestCase {
 
     func testStatusMapping() {
         XCTAssertEqual(ExternalAgentSession.Status(raw: "busy", waitingFor: nil), .busy)
-        XCTAssertEqual(ExternalAgentSession.Status(raw: "shell", waitingFor: nil), .busy)
+        XCTAssertEqual(ExternalAgentSession.Status(raw: "shell", waitingFor: nil), .shell)
+        XCTAssertEqual(session("shell", .shell, since: nil).monitorState, .running)
+        XCTAssertFalse(session("shell", .shell, since: nil).canTakeOver)
         XCTAssertEqual(ExternalAgentSession.Status(raw: "idle", waitingFor: nil), .idle)
         XCTAssertEqual(ExternalAgentSession.Status(raw: "compacting", waitingFor: nil), .other("compacting"))
         XCTAssertEqual(session("a", .other("x"), since: nil).monitorState, .idle)

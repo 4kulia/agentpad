@@ -47,6 +47,12 @@ extension ChatSessionTools {
 /// executor manifests; each reservation owns a random directory and filename.
 @MainActor
 final class ChatMCPDownloads {
+    struct DMSource: Equatable {
+        var dm: String
+        var message: String
+        var revision: Int
+        var key: String { "\(dm):\(message)" }
+    }
     struct Reservation {
         var id: String
         var file: ChatAttachment
@@ -54,14 +60,22 @@ final class ChatMCPDownloads {
         var key: ChatOrgKey
         var path: URL
         var expires: Date
+        var dmSource: DMSource?
     }
     let root: URL
     var quota = 100 * 1024 * 1024
     var now: () -> Date = Date.init
     static let ttl: TimeInterval = 24 * 60 * 60
     private var entries: [String: Reservation] = [:]
+    private var transfers: [String: Task<Data, Error>] = [:]
     private var watches: [ChatOrgKey: AnyDatabaseCancellable] = [:]
-    private var stamps: [ChatOrgKey: String] = [:]
+    private struct Revision: Equatable { var number: Int; var deleted: Bool }
+    private struct Access: Equatable {
+        var channel: String
+        var dm: String
+        var revisions: [String: Revision]
+    }
+    private var stamps: [ChatOrgKey: Access] = [:]
     private var expiry: Task<Void, Never>?
 
     init(root: URL) {
@@ -69,7 +83,7 @@ final class ChatMCPDownloads {
         // No paths from the previous app lifetime are still owned by a tab.
         removeAll()
     }
-    deinit { expiry?.cancel() }
+    deinit { expiry?.cancel(); for task in transfers.values { task.cancel() } }
 
     private func rootFD(create: Bool) throws -> Int32 {
         guard !TeamStorage.isTestProcess || TeamStorage.testDirectoryIsSafe(root) else { throw ChatSessionTools.Failure(code: "download_unavailable") }
@@ -82,7 +96,7 @@ final class ChatMCPDownloads {
         return fd
     }
 
-    func reserve(_ file: ChatAttachment, surface: String, key: ChatOrgKey, store: ChatStore) throws -> Reservation {
+    func reserve(_ file: ChatAttachment, surface: String, key: ChatOrgKey, store: ChatStore, dmSource: DMSource? = nil) throws -> Reservation {
         cleanup()
         guard file.size > 0, file.size <= quota,
               entries.values.reduce(0, { $0 + $1.file.size }) <= quota - file.size else { throw ChatSessionTools.Failure(code: "download_limit") }
@@ -93,7 +107,7 @@ final class ChatMCPDownloads {
         let ext = ["image/png": "png", "image/jpeg": "jpg", "application/pdf": "pdf", "text/plain": "txt",
                    "text/markdown": "md", "application/json": "json"][file.mime] ?? "bin"
         let path = root.appendingPathComponent(id).appendingPathComponent(UUID().uuidString.lowercased() + "." + ext)
-        let reservation = Reservation(id: id, file: file, surface: surface, key: key, path: path, expires: now().addingTimeInterval(Self.ttl))
+        let reservation = Reservation(id: id, file: file, surface: surface, key: key, path: path, expires: now().addingTimeInterval(Self.ttl), dmSource: dmSource)
         entries[id] = reservation
         watch(key, store: store)
         if expiry == nil {
@@ -106,6 +120,16 @@ final class ChatMCPDownloads {
             }
         }
         return reservation
+    }
+
+    /// Revocation, tab close, deadline and IPC cancellation all cancel the
+    /// shared HTTP transport, as well as discarding its eventual result.
+    func transfer(_ reservation: Reservation, operation: @escaping @MainActor () async throws -> Data) async throws -> Data {
+        guard entries[reservation.id] != nil, !Task.isCancelled else { throw CancellationError() }
+        let task = Task { try await operation() }
+        transfers[reservation.id] = task
+        defer { transfers[reservation.id] = nil }
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
 
     func finish(_ reservation: Reservation, bytes: Data) throws -> ChatJSON {
@@ -145,6 +169,7 @@ final class ChatMCPDownloads {
     }
 
     func remove(_ reservation: Reservation) {
+        transfers.removeValue(forKey: reservation.id)?.cancel()
         entries[reservation.id] = nil
         guard let fd = try? rootFD(create: false) else { return }
         defer { close(fd) }
@@ -152,8 +177,12 @@ final class ChatMCPDownloads {
     }
     func remove(surface: String) { for item in Array(entries.values) where item.surface == surface { remove(item) } }
     func remove(key: ChatOrgKey) { for item in Array(entries.values) where item.key == key { remove(item) } }
+    func removeDM(server: ChatServerAddress? = nil) {
+        for item in Array(entries.values) where item.dmSource != nil && (server == nil || item.key.server == server) { remove(item) }
+    }
     func cleanup() { for item in Array(entries.values) where item.expires <= now() { remove(item) } }
     func removeAll() {
+        for task in transfers.values { task.cancel() }; transfers = [:]
         entries = [:]; watches = [:]; stamps = [:]
         guard let fd = try? rootFD(create: false) else { return }
         defer { close(fd) }
@@ -187,14 +216,30 @@ final class ChatMCPDownloads {
         guard watches[key] == nil else { return }
         watches[key] = ValueObservation.tracking { db in
             let generation = try String.fetchOne(db, sql: "SELECT generation FROM meta WHERE id = 1") ?? ""
+            let pending = try String.fetchOne(db, sql: "SELECT pending_generation FROM meta WHERE id = 1") ?? ""
+            let session = try String.fetchOne(db, sql: "SELECT rights_session FROM meta WHERE id = 1") ?? ""
             let epoch = try Int.fetchOne(db, sql: "SELECT channel_access_epoch FROM meta WHERE id = 1") ?? -1
             let doubt = try Bool.fetchOne(db, sql: "SELECT rights_in_doubt FROM meta WHERE id = 1") ?? true
-            return "\(generation):\(epoch):\(doubt)"
+            let dmEpoch = try Int.fetchOne(db, sql: "SELECT epoch FROM dm_meta") ?? -1
+            let dmReady = try Bool.fetchOne(db, sql: "SELECT ready FROM dm_meta") ?? false
+            let revisions = try Row.fetchAll(db, sql: "SELECT dm_id, message_id, revision, deleted FROM dm_revisions")
+            let common = "\(generation):\(pending):\(session):\(doubt)"
+            return Access(channel: "\(common):\(epoch)", dm: "\(common):\(dmEpoch):\(dmReady)",
+                revisions: Dictionary(uniqueKeysWithValues: revisions.map { row in
+                    ("\(row["dm_id"] as String):\(row["message_id"] as String)", Revision(number: row["revision"], deleted: row["deleted"]))
+                }))
         }.removeDuplicates().start(in: store.queue, scheduling: .immediate, onError: { [weak self] _ in
             self?.remove(key: key)
         }) { [weak self] stamp in
             guard let self else { return }
-            if let previous = stamps[key], previous != stamp { remove(key: key) }
+            let previous = stamps[key]
+            for item in Array(entries.values) where item.key == key {
+                if let source = item.dmSource {
+                    if let previous, previous.dm != stamp.dm { remove(item); continue }
+                    // A member-stream tombstone also covers messages never loaded in the UI.
+                    if let revision = stamp.revisions[source.key], revision.deleted || revision.number > source.revision { remove(item) }
+                } else if let previous, previous.channel != stamp.channel { remove(item) }
+            }
             stamps[key] = stamp
         }
     }

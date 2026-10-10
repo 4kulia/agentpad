@@ -132,7 +132,7 @@ struct ChatPinnedMessages: View {
             HStack(alignment: .top, spacing: 9) {
                 ChatAvatar(identity: .init(account: pin.authorAccountId, agent: pin.authorAgentId,
                                            session: pin.authorAgentId == nil ? pin.authorSessionName : nil),
-                           name: ChatPins.author(pin, members: members), size: 28)
+                           name: ChatPins.author(pin, members: members), size: 28, key: model.key)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         Text(ChatPins.author(pin, members: members)).font(Theme.display(12, weight: .semibold))

@@ -7,6 +7,7 @@ import ImageIO
 /// ATT fields are deliberately optional on older servers; capability AND valid
 /// advertised limits are required before exposing any file action.
 struct ChatAttachmentLimits: Codable, Equatable, Sendable {
+    var dmSenderBytes: Int? = nil
     var fileBytes: Int
     var messageFiles: Int
     var messageBytes: Int
@@ -26,6 +27,7 @@ struct ChatAttachmentLimits: Codable, Equatable, Sendable {
     var mimeTypes: [String]
     var verification: String
     enum CodingKeys: String, CodingKey {
+        case dmSenderBytes = "dm_sender_bytes"
         case fileBytes = "file_bytes", messageFiles = "message_files", messageBytes = "message_bytes"
         case pendingFiles = "pending_files", pendingBytes = "pending_bytes", uploadsPerAccount = "uploads_per_account"
         case downloadsPerAccount = "downloads_per_account", uploadRequestSeconds = "upload_request_seconds"
@@ -98,11 +100,39 @@ struct ChatAttachmentMetadata: Decodable, Sendable {
     }
 }
 
+/// A DM identity never enters a channel address or an execution manifest.
+enum ChatAttachmentOwner: Codable, Equatable, Hashable, Sendable {
+    case channel(String)
+    case dm(String)
+    var id: String { switch self { case .channel(let id), .dm(let id): id } }
+    var channelID: String? { if case .channel(let id) = self { id } else { nil } }
+    var dmID: String? { if case .dm(let id) = self { id } else { nil } }
+    var field: String { channelID != nil ? "channel_id" : "dm_id" }
+    var prepareCommand: String { channelID != nil ? "attachment.prepare" : "dm.attachment.prepare" }
+    var postCommand: String { channelID != nil ? "message.post_with_attachments" : "dm.message.post_with_attachments" }
+    init?(args: ChatJSON) {
+        if let id = args["channel_id"]?.string, args["dm_id"] == nil { self = .channel(id) }
+        else if let id = args["dm_id"]?.string, args["channel_id"] == nil { self = .dm(id) }
+        else { return nil }
+    }
+}
+
+extension ChatMessage {
+    var attachmentOwner: ChatAttachmentOwner { dmId.map(ChatAttachmentOwner.dm) ?? .channel(channelId) }
+    func attachmentDisplayText(available: Bool) -> String {
+        guard attachmentOnly else { return text }
+        if available && !attachments.isEmpty { return "" }
+        return text.isEmpty ? "Attachments" : text
+    }
+}
+
 struct ChatAttachmentDraft: Codable, Equatable, Sendable, Identifiable {
     enum State: String, Codable, Sendable { case waiting, uploading, checking, ready, failed }
     var file: ChatAttachment
     var messageId: String
-    var channel: String
+    var owner: ChatAttachmentOwner
+    // Compatibility for channel callers; never returns a DM identity.
+    var channel: String { owner.channelID ?? "" }
     var root: String
     var session: String
     var generation: String
@@ -114,13 +144,41 @@ struct ChatAttachmentDraft: Codable, Equatable, Sendable, Identifiable {
     var state: State = .waiting
     var progress: Double = 0
     var problem: String?
-    /// Local ownership survives Send until the server confirms publication.
     var queued: Bool? = nil
-    /// Bound to the stored bytes. Missing on drafts written before sanitization.
     var sanitizedImageSHA256: String? = nil
     var id: String { file.id }
+    init(file: ChatAttachment, messageId: String, owner: ChatAttachmentOwner, root: String, session: String,
+         generation: String, sha256: String, createdAt: Date, expiresAt: Date, state: State = .waiting, progress: Double = 0) {
+        self.file = file; self.messageId = messageId; self.owner = owner; self.root = root; self.session = session
+        self.generation = generation; self.sha256 = sha256; self.createdAt = createdAt; self.expiresAt = expiresAt
+        self.state = state; self.progress = progress
+    }
+    init(file: ChatAttachment, messageId: String, channel: String, root: String, session: String,
+         generation: String, sha256: String, createdAt: Date, expiresAt: Date, state: State = .waiting, progress: Double = 0) {
+        self.init(file: file, messageId: messageId, owner: .channel(channel), root: root, session: session,
+                  generation: generation, sha256: sha256, createdAt: createdAt, expiresAt: expiresAt, state: state, progress: progress)
+    }
+    enum CodingKeys: String, CodingKey {
+        case file, messageId, owner, root, session, generation, sha256, createdAt, expiresAt
+        case prepareCommand, completeCommand, state, progress, problem, queued, sanitizedImageSHA256
+    }
+    private enum LegacyKeys: String, CodingKey { case channel }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        file = try c.decode(ChatAttachment.self, forKey: .file)
+        messageId = try c.decode(String.self, forKey: .messageId)
+        owner = try c.decodeIfPresent(ChatAttachmentOwner.self, forKey: .owner)
+            ?? .channel(decoder.container(keyedBy: LegacyKeys.self).decode(String.self, forKey: .channel))
+        root = try c.decode(String.self, forKey: .root); session = try c.decode(String.self, forKey: .session)
+        generation = try c.decode(String.self, forKey: .generation); sha256 = try c.decode(String.self, forKey: .sha256)
+        createdAt = try c.decode(Date.self, forKey: .createdAt); expiresAt = try c.decode(Date.self, forKey: .expiresAt)
+        prepareCommand = try c.decode(String.self, forKey: .prepareCommand); completeCommand = try c.decode(String.self, forKey: .completeCommand)
+        state = try c.decode(State.self, forKey: .state); progress = try c.decode(Double.self, forKey: .progress)
+        problem = try c.decodeIfPresent(String.self, forKey: .problem); queued = try c.decodeIfPresent(Bool.self, forKey: .queued)
+        sanitizedImageSHA256 = try c.decodeIfPresent(String.self, forKey: .sanitizedImageSHA256)
+    }
     var prepareArgs: ChatJSON { .object([
-        "attachment_id": .string(id), "channel_id": .string(channel), "message_id": .string(messageId),
+        "attachment_id": .string(id), owner.field: .string(owner.id), "message_id": .string(messageId),
         "name": .string(file.name), "size": .number(Double(file.size)), "mime": .string(file.mime), "sha256": .string(sha256)
     ]) }
 }
@@ -209,24 +267,37 @@ enum ChatAttachments {
             """)
     }
     static func drafts(_ db: Database, channel: String? = nil, root: String? = nil, includingQueued: Bool = false) throws -> [ChatAttachmentDraft] {
-        let sql = channel == nil ? "SELECT body FROM attachment_drafts ORDER BY rowid" : "SELECT body FROM attachment_drafts WHERE channel_id = ? AND thread_root_id = ? ORDER BY rowid"
-        return try String.fetchAll(db, sql: sql, arguments: channel.map { [$0, root ?? ""] } ?? []).map {
+        try drafts(db, owner: channel.map(ChatAttachmentOwner.channel), root: root, includingQueued: includingQueued)
+    }
+    static func drafts(_ db: Database, owner: ChatAttachmentOwner?, root: String? = nil, includingQueued: Bool = false) throws -> [ChatAttachmentDraft] {
+        let sql = owner.map { "SELECT body FROM attachment_drafts WHERE \($0.field) = ? AND thread_root_id = ? ORDER BY rowid" }
+            ?? "SELECT body FROM attachment_drafts ORDER BY rowid"
+        return try String.fetchAll(db, sql: sql, arguments: owner.map { [$0.id, root ?? ""] } ?? []).map {
             try JSONDecoder().decode(ChatAttachmentDraft.self, from: Data($0.utf8))
         }.filter { includingQueued || $0.queued != true }
     }
     static func put(_ db: Database, _ draft: ChatAttachmentDraft) throws {
         let json = String(decoding: try JSONEncoder().encode(draft), as: UTF8.self)
         try db.execute(sql: """
-            INSERT INTO attachment_drafts (attachment_id, channel_id, thread_root_id, body) VALUES (?, ?, ?, ?)
-            ON CONFLICT(attachment_id) DO UPDATE SET channel_id = excluded.channel_id, thread_root_id = excluded.thread_root_id, body = excluded.body
-            """,
-                       arguments: [draft.id, draft.channel, draft.root, json])
+            INSERT INTO attachment_drafts (attachment_id, channel_id, dm_id, thread_root_id, body) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(attachment_id) DO UPDATE SET channel_id = excluded.channel_id, dm_id = excluded.dm_id, thread_root_id = excluded.thread_root_id, body = excluded.body
+            """, arguments: [draft.id, draft.owner.channelID, draft.owner.dmID, draft.root, json])
     }
     static func bumpDraft(_ db: Database, channel: String, root: String) throws {
+        try bumpDraft(db, owner: .channel(channel), root: root)
+    }
+    static func bumpDraft(_ db: Database, owner: ChatAttachmentOwner, root: String) throws {
+        if case .dm(let id) = owner {
+            try db.execute(sql: """
+                INSERT INTO dm_drafts (dm_id, root, text, version) VALUES (?, ?, '', ?)
+                ON CONFLICT(dm_id, root) DO UPDATE SET version = excluded.version
+                """, arguments: [id, root, UUID().uuidString])
+            return
+        }
         try db.execute(sql: """
             INSERT INTO drafts (channel_id, thread_root_id, text, updated_at, version) VALUES (?, ?, '', ?, ?)
             ON CONFLICT(channel_id, thread_root_id) DO UPDATE SET version = excluded.version, updated_at = excluded.updated_at
-            """, arguments: [channel, root, Date().timeIntervalSince1970, UUID().uuidString.lowercased()])
+            """, arguments: [owner.id, root, Date().timeIntervalSince1970, UUID().uuidString.lowercased()])
     }
     static func write(_ db: Database, id: String, files: [ChatAttachment], only: Bool) throws {
         let json = String(decoding: try JSONEncoder().encode(files), as: UTF8.self)
@@ -246,11 +317,12 @@ enum ChatAttachments {
         }
     }
     static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
-    static func reason(_ error: Error) -> String {
+    static func reason(_ error: Error, owner: ChatAttachmentOwner? = nil) -> String {
         if let error = error as? ChatAPIError {
             switch error.code {
             case "too_large": return "File or message exceeds the server limit."
-            case "storage_quota_exceeded": return "The organization’s file storage is full."
+            case "storage_quota_exceeded": return owner?.dmID != nil ? "Your direct-message file storage is full." : "The organization’s file storage is full."
+            case "dm_read_only": return "This conversation is read-only. Your file is saved locally."
             case "rate_limited": return "Too many transfers. Try again later."
             case "upload_in_progress": return "The previous upload is being cleaned up. Try again shortly."
             case "attachment_expired": return "The server reservation expired. Retry to upload the saved file again."

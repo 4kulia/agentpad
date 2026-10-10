@@ -43,14 +43,21 @@ final class SearchIndexController {
 
 @MainActor @Observable
 final class EverywhereSearchModel {
-    var query = ""
+    var query = "" {
+        didSet {
+            if query != oldValue { focusState.queryChanged(isEmpty: query.isEmpty) }
+        }
+    }
     var source = SearchSource.all
     var filter = LocalSearchFilter()
     var scope = ChatSearchRequest.Scope.all
     var target: String?
     var person: String?
-    var suggestions = false
-    var focusRequest = 0
+    private var focusState = SearchSuggestionsState()
+    var suggestions: Bool { focusState.visible }
+    var fieldFocused: Bool { focusState.fieldFocused }
+    var focusRequest: Int { focusState.focusRequest }
+    @ObservationIgnored let fieldFocus = SearchFieldFocus()
     var selected: String?
     var scrollID: String?
     var returnAvailable = false
@@ -133,7 +140,7 @@ final class EverywhereSearchModel {
         update()
     }
     func begin() {
-        if !suggestions {
+        if !focusState.requested {
             quickTask?.cancel(); quickIndex = []
             let build = quickItems
             quickTask = Task { [weak self] in
@@ -144,7 +151,20 @@ final class EverywhereSearchModel {
         }
         indexing.start(); catalog.refresh(); Task { await indexing.index.refresh() }
         Task { await names.load(); update() }
-        suggestions = true; focusRequest += 1; update()
+        focusState.requestFocus(); update()
+        fieldFocus.field?.focusIfRequested()
+    }
+    func toggle() {
+        if suggestions { dismiss() }
+        else { begin() }
+    }
+    func updateFieldFocus(ownsFirstResponder: Bool, isKeyWindow: Bool) {
+        focusState.updateFocus(ownsFirstResponder: ownsFirstResponder, isKeyWindow: isKeyWindow)
+        if !fieldFocused { selected = nil }
+    }
+    func dismiss(restoreFocus: Bool = true) {
+        focusState.dismiss(); selected = nil
+        if restoreFocus { fieldFocus.field?.endSearchEditing() }
     }
     func update(debounce: Bool = true) {
         selected = nil; scrollID = nil
@@ -197,14 +217,14 @@ final class EverywhereSearchModel {
     }
     func activate(_ id: String? = nil) {
         let id = id ?? selected
-        suggestions = false
+        dismiss()
         if let item = quick.first(where: { "q:" + $0.id == id }) { activateQuick(item) }
         else if let item = messages.hits.first(where: { "m:" + $0.id == id }) { openMessage(item) }
         else if let item = local.first(where: { "l:" + $0.id == id }) { show(item); openResults() }
         else if let item = metadata.first(where: { "d:" + $0.id == id }) { selectedHit = nil; selectedRecord = item; context = []; openResults() }
         else { showResults() }
     }
-    func showResults() { suggestions = false; selectedHit = nil; selectedRecord = nil; openResults() }
+    func showResults() { dismiss(); selectedHit = nil; selectedRecord = nil; openResults() }
     func show(_ hit: LocalSearchHit) {
         historyTask?.cancel(); selectedHit = hit; selectedRecord = hit.record; context = []; navigationError = nil; contextLoading = true
         historyTask = Task { [weak self] in

@@ -124,7 +124,7 @@ struct ContentView: View {
             WindowDragHandle()
                 .overlay {
                     GeometryReader { proxy in
-                        if (AgentPadSettingsModel.shared.showSearchPill && proxy.size.width >= SearchTriggerPill.minimumContainerWidth) || store.search.suggestions {
+                        if (AgentPadSettingsModel.shared.showSearchPill && proxy.size.width >= SearchTriggerPill.minimumContainerWidth) || store.search.focusRequest > 0 || store.search.fieldFocused {
                             SearchEverywhereField(store: store, model: store.search)
                             .frame(width: proxy.size.width, height: proxy.size.height)
                         }

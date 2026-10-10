@@ -868,8 +868,9 @@ extension ChatInboxTests {
         func press(_ id: String) throws {
             let point: NSPoint
             switch id {
-            case "chat-inbox-unread": point = NSPoint(x: 100, y: 700 - 126)
-            case "chat-inbox-mentions": point = NSPoint(x: 100, y: 700 - 160)
+            // The unified scroll includes the Channels heading above saved views.
+            case "chat-inbox-unread": point = NSPoint(x: 100, y: 700 - 164)
+            case "chat-inbox-mentions": point = NSPoint(x: 100, y: 700 - 198)
             case "chat-inbox-mark-all-read": point = NSPoint(x: 1020, y: 700 - Theme.contentHeaderHeight - 31)
             case "chat-inbox-message-reply": point = NSPoint(x: 500, y: 700 - Theme.contentHeaderHeight - 225)
             default: return XCTFail("Unknown native target: \(id)")

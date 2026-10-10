@@ -46,7 +46,8 @@ struct ChatMentionMenu: View {
                                     Button { content.choose(row.candidate) } label: {
                                         HStack(spacing: 8) {
                                             ContactAvatar(stableID: row.candidate.agentId ?? row.candidate.id,
-                                                          name: row.candidate.label, kind: row.candidate.agentId == nil ? .person : .agent, size: 28)
+                                                          name: row.candidate.label, kind: row.candidate.agentId == nil ? .person : .agent, size: 28,
+                                                          remote: row.candidate.agentId.map { .agent($0, content.key) } ?? .account(row.candidate.id, content.key))
                                             VStack(alignment: .leading, spacing: 2) {
                                                 HStack(spacing: 5) {
                                                     Text(row.candidate.label).lineLimit(1)
@@ -88,6 +89,7 @@ final class ChatMentionPopup: NSObject {
         var selected: Int
         var title: String
         var choose: (ChatMentionCandidate) -> Void
+        var key: ChatOrgKey? = nil
         var height: CGFloat { 38 + min(300, CGFloat(sections.reduce(0) { $0 + $1.rows.count }) * 48 + CGFloat(sections.count) * 24) }
     }
     final class Panel: NSPanel {

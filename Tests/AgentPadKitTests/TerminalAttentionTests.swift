@@ -89,6 +89,109 @@ final class TerminalAttentionTests: XCTestCase {
             })), settings: settings, viewed: ledger.viewedAttentionIDs)
     }
 
+    func testSocketTurnCompleteWithBackgroundShellsOnNonVisibleTabRequestsNotificationAndFinishedRow() async throws {
+        session = store.addTab(in: try XCTUnwrap(store.active), template: .claudeCode)
+        show(session)
+        let path = NSTemporaryDirectory() + "completion-\(UUID().uuidString.prefix(8)).sock"
+        let started = expectation(description: "start, prompt and conversation hooks applied")
+        started.expectedFulfillmentCount = 3
+        let completed = expectation(description: "Stop hook applied")
+        let server = HookServer(socketPath: path) { [unowned self] message in
+            switch message {
+            case .agent(let agent, let event, let id, let details):
+                self.store.applyHookEvent(agent: agent, event: event, sessionId: id, details: details)
+                (details.reason == .completion ? completed : started).fulfill()
+            case .conversationId(let conversation, let id, let provenance, let failure, let hook):
+                self.store.applyHookConversationId(conversationId: conversation, sessionId: id,
+                    provenance: provenance, failure: failure, hook: hook)
+                started.fulfill()
+            default: XCTFail("Unexpected hook")
+            }
+        }
+        server.start()
+        defer { server.stop() }
+        let conversation = UUID().uuidString.lowercased()
+        for (event, name) in [("idle", "SessionStart"), ("running", "UserPromptSubmit")] {
+            var payload = AgentPadHookKit.buildLifecyclePayload(agent: "claude", event: event, surface: session.id.uuidString)
+            AgentPadHookKit.applyClaudeLifecycleDetails(to: &payload,
+                stdin: try JSONEncoder().encode(["hook_event_name": name, "session_id": conversation]))
+            let outgoing = payload
+            let sent = await Task.detached { AgentPadHookKit.sendPayload(outgoing, to: path) }.value
+            XCTAssertTrue(sent)
+        }
+        let mirrored = AgentPadHookKit.buildConversationIdPayload(surface: session.id.uuidString, conversationId: conversation)
+        let mirroredSent = await Task.detached { AgentPadHookKit.sendPayload(mirrored, to: path) }.value
+        XCTAssertTrue(mirroredSent)
+        await fulfillment(of: [started], timeout: 3)
+        XCTAssertEqual(session.activityState, .running)
+        XCTAssertEqual(session.conversationId, conversation)
+        for id in ["shell-1", "shell-2"] {
+            store.applyToolCallEvent(agent: .claudeCode, toolName: "Bash", identifier: id, event: .pre,
+                success: nil, toolUseId: id, sessionId: session.id, mainThread: true)
+        }
+        XCTAssertEqual(session.openMainThreadCalls.count, 2)
+        show(other)
+        var completion = AgentPadHookKit.buildLifecyclePayload(agent: "claude", event: "turn_complete", surface: session.id.uuidString)
+        AgentPadHookKit.applyClaudeLifecycleDetails(to: &completion,
+            stdin: try JSONSerialization.data(withJSONObject: [
+                "hook_event_name": "Stop", "session_id": conversation,
+                "background_tasks": [
+                    ["id": "shell-1", "type": "shell", "status": "running"],
+                    ["id": "shell-2", "type": "shell", "status": "running"],
+                ],
+            ]))
+        let outgoing = completion
+        let sent = await Task.detached { AgentPadHookKit.sendPayload(outgoing, to: path) }.value
+        XCTAssertTrue(sent)
+        await fulfillment(of: [completed], timeout: 3)
+        await manager.drain()
+        XCTAssertEqual(session.activityState, .attention)
+        XCTAssertEqual(AgentMonitor.state(of: session), .attention)
+        XCTAssertEqual(session.attentionReason, .completion)
+        XCTAssertEqual(session.backgroundWork, .init(subagents: 0, shells: 2))
+        XCTAssertTrue(session.openMainThreadCalls.isEmpty, "Stop ends the foreground batch even with shells open")
+        XCTAssertEqual(client.submitted.count, 1)
+        XCTAssertEqual(client.submitted.first?.sound, true)
+        XCTAssertEqual(rows().map(\.tier), [1])
+        XCTAssertEqual(rows().first?.subtitle, "Finished · waiting for you")
+        XCTAssertEqual(rows().map(\.id), client.submitted.map(\.id))
+        let event = try XCTUnwrap(ledger.events.first)
+        XCTAssertFalse(ledger.isFocused(event))
+        XCTAssertFalse(ledger.viewedAttentionIDs.contains(event.id))
+
+        // A settled shell status, even beyond the stale-hook override, is
+        // background activity and must not retract the finished foreground turn.
+        let now = session.hookStateAt.addingTimeInterval(60)
+        let shellStatus = try XCTUnwrap(ExternalSessionParser.session(from: [
+            "pid": 1, "sessionId": conversation, "cwd": "/p", "status": "shell",
+            "statusUpdatedAt": now.addingTimeInterval(-5).timeIntervalSince1970 * 1000,
+        ]))
+        store.reconcileWithClaudeStatus([shellStatus], now: now)
+        XCTAssertEqual(session.activityState, .attention)
+        XCTAssertEqual(rows().map(\.id), [event.id])
+        for id in ["shell-1", "shell-2"] {
+            store.applyToolCallEvent(agent: .claudeCode, toolName: "Bash", identifier: id, event: .post,
+                success: true, toolUseId: id, sessionId: session.id, mainThread: true)
+            XCTAssertEqual(rows().map(\.id), [event.id], "Late tool ends must not resume a completed turn")
+        }
+        store.applyToolBatchResolved(sessionId: session.id)
+        XCTAssertEqual(rows().first?.subtitle, "Finished · waiting for you")
+        try hook("attention", name: "Notification", notification: "idle_prompt")
+        reminder()
+        await manager.drain()
+        XCTAssertEqual(rows().map(\.id), [event.id])
+        XCTAssertEqual(client.submitted.map(\.id), [event.id], "Background reminders share the completed episode")
+        show(session)
+        XCTAssertTrue(ledger.isFocused(event))
+        ledger.markFocusedAttentionViewed()
+        XCTAssertTrue(rows().isEmpty)
+        show(other)
+        reminder()
+        await manager.drain()
+        XCTAssertTrue(rows().isEmpty, "Background reminders cannot revive a viewed turn")
+        XCTAssertEqual(client.submitted.map(\.id), [event.id])
+    }
+
     func testNotificationHooksShowTierOneOnAnotherTabInTheActiveWindow() async throws {
         for type in ["idle_prompt", "permission_prompt"] {
             try hook("running", name: "UserPromptSubmit")
@@ -218,7 +321,8 @@ final class TerminalAttentionTests: XCTestCase {
         try hook("running", name: "UserPromptSubmit")
         try hook("turn_complete", name: "Stop")
         let first = try XCTUnwrap(rows().first?.id)
-        store.applyToolBatchResolved(sessionId: session.id)
+        store.applyToolCallEvent(agent: .claudeCode, toolName: "Bash", identifier: "next turn", event: .pre,
+            success: nil, toolUseId: "next-turn", sessionId: session.id, mainThread: true)
         XCTAssertTrue(rows().isEmpty)
         XCTAssertEqual(ledger.events.map(\.id), [first], "Resuming must retain completion history")
         try hook("turn_complete", name: "Stop")

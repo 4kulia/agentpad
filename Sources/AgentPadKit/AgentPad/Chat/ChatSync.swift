@@ -25,6 +25,9 @@ final class ChatSync: ChatStreamSink {
     private weak var outbox: ChatOutbox?
     private(set) var state: State = .starting
     /// A new server generation was seen (D9 voids approvals of the old one).
+    var onAvatarSnapshot: @MainActor (ChatOrgState) -> Void = { _ in }
+    var onAvatarEvent: @MainActor (ChatEvent) -> Void = { _ in }
+    var onAvatarAccessChanged: @MainActor () -> Void = {}
     var onGenerationChanged: @MainActor (String) -> Void = { _ in }
     /// Voids approvals of other generations; a failure keeps the change pending.
     var voidApprovals: @MainActor (String) throws -> Void = { _ in }
@@ -287,6 +290,7 @@ final class ChatSync: ChatStreamSink {
         // The doubt is over: a write of it still owed is not made.
         doubtWrites += 1
         onStorageProblem(false)
+        onAvatarSnapshot(state)
         try afterSnapshotApplied()
         let before = followed
         followed = wanted
@@ -390,6 +394,7 @@ final class ChatSync: ChatStreamSink {
                 try store.beginGeneration(generation, keeping: try runningRequests())
                 try voidApprovals(generation)
                 try outbox?.generationChanged()
+                onAvatarAccessChanged()
                 onGenerationChanged(generation)
                 // The cache was emptied of the server's part: the view follows.
                 callsChanged()
@@ -458,6 +463,7 @@ final class ChatSync: ChatStreamSink {
     func cursor(_ stream: String) -> Int { (try? store.cursor(stream)) ?? 0 }
 
     func apply(_ event: ChatEvent) -> Bool {
+        if event.seq > cursor(event.stream) { onAvatarEvent(event) }
         // A sign of rights taken away counts before it is written: a write
         // that fails changes nothing of it (review C6e p1-2).
         if event.seq > cursor(event.stream), event.body["account_id"]?.string == myAccountId {
@@ -569,6 +575,7 @@ final class ChatSync: ChatStreamSink {
     /// The doubt is kept only in the cache; a write that fails is tried
     /// again after a pause until it works (review C6g p1-2).
     func rightsInDoubt(snapshot: Bool = true) {
+        onAvatarAccessChanged()
         dm.invalidate()
         revocations += 1
         doubtWrites += 1
@@ -647,7 +654,10 @@ final class ChatSync: ChatStreamSink {
         }
         // The admin stream refused: a manager's rights in doubt. A team's: the
         // team leaves the cache here; a snapshot read before must not bring it back.
-        if stream.hasPrefix("org-admin:") { rightsInDoubt() } else if stream.hasPrefix("team:") { revocations += 1 }
+        if stream.hasPrefix("org-admin:") { rightsInDoubt() } else if stream.hasPrefix("team:") {
+            revocations += 1
+            onAvatarAccessChanged()
+        }
         defer { callsChanged() }
         do { try store.drop(stream: stream) } catch {
             // Not removed: the cache is not in step; a snapshot drops it

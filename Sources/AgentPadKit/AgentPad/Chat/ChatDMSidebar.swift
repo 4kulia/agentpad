@@ -14,7 +14,7 @@ struct ChatDMSidebarSection: View {
                     Button { expanded.toggle() } label: {
                         HStack(spacing: 5) {
                             Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.system(size: 9))
-                            Text("Direct messages").font(Theme.display(11, weight: .semibold))
+                            Text("People").font(Theme.display(11, weight: .semibold))
                         }
                     }.buttonStyle(.plain).chatFocusRing()
                     Spacer()
@@ -25,7 +25,7 @@ struct ChatDMSidebarSection: View {
                     ForEach(visible) { row in
                         Button { ChatDMTabs.open(key, peer: row.id, from: store, service: service) } label: {
                             HStack(spacing: 8) {
-                                ContactAvatar(stableID: row.id, name: row.peer.name, kind: .person, size: 27)
+                                ContactAvatar(stableID: row.id, name: row.peer.name, kind: .person, size: 27, remote: .account(row.id, key))
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(row.peer.name).font(Theme.display(12, weight: row.unread ? .semibold : .regular)).lineLimit(1)
                                     if !row.hasMessages { Text("No messages yet").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary) }

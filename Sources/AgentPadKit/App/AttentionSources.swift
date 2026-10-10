@@ -34,7 +34,7 @@ extension AttentionCoordinator {
             // hook reaching us. The known wait supplies the meaning; arbitrary
             // program text from a shell or a working agent is not an input request.
             let waiting = !session.displayAgent.isShell && session.activityState == .attention
-                && session.attentionReason != .failure && session.backgroundWork == nil
+                && session.attentionReason != .failure
             eventKind = waiting ? .input : .program
         }
         let episode = eventKind == .program

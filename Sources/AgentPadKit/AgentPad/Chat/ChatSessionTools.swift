@@ -171,7 +171,10 @@ enum ChatSessionTools {
                 let reservation = try service.mcpDownloads.reserve(file, surface: caller.surface, key: key, store: store)
                 var completed = false
                 defer { if !completed { service.mcpDownloads.remove(reservation) } }
-                let bytes = try await api.attachmentBytes(path: "/v1/orgs/\(org)/attachments/\(attachment)/original", token: token, limit: file.size)
+                let bytes = try await service.mcpDownloads.transfer(reservation) {
+                    guard try current() else { throw Failure(code: "not_found") }
+                    return try await api.attachmentBytes(path: "/v1/orgs/\(org)/attachments/\(attachment)/original", token: token, limit: file.size)
+                }
                 guard try current() else { throw Failure(code: "not_found") }
                 let result = try service.mcpDownloads.finish(reservation, bytes: bytes)
                 guard try current() else { throw Failure(code: "not_found") }

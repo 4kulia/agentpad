@@ -19,6 +19,38 @@ final class EverywhereSearchTests: XCTestCase {
                                      indexing: .init(index: index), catalog: .init(scan: { _ in .init(records: [], scanned: 0, total: 0, skipped: 0) }),
                                      names: SessionNames(url: root.appendingPathComponent("names.sqlite")), visibility: { .init(channelIds: []) })
     }
+    func testFocusAloneNeverOpensSuggestions() {
+        let model = model()
+        for query in ["", "retained query"] {
+            model.query = query
+            model.updateFieldFocus(ownsFirstResponder: true, isKeyWindow: true)
+            XCTAssertTrue(model.fieldFocused)
+            XCTAssertFalse(model.suggestions)
+            XCTAssertEqual(model.focusRequest, 0)
+            model.dismiss()
+        }
+    }
+    func testExplicitActivationAndTypingControlSuggestions() {
+        let model = model()
+        model.toggle() // Command-P; a field can mount after the request.
+        XCTAssertFalse(model.suggestions); XCTAssertGreaterThan(model.focusRequest, 0)
+        model.updateFieldFocus(ownsFirstResponder: true, isKeyWindow: true)
+        XCTAssertTrue(model.suggestions); XCTAssertEqual(model.focusRequest, 0)
+        model.query = "typed"
+        model.query = ""
+        XCTAssertFalse(model.suggestions)
+        model.updateFieldFocus(ownsFirstResponder: true, isKeyWindow: true) // Repeated focus callbacks are not user actions.
+        XCTAssertFalse(model.suggestions)
+        model.query = "typed again"
+        XCTAssertTrue(model.suggestions)
+        model.dismiss()
+        model.query = "late update"; model.update(debounce: false)
+        XCTAssertFalse(model.suggestions); XCTAssertEqual(model.focusRequest, 0)
+        model.begin() // An explicit click reopens even with an unchanged query.
+        XCTAssertFalse(model.suggestions)
+        model.updateFieldFocus(ownsFirstResponder: true, isKeyWindow: true)
+        XCTAssertTrue(model.suggestions)
+    }
     func testKeyboardQuickMatchesAndReturnWithoutSelection() async throws {
         let model = model()
         let item = PaletteItem(id: "agent", title: "Open Claude Code", subtitle: "agent", kind: .agent(templateId: "claude-code"), symbol: "terminal", iconAsset: nil)
@@ -28,7 +60,7 @@ final class EverywhereSearchTests: XCTestCase {
         for _ in 0..<200 { if !model.quick.isEmpty { break }; try await Task.sleep(for: .milliseconds(5)) }
         model.move(1); XCTAssertEqual(model.selected, "q:agent"); model.activate(); XCTAssertTrue(picked); XCTAssertFalse(opened)
         model.selected = nil; model.activate(); XCTAssertTrue(opened)
-        model.suggestions = true; model.showResults(); XCTAssertFalse(model.suggestions)
+        model.begin(); model.showResults(); XCTAssertFalse(model.suggestions)
     }
     func testMetadataSearchSurvivesIndexOffAndUsesWholeFolderPaths() {
         let records = [AgentSessionRecord(agentId: "gemini", conversationId: "one", title: "Release plan", cwd: URL(fileURLWithPath: "/a/project"), lastActivity: .now),

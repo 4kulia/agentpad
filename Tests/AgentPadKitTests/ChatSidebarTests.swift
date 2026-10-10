@@ -1,5 +1,6 @@
 import AppKit
 import GRDB
+import SwiftUI
 import XCTest
 @testable import AgentPadKit
 
@@ -522,4 +523,78 @@ extension ChatSidebarTests {
         XCTAssertNil(TeamAgentEditing.resolve(agentID: second.id.uuidString, key: key,
             currentKey: ChatOrgKey(server: key.server, accountId: "other", orgId: key.orgId), agents: [first, second]))
     }
+    func testProfileKeyboardEnterStartsWhileArrowsOnlyDiscloseHistory() {
+        let id = UUID(), profile = ChatSidebarRowID.profile(id), session = ChatSidebarRowID.history(id, "session")
+        let rows: [ChatSidebarKeyboard.Row] = [.init(id: profile, expanded: true), .init(id: session, parent: profile), .init(id: .allSessions)]
+        XCTAssertEqual(ChatSidebarKeyboard.route(.enter, selection: profile, rows: rows), .activate(profile))
+        XCTAssertEqual(ChatSidebarKeyboard.route(.left, selection: profile, rows: rows), .expand(profile, false))
+        XCTAssertEqual(ChatSidebarKeyboard.route(.right, selection: profile, rows: rows), .select(session))
+        XCTAssertEqual(ChatSidebarKeyboard.route(.enter, selection: session, rows: rows), .activate(session))
+        XCTAssertEqual(ChatSidebarKeyboard.route(.down, selection: session, rows: rows), .select(.allSessions))
+    }
+
+    func testOnlyConfirmedLocalPublicationDeduplicatesRemoteRows() {
+        let profile = UUID(), own = snapshot(model()).agents.first!
+        var result = LocalProfilePublications()
+        result.include(agent: own, profileID: profile, confirmed: false)
+        result.include(agent: own, profileID: nil, confirmed: true)
+        XCTAssertTrue(result.agents.isEmpty, "Name/account matches are not local origin")
+        var remote = own; remote.mine = false
+        result.include(agent: remote, profileID: profile, confirmed: true)
+        XCTAssertTrue(result.profiles.isEmpty)
+        result.include(agent: own, profileID: profile, confirmed: true)
+        result.include(agent: own, profileID: profile, confirmed: true)
+        XCTAssertEqual(result.profiles, [profile]); XCTAssertEqual(result.agents, [own.id])
+    }
+
+    func testUnifiedSidebarKeepsLocalProfilesWhenTeamAccessIsClosedAndRendersNarrow() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("sidebar-profiles-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profiles = AgentProfileStore(), store = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true,
+            agentProfiles: profiles, engineFactory: { TestEngine() }, optionsProvider: { _ in nil })
+        defer { store.terminate() }
+        let profile = try profiles.add(template: .codex, folder: root, name: "Local writer")
+        store.expandedAgentProfiles.insert(profile.id)
+        let model = model()
+        let history = AgentSessionHistory(profiles: profiles); history.scan = { [] }
+        let previous = AgentPadSettingsModel.testModel
+        defer { AgentPadSettingsModel.testModel = previous }
+        for state in ["connected", "local", "offline", "checking"] {
+            model.showsOffline = { state == "offline" }; model.snapshotOwed = { state == "checking" }
+            let activeModel = state == "local" ? nil : model
+            let snapshot = ChatSidebarSnapshot(model: activeModel, active: nil)
+            if state == "checking" || state == "local" { XCTAssertTrue(snapshot.agents.isEmpty); XCTAssertTrue(snapshot.teams.isEmpty) }
+            XCTAssertEqual(profiles.profiles, [profile])
+            for dark in [false, true] {
+                AgentPadSettingsModel.testModel = AgentPadSettingsModel(read: { ["appearance": ["mode": dark ? "dark" : "light"]] }, write: { _ in }, appliesRuntimeEffects: false)
+                let host = NSHostingView(rootView: ChatSidebarView(store: store, navigation: ChatSidebarNavigation(), model: activeModel, profileHistory: history)
+                    .foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground).environment(\.colorScheme, dark ? .dark : .light))
+                host.frame = NSRect(x: 0, y: 0, width: 236, height: 980); host.layoutSubtreeIfNeeded()
+                let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                if let path = ProcessInfo.processInfo.environment["AGENTPAD_TEST_ARTIFACTS"] {
+                    try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path).appendingPathComponent("sidebar-\(state)-\(dark ? "dark" : "light").png"))
+                }
+            }
+        }
+    }
+
+    func testConfirmedLinkProjectionIsScopedAndKeepsAnotherMacRemote() throws {
+        let profiles = AgentProfileStore()
+        let profile = try profiles.add(template: .codex, folder: FileManager.default.temporaryDirectory)
+        var details = profiles.details.archive
+        details.confirmedPublications = [.init(scope: OrgKey(key), agentID: "a1", profileID: profile.id, acceptedSessionID: "this-mac")]
+        try profiles.details.commit(details)
+        var agent = snapshot(model()).agents.first!
+        agent.executorSessionID = "this-mac"
+        XCTAssertEqual(LocalProfilePublications.current(profiles, key: key, agents: [agent]).profiles, [profile.id])
+        agent.executorSessionID = "other-mac"
+        XCTAssertTrue(LocalProfilePublications.current(profiles, key: key, agents: [agent]).agents.isEmpty)
+        agent.executorSessionID = "this-mac"
+        let other = ChatOrgKey(server: key.server, accountId: key.accountId, orgId: "another-org")
+        XCTAssertTrue(LocalProfilePublications.current(profiles, key: other, agents: [agent]).profiles.isEmpty)
+        XCTAssertEqual(profiles.details.archive.confirmedPublications?.map(\.profileID), [profile.id], "Local mode keeps the accepted link without probing a server")
+    }
+
 }

@@ -147,23 +147,26 @@ final class WaitingResumeTests: XCTestCase {
     // MARK: Background work
 
     private func stop(subagents: Int, shells: Int) {
-        store.applyHookEvent(agent: .claudeCode, event: subagents + shells > 0 ? .running : .attention,
+        store.applyHookEvent(agent: .claudeCode, event: .turnComplete,
                              sessionId: session.id,
                              details: HookLifecycleDetails(backgroundSubagents: subagents, backgroundShells: shells))
     }
 
-    func testTurnEndingWithBackgroundWorkIsRunning() {
+    func testTurnEndingWithBackgroundWorkWaitsForUser() {
         stop(subagents: 1, shells: 1)
-        XCTAssertEqual(session.activityState, .running)
+        XCTAssertEqual(session.activityState, .attention)
+        XCTAssertEqual(session.attentionReason, .completion)
         XCTAssertEqual(session.backgroundWork, Session.BackgroundWork(subagents: 1, shells: 1))
-        XCTAssertEqual(AgentMonitor.state(of: session), .running)
+        XCTAssertEqual(AgentMonitor.state(of: session), .attention)
     }
 
     func testIdleReminderDuringBackgroundWorkIsIgnored() {
         stop(subagents: 1, shells: 0)
         store.applyHookEvent(agent: .claudeCode, event: .attention, sessionId: session.id,
                              details: HookLifecycleDetails(notificationType: "idle_prompt"))
-        XCTAssertEqual(session.activityState, .running)
+        XCTAssertEqual(session.activityState, .attention)
+        XCTAssertEqual(session.attentionReason, .completion)
+        XCTAssertEqual(session.backgroundWork, .init(subagents: 1, shells: 0))
     }
 
     /// A background subagent asking for permission does need the user.
@@ -194,16 +197,38 @@ final class WaitingResumeTests: XCTestCase {
         store.reconcileWithClaudeStatus(claude(status, since: Date().addingTimeInterval(-secondsAgo)))
     }
 
-    /// Review case: background work ended without waking the agent. Claude
-    /// went idle; the tab must not stay "running · background" forever.
+    /// Background work ended without waking the agent. Clear its counts
+    /// while retaining the foreground turn's completion episode.
     func testIdleClaudeEndsStaleBackgroundWork() {
         session.conversationId = "conv-1"
         stop(subagents: 0, shells: 1)
+        let episode = session.attentionEpisode
         session.hookStateAt = Date().addingTimeInterval(-60)
         reconcile(.idle, secondsAgo: 5)
         XCTAssertEqual(session.activityState, .attention)
         XCTAssertNil(session.backgroundWork)
         XCTAssertEqual(session.attentionReason, .completion)
+        XCTAssertEqual(session.attentionEpisode, episode)
+    }
+
+    func testBackgroundShellStatusPreservesCompletionButForegroundBusyResumes() {
+        session.conversationId = "conv-1"
+        stop(subagents: 0, shells: 2)
+        session.hookStateAt = Date().addingTimeInterval(-60)
+        reconcile(.shell, secondsAgo: 5)
+        XCTAssertEqual(session.activityState, .attention)
+        XCTAssertEqual(session.attentionReason, .completion)
+        reconcile(.busy, secondsAgo: 5)
+        XCTAssertEqual(session.activityState, .running)
+    }
+
+    func testShellPermissionAnswerStillResumes() {
+        session.conversationId = "conv-1"
+        pre("shell")
+        waitForUser()
+        session.hookStateAt = Date().addingTimeInterval(-60)
+        reconcile(.shell, secondsAgo: 5)
+        XCTAssertEqual(session.activityState, .running)
     }
 
     /// Review case: a prompt answered while another call still runs, or one

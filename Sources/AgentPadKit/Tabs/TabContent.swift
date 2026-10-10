@@ -19,7 +19,7 @@ struct OrgKey: Codable, Hashable, Sendable {
 enum TeamScope: Codable, Hashable, Sendable { case local, server(OrgKey) }
 
 enum SettingsTabSection: String, CaseIterable, Codable, Sendable {
-    case general, appearance, agents, terminals, openIn, statusBar, notifications, search, advanced, about, updates
+    case general, profile, appearance, agents, terminals, openIn, statusBar, notifications, search, advanced, about, updates
     var title: String {
         switch self {
         case .openIn: "Open in"
@@ -51,6 +51,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
     case forward(sourceSessionID: UUID, answerSnapshotID: UUID)
     case connection
     case newChannel(OrgKey, teamID: String, draftID: UUID)
+    case agentProfile(UUID)
     case newAgent(draftID: UUID)
     case newSSH(draftID: UUID)
     case newWorktree(repository: String, sourceWorkspaceID: UUID, draftID: UUID)
@@ -59,6 +60,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
     case closeWorkspaces(intentID: UUID)
     case fileOperations(operationID: UUID)
     case importSession(agentID: String, conversationID: String, externalSourceID: String)
+    case dmViewer(OrgKey, dmID: String, messageID: String, attachmentID: String)
     case viewer(OrgKey, channelID: String, messageID: String, attachmentID: String)
     case unavailable(UUID)
 
@@ -97,6 +99,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         case .forward: "Forward"
         case .connection: "Connection"
         case .newChannel: "New channel"
+        case .agentProfile: "Edit profile"
         case .newAgent: "New agent"
         case .newSSH: "New SSH workspace"
         case .newWorktree: "New worktree"
@@ -105,7 +108,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         case .closeWorkspaces: "Close workspaces"
         case .fileOperations: "File operations"
         case .importSession: "Import session"
-        case .viewer: "Viewer"
+        case .viewer, .dmViewer: "Viewer"
         case .unavailable: "Unavailable tab"
         }
     }
@@ -169,6 +172,7 @@ final class TabState {
     var dmModel: ChatDMModel?
     var dmPeerModel: ChatDMPeerModel?
     var newDMModel: ChatDMNewModel?
+    var profileEditor: AgentProfileEditor?
     var localForm: LocalFormState?
     var organizationForm: OrganizationFormState?
     var publicationForm: PublicationFormState?
@@ -212,5 +216,5 @@ final class TabState {
         // input even when the last window and its TabState remain alive.
         if !moving { connectionForm?.close(); connectionForm = nil }
     }
-    func close() { dmPeerModel?.stop(); dmPeerModel = nil; dmModel?.stop(); dmModel = nil; newDMModel?.stop(); newDMModel = nil; allSessionsModel?.stop(); allSessionsModel = nil; leave(); files?.cancel(); viewerForm?.invalidate(); transient.removeAll(); isClosed = true }
+    func close() { profileEditor?.invalidate(); profileEditor = nil; dmPeerModel?.stop(); dmPeerModel = nil; dmModel?.stop(); dmModel = nil; newDMModel?.stop(); newDMModel = nil; allSessionsModel?.stop(); allSessionsModel = nil; leave(); files?.cancel(); viewerForm?.invalidate(); transient.removeAll(); isClosed = true }
 }

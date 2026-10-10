@@ -144,7 +144,9 @@ struct ChatFiles: Sendable {
     /// Saved originals belong to this cache even if no attachment manager was
     /// opened this time. Remove them before their ownership records disappear.
     func removeCache(_ key: ChatOrgKey) {
-        try? FileManager.default.removeItem(at: attachmentStorage.directory(key))
+        let kept = Set(((try? savedDMOutbox(key))?.attachments ?? []).map(\.id))
+        if kept.isEmpty { try? FileManager.default.removeItem(at: attachmentStorage.directory(key)) }
+        else { attachmentStorage.prune(key, keeping: kept) }
         let url = cacheURL(key)
         for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
     }

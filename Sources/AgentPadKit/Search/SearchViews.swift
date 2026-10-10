@@ -4,40 +4,25 @@ import SwiftUI
 struct SearchEverywhereField: View {
     let store: WorkspaceStore
     @Bindable var model: EverywhereSearchModel
-    @FocusState private var focused: Bool
     var body: some View {
         HStack(spacing: 7) {
             if model.returnAvailable {
-                Button { model.suggestions = false; model.openResults(); model.returnAvailable = false } label: { Image(systemName: "arrow.left") }
+                Button { model.dismiss(); model.openResults(); model.returnAvailable = false } label: { Image(systemName: "arrow.left") }
                     .buttonStyle(.plain).help("Back to results").accessibilityLabel("Back to results")
             }
             Image(systemName: "magnifyingglass").foregroundStyle(ChatAppearance.secondary)
-            TextField("Search everywhere…", text: $model.query).textFieldStyle(.plain).focused($focused)
-                .accessibilityLabel("Search everywhere")
-                .onKeyPress(.downArrow) { model.suggestions = true; model.move(1); return .handled }
-                .onKeyPress(.upArrow) { model.move(-1); return .handled }
-                .onKeyPress(.return) {
-                    if NSApp.currentEvent?.modifierFlags.contains(.command) == true { model.showResults() } else { model.activate() }
-                    focused = false; return .handled
-                }
-                .onKeyPress(.escape) {
-                    model.suggestions = false; focused = false
-                    DispatchQueue.main.async { restoreTabFocus() }
-                    return .handled
-                }
+            SearchTextFieldRepresentable(store: store, model: model)
             if !model.query.isEmpty {
                 Button { model.query = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).accessibilityLabel("Clear query")
             }
             Text("⌘P").font(.system(size: 10)).foregroundStyle(ChatAppearance.secondary)
         }.font(Theme.display(11)).padding(.horizontal, 10).frame(maxWidth: 470).frame(height: 24)
             .background(Theme.chromeHover, in: RoundedRectangle(cornerRadius: 6))
-            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(focused ? ChatAppearance.accent : Theme.chromeSeparator))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(model.fieldFocused ? ChatAppearance.accent : Theme.chromeSeparator))
+            .background(SearchInteractionRegion(focus: model.fieldFocus, suggestions: false))
             .padding(.horizontal, 12)
-            .onChange(of: focused) { _, value in
-                if value { (NSApp.delegate as? AppDelegate)?.prepareSearch(in: store); model.begin() }
-            }
-            .onChange(of: model.focusRequest, initial: true) { _, request in if request > 0 { focused = true } }
-            .onChange(of: model.query) { _, _ in model.suggestions = focused; model.update() }
+            .onChange(of: model.query) { _, _ in model.update() }
+            .onChange(of: [store.active?.id, store.active?.activePaneId, store.active?.activeSession?.id]) { _, _ in model.dismiss() }
             .onChange(of: model.names.values) { _, _ in model.localSearch() }
             .onChange(of: model.catalog.revision) { _, _ in model.localSearch() }
             .onChange(of: ChatOrgCurrent.identity()) { _, _ in
@@ -46,11 +31,6 @@ struct SearchEverywhereField: View {
             .onChange(of: ChatService.shared.searchAvailability) { _, _ in
                 model.messages.checkContext(); model.serverSearch(debounce: true)
             }
-    }
-    private func restoreTabFocus() {
-        guard let engine = store.active?.activeSession?.engine else { return }
-        if let native = engine as? NativeTabEngine { native.focus() }
-        else { engine.view.window?.makeFirstResponder(engine.view) }
     }
 }
 
@@ -124,6 +104,7 @@ struct SearchSuggestionsView: View {
             Button { model.showResults() } label: { HStack { Text("View all results"); Spacer(); Text("⌘↵").foregroundStyle(ChatAppearance.secondary) }.padding(12) }
                 .buttonStyle(.plain)
         }.background(ChatAppearance.surface, in: RoundedRectangle(cornerRadius: 10))
+            .background(SearchInteractionRegion(focus: model.fieldFocus, suggestions: true))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.chromeSeparator))
             .shadow(color: .black.opacity(0.2), radius: 14, y: 5).foregroundStyle(Theme.chromeForeground)
     }

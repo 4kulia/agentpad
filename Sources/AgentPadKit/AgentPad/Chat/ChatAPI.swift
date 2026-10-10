@@ -8,7 +8,8 @@ struct ChatServerInfo: Codable, Equatable, Sendable {
         let message, request, result, frame: Int
         var chatB1: ChatB1.Limits? = nil
         var attachments: ChatAttachmentLimits? = nil
-        enum CodingKeys: String, CodingKey { case message, request, result, frame, attachments, chatB1 = "chat_b1" }
+        var avatars: ChatAvatarLimits? = nil
+        enum CodingKeys: String, CodingKey { case message, request, result, frame, attachments, avatars, chatB1 = "chat_b1" }
     }
 
     let name: String
@@ -70,9 +71,10 @@ struct ChatMe: Codable, Equatable, Sendable {
     let sessionId: String
     let orgs: [ChatOrgMembership]
     let streams: [String: Int]
+    var avatar: ChatAvatarMetadata? = nil
 
     enum CodingKeys: String, CodingKey {
-        case orgs, streams
+        case orgs, streams, avatar
         case accountId = "account_id", sessionId = "session_id"
     }
 }
@@ -208,10 +210,18 @@ final class ChatAPI: Sendable {
 
     deinit { session.finishTasksAndInvalidate() }
 
+    /// Avatar requests share this scope's ephemeral session while retaining
+    /// per-request byte bounds, redirect refusal, and task cancellation.
+    func avatarTransfer(_ request: URLRequest, upload: Data?, limit: Int) async throws -> Response {
+        try await ChatAttachmentTransfer(limit: limit, progress: { _ in })
+            .run(request, upload: upload, protocols: attachmentProtocols, session: session)
+    }
+
     struct Response: Sendable {
         let status: Int
         let body: Data
         let retryAfter: TimeInterval?
+        var headers: [String: String] = [:]
     }
 
     /// One request. Any status comes back; only a transport failure or a

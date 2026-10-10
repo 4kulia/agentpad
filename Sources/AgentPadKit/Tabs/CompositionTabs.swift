@@ -155,7 +155,9 @@ final class CompositionTabs {
         return model
     }
     func viewer(key: ChatOrgKey, message: ChatMessage, file: ChatAttachment, from store: WorkspaceStore? = nil) {
-        open(.viewer(OrgKey(key), channelID: message.channelId, messageID: message.id, attachmentID: file.id), from: store)
+        let route: ToolRoute = message.dmId.map { .dmViewer(OrgKey(key), dmID: $0, messageID: message.id, attachmentID: file.id) }
+            ?? .viewer(OrgKey(key), channelID: message.channelId, messageID: message.id, attachmentID: file.id)
+        open(route, from: store)
     }
     func viewerModel(_ state: TabState) -> AttachmentViewerModel {
         if let model = state.viewerForm { return model }

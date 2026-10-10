@@ -160,6 +160,8 @@ final class TeamMCPServerTests: XCTestCase {
         }, write: { _ in })
         _ = server.callTool("chat_read", arguments: ["org_id": UUID().uuidString, "channel_id": UUID().uuidString,
                                                      "attachment_id": UUID().uuidString], requestKey: "download", progressToken: nil)
+        _ = server.callTool("chat_read", arguments: ["org_id": UUID().uuidString, "kind": "dm", "dm_id": UUID().uuidString,
+                                                     "attachment_id": UUID().uuidString], requestKey: "dm-download", progressToken: nil)
     }
 
     func testChatPostImmediatelyForwardsCanonicalArgumentsAndPendingResult() throws {

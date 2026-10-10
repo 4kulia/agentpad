@@ -122,6 +122,7 @@ struct ChatReactorsView: View {
 }
 
 struct ChatServerReplies: View {
+    var key: ChatOrgKey? = nil
     let summary: ChatB1.Summary
     let members: [ChatOrgView.Member]
     var unreadCount = 0
@@ -132,7 +133,7 @@ struct ChatServerReplies: View {
                 HStack(spacing: -4) {
                     ForEach(summary.lastParticipants) { participant in
                         ChatAvatar(identity: participant.identity, name: participant.authorAgentName ?? participant.authorSessionName
-                            ?? members.first { $0.accountId == participant.authorAccountId }?.name ?? "Former member", size: 21)
+                            ?? members.first { $0.accountId == participant.authorAccountId }?.name ?? "Former member", size: 21, key: key)
                             .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(ChatAppearance.surface, lineWidth: 2))
                     }
                 }

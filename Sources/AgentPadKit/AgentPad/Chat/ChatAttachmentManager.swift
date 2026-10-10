@@ -14,7 +14,11 @@ final class ChatAttachmentManager {
         var access: Int
         var window: Int
         var connection: Int
-        var channel: String
+        var owner: ChatAttachmentOwner
+        var channel: String { owner.channelID ?? "" }
+        var dmEpoch: Int? = nil
+        var dmVersion: Int? = nil
+        var dmWritable: Bool? = nil
         var message: String?
         var revision: Int?
         var file: ChatAttachment?
@@ -43,7 +47,7 @@ final class ChatAttachmentManager {
     @ObservationIgnored private var activePreviews = 0
     @ObservationIgnored private var expiry: Task<Void, Never>?
     @ObservationIgnored private var imports: [UUID: Task<Void, Never>] = [:]
-    private(set) var importing: [UUID: (channel: String, root: String)] = [:]
+    private(set) var importing: [UUID: (owner: ChatAttachmentOwner, root: String)] = [:]
     @ObservationIgnored private var thumbnails: [String: (Stamp, CGImage)] = [:]
     @ObservationIgnored private var thumbnailTasks: [String: (UUID, Task<Void, Never>)] = [:]
     @ObservationIgnored private var thumbnailAttempts: [String: Stamp] = [:]
@@ -53,7 +57,7 @@ final class ChatAttachmentManager {
         self.service = service; self.key = key; self.store = store; self.storage = storage
         let changed = CoalescedMainActorAction { [weak self] in self?.reconcile() }
         watch = DatabaseRegionObservation(tracking: Table("meta"), Table("channels"), Table("teams"), Table("messages"),
-            Table("requests"), Table("channel_call_intents"), Table("request_contents"), Table("attachment_drafts"), Table("attachment_deleted_sources"), Table("drafts"), Table("outbox"))
+            Table("requests"), Table("channel_call_intents"), Table("request_contents"), Table("attachment_drafts"), Table("attachment_deleted_sources"), Table("drafts"), Table("outbox"), Table("dm_meta"), Table("dm_cards"), Table("dm_revisions"), Table("dm_messages"), Table("dm_drafts"))
             .start(in: store.queue, onError: { _ in changed.schedule() }) { _ in changed.schedule() }
         // Recheck composer uploads after restart. Queued ready posts must replay
         // their exact payload first: publication may have lost its receipt.
@@ -76,7 +80,20 @@ final class ChatAttachmentManager {
               let limits = service.serverAttachmentLimits[key.server], limits.valid else { return nil }
         return limits
     }
+    func limits(for owner: ChatAttachmentOwner) -> ChatAttachmentLimits? {
+        guard let limits else { return nil }
+        if owner.dmID != nil {
+            guard service?.supports("chat.dm.attachments", key: key) == true, (limits.dmSenderBytes ?? 0) > 0 else { return nil }
+        }
+        return limits
+    }
     func stamp(channel: String, message: ChatMessage? = nil, file: ChatAttachment? = nil) -> Stamp? {
+        stamp(owner: .channel(channel), message: message, file: file)
+    }
+    func stamp(owner: ChatAttachmentOwner, message: ChatMessage? = nil, file: ChatAttachment? = nil) -> Stamp? {
+        if let message, message.attachmentOwner != owner { return nil }
+        if let dm = owner.dmID { return dmStamp(dm, message: message, file: file) }
+        let channel = owner.id
         _ = revision
         guard let service, limits != nil, service.orgSessions[key]?.store === store,
               service.isServerKnown(service, key), ChatNotifications.allowed(service, key, channel: channel), let connection = service.connection else { return nil }
@@ -89,21 +106,25 @@ final class ChatAttachmentManager {
                       current.revision == message.revision, current.attachments.contains(file) else { return nil }
             }
             return Stamp(session: connection.sessionId, generation: generation, access: row["channel_access_epoch"],
-                window: try ChatMessages.epoch(db, channel), connection: service.attachmentEpoch, channel: channel,
+                window: try ChatMessages.epoch(db, channel), connection: service.attachmentEpoch, owner: owner,
                 message: message?.id, revision: message?.revision, file: file,
                 executionAccess: try Int.fetchOne(db, sql: "SELECT version FROM attachment_access_versions WHERE channel_id = ?", arguments: [channel]) ?? -1)
         }
     }
-    func current(_ capture: Stamp) -> Bool {
-        var message: ChatMessage?
-        if let id = capture.message {
-            message = try? store.queue.read { try Row.fetchOne($0, sql: "SELECT * FROM messages WHERE message_id = ?", arguments: [id]).map(ChatMessage.init(row:)) }
-            guard message != nil else { return false }
+    func message(owner: ChatAttachmentOwner, id: String) -> ChatMessage? {
+        try? store.queue.read { db in
+            if let dm = owner.dmID { return try ChatDMStore.messages(db, dm).first { $0.id == id } }
+            return try Row.fetchOne(db, sql: "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?", arguments: [owner.id, id]).map(ChatMessage.init(row:))
         }
-        return stamp(channel: capture.channel, message: message, file: capture.file) == capture
     }
+    func current(_ capture: Stamp) -> Bool {
+        let message = capture.message.flatMap { self.message(owner: capture.owner, id: $0) }
+        if capture.message != nil && message == nil { return false }
+        return stamp(owner: capture.owner, message: message, file: capture.file) == capture
+    }
+    func writable(_ capture: Stamp) -> Bool { current(capture) && uploadStamp(owner: capture.owner) == capture }
     func currentExecution(_ capture: Stamp, manifest: [ChatAttachmentManifest]) -> Bool {
-        guard service?.supports("chat.attachments_context", key: key) == true,
+        guard capture.owner.channelID != nil, service?.supports("chat.attachments_context", key: key) == true,
               let now = stamp(channel: capture.channel), now.session == capture.session, now.generation == capture.generation,
               now.connection == capture.connection, now.executionAccess == capture.executionAccess, now.executionAccess >= 0 else { return false }
         return (try? store.queue.read { db in
@@ -115,11 +136,15 @@ final class ChatAttachmentManager {
     private func current(_ capture: Stamp, execution: [ChatAttachmentManifest]?) -> Bool {
         execution.map { currentExecution(capture, manifest: $0) } ?? current(capture)
     }
-    func files(channel: String, root: String?) -> [ChatAttachmentDraft] {
-        guard let service, ChatNotifications.allowed(service, key, channel: channel) else { return [] }
-        return drafts.filter { $0.channel == channel && $0.root == (root ?? "") }
+    func files(channel: String, root: String?) -> [ChatAttachmentDraft] { files(owner: .channel(channel), root: root) }
+    func files(owner: ChatAttachmentOwner, root: String?) -> [ChatAttachmentDraft] {
+        guard let service else { return [] }
+        let allowed = owner.dmID.map { service.dmAllowed(key, $0) } ?? ChatNotifications.allowed(service, key, channel: owner.id)
+        guard allowed else { return [] }
+        return drafts.filter { $0.owner == owner && $0.root == (root ?? "") }
     }
-    var pauseReason: String? { limits == nil ? ChatAttachmentError.paused.localizedDescription : nil }
+    var pauseReason: String? { pauseReason(owner: .channel("")) }
+    func pauseReason(owner: ChatAttachmentOwner) -> String? { limits(for: owner) == nil ? ChatAttachmentError.paused.localizedDescription : nil }
     func suspend() {
         for task in imports.values { task.cancel() }; imports = [:]; importing = [:]
         for (_, task) in thumbnailTasks.values { task.cancel() }; thumbnailTasks = [:]
@@ -128,13 +153,14 @@ final class ChatAttachmentManager {
         for (_, task, _) in reads.values { task.cancel() }; reads = [:]
         previews = [:]; decodedPreviews = [:]; previewCosts = [:]; lru = []; revision += 1
     }
-    func revoke() {
+    func revoke(preservingDM: Bool = false) {
         suspend()
         try? store.queue.write {
-            try $0.execute(sql: "DELETE FROM attachment_drafts")
+            try $0.execute(sql: preservingDM ? "DELETE FROM attachment_drafts WHERE channel_id IS NOT NULL" : "DELETE FROM attachment_drafts")
             try $0.execute(sql: "UPDATE drafts SET attachment_selection = '[]' WHERE attachment_selection != '[]'")
         }
-        storage.prune(key, keeping: [])
+        let kept = (try? store.queue.read { try ChatAttachments.drafts($0, includingQueued: true) }) ?? []
+        storage.prune(key, keeping: Set(kept.map(\.id)))
         drafts = []; queued = []
         scrubConsents(revoked: true)
     }
@@ -155,7 +181,7 @@ final class ChatAttachmentManager {
             }
             if draft.queued != true, draft.state != .failed {
                 do {
-                    if let capture = uploadStamp(channel: draft.channel) {
+                    if let capture = uploadStamp(owner: draft.owner) {
                         if draft.expiresAt <= Date() || draft.session != capture.session || draft.generation != capture.generation
                             || (draft.file.isImage && draft.sanitizedImageSHA256 != draft.sha256) {
                             let next = try renewed(draft, capture: capture)
@@ -165,7 +191,7 @@ final class ChatAttachmentManager {
                         }
                     } else if draft.expiresAt <= Date() { throw ChatAttachmentError.expired }
                 } catch {
-                    draft.state = .failed; draft.problem = ChatAttachments.reason(error)
+                    draft.state = .failed; draft.problem = ChatAttachments.reason(error, owner: draft.owner)
                     try? store.queue.write { try ChatAttachments.put($0, draft) }
                 }
             }
@@ -179,12 +205,12 @@ final class ChatAttachmentManager {
         storage.prune(key, keeping: Set(kept.map(\.id)))
         for (id, read) in reads where !current(read.0, execution: read.2) { read.1.cancel(); reads[id] = nil }
         for capture in Array(previews.keys) where !current(capture) { previews[capture] = nil; decodedPreviews[capture] = nil; previewCosts[capture] = nil; lru.removeAll { $0 == capture }; revision += 1 }
-        if limits == nil || !ChatNotifications.allowed(service, key, channel: nil) { suspend(); return }
+        if limits == nil || (!ChatNotifications.allowed(service, key, channel: nil) && !service.dmAllowed(key)) { suspend(); return }
         for (id, cached) in thumbnails where !kept.contains(where: { $0.id == id }) || !current(cached.0) {
             thumbnails[id] = nil; thumbnailAttempts[id] = nil
         }
         for draft in composing where draft.file.isImage && thumbnailTasks[draft.id] == nil {
-            guard let capture = stamp(channel: draft.channel), thumbnailAttempts[draft.id] != capture,
+            guard let capture = stamp(owner: draft.owner), thumbnailAttempts[draft.id] != capture,
                   let limits, let url = try? storage.url(key, id: draft.id) else { continue }
             let attempt = UUID()
             thumbnailAttempts[draft.id] = capture
@@ -196,46 +222,56 @@ final class ChatAttachmentManager {
                 if let image { self.thumbnails[draft.id] = (capture, image); self.revision += 1 }
             })
         }
-        for (id, task) in transfers where !kept.contains(where: { $0.id == id && $0.state != .failed && uploadStamp(channel: $0.channel) != nil }) {
+        for (id, task) in transfers where !kept.contains(where: { $0.id == id && $0.state != .failed && uploadStamp(owner: $0.owner) != nil }) {
             task.1.cancel(); transfers[id] = nil
         }
         revision += 1
         pump()
         if service.attachmentManagers[key] === self { service.orgSessions[key]?.outbox?.pump() }
     }
-    func add(urls: [URL], channel: String, root: String?) throws {
+    func add(urls: [URL], channel: String, root: String?) throws { try add(urls: urls, owner: .channel(channel), root: root) }
+    func add(data: Data, name: String, channel: String, root: String?) throws { try add(data: data, name: name, owner: .channel(channel), root: root) }
+    func importFiles(_ inputs: [ChatAttachmentWorker.Input], channel: String, root: String?, completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws {
+        try importFiles(inputs, owner: .channel(channel), root: root, completion: completion)
+    }
+    func importFiles(count: Int, channel: String, root: String?, start: @MainActor () throws -> Void = {},
+                     load: @escaping @MainActor () async throws -> [ChatAttachmentWorker.Input], cleanup: @escaping @MainActor () -> Void = {},
+                     completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws {
+        try importFiles(count: count, owner: .channel(channel), root: root, start: start, load: load, cleanup: cleanup, completion: completion)
+    }
+    func isImporting(channel: String, root: String?) -> Bool { isImporting(owner: .channel(channel), root: root) }
+    func add(urls: [URL], owner: ChatAttachmentOwner, root: String?) throws {
         for url in urls {
-            guard let limits else { throw ChatAttachmentError.unavailable }
+            guard let limits = limits(for: owner) else { throw ChatAttachmentError.unavailable }
             let accessed = url.startAccessingSecurityScopedResource()
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
             let bytes = try ChatAttachmentStorage.read(url, limit: limits.fileBytes)
-            try add(data: bytes, name: url.lastPathComponent, channel: channel, root: root)
+            try add(data: bytes, name: url.lastPathComponent, owner: owner, root: root)
         }
     }
-    func add(data: Data, name: String, channel: String, root: String?) throws {
-        guard let limits, let capture = stamp(channel: channel), let service,
-              service.isServerKnown(service, key),
-              (try? store.queue.read { try Bool.fetchOne($0, sql: "SELECT archived FROM channels WHERE channel_id = ?", arguments: [channel]) }) == false else { throw ChatAttachmentError.unavailable }
+    func add(data: Data, name: String, owner: ChatAttachmentOwner, root: String?) throws {
+        guard let limits = limits(for: owner), let capture = uploadStamp(owner: owner) else { throw ChatAttachmentError.unavailable }
         let (data, name) = try ChatAttachmentWorker.sanitizedFile(data, name: name, limits: limits)
         let file = try ChatAttachmentStorage.descriptor(data: data, name: name, limits: limits)
         try commit(data: data, file: file, digest: ChatAttachments.digest(data), thumbnail: nil, capture: capture, root: root)
     }
     /// Capture authorization before queueing work and recheck it on the actor
     /// before applying any bytes. Queued imports are bounded as well as decoding.
-    func importFiles(_ inputs: [ChatAttachmentWorker.Input], channel: String, root: String?,
+    func importFiles(_ inputs: [ChatAttachmentWorker.Input], owner: ChatAttachmentOwner, root: String?,
                      completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws {
-        try importFiles(count: inputs.count, channel: channel, root: root, load: { inputs }, completion: completion)
+        try importFiles(count: inputs.count, owner: owner, root: root, load: { inputs }, completion: completion)
     }
-    func importFiles(count: Int, channel: String, root: String?,
+    func importFiles(count: Int, owner: ChatAttachmentOwner, root: String?,
                      start: @MainActor () throws -> Void = {},
                      load: @escaping @MainActor () async throws -> [ChatAttachmentWorker.Input],
                      cleanup: @escaping @MainActor () -> Void = {},
                      completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws {
-        guard let limits, let capture = stamp(channel: channel) else { throw ChatAttachmentError.unavailable }
+        guard let limits = limits(for: owner), let capture = uploadStamp(owner: owner) else { throw ChatAttachmentError.unavailable }
         guard count > 0, count <= limits.messageFiles, imports.count < min(8, limits.pendingFiles) else { throw ChatAttachmentError.size }
         do { try start() } catch { cleanup(); throw error }
         let id = UUID()
-        importing[id] = (channel, root ?? "")
+        var version = draftVersion(owner: owner, root: root)
+        importing[id] = (owner, root ?? "")
         imports[id] = Task { [weak self] in
             defer { cleanup() }
             guard let self else { return }
@@ -243,19 +279,20 @@ final class ChatAttachmentManager {
             do {
                 let inputs = try await load()
                 guard !inputs.isEmpty, inputs.count <= limits.messageFiles else { throw ChatAttachmentError.size }
-                guard !Task.isCancelled, self.current(capture), self.limits == limits else { throw ChatAttachmentError.unavailable }
+                guard !Task.isCancelled, self.writable(capture), self.limits(for: owner) == limits, self.draftVersion(owner: owner, root: root) == version else { throw ChatAttachmentError.unavailable }
                 for input in inputs {
                     let prepared = try await ChatAttachmentWorker.shared.prepare(input, limits: limits)
-                    guard !Task.isCancelled, self.current(capture), self.limits == limits else { throw ChatAttachmentError.unavailable }
+                    guard !Task.isCancelled, self.writable(capture), self.limits(for: owner) == limits, self.draftVersion(owner: owner, root: root) == version else { throw ChatAttachmentError.unavailable }
                     try self.commit(data: prepared.data, file: prepared.file, digest: prepared.digest,
                         thumbnail: prepared.thumbnail, capture: capture, root: root)
+                    version = self.draftVersion(owner: owner, root: root)
                 }
                 completion(nil)
             } catch { completion(error) }
         }
     }
-    func isImporting(channel: String, root: String?) -> Bool {
-        importing.values.contains { $0.channel == channel && $0.root == (root ?? "") }
+    func isImporting(owner: ChatAttachmentOwner, root: String?) -> Bool {
+        importing.values.contains { $0.owner == owner && $0.root == (root ?? "") }
     }
     func draftImage(_ draft: ChatAttachmentDraft) -> CGImage? {
         _ = revision
@@ -263,21 +300,20 @@ final class ChatAttachmentManager {
         return cached.1
     }
     private func commit(data: Data, file: ChatAttachment, digest: String, thumbnail: CGImage?, capture: Stamp, root: String?) throws {
-        let channel = capture.channel
-        guard current(capture), let limits,
-              (try? store.queue.read { try Bool.fetchOne($0, sql: "SELECT archived FROM channels WHERE channel_id = ?", arguments: [channel]) }) == false else { throw ChatAttachmentError.unavailable }
+        let owner = capture.owner
+        guard writable(capture), let limits = limits(for: owner) else { throw ChatAttachmentError.unavailable }
         let all = try store.queue.read { try ChatAttachments.drafts($0, includingQueued: true) }
-        let selected = all.filter { $0.queued != true && $0.channel == channel && $0.root == (root ?? "") }
+        let selected = all.filter { $0.queued != true && $0.owner == owner && $0.root == (root ?? "") }
         guard selected.count < limits.messageFiles, selected.reduce(data.count, { $0 + $1.file.size }) <= limits.messageBytes,
               all.count < limits.pendingFiles, all.reduce(data.count + limits.previewBytes, { $0 + $1.file.size + limits.previewBytes }) <= limits.pendingBytes else { throw ChatAttachmentError.size }
         var draft = ChatAttachmentDraft(file: file, messageId: selected.first?.messageId ?? UUID().uuidString.lowercased(),
-            channel: channel, root: root ?? "", session: capture.session, generation: capture.generation,
+            owner: owner, root: root ?? "", session: capture.session, generation: capture.generation,
             sha256: digest, createdAt: Date(), expiresAt: Date().addingTimeInterval(Double(limits.draftTTLSeconds)))
         if file.isImage { draft.sanitizedImageSHA256 = digest }
         try storage.save(data, key: key, id: file.id)
         do {
             try store.queue.write { db in
-                try ChatAttachments.put(db, draft); try ChatAttachments.bumpDraft(db, channel: channel, root: root ?? "")
+                try ChatAttachments.put(db, draft); try ChatAttachments.bumpDraft(db, owner: owner, root: root ?? "")
             }
         } catch { storage.remove(key, id: file.id); throw error }
         if let thumbnail { thumbnails[file.id] = (capture, thumbnail); thumbnailAttempts[file.id] = capture }
@@ -292,11 +328,11 @@ final class ChatAttachmentManager {
         transfers.removeValue(forKey: draft.id)?.1.cancel()
         try? store.queue.write { db in
             try db.execute(sql: "DELETE FROM attachment_drafts WHERE attachment_id = ?", arguments: [draft.id])
-            if draft.queued != true { try ChatAttachments.bumpDraft(db, channel: draft.channel, root: draft.root) }
+            if draft.queued != true { try ChatAttachments.bumpDraft(db, owner: draft.owner, root: draft.root) }
         }
         storage.remove(key, id: draft.id)
         drafts.removeAll { $0.id == draft.id }; queued.removeAll { $0.id == draft.id }; revision += 1
-        if cancelOnServer, limits != nil, let service, service.connection?.sessionId == draft.session, let token = service.token {
+        if cancelOnServer, uploadStamp(owner: draft.owner) != nil, let service, service.connection?.sessionId == draft.session, let token = service.token {
             let api = service.makeAPI(key.server), org = key.orgId, id = draft.id
             Task { try? await api.attachmentCommand(org: org, id: ChatUUID.v7(), type: "attachment.cancel", args: .object(["attachment_id": .string(id)]), token: token) }
         }
@@ -340,12 +376,18 @@ final class ChatAttachmentManager {
             }
         }
     }
-    func uploadStamp(channel: String) -> Stamp? {
+    func uploadStamp(channel: String) -> Stamp? { uploadStamp(owner: .channel(channel)) }
+    func uploadStamp(owner: ChatAttachmentOwner) -> Stamp? {
+        if let dm = owner.dmID {
+            guard (try? store.dmRead { try ChatDMStore.card($0, dm)?.writable }) == true else { return nil }
+            return stamp(owner: owner)
+        }
+        let channel = owner.id
         guard (try? store.queue.read { try Bool.fetchOne($0, sql: "SELECT archived FROM channels WHERE channel_id = ?", arguments: [channel]) }) == false else { return nil }
         return stamp(channel: channel)
     }
     func canRetry(_ draft: ChatAttachmentDraft) -> Bool {
-        draft.queued != true && draft.state == .failed && uploadStamp(channel: draft.channel) != nil
+        draft.queued != true && draft.state == .failed && uploadStamp(owner: draft.owner) != nil
     }
     func retry(_ draft: ChatAttachmentDraft) {
         guard let current = try? store.queue.read({ try ChatAttachments.drafts($0).first { $0.id == draft.id } }),
@@ -357,13 +399,13 @@ final class ChatAttachmentManager {
     private func pump() {
         guard let service, service.isServerKnown(service, key), let limits, let token = service.token else { return }
         for draft in drafts + queued where draft.state == .waiting && transfers[draft.id] == nil {
-            guard transfers.count < min(2, limits.uploadsPerAccount), let capture = uploadStamp(channel: draft.channel) else { continue }
+            guard transfers.count < min(2, limits.uploadsPerAccount), let capture = uploadStamp(owner: draft.owner) else { continue }
             let attempt = UUID(), api = service.makeAPI(key.server)
             transfers[draft.id] = (attempt, Task { [weak self] in
                 guard let self else { return }
                 defer { if self.transfers[draft.id]?.0 == attempt { self.transfers[draft.id] = nil; self.reconcile() } }
                 @MainActor func update(_ change: (inout ChatAttachmentDraft) -> Void) throws {
-                    guard !Task.isCancelled, self.current(capture), self.transfers[draft.id]?.0 == attempt,
+                    guard !Task.isCancelled, self.writable(capture), self.transfers[draft.id]?.0 == attempt,
                           var row = try self.store.queue.read({ try ChatAttachments.drafts($0, includingQueued: true).first { $0.id == draft.id } }),
                           row.state != .failed else { throw CancellationError() }
                     change(&row)
@@ -377,13 +419,13 @@ final class ChatAttachmentManager {
                     // Composer drafts are sanitized into a fresh reservation by
                     // reconcile. Never mutate an unanswered queued post's IDs.
                     guard !draft.file.isImage || draft.sanitizedImageSHA256 == draft.sha256 else { throw ChatAttachmentError.changed }
-                    try await api.attachmentCommand(org: self.key.orgId, id: draft.prepareCommand, type: "attachment.prepare", args: draft.prepareArgs, token: token)
+                    try await api.attachmentCommand(org: self.key.orgId, id: draft.prepareCommand, type: draft.owner.prepareCommand, args: draft.prepareArgs, token: token)
                     try update { _ in }
                     var metadata = try await api.attachmentMetadata(org: self.key.orgId, id: draft.id, token: token)
                     if ["reserved", "uploading"].contains(metadata.state) {
                         try await api.attachmentUpload(org: self.key.orgId, id: draft.id, data: data, token: token, seconds: limits.uploadRequestSeconds) { [weak self] value in
                             Task { @MainActor in
-                                guard let self, self.current(capture), self.transfers[draft.id]?.0 == attempt,
+                                guard let self, self.writable(capture), self.transfers[draft.id]?.0 == attempt,
                                       let index = self.drafts.firstIndex(where: { $0.id == draft.id }) else { return }
                                 self.drafts[index].progress = value
                             }
@@ -413,7 +455,7 @@ final class ChatAttachmentManager {
                 } catch is CancellationError { }
                 catch {
                     try? update {
-                        $0.state = .failed; $0.problem = ChatAttachments.reason(error)
+                        $0.state = .failed; $0.problem = ChatAttachments.reason(error, owner: draft.owner)
                         if (error as? ChatAPIError)?.code == "attachment_expired" { $0.expiresAt = .distantPast }
                     }
                     service.attachmentAccessFailed(error, key: self.key, store: self.store, session: capture.session)
@@ -422,24 +464,25 @@ final class ChatAttachmentManager {
         }
     }
     /// Called synchronously before the send transaction. No caption-only fallback.
-    func prepared(channel: String, root: String?) throws -> [ChatAttachmentDraft] {
-        guard !isImporting(channel: channel, root: root) else { throw ChatAttachmentError.changed }
-        let files = try store.queue.read { try ChatAttachments.drafts($0, channel: channel, root: root) }
+    func prepared(channel: String, root: String?) throws -> [ChatAttachmentDraft] { try prepared(owner: .channel(channel), root: root) }
+    func prepared(owner: ChatAttachmentOwner, root: String?) throws -> [ChatAttachmentDraft] {
+        guard !isImporting(owner: owner, root: root) else { throw ChatAttachmentError.changed }
+        let files = try store.queue.read { try ChatAttachments.drafts($0, owner: owner, root: root) }
         guard !files.isEmpty else { return [] }
-        guard limits != nil else { throw ChatAttachmentError.paused }
-        guard let limits, let capture = stamp(channel: channel), files.count <= limits.messageFiles,
+        guard limits(for: owner) != nil else { throw ChatAttachmentError.paused }
+        guard let limits = limits(for: owner), let capture = uploadStamp(owner: owner), files.count <= limits.messageFiles,
               files.reduce(0, { $0 + $1.file.size }) <= limits.messageBytes,
               files.allSatisfy({ $0.state == .ready && $0.expiresAt > Date() && $0.session == capture.session && $0.generation == capture.generation }) else { throw ChatAttachmentError.changed }
         return files
     }
     func image(_ message: ChatMessage, file: ChatAttachment) -> CGImage? {
         _ = revision
-        guard let capture = stamp(channel: message.channelId, message: message, file: file), let image = decodedPreviews[capture] else { return nil }
+        guard let capture = stamp(owner: message.attachmentOwner, message: message, file: file), let image = decodedPreviews[capture] else { return nil }
         lru.removeAll { $0 == capture }; lru.append(capture)
         return image
     }
     func load(_ message: ChatMessage, file: ChatAttachment, preview: Bool) async throws -> Data {
-        guard let capture = stamp(channel: message.channelId, message: message, file: file), let limits else { throw ChatAttachmentError.unavailable }
+        guard let capture = stamp(owner: message.attachmentOwner, message: message, file: file), let limits else { throw ChatAttachmentError.unavailable }
         if preview, let cached = previews[capture] { return cached }
         let data: Data
         do {
@@ -490,7 +533,7 @@ final class ChatAttachmentManager {
         return data
     }
     func save(_ message: ChatMessage, file: ChatAttachment, window: NSWindow, stillValid: @MainActor () -> Bool) async throws {
-        guard let capture = stamp(channel: message.channelId, message: message, file: file) else { throw ChatAttachmentError.unavailable }
+        guard let capture = stamp(owner: message.attachmentOwner, message: message, file: file) else { throw ChatAttachmentError.unavailable }
         let panel = NSSavePanel(); panel.nameFieldStringValue = file.name
         guard await panel.beginSheetModal(for: window) == .OK, let url = panel.url, current(capture), stillValid() else { return }
         let data = try await load(message, file: file, preview: false)

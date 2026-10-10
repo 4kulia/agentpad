@@ -321,7 +321,6 @@ struct SidebarView: View {
                         )
                     }
                 } else {
-                    AgentProfilesSection(store: store)
                     // A workspace is "top-level" either because it has no
                     // parent, or because its parent is gone — defensive
                     // fallback so a bug that strands a worktree (parent

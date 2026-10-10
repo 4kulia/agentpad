@@ -6,9 +6,10 @@ import Foundation
 /// (DeepLink / PaneTreeHost / CLIController) earned it the shared home —
 /// a new WorkspaceStore injection seam lands here once, not per file.
 @MainActor
-func makeTestStore(persistence: any Persistence = InMemoryPersistence(), claudeProjectsRoot: URL = FileManager.default.temporaryDirectory.appendingPathComponent("agentpad-no-claude-sessions")) -> WorkspaceStore {
+func makeTestStore(persistence: any Persistence = InMemoryPersistence(), claudeProjectsRoot: URL = FileManager.default.temporaryDirectory.appendingPathComponent("agentpad-no-claude-sessions"), agentProfiles: AgentProfileStore? = nil) -> WorkspaceStore {
     WorkspaceStore(
         persistence: persistence,
+        agentProfiles: agentProfiles,
         engineFactory: { TestEngine() },
         optionsProvider: { _ in nil },
         resumeProvider: { true },

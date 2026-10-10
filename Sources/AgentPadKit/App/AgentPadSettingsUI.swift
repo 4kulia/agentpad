@@ -1309,6 +1309,7 @@ struct AgentPadSettingsView: View {
             }
             switch selected {
             case .general: generalDetail
+            case .profile: AccountProfileSettings()
             case .appearance: appearanceDetail
             case .agents: codingAgentsDetail
             case .terminals: terminalPresetsDetail
@@ -1594,7 +1595,10 @@ struct AgentPadSettingsView: View {
                 SettingsRow(label: "Agents in my tabs can read and send direct messages") {
                     Toggle("", isOn: $model.agentsDirectMessages)
                         .labelsHidden()
-                        .onChange(of: model.agentsDirectMessages) { _, _ in model.flushSave() }
+                        .onChange(of: model.agentsDirectMessages) { _, enabled in
+                            model.flushSave()
+                            if !enabled { ChatService.shared.mcpDownloads.removeDM() }
+                        }
                 }
                 Text("Only at your request. Colleagues get a fresh session if this session has used direct messages.")
                     .font(.caption).foregroundStyle(.secondary)

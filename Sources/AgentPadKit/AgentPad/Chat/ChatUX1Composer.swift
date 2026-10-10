@@ -5,23 +5,38 @@ import UniformTypeIdentifiers
 /// does not change its destination; access and draft changes still invalidate it.
 @MainActor
 struct ChatComposerFileSelection {
-    private let model: ChatChannelModel
     private let attachments: ChatAttachmentManager
     private let root: String?
     private let capture: ChatAttachmentManager.Stamp
     private let version: String?
+    private let valid: @MainActor () -> Bool
 
     init?(model: ChatChannelModel, root: String?, attachments: ChatAttachmentManager) {
-        guard let capture = attachments.stamp(channel: model.channel) else { return nil }
-        self.model = model; self.attachments = attachments; self.root = root; self.capture = capture
-        version = model.draftVersion(root: root)
+        self.init(attachments: attachments, owner: .channel(model.channel), root: root, valid: { true })
+    }
+    init?(attachments: ChatAttachmentManager, owner: ChatAttachmentOwner, root: String?, valid: @escaping @MainActor () -> Bool) {
+        guard let capture = attachments.uploadStamp(owner: owner) else { return nil }
+        self.attachments = attachments; self.root = root; self.capture = capture; self.valid = valid
+        version = attachments.draftVersion(owner: owner, root: root)
     }
     @discardableResult
     func importFiles(_ urls: [URL], completion: @escaping @MainActor (Error?) -> Void = { _ in }) throws -> Bool {
-        guard attachments.current(capture), model.draftVersion(root: root) == version else { return false }
-        try attachments.importFiles(urls.map(ChatAttachmentWorker.Input.file), channel: model.channel, root: root, completion: completion)
+        guard valid(), attachments.writable(capture), attachments.draftVersion(owner: capture.owner, root: root) == version else { return false }
+        try attachments.importFiles(urls.map(ChatAttachmentWorker.Input.file), owner: capture.owner, root: root, completion: completion)
         return true
     }
+    static func choose(attachments: ChatAttachmentManager, owner: ChatAttachmentOwner, root: String?, window: NSWindow,
+                       valid: @escaping @MainActor () -> Bool, completion: @escaping @MainActor (Error?) -> Void) {
+        guard let limits = attachments.limits(for: owner), let selection = Self(attachments: attachments, owner: owner, root: root, valid: valid) else { return }
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = limits.extensions.compactMap { UTType(filenameExtension: $0) }
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK else { return }
+            do { _ = try selection.importFiles(panel.urls, completion: completion) }
+            catch { completion(error) }
+        }
+    }
+
 }
 
 struct ChatUX1Composer: View {
@@ -33,7 +48,6 @@ struct ChatUX1Composer: View {
     @State private var text = ""
     @State private var control = ChatEditorControl()
     @State private var editorHeight: CGFloat = 58
-    @AppStorage("chat.ux2.formatting") private var formatting = true
     @State private var selection = NSRange(location: 0, length: 0)
     @State private var version: String?
     @State private var mentionOnly = false
@@ -69,20 +83,13 @@ struct ChatUX1Composer: View {
     private func chooseFiles() {
         guard let attachments, let limits = attachments.limits, let tabID = model.tabID,
               let owner = TabRouter.shared.owner(of: tabID), let window = owner.session.engine.view.window else { return }
-        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = limits.extensions.compactMap { UTType(filenameExtension: $0) }
-        let selection = ChatComposerFileSelection(model: model, root: root, attachments: attachments)
-        panel.beginSheetModal(for: window) { result in
-            guard result == .OK, let selection,
-                  TabRouter.shared.owner(of: tabID)?.store === owner.store else { return }
-            do {
-                try selection.importFiles(panel.urls) { error in
-                    if let error { model.attachmentProblem(error) }
-                    self.version = model.draftVersion(root: root)
-                }
+        _ = limits
+        ChatComposerFileSelection.choose(attachments: attachments, owner: .channel(model.channel), root: root, window: window,
+            valid: { TabRouter.shared.owner(of: tabID)?.store === owner.store }) { error in
+                if let error { model.attachmentProblem(error) }
+                self.version = model.draftVersion(root: root)
             }
-            catch { model.attachmentProblem(error) }
-        }
+
     }
 
     private var org: ChatOrgModel? { ChatOrgCurrent.shared.model }
@@ -222,35 +229,16 @@ struct ChatUX1Composer: View {
     }
 
     private var inputBox: some View {
-            VStack(spacing: 0) {
-                if let attachments { ChatAttachmentDraftStrip(manager: attachments, channel: model.channel, root: root) }
-                if formatting { ChatFormattingBar(control: control) }
-                ChatMentionEditor(text: Binding(get: { text }, set: { changed($0) }), selection: $selection, candidates: candidates,
-                                  autofocus: root != nil, navigationTarget: root == nil && draftLoaded ? ChannelRef(model.key, channel: model.channel) : nil,
-                                  control: control,
-                                  heightChanged: { if editorHeight != $0 { editorHeight = $0 } }, placeholder: recipient,
-                                  accessibilityName: recipient,
-                                  suggestions: .init(sections: sections, selected: min(selected, max(0, matches.count - 1)),
-                                                     title: "Mention in \(root == nil ? "channel" : "thread")", choose: choose),
-                                  attachments: pasteHandler, dropAttachments: dropHandler, dropTarget: { dropping = $0 },
-                                  key: { key($0, $1) })
-                    .frame(height: editorHeight)
-                    .accessibilityLabel(recipient)
-                HStack(spacing: 2) {
-                    if fileUI { ChatIconButton(title: "Attach files", symbol: "paperclip", action: chooseFiles) }
-                    ChatIconButton(title: "Insert emoji", symbol: "face.smiling", action: control.emoji)
-                    ChatIconButton(title: "Mention a person or agent", symbol: "at") { control.insert("@") }
-                    Button("Aa") { formatting.toggle() }.buttonStyle(.plain).frame(width: 28, height: 28)
-                        .help("Show formatting").accessibilityLabel("Show formatting").accessibilityValue(formatting ? "Shown" : "Hidden").chatFocusRing()
-                    Spacer()
-                    Button(action: send) { Image(systemName: "paperplane.fill").frame(width: 32, height: 28) }
-                        .buttonStyle(.plain).foregroundStyle(canSend ? ChatAppearance.surface : ChatAppearance.secondary)
-                        .background(canSend ? ChatAppearance.accent : Theme.chromeSelection, in: RoundedRectangle(cornerRadius: 5))
-                        .disabled(!canSend).help("Send (⌘↩)").accessibilityLabel("Send").chatFocusRing()
-                }.padding(.horizontal, 8).padding(.bottom, 8)
-            }
-            .background(ChatAppearance.composerSurface, in: RoundedRectangle(cornerRadius: 9))
-            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(control.focused ? ChatAppearance.accent : ChatAppearance.border, lineWidth: control.focused ? 2 : 1))
+        ChatComposerBox(control: control, attachments: attachments, owner: .channel(model.channel), root: root,
+                        fileUI: fileUI, mentionTitle: "Mention a person or agent", canSend: canSend, chooseFiles: chooseFiles, send: send) {
+            ChatMentionEditor(text: Binding(get: { text }, set: { changed($0) }), selection: $selection, candidates: candidates,
+                autofocus: root != nil, navigationTarget: root == nil && draftLoaded ? ChannelRef(model.key, channel: model.channel) : nil,
+                control: control, heightChanged: { if editorHeight != $0 { editorHeight = $0 } }, placeholder: recipient,
+                accessibilityName: recipient, suggestions: .init(sections: sections, selected: min(selected, max(0, matches.count - 1)),
+                    title: "Mention in \(root == nil ? "channel" : "thread")", choose: choose, key: model.key),
+                attachments: pasteHandler, dropAttachments: dropHandler, dropTarget: { dropping = $0 }, key: key)
+                .frame(height: editorHeight).accessibilityLabel(recipient)
+        }
     }
 
     private var contextPicker: some View {

@@ -1,18 +1,17 @@
 import Foundation
 
 // AgentPad: Claude ends a turn (`Stop`) while subagents or shell commands it
-// started in the background are still running, then wakes itself when each
-// one finishes. Such a tab is working, not waiting on the user. `Stop` lists
-// that work in `background_tasks`; Claude Code's own session status reads
-// "shell" at that point, which the external-session list already shows as busy.
+// started in the background are still running. `Stop` is still the foreground
+// turn's completion: background work is separate metadata, not a reason to
+// suppress the completion alert or keep the tab working.
 
 extension AgentPadHookKit {
     public static let backgroundSubagentsKey = "background_subagents"
     public static let backgroundShellsKey = "background_shells"
     public static let notificationTypeKey = "notification_type"
 
-    /// Adjusts a Claude lifecycle payload from the hook's stdin: a `Stop` with
-    /// background work still running reports `running` plus its counts, and a
+    /// Enriches a Claude lifecycle payload from the hook's stdin: a `Stop`
+    /// preserves its completion event and adds background work counts, and a
     /// `Notification` carries its type so the app can tell "idle" from a
     /// prompt. Other agents and unreadable stdin leave the payload unchanged.
     public static func applyClaudeLifecycleDetails(to payload: inout [String: String], stdin data: Data) {
@@ -28,7 +27,6 @@ extension AgentPadHookKit {
             let subagents = running.filter { $0["type"] as? String == "subagent" }.count
             let shells = running.filter { $0["type"] as? String == "shell" }.count
             guard subagents + shells > 0 else { return }
-            payload["event"] = "running"
             payload[backgroundSubagentsKey] = String(subagents)
             payload[backgroundShellsKey] = String(shells)
         case "StopFailure":

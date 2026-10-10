@@ -85,7 +85,8 @@ final class ChatDMModel: ChatConversationPresentation {
     }
     var feed: ChatChannelModel.Feed {
         guard readable else { return .init() }
-        let roots = content.messages.filter { $0.threadRootId == nil }
+        let rootIDs = Set(content.messages.filter { $0.threadRootId == nil }.map(\.id))
+        let roots = content.messages.filter { $0.threadRootId == nil || ($0.localState != nil && !rootIDs.contains($0.threadRootId ?? "")) }
         let visible = Array(roots.suffix(shown)), replies = Dictionary(grouping: content.messages.filter { $0.threadRootId != nil }, by: { $0.threadRootId! })
         var feed = ChatChannelModel.Feed(messages: visible, replies: replies.mapValues(\.count),
             replySummaries: replies.mapValues { ChatReplySummary(messages: $0, complete: content.historyNext == nil) },
@@ -199,8 +200,16 @@ final class ChatDMModel: ChatConversationPresentation {
         do { return try store.dmWrite { try ChatDMStore.saveDraft($0, ref.dm, root: root, text: text) } }
         catch { problem = "The draft could not be saved on this Mac."; return nil }
     }
+    var orphanedFileDraftRoots: [String] {
+        guard readable, let manager = service.attachments(key) else { return [] }
+        return Set(manager.drafts.filter { $0.owner == .dm(ref.dm) && !$0.root.isEmpty && message($0.root) == nil }.map(\.root)).sorted()
+    }
+    func attachmentProblem(_ error: Error) { problem = ChatAttachments.reason(error, owner: .dm(ref.dm)) }
     func deleteDraft(root: String?) {
         guard readable else { return }
+        if let manager = service.attachments(key) {
+            for file in manager.files(owner: .dm(ref.dm), root: root) { manager.remove(file) }
+        }
         try? store?.dmWrite { try $0.execute(sql: "DELETE FROM dm_drafts WHERE dm_id = ? AND root = ?", arguments: [ref.dm, root ?? ""]) }
     }
     @discardableResult func send(_ text: String, root: String?, members: [(account: String, handle: String)], version: String?) -> Bool {

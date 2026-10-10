@@ -40,19 +40,51 @@ struct ContactAvatar: View {
     let name: String
     let kind: AvatarPlaceholder.Kind
     var size: CGFloat = 32
+    var image: NSImage?
+    var localProfileID: UUID?
+    var remote: ChatAvatarReference?
+    var service: ChatService = .shared
+    private struct Content: Hashable { var reference: ChatAvatarReference?; var context: ChatAvatarContext?; var version: ChatAvatarMetadata? }
+    private struct Load: Hashable { var content: Content; var generation: Int }
+    @State private var visibilityID = UUID()
+    @State private var displayed: (Content, NSImage)?
     private var placeholder: AvatarPlaceholder { .init(stableID: stableID, name: name, kind: kind) }
 
     var body: some View {
         let rgb = placeholder.color(isLight: Theme.resolved.isLight)
         let color = Color(red: Double((rgb >> 16) & 255) / 255,
                           green: Double((rgb >> 8) & 255) / 255, blue: Double(rgb & 255) / 255)
-        Text(placeholder.letter).font(Theme.display(size * 0.46, weight: .semibold))
-            .lineLimit(1).minimumScaleFactor(0.6).foregroundStyle(.white)
-            .frame(width: size, height: size)
-            .background {
-                if kind == .person { Circle().fill(color) }
-                else { RoundedRectangle(cornerRadius: placeholder.cornerRadius(size: size)).fill(color) }
+        // The context includes the access epoch, so a held image survives cache
+        // eviction but stops displaying as soon as membership or rights change.
+        let context = remote.flatMap { service.avatarDisplayContext($0.key) }
+        let version = remote.flatMap { service.avatars.metadata[$0.subject] }
+        let content = Content(reference: remote, context: context, version: version)
+        let generation = remote.map { service.avatars.imageGeneration($0) } ?? 0
+        let picture = image ?? localProfileID.flatMap { AgentProfileStore.shared.details.image($0) }
+            ?? (displayed?.0 == content && context != nil ? displayed?.1 : nil)
+            ?? remote.flatMap { service.avatars.image($0) }
+        ZStack {
+            if let picture {
+                Image(nsImage: picture).resizable().scaledToFill().frame(width: size, height: size)
+            } else {
+                Text(placeholder.letter).font(Theme.display(size * 0.46, weight: .semibold))
+                    .lineLimit(1).minimumScaleFactor(0.6).foregroundStyle(.white)
+                    .frame(width: size, height: size)
+                    .background {
+                        if kind == .person { Circle().fill(color) }
+                        else { RoundedRectangle(cornerRadius: placeholder.cornerRadius(size: size)).fill(color) }
+                    }
             }
+        }.frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: placeholder.cornerRadius(size: size)))
             .accessibilityHidden(true)
+            .task(id: Load(content: content, generation: generation)) {
+                service.avatars.setVisible(remote, id: visibilityID)
+                if let remote, context != nil {
+                    let loaded = await service.avatars.load(remote)
+                    if !Task.isCancelled { displayed = loaded.map { (content, $0) } }
+                } else { displayed = nil }
+            }
+            .onDisappear { service.avatars.setVisible(nil, id: visibilityID); displayed = nil }
     }
 }

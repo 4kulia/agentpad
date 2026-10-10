@@ -47,7 +47,7 @@ enum SearchNavigation {
                 tab.tabState?.dmSearchTarget = hit.messageID
                 tab.tabState?.dmModel?.navigateToSearchMessage(hit.messageID)
             }
-            model.suggestions = false; model.returnAvailable = true
+            model.dismiss(); model.returnAvailable = true
         } catch { unavailable(model) }
     }
     private static func unavailable(_ model: EverywhereSearchModel, deleted: Bool = false) {

@@ -23,6 +23,7 @@ import GRDB
         }
     }
     func apply(to request: inout TeamRunRequest) throws {
+        guard stamp.owner.channelID != nil else { throw ChatAttachmentError.unavailable }
         guard !request.agent.access.runsShell else { throw ChatAttachmentError.bash }
         request.agent.extraFolders = (request.agent.extraFolders ?? []) + [directory.path]
         request.attachmentDirectory = directory.path

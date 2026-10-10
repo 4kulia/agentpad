@@ -378,7 +378,7 @@ enum ChatMessages {
         try db.execute(sql: "DELETE FROM messages WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM channel_windows WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM thread_cursors WHERE channel_id NOT IN (\(kept))")
-        try db.execute(sql: "DELETE FROM attachment_drafts WHERE channel_id NOT IN (\(kept))")
+        try db.execute(sql: "DELETE FROM attachment_drafts WHERE channel_id IS NOT NULL AND channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM drafts WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM local_edits WHERE channel_id NOT IN (\(kept))")
         try db.execute(sql: "DELETE FROM read_marks WHERE channel_id NOT IN (\(kept))")

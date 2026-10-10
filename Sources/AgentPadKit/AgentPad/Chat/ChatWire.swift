@@ -110,7 +110,8 @@ struct ChatOrgState: Codable, Equatable, Sendable {
 
     struct Member: Codable, Equatable, Sendable {
         let accountId, handle, name, role: String
-        enum CodingKeys: String, CodingKey { case handle, name, role, accountId = "account_id" }
+        var avatar: ChatAvatarMetadata? = nil
+        enum CodingKeys: String, CodingKey { case handle, name, role, avatar, accountId = "account_id" }
     }
 
     struct Team: Codable, Equatable, Sendable {

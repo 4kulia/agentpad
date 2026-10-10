@@ -7,7 +7,7 @@ import Vision
 import XCTest
 @testable import AgentPadKit
 
-private final class AttachmentTestServer: @unchecked Sendable {
+final class AttachmentTestServer: @unchecked Sendable {
     let lock = NSLock()
     var rows: [String: [String: Any]] = [:]
     var bytes: [String: Data] = [:]
@@ -37,14 +37,14 @@ private final class AttachmentTestServer: @unchecked Sendable {
             let command = try! JSONDecoder().decode(ChatCommandEnvelope.self, from: body)
             let id = command.args["attachment_id"]?.string ?? ""
             switch command.type {
-            case "message.post_with_attachments":
+            case "message.post_with_attachments", "dm.message.post_with_attachments":
                 if let postError { return reply(["error": postError], status: 409) }
                 if losePostReply { return .failure(URLError(.networkConnectionLost)) }
                 if validatePosts, case .array(let ids) = command.args["attachment_ids"],
                    ids.contains(where: { rows[$0.string ?? ""]?["state"] as? String != "ready" }) {
                     return reply(["error": "attachment_not_ready"], status: 409)
                 }
-            case "attachment.prepare":
+            case "attachment.prepare", "dm.attachment.prepare":
                 if rows[id] == nil {
                     rows[id] = ["attachment_id": id, "state": "reserved", "name": command.args["name"]!.string!,
                                 "size": command.args["size"]!.int!, "mime": command.args["mime"]!.string!, "has_preview": false,

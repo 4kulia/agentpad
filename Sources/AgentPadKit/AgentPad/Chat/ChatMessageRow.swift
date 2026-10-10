@@ -53,7 +53,7 @@ struct ChatMessageRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Group {
-                if startsGroup { ChatAvatar(identity: identity, name: displayName) }
+                if startsGroup { ChatAvatar(identity: identity, name: displayName, key: model.key) }
                 else { timestamp.font(Theme.display(9)).padding(.top, 3) }
             }.frame(width: 32)
             VStack(alignment: .leading, spacing: 3) {
@@ -65,7 +65,7 @@ struct ChatMessageRow: View {
                     }.frame(minHeight: 19, alignment: .leading)
                 }
                 if editing != nil && !message.deleted { editor } else { body(of: message) }
-                if !model.isDM, !message.deleted, let attachments = model.service.attachments(model.key), attachments.limits != nil {
+                if !message.deleted, let attachments = model.service.attachments(model.key), attachments.limits(for: message.attachmentOwner) != nil {
                     ChatMessageAttachments(manager: attachments, message: message, inThread: inThread)
                 }
                 if message.editedAt != nil && !message.deleted { Text("edited").font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary) }
@@ -102,7 +102,7 @@ struct ChatMessageRow: View {
                 if !inThread {
                     if let b1 = model.b1, b1.supports("chat.thread_summary"), let summary = b1.state.metadata[message.id]?.threadSummary {
                         if summary.replyCount > 0 {
-                            ChatServerReplies(summary: summary, members: members, unreadCount: unreadReplies) { model.openThread(message.id) }
+                            ChatServerReplies(key: model.key, summary: summary, members: members, unreadCount: unreadReplies) { model.openThread(message.id) }
                         } else if unreadReplies > 0 { localReplies }
                     } else { localReplies }
                     if requests > 0 {
@@ -165,7 +165,7 @@ struct ChatMessageRow: View {
                 HStack(spacing: -4) {
                     ForEach(summary.participants) { participant in
                         ChatAvatar(identity: ChatAuthorIdentity(participant),
-                                   name: members.first { $0.accountId == participant.authorAccountId }?.name ?? "?", size: 21)
+                                   name: members.first { $0.accountId == participant.authorAccountId }?.name ?? "?", size: 21, key: model.key)
                             .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(ChatAppearance.surface, lineWidth: 2))
                     }
                 }
@@ -190,7 +190,7 @@ struct ChatMessageRow: View {
     private var marks: some View {
         switch message.localState {
         case .sending:
-            Text(message.attachments.isEmpty ? "sending…" : (model.service.attachments(model.key)?.pauseReason ?? "sending…"))
+            Text(message.attachments.isEmpty ? "sending…" : (model.service.attachments(model.key)?.pauseReason(owner: message.attachmentOwner) ?? "sending…"))
                 .foregroundStyle(.secondary).font(.caption)
             if model.isDM {
                 Button("Don't send") { model.discard(message) }.buttonStyle(.link).font(.caption)
@@ -216,7 +216,7 @@ struct ChatMessageRow: View {
             Text("Loading…").foregroundStyle(.secondary)
         } else {
             VStack(alignment: .leading, spacing: 2) {
-                ChatMentionText(markdown: message.attachmentOnly && model.service.supports("chat.attachments", key: model.key) ? "" : message.text, addresses: mentionable.map(\.handle)
+                ChatMentionText(markdown: message.attachmentDisplayText(available: model.service.attachments(model.key)?.stamp(owner: message.attachmentOwner) != nil), addresses: mentionable.map(\.handle)
                     + (model.isDM ? [] : ChatOrgCurrent.shared.model?.agents(in: message.channelId).compactMap(\.address) ?? []), fontSize: inThread ? 13 : 14)
                 if let channel = model as? ChatChannelModel { ChatAgentMembershipHint(model: channel, text: message.text) }
                 if message.stale != nil { Text("updating…").foregroundStyle(.secondary).font(.caption) }

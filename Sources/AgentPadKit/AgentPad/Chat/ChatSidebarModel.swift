@@ -33,6 +33,7 @@ enum ChatSidebarFilter: String, CaseIterable {
 
 enum ChatSidebarRowID: Equatable, Hashable {
     case team(String), channel(String), agents, agent(String)
+    case profile(UUID), history(UUID, String), more(UUID), allSessions
 }
 
 /// Pure keyboard routing: arrows move focus, Return activates; no opening a
@@ -67,6 +68,7 @@ enum ChatSidebarKeyboard {
             }
             return .none
         case .enter:
+            if case .profile = row.id { return .activate(row.id) }
             if let expanded = row.expanded { return .expand(row.id, !expanded) }
             return .activate(row.id)
         }
@@ -122,6 +124,10 @@ struct ChatSidebarSnapshot {
         var mine: Bool
         var channels: [String]
         var inCurrentChannel: Bool
+        var device: String?
+        var executorSessionID: String?
+        var available = true
+        var enabled = true
     }
 
     var state: State = .notConnected
@@ -175,12 +181,16 @@ struct ChatSidebarSnapshot {
                          description: member?.description ?? own[id]?.description ?? "",
                          access: member?.access ?? own[id]?.access ?? "", mine: ownerID == model.me,
                          channels: memberships.map(\.channelId).sorted(),
-                         inCurrentChannel: memberships.contains { $0.channelId == currentChannel })
+                         inCurrentChannel: memberships.contains { $0.channelId == currentChannel },
+                         device: member?.executorDeviceName ?? own[id]?.executorDeviceName,
+                         executorSessionID: member?.executorSessionId ?? own[id]?.executorSessionId,
+                         available: member?.available ?? own[id]?.available ?? false,
+                         enabled: member?.enabled ?? own[id]?.enabled ?? false)
         }.sorted {
-            if $0.inCurrentChannel != $1.inCurrentChannel { return $0.inCurrentChannel }
-            if $0.mine != $1.mine { return $0.mine }
             let order = $0.name.localizedStandardCompare($1.name)
-            return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
+            if order != .orderedSame { return order == .orderedAscending }
+            let owner = $0.owner.localizedStandardCompare($1.owner)
+            return owner == .orderedSame ? $0.id < $1.id : owner == .orderedAscending
         }
     }
 

@@ -28,7 +28,7 @@ final class ChatOutbox {
     static func neverResent(_ type: String) -> Bool {
         ChatB1.commands.contains(type) || type.hasPrefix("run.") || type == "request.decide" || type == "request.decide_automatic"
             || type == "agent.channel_trust.set"
-            || type == "message.post_with_attachments" || type == "request.create_in_channel_with_attachments"
+            || type == "dm.message.post_with_attachments" || type == "message.post_with_attachments" || type == "request.create_in_channel_with_attachments"
             || type == "message.post_from_session" || type == "request.create_in_channel_v2" || ChatPublication.isDecision(type)
     }
     static let maxAge: TimeInterval = 30 * 24 * 60 * 60
@@ -377,7 +377,7 @@ final class ChatOutbox {
                 // Don't send can cancel a DM while HTTP is in flight. A late
                 // acceptance still wins; its owner hydrates the same message ID.
                 _ = try queue.update(sent, ifState: .pending) || queue.update(sent, ifState: .unconfirmed)
-                    || (sent.type == "dm.message.post" && queue.update(sent, ifState: .dropped))
+                    || (["dm.message.post", "dm.message.post_with_attachments"].contains(sent.type) && queue.update(sent, ifState: .dropped))
                 // Revocation may have erased the body while HTTP was in flight.
                 // Its successful answer still belongs to the command's owner.
                 onSent(sent, try? JSONDecoder().decode(ChatCommandAnswer.self, from: answer.body))

@@ -12,27 +12,30 @@ final class BackgroundWorkTests: XCTestCase {
         try! JSONSerialization.data(withJSONObject: object)
     }
 
-    func testStopWithRunningBackgroundWorkReportsRunning() {
-        var p = payload("attention")
-        AgentPadHookKit.applyClaudeLifecycleDetails(to: &p, stdin: stdin([
-            "hook_event_name": "Stop",
-            "background_tasks": [
-                ["id": "bcw7jeuwj", "type": "shell", "status": "running"],
-                ["id": "a52e4d084c377ea63", "type": "subagent", "status": "running"],
-                ["id": "old", "type": "shell", "status": "completed"],
-            ],
-        ]))
-        XCTAssertEqual(p["event"], "running")
-        XCTAssertEqual(p[AgentPadHookKit.backgroundSubagentsKey], "1")
-        XCTAssertEqual(p[AgentPadHookKit.backgroundShellsKey], "1")
+    func testStopWithRunningBackgroundWorkPreservesCompletion() {
+        for event in ["turn_complete", "attention"] { // Includes legacy Stop hooks.
+            var p = payload(event)
+            AgentPadHookKit.applyClaudeLifecycleDetails(to: &p, stdin: stdin([
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    ["id": "bcw7jeuwj", "type": "shell", "status": "running"],
+                    ["id": "a52e4d084c377ea63", "type": "subagent", "status": "running"],
+                    ["id": "old", "type": "shell", "status": "completed"],
+                ],
+            ]))
+            XCTAssertEqual(p["event"], event)
+            XCTAssertEqual(p["reason"], "completion")
+            XCTAssertEqual(p[AgentPadHookKit.backgroundSubagentsKey], "1")
+            XCTAssertEqual(p[AgentPadHookKit.backgroundShellsKey], "1")
+        }
     }
 
-    func testStopWithNothingRunningStaysAttention() {
-        var p = payload("attention")
+    func testStopWithNothingRunningStaysComplete() {
+        var p = payload("turn_complete")
         AgentPadHookKit.applyClaudeLifecycleDetails(to: &p, stdin: stdin([
             "hook_event_name": "Stop", "background_tasks": [] as [Any],
         ]))
-        XCTAssertEqual(p["event"], "attention")
+        XCTAssertEqual(p["event"], "turn_complete")
         XCTAssertEqual(p["reason"], "completion")
     }
 

@@ -48,7 +48,7 @@ final class NewAgentFormTests: XCTestCase {
         XCTAssertEqual(profile.name, "My agent")
         XCTAssertEqual(profile.launchOptions, "--model example")
         XCTAssertEqual(b.revealedAgentProfileID, profile.id)
-        XCTAssertEqual(b.sidebarContent, .workspaces)
+        XCTAssertEqual(b.sidebarContent, .chat)
         XCTAssertEqual(b.workspaces.count, 1, "The list must stay visible after the last form tab closes")
         XCTAssertNil(router.owner(of: session.id)); XCTAssertTrue(state.isClosed)
         XCTAssertTrue(drafts.drafts.isEmpty)
@@ -57,12 +57,13 @@ final class NewAgentFormTests: XCTestCase {
         XCTAssertEqual(profiles.profiles.count, 1)
     }
 
-    func testDuplicateBaseTemplateAndSymlinkRevealExistingWithoutChangingItsNameOrOptions() throws {
+    func testDuplicateExactTemplateAndOptionsRevealExistingThroughSymlink() throws {
         let existing = try profiles.add(template: .claudeCode, folder: root, name: "Original", launchOptions: "--model original")
         let alias = root.appendingPathComponent("alias")
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: root)
         let custom = AgentTemplate.fromCustom(CustomAgentData(id: "opus", baseAgentId: "claude-code"))
-        tabs.agentTemplates = { [custom] }
+        tabs.agentTemplates = { [.claudeCode, custom] }
+        tabs.agentOptions = { _ in "--model original" }
         let owner = store(), state = try XCTUnwrap(tabs.newAgent(from: owner)?.tabState)
         let form = tabs.form(state)
         form.newAgent.folder = alias.path; form.newAgent.name = "Duplicate"

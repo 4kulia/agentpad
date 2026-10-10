@@ -40,7 +40,7 @@ final class AgentProfileStoreTests: XCTestCase {
         AgentSessionRecord(agentId: agent, conversationId: id, title: id, cwd: cwd, lastActivity: Date(timeIntervalSince1970: date))
     }
 
-    func testAddOnlyWritesArchiveAndDeduplicatesBaseToolAndCanonicalFolder() throws {
+    func testAddDeduplicatesExactTemplateOptionsAndCanonicalFolder() throws {
         let project = try folder("project"), alias = root.appendingPathComponent("alias")
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: project)
         let file = root.appendingPathComponent("data/profiles.json")
@@ -48,11 +48,11 @@ final class AgentProfileStoreTests: XCTestCase {
         let first = try store.add(template: .claudeCode, folder: project, name: "  ", launchOptions: "--model opus")
         let custom = AgentTemplate.fromCustom(CustomAgentData(id: "opus", baseAgentId: "claude-code"))
         let duplicate = try store.add(template: custom, folder: alias.appendingPathComponent("."), name: "ignored")
-        XCTAssertEqual(first, duplicate)
-        XCTAssertEqual(try store.add(template: custom, folder: URL(fileURLWithPath: project.path, isDirectory: true)), first)
+        XCTAssertNotEqual(first.id, duplicate.id)
+        XCTAssertEqual(try store.add(template: custom, folder: URL(fileURLWithPath: project.path, isDirectory: true)), duplicate)
         XCTAssertEqual(first.name, "project")
         XCTAssertEqual(first.folder, canonicalDiskPath(project))
-        XCTAssertEqual(store.profiles.count, 1)
+        XCTAssertEqual(store.profiles.count, 2)
         XCTAssertNotEqual(try store.add(template: .codex, folder: project).id, first.id)
         XCTAssertNotEqual(try store.add(template: .claudeCode, folder: folder("worktree")).id, first.id)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: project.path), [])
@@ -64,12 +64,12 @@ final class AgentProfileStoreTests: XCTestCase {
         let old = try folder("old"), new = try folder("new"), sub = try folder("old/sub")
         let file = root.appendingPathComponent("profiles.json"), store = AgentProfileStore(fileURL: file)
         let profile = try store.add(template: .codex, folder: old)
-        try store.discover([record("original", old), record("nested", sub)])
+        try store.discoverKnown([record("original", old), record("nested", sub)])
         XCTAssertNil(store.binding(agentID: "codex", conversationID: "nested"))
         try store.move(profile.id, to: new)
         let second = try store.add(template: .codex, folder: old)
-        try store.discover([record("original", new, date: 4), record("old-new", old, date: 3), record("new", new, date: 2)])
-        try store.discover([])
+        try store.discoverKnown([record("original", new, date: 4), record("old-new", old, date: 3), record("new", new, date: 2)])
+        try store.discoverKnown([])
         try store.flush()
         let restored = AgentProfileStore(fileURL: file)
         XCTAssertEqual(restored.profile(profile.id)?.folder, canonicalDiskPath(new))
@@ -126,7 +126,7 @@ final class AgentProfileStoreTests: XCTestCase {
         let file = root.appendingPathComponent("profiles.json"), profiles = AgentProfileStore(fileURL: file)
         let profile = try profiles.add(template: .codex, folder: root)
         let delegate = AppDelegate(appPersistence: AppPersistence(fileURL: root.appendingPathComponent("windows.json")), agentProfiles: profiles)
-        try profiles.discover([record("during-close", root)])
+        try profiles.discoverKnown([record("during-close", root)])
         defer { try? profiles.flush() }
         XCTAssertTrue(AgentProfileStore(fileURL: file).bindings.isEmpty, "Discovery has not reached its debounce deadline")
 
@@ -134,7 +134,7 @@ final class AgentProfileStoreTests: XCTestCase {
         XCTAssertEqual(AgentProfileStore(fileURL: file).records(for: profile.id).map(\.conversationId), ["during-close"])
 
         // Discovery can finish while native surfaces drain, after the first save.
-        try profiles.discover([record("during-drain", root)])
+        try profiles.discoverKnown([record("during-drain", root)])
         XCTAssertTrue(delegate.flushTerminationPersistence())
         XCTAssertEqual(Set(AgentProfileStore(fileURL: file).records(for: profile.id).map(\.conversationId)),
             ["during-close", "during-drain"])
@@ -145,7 +145,7 @@ final class AgentProfileStoreTests: XCTestCase {
         let profiles = AgentProfileStore(fileURL: file) { try probe.write($0, to: $1) }
         let profile = try profiles.add(template: .codex, folder: root)
         let delegate = AppDelegate(appPersistence: AppPersistence(fileURL: root.appendingPathComponent("windows.json")), agentProfiles: profiles)
-        try profiles.discover([record("pending", root)])
+        try profiles.discoverKnown([record("pending", root)])
         defer { probe.fail = false; try? profiles.flush() }
         probe.fail = true
         XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateCancel)
@@ -164,7 +164,7 @@ final class AgentProfileStoreTests: XCTestCase {
         let claude = try store.add(template: .claudeCode, folder: old)
         try store.move(codex.id, to: new)
         try store.bind(record("same", old), to: codex.id)
-        try store.discover([record("same", old, agent: "claude-code")])
+        try store.discoverKnown([record("same", old, agent: "claude-code")])
         XCTAssertEqual(store.binding(agentID: "codex", conversationID: "same")?.profileID, codex.id)
         XCTAssertEqual(store.binding(agentID: "claude-code", conversationID: "same")?.profileID, claude.id)
     }
@@ -208,6 +208,7 @@ final class AgentProfileStoreTests: XCTestCase {
         let store = AgentProfileStore(fileURL: file) { try probe.write($0, to: $1) }
         let profile = try store.add(template: .codex, folder: path)
         let records = (0..<150).map { record("id-\($0)", path, date: Double($0)) }
+        try store.rememberKnownOrigins(records)
         probe.reset()
         let catalog = SessionCatalog(profiles: store) { progress in
             for count in [50, 100, 150] {
@@ -235,13 +236,13 @@ final class AgentProfileStoreTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: original)
         let profile = try store.add(template: .codex, folder: destination)
         let found = record("unbound", alias)
-        try store.discover([found])
+        try store.discoverKnown([found])
         XCTAssertTrue(store.bindings.isEmpty)
         try FileManager.default.removeItem(at: alias)
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: destination)
-        try store.discover([found])
+        try store.discoverKnown([found])
         XCTAssertTrue(store.bindings.isEmpty, "Repeated progress must not rediscover the same record at a different path")
-        try store.discover([record("new-conversation", alias)])
+        try store.discoverKnown([record("new-conversation", alias)])
         XCTAssertEqual(store.binding(agentID: "codex", conversationID: "new-conversation")?.profileID, profile.id,
             "A new record must resolve the folder as it exists now")
     }
@@ -249,11 +250,11 @@ final class AgentProfileStoreTests: XCTestCase {
     func testHistorySeenBeforeProfileCreationAttachesWithoutAnotherScan() throws {
         let path = try folder("project"), store = AgentProfileStore()
         let found = record("earlier", path)
-        try store.discover([found])
+        try store.discoverKnown([found])
         XCTAssertTrue(store.bindings.isEmpty)
         let profile = try store.add(template: .codex, folder: path)
         XCTAssertEqual(store.records(for: profile.id).map(\.conversationId), ["earlier"])
-        try store.discover([found])
+        try store.discoverKnown([found])
         XCTAssertEqual(store.bindings.count, 1)
     }
 
@@ -262,22 +263,39 @@ final class AgentProfileStoreTests: XCTestCase {
         let store = AgentProfileStore(fileURL: file) { try probe.write($0, to: $1) }
         let profile = try store.add(template: .codex, folder: path), found = record("history", path)
         probe.fail = true
-        try store.discover([found])
+        try store.discoverKnown([found])
         for _ in 0..<100 where store.problem == nil { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertNotNil(store.problem)
         XCTAssertEqual(store.records(for: profile.id).count, 1)
         XCTAssertTrue(AgentProfileStore(fileURL: file).bindings.isEmpty)
         probe.fail = false
-        try store.discover([found])
+        try store.discoverKnown([found])
         for _ in 0..<100 where store.problem != nil { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertNil(store.problem)
         XCTAssertEqual(AgentProfileStore(fileURL: file).bindings.count, 1)
 
-        try store.discover([record("newer", path)])
+        try store.discoverKnown([record("newer", path)])
         let second = try store.add(template: .claudeCode, folder: path)
         try await Task.sleep(for: .milliseconds(400))
         let restored = AgentProfileStore(fileURL: file)
         XCTAssertEqual(restored.profiles.map(\.id), [profile.id, second.id])
         XCTAssertEqual(restored.bindings.count, 2, "An explicit commit must include pending discovery")
+    }
+}
+
+// These fixtures model transcripts from known launches. Scanner-only records do
+// not prove the custom template or options; that refusal has its own coverage.
+@MainActor
+extension AgentProfileStore {
+    func rememberKnownOrigins(_ records: [AgentSessionRecord]) throws {
+        for record in records {
+            let profile = existing(rosterID: record.agentId, folder: record.cwd)
+            guard let template = AgentTemplate.builtin(id: profile?.templateID ?? record.agentId) else { continue }
+            try details.remember(AgentLaunchOrigin(template: template, folder: record.cwd, options: profile?.launchOptions ?? ""), conversation: record.conversationId)
+        }
+    }
+    func discoverKnown(_ records: [AgentSessionRecord]) throws {
+        try rememberKnownOrigins(records)
+        try discover(records)
     }
 }

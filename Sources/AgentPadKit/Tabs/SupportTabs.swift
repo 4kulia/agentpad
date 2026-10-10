@@ -85,11 +85,17 @@ final class SupportTabs {
             return AnyView(AllSessionsTab(model: state.allSessionsModel!, owner: { [weak self, weak state] in
                 guard let state else { return nil }; return self?.owner(state)?.store
             }))
+        case .agentProfile(let id):
+            if let store = owner(state)?.store, let profile = store.agentProfiles.profile(id) {
+                if state.profileEditor == nil { state.profileEditor = AgentProfileEditor(profile: profile, profiles: store.agentProfiles) }
+                return AnyView(AgentProfileEditorView(state: state, editor: state.profileEditor!))
+            }
+            return AnyView(Text("This agent is no longer available."))
         case .agent: return AnyView(AgentTab(state: state, tabs: .shared))
         case .ask: return AnyView(PersonalAskTab(state: state, model: CompositionTabs.shared.askModel(state)))
         case .newChannel: return AnyView(NewChannelTab(model: CompositionTabs.shared.channelModel(state)))
         case .forward: return AnyView(ForwardTab(state: state, tabs: .shared))
-        case .viewer: return AnyView(AttachmentViewerTab(model: CompositionTabs.shared.viewerModel(state)))
+        case .viewer, .dmViewer: return AnyView(AttachmentViewerTab(model: CompositionTabs.shared.viewerModel(state)))
         case .connection:
             return AnyView(ConnectionTabView(state: state, tabs: .shared))
         case .fileOperations:
@@ -261,7 +267,7 @@ struct NotificationTabView: View {
 extension ToolRoute {
     var organizationScope: OrgKey? {
         switch self {
-        case .directMessageDraft(let key, _), .newDM(let key), .organization(let key), .agent(let key, _), .ask(let key, _), .newChannel(let key, _, _), .viewer(let key, _, _, _): return key
+        case .directMessageDraft(let key, _), .newDM(let key), .organization(let key), .agent(let key, _), .ask(let key, _), .newChannel(let key, _, _), .viewer(let key, _, _, _), .dmViewer(let key, _, _, _): return key
         case .directMessage(let ref): return ref.key.map(OrgKey.init)
         case .request(let scope, _), .publishedAgents(let scope), .teamActivity(let scope), .publication(let scope, _), .publish(let scope, _, _, _):
             if case .server(let key) = scope { return key }; return nil

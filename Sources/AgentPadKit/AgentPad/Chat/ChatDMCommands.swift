@@ -67,15 +67,17 @@ extension ChatService {
     @discardableResult func postDM(_ key: ChatOrgKey, dm: String, root: String?, text: String, mentions: [String], draftVersion: String? = nil, draftID: String? = nil) throws -> String {
         let (store, card) = try writableDM(key, dm)
         let draftID = draftID ?? dm
-        if let problem = ChatChannelModel.textProblem(text) { throw ChatError.storage(problem) }
         if let draftVersion, let sent = try store.dmRead({ try String.fetchOne($0, sql: "SELECT message_id FROM dm_sends WHERE draft_version = ? AND dm_id = ?", arguments: [draftVersion, dm]) }) { return sent }
-        let id = UUID().uuidString.lowercased()
+        let uploads = try attachments(key)?.prepared(owner: .dm(dm), root: root) ?? []
+        if let problem = ChatChannelModel.textProblem(text), !(text.isEmpty && !uploads.isEmpty) { throw ChatError.storage(problem) }
+        let id = uploads.first?.messageId ?? UUID().uuidString.lowercased()
         let members = Set([key.accountId, card.peer.accountId])
         let mentions = Array(Set(mentions).intersection(members)).sorted()
         var args: [String: ChatJSON] = ["dm_id": .string(dm), "message_id": .string(id), "text": .string(text),
             "mentions": .array(mentions.map { .object(["account_id": .string($0)]) })]
         if let root { args["thread_root_id"] = .string(root) }
-        let prepared = try prepareCommand(key, type: "dm.message.post", args: .object(args))
+        if !uploads.isEmpty { args["attachment_ids"] = .array(uploads.map { .string($0.id) }) }
+        let prepared = try prepareCommand(key, type: uploads.isEmpty ? "dm.message.post" : "dm.message.post_with_attachments", args: .object(args))
         try store.dmWrite { db in
             if let draftVersion {
                 guard let draft = try ChatDMStore.draft(db, draftID, root: root), draft.version == draftVersion, draft.text == text else {
@@ -85,8 +87,11 @@ extension ChatService {
             if let root {
                 guard try ChatDMStore.messages(db, dm).contains(where: { $0.id == root && $0.threadRootId == nil && $0.hasFixed }) else { throw ChatError.storage("The thread is no longer available.") }
             }
-            let m = ChatDMMessageWire(messageId: id, dmId: dm, threadRootId: root, authorAccountId: key.accountId, text: text,
+            var m = ChatDMMessageWire(messageId: id, dmId: dm, threadRootId: root, authorAccountId: key.accountId, text: text,
                 mentions: mentions.map { .init(accountId: $0) }, revision: 0, seq: 0, createdAt: Self.now())
+            m.attachments = uploads.enumerated().map { index, draft in var file = draft.file; file.position = index; return file }
+            m.attachmentOnly = !uploads.isEmpty && text.isEmpty
+            for var upload in uploads { upload.queued = true; try ChatAttachments.put(db, upload) }
             try db.execute(sql: "INSERT INTO dm_messages (dm_id, message_id, body, seq, root, revision, deleted, local_state, command_id) VALUES (?, ?, ?, 0, ?, 0, 0, 'sending', ?)",
                            arguments: [dm, id, try JSONEncoder().encode(m), root, prepared.record.commandId])
             _ = try prepared.table.insert(db, prepared.record, seq: prepared.record.seq)
@@ -96,6 +101,7 @@ extension ChatService {
                 try db.execute(sql: "DELETE FROM dm_drafts WHERE dm_id = ? AND root = ? AND version = ?", arguments: [draftID, root ?? "", draftVersion])
             }
         }
+        attachmentManagers[key]?.reconcile()
         prepared.sent(); return id
     }
     func changeDM(_ key: ChatOrgKey, dm: String, message: String, text: String?, mentions: [String] = [], revision: Int) throws {
@@ -126,9 +132,12 @@ extension ChatService {
         guard let row = try store.dmRead({ try ChatDMStore.messages($0, dm).first { $0.id == message && $0.localState == .failed } }),
               let original = try store.outbox.commands().last(where: {
                   let args = Self.args($0)
-                  return $0.type == "dm.message.post" && args["message_id"]?.string == row.id
+                  return ["dm.message.post", "dm.message.post_with_attachments"].contains($0.type) && args["message_id"]?.string == row.id
                       && (args["dm_id"]?.string == dm || args["peer_account_id"]?.string == card.peer.accountId)
               }), !original.isSessionDM else { return }
+        if original.type == "dm.message.post_with_attachments" {
+            try retryDMAttachmentPost(key, row: row, original: original); return
+        }
         var args = Self.args(original)
         if args["dm_id"] == nil { args["open_command_id"] = .string(ChatUUID.v7()) }
         let prepared = try prepareCommand(key, type: original.type, args: .object(args))
@@ -148,15 +157,17 @@ extension ChatService {
                 SELECT EXISTS(SELECT 1 FROM dm_messages m LEFT JOIN outbox o ON o.command_id = m.command_id
                     WHERE m.dm_id = ? AND m.message_id = ? AND m.local_state IN ('sending', 'failed') AND o.state IS NOT 'sent')
                 """, arguments: [dm, message]) == true else { return }
-            let commands = try ChatCommandRecord.fetchAll(db, sql: "SELECT * FROM outbox WHERE type = 'dm.message.post' AND state != 'sent'")
+            let commands = try ChatCommandRecord.fetchAll(db, sql: "SELECT * FROM outbox WHERE type IN ('dm.message.post', 'dm.message.post_with_attachments') AND state != 'sent'")
             for command in commands {
                 let args = Self.args(command)
                 guard args["message_id"]?.string == message,
                       args["dm_id"]?.string == dm || (peer != nil && args["peer_account_id"]?.string == peer) else { continue }
                 try db.execute(sql: "UPDATE outbox SET state = 'dropped', error = 'dismissed', dismissed = 1, next_attempt_at = NULL WHERE command_id = ?", arguments: [command.commandId])
             }
+            try db.execute(sql: "DELETE FROM attachment_drafts WHERE dm_id = ? AND json_extract(body, '$.messageId') = ? AND json_extract(body, '$.queued') = 1", arguments: [dm, message])
             try db.execute(sql: "DELETE FROM dm_messages WHERE dm_id = ? AND message_id = ?", arguments: [dm, message])
         }
+        attachmentManagers[key]?.reconcile()
         orgSessions[key]?.outbox?.pump()
     }
     func installDMCommands() {
@@ -174,6 +185,7 @@ extension ChatService {
             return
         }
         guard let dm = args["dm_id"]?.string, let id = args["message_id"]?.string else { return }
+        defer { attachmentManagers[key]?.reconcile() }
         switch outcome {
         case .taken(let answer):
             try? store.dmWrite { try $0.execute(sql: "DELETE FROM dm_changes WHERE dm_id = ? AND message_id = ? AND command_id = ?", arguments: [dm, id, record.commandId]) }
@@ -184,8 +196,12 @@ extension ChatService {
                 try db.execute(sql: "UPDATE dm_messages SET local_state = 'failed', local_error = ? WHERE dm_id = ? AND message_id = ? AND command_id = ? AND local_state IS NOT NULL", arguments: [code, dm, id, record.commandId])
                 try db.execute(sql: "UPDATE dm_changes SET state = 'failed', error = ? WHERE dm_id = ? AND message_id = ? AND command_id = ?", arguments: [code, dm, id, record.commandId])
             }
-            if ["dm_read_only", "revision_conflict"].contains(code), let sync = orgSessions[key]?.sync?.dm { Task { _ = try? await sync.refresh(dm) } }
-            if ["forbidden", "not_found"].contains(code) {
+            // A missing attachment reservation (for example after reconnect)
+            // is not DM revocation. Keep the files for Retry to renew; only a
+            // read of the DM itself can confirm access loss and remove it.
+            let attachmentNotFound = record.type == "dm.message.post_with_attachments" && code == "not_found"
+            if attachmentNotFound || ["dm_read_only", "revision_conflict"].contains(code), let sync = orgSessions[key]?.sync?.dm { Task { _ = try? await sync.refresh(dm) } }
+            if ["forbidden", "not_found"].contains(code), !attachmentNotFound {
                 try? store.dmWrite { try ChatDMStore.remove($0, dm) }; orgSessions[key]?.sync?.rightsInDoubt()
             }
         }

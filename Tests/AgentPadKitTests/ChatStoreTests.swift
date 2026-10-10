@@ -31,6 +31,34 @@ final class ChatStoreTests: XCTestCase {
         try ChatStore.open(files: files, key: try key()).store
     }
 
+    func testDMAttachmentUpgradeRetainsLegacyChannelDraftAndRequiresOneOwner() throws {
+        let cache = try DatabaseQueue()
+        try ChatStoreMigrations.cache.migrate(cache, upTo: "release-26-dm-peer-lookup")
+        let channel = UUID().uuidString.lowercased()
+        let file = ChatAttachment(attachmentId: UUID().uuidString.lowercased(), position: 0,
+                                  name: "saved.txt", mime: "text/plain", size: 5, hasPreview: false)
+        var draft = ChatAttachmentDraft(file: file, messageId: UUID().uuidString.lowercased(), channel: channel,
+            root: "", session: "old-session", generation: "g1", sha256: ChatAttachments.digest(Data("saved".utf8)),
+            createdAt: Date(), expiresAt: Date().addingTimeInterval(3600), state: .ready)
+        draft.queued = true
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(draft)) as? [String: Any])
+        legacy["owner"] = nil; legacy["channel"] = channel
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: legacy), as: UTF8.self)
+        try cache.write {
+            try $0.execute(sql: "INSERT INTO attachment_drafts (attachment_id, channel_id, thread_root_id, body) VALUES (?, ?, '', ?)", arguments: [file.id, channel, json])
+        }
+        try ChatStoreMigrations.cache.migrate(cache)
+        try cache.read { db in
+            XCTAssertEqual(try ChatAttachments.drafts(db, includingQueued: true), [draft])
+            XCTAssertEqual(try String.fetchOne(db, sql: "SELECT channel_id FROM attachment_drafts"), channel)
+            XCTAssertNil(try String.fetchOne(db, sql: "SELECT dm_id FROM attachment_drafts"))
+        }
+        try cache.write { db in
+            XCTAssertThrowsError(try db.execute(sql: "UPDATE attachment_drafts SET dm_id = ?", arguments: [channel]))
+            XCTAssertThrowsError(try db.execute(sql: "UPDATE attachment_drafts SET channel_id = NULL"))
+        }
+    }
+
     func testMergedSchemasMigrateCleanDatabasesAndReopen() throws {
         let cache = try DatabaseQueue()
         let journal = try DatabaseQueue()
@@ -40,7 +68,7 @@ final class ChatStoreTests: XCTestCase {
         try ChatStoreMigrations.journal.migrate(journal)
         try cache.read { db in
             XCTAssertEqual(try String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"),
-                           (1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review", "release-14-ux2-thread-read-floor", "release-15-ux2-draft-options", "release-16-conversation-read-marks", "release-17-b1", "release-18-b1-review", "release-19-chat-reply-heads", "release-20-pin-preferences", "release-21-attachments", "release-22-attachment-access", "release-23-attachment-retention", "release-24-composition-drafts", "release-25-direct-messages", "release-26-dm-peer-lookup"])
+                           (1...11).map { "release-\($0)" } + ["release-12-ux1", "release-13-ux1-review", "release-14-ux2-thread-read-floor", "release-15-ux2-draft-options", "release-16-conversation-read-marks", "release-17-b1", "release-18-b1-review", "release-19-chat-reply-heads", "release-20-pin-preferences", "release-21-attachments", "release-22-attachment-access", "release-23-attachment-retention", "release-24-composition-drafts", "release-25-direct-messages", "release-26-dm-peer-lookup", "release-27-dm-attachments"])
             for table in ["requests", "agent_channels", "request_contents", "publication_intents", "my_threads", "channel_sends", "channel_call_intents", "session_posts", "thread_read_marks", "attachment_access_versions", "composition_drafts"] {
                 XCTAssertTrue(try db.tableExists(table), table)
             }

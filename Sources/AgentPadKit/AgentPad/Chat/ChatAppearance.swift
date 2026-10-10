@@ -36,8 +36,10 @@ struct ChatAvatar: View {
     let identity: ChatAuthorIdentity
     let name: String
     var size: CGFloat = 32
+    var key: ChatOrgKey?
     var body: some View {
-        ContactAvatar(stableID: identity.avatarID, name: name, kind: identity.isBot ? .agent : .person, size: size)
+        ContactAvatar(stableID: identity.avatarID, name: name, kind: identity.isBot ? .agent : .person, size: size,
+                      remote: identity.agent.map { .agent($0, key) } ?? .account(identity.account, key))
     }
 }
 

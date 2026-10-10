@@ -94,6 +94,10 @@ final class Session: Identifiable {
     /// sync via OSC 7 (`engine.onPwdChange`). Drives the tab title so users see
     /// where they are, not which agent template the tab was launched from.
     var currentDirectory: URL
+    /// Frozen per agent launch/restore; refreshed only when a shell upgrades to
+    /// an agent. Never persisted or updated by later cwd/conversation reports.
+    var profileAdoption: AgentProfileAdoption.Candidate?
+    var launchOrigin: AgentLaunchOrigin?
     var profileID: UUID?
     /// Pinned for profile launches; OSC cwd changes must not rewrite history.
     var profileOriginalCwd: URL?
@@ -424,9 +428,6 @@ final class Session: Identifiable {
     /// permission sends no PostToolUse) cannot keep a tab waiting.
     var openMainThreadCalls: Set<String> = []
 
-    /// AgentPad: subagents and shell commands still running in the background
-    /// after the agent ended its turn. Non-nil only while the tab shows
-    /// "running" for that reason; the next lifecycle event replaces it.
     var notificationIncarnation = UUID()
     var notificationEpisode = 0
     var notificationPhase = "turn"
@@ -438,6 +439,8 @@ final class Session: Identifiable {
     /// Some shells emit a first-prompt D after the explicit launch result.
     /// A preexec command marker opens the next command's result again.
     var reportedAgentLaunchExit = false
+    /// Work left in the background after Stop, independent of the completed
+    /// foreground turn. The next lifecycle event or idle status replaces it.
     var backgroundWork: BackgroundWork?
 
     /// AgentPad: when a hook last set `activityState`. Claude Code's own
@@ -529,7 +532,8 @@ final class Session: Identifiable {
         agent: AgentTemplate,
         customTitle: String? = nil,
         conversationId: String? = nil,
-        launchedConversationId: String? = nil
+        launchedConversationId: String? = nil,
+        profileAdoption: AgentProfileAdoption.Candidate? = nil
     ) {
         self.id = id
         self.engine = engine
@@ -538,6 +542,7 @@ final class Session: Identifiable {
         self.customTitle = customTitle
         self.conversationId = conversationId
         self.launchedConversationId = launchedConversationId
+        self.profileAdoption = profileAdoption
     }
 }
 

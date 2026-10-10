@@ -52,13 +52,13 @@ struct ChatDMView: View {
                 if !narrow || model.threadRoot == nil {
                     VStack(spacing: 0) {
                         header
-                        if model.service.socket?.state != .connected {
+                        if card.writable, model.service.socket?.state != .connected {
                             Text("Offline — messages will be sent when the connection returns.")
                                 .font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary).padding(10)
                         }
                         if model.feed.messages.isEmpty {
                             VStack(spacing: 8) {
-                                ContactAvatar(stableID: card.peer.accountId, name: card.peer.name, kind: .person, size: 48)
+                                ContactAvatar(stableID: card.peer.accountId, name: card.peer.name, kind: .person, size: 48, remote: .account(card.peer.accountId, model.key))
                                 Text(card.peer.name).font(Theme.display(19, weight: .semibold))
                                 Text("Only the two of you can read this conversation. Organization admins and owners can't.")
                                     .font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary).multilineTextAlignment(.center)
@@ -94,7 +94,7 @@ struct ChatDMView: View {
     private var header: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                ContactAvatar(stableID: card.peer.accountId, name: card.peer.name, kind: .person, size: 34)
+                ContactAvatar(stableID: card.peer.accountId, name: card.peer.name, kind: .person, size: 34, remote: .account(card.peer.accountId, model.key))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(card.peer.name).font(Theme.display(15, weight: .semibold))
                     Label("Only the two of you", systemImage: "lock").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
@@ -107,18 +107,32 @@ struct ChatDMView: View {
         }
     }
     @ViewBuilder private func composer(root: String?) -> some View {
+        if root == nil, let manager = model.attachmentManager {
+            ForEach(model.orphanedFileDraftRoots, id: \.self) { savedRoot in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Saved reply draft — its thread is not loaded").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                    if let draft = model.draft(root: savedRoot), !draft.text.isEmpty { Text(draft.text).font(Theme.display(12)).textSelection(.enabled) }
+                    ChatAttachmentDraftStrip(manager: manager, owner: .dm(model.ref.dm), root: savedRoot, allowsRetry: false)
+                    Button("Delete draft") { model.deleteDraft(root: savedRoot) }.buttonStyle(.link)
+                }.padding(12)
+            }
+        }
         if card.writable { ChatDMComposer(model: model, root: root, members: members, peer: card.peer.name) }
         else {
             VStack(alignment: .leading, spacing: 8) {
                 Label(root == nil ? "\(card.peer.name) was removed from the organization" : "Read-only", systemImage: "lock").font(Theme.display(12, weight: .semibold))
                 Text("The history remains available. New messages, edits and deletions are turned off.").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
-                if let draft = model.draft(root: root), !draft.text.isEmpty {
+                let savedFiles = model.attachmentManager?.files(owner: .dm(model.ref.dm), root: root) ?? []
+                if model.draft(root: root)?.text.isEmpty == false || !savedFiles.isEmpty {
                     Text("Your unsent draft — kept on this Mac only").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
-                    Text(draft.text).font(Theme.display(12)).textSelection(.enabled)
+                    if let draft = model.draft(root: root), !draft.text.isEmpty { Text(draft.text).font(Theme.display(12)).textSelection(.enabled) }
+                    if let manager = model.attachmentManager { ChatAttachmentDraftStrip(manager: manager, owner: .dm(model.ref.dm), root: root) }
                     HStack {
-                        Button("Copy") {
-                            guard let current = model.draft(root: root) else { return }
-                            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(current.text, forType: .string)
+                        if model.draft(root: root)?.text.isEmpty == false {
+                            Button("Copy") {
+                                guard let current = model.draft(root: root), !current.text.isEmpty else { return }
+                                NSPasteboard.general.clearContents(); NSPasteboard.general.setString(current.text, forType: .string)
+                            }
                         }
                         Button("Delete draft") { model.deleteDraft(root: root) }
                     }
@@ -131,8 +145,13 @@ struct ChatDMView: View {
 
 @MainActor
 protocol ChatDMComposing: AnyObject {
+    var key: ChatOrgKey { get }
     var writable: Bool { get }
     var problem: String? { get }
+    var attachmentManager: ChatAttachmentManager? { get }
+    var attachmentOwner: ChatAttachmentOwner? { get }
+    func attachmentProblem(_ error: Error)
+    func prepareAttachments() async throws -> ChatAttachmentOwner
     func draft(root: String?) -> ChatDMContent.Draft?
     @discardableResult func saveDraft(_ text: String, root: String?) -> String?
     func send(_ text: String, root: String?, members: [(account: String, handle: String)], version: String?) -> Bool
@@ -142,7 +161,11 @@ protocol ChatDMComposing: AnyObject {
     @discardableResult func beginEditing(_ message: ChatMessage, root: String?, recovering: Bool) -> Bool
 }
 
-extension ChatDMModel: ChatDMComposing {}
+extension ChatDMModel: ChatDMComposing {
+    var attachmentManager: ChatAttachmentManager? { service.attachments(key) }
+    var attachmentOwner: ChatAttachmentOwner? { .dm(ref.dm) }
+    func prepareAttachments() async throws -> ChatAttachmentOwner { .dm(ref.dm) }
+}
 
 struct ChatDMComposer: View {
     let model: any ChatDMComposing
@@ -158,34 +181,46 @@ struct ChatDMComposer: View {
     @State private var candidateIndex = 0
     @State private var dismissed = false
     @State private var fileHint = false
+    @State private var dropping = false
+    @State private var choosingFiles = false
+    private var attachments: ChatAttachmentManager? { model.attachmentManager }
+    private var owner: ChatAttachmentOwner? { model.attachmentOwner }
+    private var fileUI: Bool { owner != nil && attachments?.limits(for: owner ?? .dm("")) != nil }
+    private var uploads: [ChatAttachmentDraft] { owner.map { attachments?.files(owner: $0, root: root) ?? [] } ?? [] }
+
     private var candidates: [ChatMentionCandidate] { members.filter { !$0.handle.isEmpty }.map { .init(id: $0.accountId, address: $0.handle, label: $0.name) } }
     private var token: (range: NSRange, query: String)? { ChatMentionCandidate.token(text, caret: selection.location) }
     private var matches: [ChatMentionCandidate] { dismissed ? [] : token.map { ChatMentionCandidate.filtered(candidates, query: $0.query) } ?? [] }
     private var mentionable: [(account: String, handle: String)] { members.map { ($0.accountId, $0.handle) } }
-    private var canSend: Bool { isActive() && model.writable && version != nil && ChatChannelModel.textProblem(text) == nil }
+    private var canSend: Bool {
+        isActive() && model.writable && version != nil && !choosingFiles
+            && (owner.map { attachments?.isImporting(owner: $0, root: root) } ?? false) != true
+            && (ChatChannelModel.textProblem(text) == nil || text.isEmpty && !uploads.isEmpty)
+            && (uploads.isEmpty || fileUI) && uploads.allSatisfy { $0.state == .ready }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             if let problem = model.problem { Text(problem).font(Theme.display(11)).foregroundStyle(ChatAppearance.failure) }
-            VStack(spacing: 0) {
-                ChatFormattingBar(control: control)
+            HStack {
+                Text(dropping ? "Attach to: \(peer)" : (root == nil ? "Message to \(peer)" : "Reply to \(peer)"))
+                Spacer()
+                if !text.isEmpty || !uploads.isEmpty { Label("Draft", systemImage: "pencil") }
+            }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+            ChatComposerBox(control: control, attachments: attachments, owner: owner, root: root, fileUI: fileUI,
+                            mentionTitle: "Mention a person", canSend: canSend, chooseFiles: chooseFiles, send: send) {
                 ChatMentionEditor(text: $text, selection: $selection, candidates: candidates, autofocus: root != nil, control: control,
                     heightChanged: { height = $0 }, placeholder: root == nil ? "Message \(peer)" : "Reply…", accessibilityName: root == nil ? "Direct message" : "Reply",
-                    suggestions: .init(sections: ChatMentionSection.grouped(matches), selected: min(candidateIndex, max(0, matches.count - 1)), title: "Mention a person", choose: choose),
-                    attachments: rejectFiles, dropAttachments: rejectFiles, key: key)
+                    suggestions: .init(sections: ChatMentionSection.grouped(matches), selected: min(candidateIndex, max(0, matches.count - 1)), title: "Mention a person", choose: choose, key: model.key),
+                    attachments: { attach($0) }, dropAttachments: { attach($0, fromDrop: true) }, dropTarget: { dropping = $0 }, key: key)
                     .frame(height: height)
-                HStack {
-                    ChatIconButton(title: "Mention a person", symbol: "at") { control.insert("@") }
-                    Spacer()
-                    Button(action: send) { Image(systemName: "paperplane.fill").frame(width: 32, height: 28) }
-                        .buttonStyle(.plain).foregroundStyle(canSend ? ChatAppearance.surface : ChatAppearance.secondary)
-                        .background(canSend ? ChatAppearance.accent : Theme.chromeSelection, in: RoundedRectangle(cornerRadius: 5))
-                        .disabled(!canSend).help("Send (↩)").accessibilityLabel("Send").chatFocusRing()
-                }.padding(8)
-            }.background(ChatAppearance.composerSurface, in: RoundedRectangle(cornerRadius: 9))
-                .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(control.focused ? ChatAppearance.accent : ChatAppearance.border, lineWidth: control.focused ? 2 : 1))
+            }
+            if fileUI, let limits = attachments?.limits {
+                Text("Up to \(limits.messageFiles) files · \(ByteCountFormatter.string(fromByteCount: Int64(limits.fileBytes), countStyle: .file)) each · \(ByteCountFormatter.string(fromByteCount: Int64(limits.messageBytes), countStyle: .file)) total")
+                    .font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
+            }
             if fileHint {
                 HStack {
-                    Text("Attachments aren't available in direct messages yet. Share files in a channel.")
+                    Text("Attachments are not available in this conversation on this server.")
                     Button("Dismiss") { fileHint = false }.buttonStyle(.link)
                 }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
             }
@@ -193,7 +228,7 @@ struct ChatDMComposer: View {
                 HStack {
                     Label("Only you and \(peer)", systemImage: "lock")
                     Spacer()
-                    Text("Enter — send · ⇧Enter — new line")
+                    Text(attachments?.limits(for: .dm("")) == nil ? "Enter — send · ⇧Enter — new line" : "⌘↩ Send · Return for a new line")
                 }.font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
             }
         }.padding(root == nil ? 20 : 14)
@@ -213,9 +248,38 @@ struct ChatDMComposer: View {
         let draft = model.draft(root: root); text = draft?.text ?? ""
         version = draft?.version ?? model.saveDraft(text, root: root)
     }
-    private func rejectFiles(_ pasteboard: NSPasteboard) -> Bool {
-        guard ChatAttachmentPaste.accepts(pasteboard) else { return false }
-        fileHint = true; return true
+    private func attach(_ pasteboard: NSPasteboard, fromDrop: Bool = false) -> Bool {
+        guard isActive(), ChatAttachmentPaste.accepts(pasteboard, fromDrop: fromDrop) else { return false }
+        guard fileUI, let attachments else { fileHint = true; return true }
+        guard let owner else {
+            // Establish the private pair before accepting bytes. The peer model
+            // normally resolves this while the new conversation tab opens.
+            Task { do { _ = try await model.prepareAttachments() } catch { model.attachmentProblem(error) } }
+            model.attachmentProblem(ChatError.storage("Opening the conversation. Paste or drop the files again when it is ready."))
+            return true
+        }
+        do {
+            return try ChatAttachmentPaste.take(pasteboard, manager: attachments, owner: owner, root: root, fromDrop: fromDrop) { error in
+                if let error { model.attachmentProblem(error) }
+                version = model.draft(root: root)?.version
+            }
+        } catch { model.attachmentProblem(error); return true }
+    }
+    private func chooseFiles() {
+        guard isActive(), let attachments, let window = control.view?.window else { return }
+        choosingFiles = true
+        Task {
+            defer { choosingFiles = false }
+            do {
+                let owner = try await model.prepareAttachments()
+                guard isActive(), model.writable else { return }
+                ChatComposerFileSelection.choose(attachments: attachments, owner: owner, root: root, window: window,
+                    valid: { isActive() && model.writable }) { error in
+                        if let error { model.attachmentProblem(error) }
+                        version = model.draft(root: root)?.version
+                    }
+            } catch { model.attachmentProblem(error) }
+        }
     }
     private func choose(_ candidate: ChatMentionCandidate) {
         guard let token else { return }
@@ -226,7 +290,8 @@ struct ChatDMComposer: View {
         control.clearAfterSend(); text = ""; version = model.saveDraft("", root: root)
     }
     private func key(_ code: UInt16, _ modifiers: NSEvent.ModifierFlags) -> Bool {
-        if (code == 36 || code == 76), modifiers.intersection([.shift, .option, .control]).isEmpty, matches.isEmpty { send(); return true }
+        if attachments?.limits(for: .dm("")) == nil, (code == 36 || code == 76),
+           modifiers.intersection([.shift, .option, .control]).isEmpty, matches.isEmpty { send(); return true }
         switch ChatComposerKey.action(code: code, modifiers: modifiers, hasCandidates: !matches.isEmpty, text: text, inThread: root != nil) {
         case .send: send(); return true
         case .previousCandidate: candidateIndex = max(0, candidateIndex - 1); return true
