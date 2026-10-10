@@ -34,7 +34,7 @@ final class AgentProfileSessionTests: XCTestCase {
     }
     private func record(_ cwd: URL, id: String? = nil, date: Double = 1) -> AgentSessionRecord {
         AgentSessionRecord(agentId: "codex", conversationId: id ?? conversation, title: "Earlier work", cwd: cwd,
-            lastActivity: Date(timeIntervalSince1970: date))
+            lastActivity: Date(timeIntervalSince1970: date), scannedAt: Date(timeIntervalSince1970: date))
     }
     private func config(_ session: Session) throws -> TerminalSessionConfig {
         try XCTUnwrap((session.engine as? TestEngine)?.startedConfigs.last)
@@ -72,6 +72,19 @@ final class AgentProfileSessionTests: XCTestCase {
         XCTAssertNil(quick.profileID)
         let rows = owner.profileSessionItems(profile)
         XCTAssertEqual(Set(rows.map(\.id)), [a.id.uuidString, b.id.uuidString])
+    }
+
+    func testProfileConversationReportDoesNotInventTitleOrActivity() throws {
+        let path = try folder("project"), owner = store()
+        let profile = try profiles.add(template: .codex, folder: path, name: "My agent")
+        let session = try owner.startAgentProfile(profile.id).get()
+        XCTAssertNil(session.customTitle, "The agent name must not mask terminal session titles")
+        owner.applyConversationId(conversationId: conversation, sessionId: session.id)
+        let binding = try XCTUnwrap(profiles.binding(agentID: "codex", conversationID: conversation))
+        XCTAssertEqual(binding.record.title, "")
+        XCTAssertEqual(binding.record.lastActivity, .distantPast)
+        session.terminalTitle = "Prepare the release"
+        XCTAssertEqual(owner.profileSessionItems(profile).first?.title, "Prepare the release")
     }
 
     func testExplicitHistoryBindingKeepsLaunchFolderAfterProfileMoveAndShellCd() throws {

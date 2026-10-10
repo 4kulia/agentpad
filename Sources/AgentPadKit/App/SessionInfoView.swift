@@ -530,7 +530,7 @@ private struct ProcessRow: View {
         .overlay(RightClickCatcher { _ in
             contextMenu = PopoverPresentation(value: process)
         })
-        .popover(item: $contextMenu, arrowEdge: .trailing) { presented in
+        .attentionPopover(item: $contextMenu, arrowEdge: .trailing) { presented in
             ProcessContextMenu(process: presented.value, session: session) { contextMenu = nil }
         }
     }
@@ -929,7 +929,7 @@ private struct AskFixButton: View {
             .buttonStyle(.plain)
             .onHover { chevronHovered = $0 }
             .animation(.easeOut(duration: 0.12), value: chevronHovered)
-            .popover(item: $picker, arrowEdge: .bottom) { presented in
+            .attentionPopover(item: $picker, arrowEdge: .bottom) { presented in
                 AskAgentPicker(agents: presented.value) { agent in
                     picker = nil
                     askFix.run(agent)

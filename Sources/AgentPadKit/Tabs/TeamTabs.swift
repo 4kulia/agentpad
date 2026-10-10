@@ -161,7 +161,6 @@ struct TeamScopeView<Content: View>: View {
                 }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task(id: ChatOrgCurrent.identity()) { ChatOrgCurrent.shared.refresh() }
     }
 }
 

@@ -83,14 +83,14 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(store.pendingRenameWorkspace?.id, store.active?.id)
     }
 
-    func testRequestRenameActiveWorkspaceUsesHeaderWithHiddenSidebar() {
+    func testRequestRenameActiveWorkspaceUsesPeekWithHiddenRail() {
         let store = makeStore()
         store.setSidebarMode(.hidden)
         store.requestRenameActiveWorkspace()
         XCTAssertEqual(store.sidebarMode, .hidden)
-        XCTAssertTrue(store.workspaceRenameInHeader)
+        XCTAssertNotEqual(store.navigationPresentation.list, .closed)
         XCTAssertEqual(store.active?.nameEdit.isEditing, true)
-        XCTAssertNil(store.pendingRenameWorkspace)
+        XCTAssertEqual(store.pendingRenameWorkspace?.id, store.active?.id)
     }
 
     func testInitialStateHasOneWorkspaceWithOnePaneAndOneTab() {
@@ -1324,7 +1324,7 @@ final class WorkspaceStoreTests: XCTestCase {
         // Pre-resizable-sidebar state files (no key) restore the default.
         var legacy = persistence.saved!
         legacy.sidebarWidth = nil
-        XCTAssertEqual(makeStore(initial: legacy).sidebarWidth, SidebarView.fullWidth)
+        XCTAssertEqual(makeStore(initial: legacy).sidebarWidth, LeftNavigationLayout.defaultPanelWidth)
     }
 
     func testRightSidebarWidthPersistsAndRestoresClamped() throws {
@@ -1388,13 +1388,13 @@ final class WorkspaceStoreTests: XCTestCase {
         }
     }
 
-    func testRequestRenameActiveWorkspaceUsesHeaderInFilesMode() {
+    func testRequestRenameActiveWorkspaceUsesListBesideFilesPanel() {
         let store = makeStore()
         store.addWorkspace(workingDirectory: projectA)
         store.setSidebarContent(.files)
         store.requestRenameActiveWorkspace()
         XCTAssertEqual(store.sidebarContent, .files)
-        XCTAssertTrue(store.workspaceRenameInHeader)
+        XCTAssertNotEqual(store.navigationPresentation.list, .closed)
         XCTAssertEqual(store.active?.nameEdit.isEditing, true)
     }
 

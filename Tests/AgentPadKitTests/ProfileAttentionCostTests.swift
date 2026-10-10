@@ -5,33 +5,34 @@ import XCTest
 
 @MainActor
 final class ProfileAttentionCostTests: XCTestCase {
-    func testAttentionAggregationIsSharedUntilObservedStateChanges() throws {
+    func testAttentionAggregationIsSharedUntilObservedStateChanges() async throws {
         let store = makeTestStore(), ledger = AttentionLedger()
-        let previous = AgentMonitor.shared.storesProvider
         var reads = 0
-        AgentMonitor.shared.storesProvider = { reads += 1; return [store] }
-        defer { AgentMonitor.shared.storesProvider = previous; store.terminate() }
+        defer { store.terminate() }
         let session = try XCTUnwrap(store.active?.activeSession)
         let profile = try store.agentProfiles.add(template: .codex, folder: session.currentDirectory, name: "Original")
         session.profileID = profile.id
         let event = AttentionEvent(source: "terminal", object: session.id.uuidString, episode: session.attentionEpisode,
             kind: .input, destination: .terminal(session.id))
         ledger.upsert(event)
-        let sidebar = AttentionSidebarModel(ledger: ledger)
+        let sidebar = AttentionSidebarModel(ledger: ledger, storesProvider: { reads += 1; return [store] })
         for _ in 0..<100 {
             XCTAssertEqual(sidebar.items.first?.subjectName, "Original")
             XCTAssertEqual(sidebar.terminalIDsNeedingAttention, [session.id])
         }
         XCTAssertEqual(reads, 1, "All rows and windows must share one attention projection")
         try store.agentProfiles.rename(profile.id, to: "Renamed")
+        await Task.yield()
         XCTAssertEqual(sidebar.items.first?.subjectName, "Renamed")
         XCTAssertEqual(sidebar.terminalIDsNeedingAttention, [session.id])
         XCTAssertEqual(reads, 2)
         ledger.markAttentionViewed(event)
+        await Task.yield()
         XCTAssertTrue(sidebar.items.isEmpty)
         XCTAssertTrue(sidebar.terminalIDsNeedingAttention.isEmpty)
         XCTAssertEqual(reads, 3)
         AgentMonitor.shared.windowGeneration += 1
+        await Task.yield()
         XCTAssertTrue(sidebar.items.isEmpty)
         XCTAssertEqual(reads, 4, "Window membership invalidates the shared projection")
     }
@@ -58,18 +59,16 @@ final class ProfileAttentionCostTests: XCTestCase {
         XCTAssertGreaterThan(historyReads, 0, "Expanding a profile loads its sessions")
     }
 
-    func testSharedSurfaceMapCountsEachSessionOnceAndTracksLiveChangesAcrossWindows() throws {
+    func testSharedSurfaceMapCountsEachSessionOnceAndTracksLiveChangesAcrossWindows() async throws {
         let profiles = AgentProfileStore()
         let a = makeTestStore(agentProfiles: profiles), b = makeTestStore(agentProfiles: profiles)
-        let previous = AgentMonitor.shared.storesProvider
-        AgentMonitor.shared.storesProvider = { [a, b] }
-        defer { AgentMonitor.shared.storesProvider = previous; a.terminate(); b.terminate() }
+        defer { a.terminate(); b.terminate() }
         let first = try XCTUnwrap(a.active?.activeSession), second = try XCTUnwrap(b.active?.activeSession)
         let profile = try profiles.add(template: .codex, folder: first.currentDirectory)
         first.profileID = profile.id; second.profileID = profile.id
         // Keep the first surface in a hidden workspace.
         _ = a.addEmptyWorkspace()
-        let ledger = AttentionLedger(), sidebar = AttentionSidebarModel(ledger: ledger)
+        let ledger = AttentionLedger(), sidebar = AttentionSidebarModel(ledger: ledger, storesProvider: { [a, b] })
         let input = AttentionEvent(source: "terminal", object: first.id.uuidString, episode: first.attentionEpisode,
             kind: .input, destination: .terminal(first.id))
         ledger.upsert(input)
@@ -79,16 +78,21 @@ final class ProfileAttentionCostTests: XCTestCase {
         ledger.upsert(failure)
         ledger.upsert(AttentionEvent(source: "terminal", object: second.id.uuidString, episode: second.attentionEpisode,
             kind: .input, destination: .terminal(second.id)))
+        await Task.yield()
         XCTAssertEqual(sidebar.terminalAttention[first.id]?.count, 2)
         XCTAssertEqual(sidebar.profileAttentionCounts[profile.id], 2, "Two reasons on one surface count as one session")
         first.customTitle = "Updated live title"
-        XCTAssertTrue(sidebar.terminalAttention[first.id]?.allSatisfy { $0.title == "Updated live title" } == true)
+        await Task.yield()
+        XCTAssertTrue(sidebar.terminalAttention[first.id]?.allSatisfy { sidebar.title(for: $0) == "Updated live title" } == true)
         first.engine.onUserInput?()
+        await Task.yield()
         XCTAssertEqual(sidebar.terminalAttention[first.id]?.map(\.id), [input.id])
         ledger.markAttentionViewed(input)
+        await Task.yield()
         XCTAssertNil(sidebar.terminalAttention[first.id])
         XCTAssertEqual(sidebar.profileAttentionCounts[profile.id], 1)
         b.closeTab(second, in: b.active!)
+        await Task.yield()
         XCTAssertTrue(sidebar.profileAttentionCounts.isEmpty)
     }
 }

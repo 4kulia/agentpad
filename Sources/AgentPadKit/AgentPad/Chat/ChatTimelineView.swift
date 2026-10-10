@@ -183,6 +183,9 @@ struct ChatTimelineView: View {
         .onDisappear { started = false; model.endReading(root: root); ChatNotifications.hide(place, view: box.id) }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in readIfLooking() }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in readIfLooking() }
+        .onReceive(NotificationCenter.default.publisher(for: NavigationPresentationGate.didChange)) { notification in
+            if notification.object as? NSWindow === box.window { readIfLooking() }
+        }
     }
 
     private func move(_ direction: Int, proxy: ScrollViewProxy) {

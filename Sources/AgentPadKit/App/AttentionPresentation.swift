@@ -45,13 +45,12 @@ final class NotificationNavigation {
 @MainActor
 enum AttentionFocus {
     static func terminalVisible(_ id: UUID, in store: WorkspaceStore, window: NSWindow?, appActive: Bool) -> Bool {
-        guard appActive, let window, window.isKeyWindow, window.isVisible, !window.isMiniaturized,
+        guard appActive, let window, !NavigationPresentationGate.obscures(window), window.isKeyWindow, window.isVisible, !window.isMiniaturized,
               let workspace = store.active, let pane = workspace.root.pane(containingSessionId: id),
               pane.activeTabId == id, let session = pane.activeTab else { return false }
         if let zoomed = workspace.zoomedPaneId, zoomed != pane.id { return false }
         let view = session.engine.view
-        return view.window === window && !view.isHiddenOrHasHiddenAncestor
-            && !view.frame.isEmpty && !view.visibleRect.isEmpty
+        return view.window === window && NavigationPresentationGate.allowsAcknowledgement(view, appActive: appActive)
     }
 
     static var places: [UUID: (destinations: Set<AttentionDestination>, view: WeakView)] = [:]
@@ -63,8 +62,7 @@ enum AttentionFocus {
         guard NSApp?.isActive == true else { return false }
         return places.values.contains { entry in
             guard entry.destinations.contains(destination), let view = entry.view.view,
-                  let window = view.window, window.isVisible, !window.isMiniaturized,
-                  window.isKeyWindow, !view.isHiddenOrHasHiddenAncestor, !view.visibleRect.isEmpty else { return false }
+                  NavigationPresentationGate.allowsAcknowledgement(view, appActive: NSApp?.isActive == true) else { return false }
             return true
         }
     }

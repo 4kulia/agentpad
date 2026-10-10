@@ -272,13 +272,8 @@ final class AgentPadWindowLayoutTests: XCTestCase {
             pane = try XCTUnwrap(store.splitPane(pane, orientation: .horizontal, in: workspace))
         }
 
-        let desired = AgentPadWindowLayout.minimumWindowWidth(
-            leftMode: store.sidebarMode,
-            expandedLeftWidth: store.sidebarWidth,
-            rightMode: store.rightSidebarMode,
-            expandedRightWidth: store.rightSidebarWidth,
-            terminalWidth: AgentPadWindowLayout.minimumTerminalTreeWidth(for: workspace.root)
-        )
+        // The left panel overlays before the split tree loses its minimum.
+        let desired = LeftNavigationLayout.railWidth + AgentPadWindowLayout.minimumTerminalTreeWidth(for: store.active?.root) + store.rightSidebarWidth + 1
         let expected = AgentPadWindowLayout.screenBoundMinimumWindowWidth(
             desiredWidth: desired,
             visibleScreenWidth: NSScreen.main?.visibleFrame.width
@@ -293,6 +288,26 @@ final class AgentPadWindowLayoutTests: XCTestCase {
             store.terminate()
         }
         XCTAssertEqual(try XCTUnwrap(controller.window).frame.width, expected, accuracy: 1)
+    }
+
+    func testDockedThreePaneWindowCanResizeIntoOverlayMode() throws {
+        let store = makeTestStore()
+        defer { store.terminate() }
+        let workspace = try XCTUnwrap(store.active)
+        let second = try XCTUnwrap(store.splitPane(try XCTUnwrap(workspace.activePane), orientation: .horizontal, in: workspace))
+        _ = try XCTUnwrap(store.splitPane(second, orientation: .horizontal, in: workspace))
+        let controller = AgentPadWindowController(windowId: UUID(), store: store)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setContentSize(NSSize(width: 1100, height: 720))
+        controller.updateMinimumWindowSize(expandIfNeeded: true, animate: false)
+        XCTAssertEqual(window.minSize.width, 602 + 58)
+        let size = controller.windowWillResize(window, to: NSSize(width: 800, height: 720))
+        XCTAssertEqual(size.width, 800, "The docked panel must not trap the window above its overlay threshold")
+        let layout = LeftNavigationLayout(preferences: store.leftNavigation, presentation: .init(),
+            availableWidth: size.width, panelWidth: store.sidebarDisplayWidth, minimumTreeWidth: 602)
+        XCTAssertTrue(layout.narrow)
+        XCTAssertEqual(layout.dockedPanelWidth, 0)
     }
 
 

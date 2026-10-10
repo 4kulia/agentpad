@@ -107,8 +107,8 @@ enum AgentProfileAdoption {
             result.assignments[candidate.tabID] = Assignment(candidate: candidate, profileID: id, folder: folder.url)
             if let conversation = candidate.conversationID {
                 result.bindings.append(AgentProfileBinding(profileID: id, record: AgentSessionRecord(
-                    agentId: candidate.rosterID, conversationId: conversation, title: candidate.title,
-                    cwd: folder.url, lastActivity: candidate.createdAt)))
+                    agentId: candidate.rosterID, conversationId: conversation, title: "",
+                    cwd: folder.url, lastActivity: .distantPast)))
             }
         }
         return result

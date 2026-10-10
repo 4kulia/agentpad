@@ -21,7 +21,6 @@ enum TeamUI {
         service.calls.onAccessRequest = { _, _ in AttentionCoordinator.shared.refreshSources() }
         service.calls.onIncomingCall = { _ in AttentionCoordinator.shared.refreshSources() }
         service.calls.onOutgoingFinished = { _ in AttentionCoordinator.shared.refreshSources() }
-        AttentionSidebarModel.shared.aggregates.dmSource = ChatDMAttentionSource()
         ChatNotifications.emit = { AttentionLedger.shared.upsert($0) }
         ChatNotifications.projectionChanged = { AttentionCoordinator.shared.refreshSources() }
         TeamWake.shared.add { ChatService.shared.socket?.reconnectNow(force: true, reason: .wake) }

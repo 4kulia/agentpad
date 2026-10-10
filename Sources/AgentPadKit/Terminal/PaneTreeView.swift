@@ -118,7 +118,7 @@ private struct PaneView: View {
                             }
                         }
                     }
-                    .popover(
+                    .attentionPopover(
                         isPresented: $contextMenuOpen,
                         attachmentAnchor: .point(contextMenuAnchor),
                         arrowEdge: .top
@@ -137,9 +137,10 @@ private struct PaneView: View {
                         if active.searchActive, active.hasProcess {
                             PaneSearchBar(
                                 session: active,
-                                isWorkspaceActive: store.activeWorkspaceId == workspace.id,
+                                isPaneActive: isFocused && store.activeWorkspaceId == workspace.id,
                                 onFocusGained: { store.focusPane(pane, in: workspace) }
                             )
+                            .id(active.id)
                             .padding(.top, Theme.space3)
                             .padding(.horizontal, Theme.space3)
                         }
@@ -889,7 +890,7 @@ private struct PopoverStatusSegment<Snapshot: Sendable, Label: View, Content: Vi
         .onHover { isHovered = $0 }
         .animation(.easeOut(duration: 0.12), value: isHovered)
         .animation(Theme.chromeTransition, value: presentation != nil || loadRequest != nil)
-        .popover(item: $presentation, arrowEdge: .bottom) { presented in
+        .attentionPopover(item: $presentation, arrowEdge: .bottom) { presented in
             AgentPadMenuList(width: popoverWidth, maxHeight: popoverMaxHeight) {
                 content(presented.value) { presentation = nil }
             }
@@ -1423,11 +1424,9 @@ private struct LinkPreviewBadge: View {
 
 private struct PaneSearchBar: View {
     @Bindable var session: Session
-    /// C2: this bar survives a workspace switch (nothing re-mounts), so the
-    /// `.onAppear` focus grab never re-runs on return — it re-claims the
-    /// keyboard when its workspace becomes the visible one again, and the
-    /// host's `syncFocus` yields to it (Codex P1).
-    let isWorkspaceActive: Bool
+    /// Surviving bars reclaim the keyboard when their pane becomes active,
+    /// including switches between panes in the same workspace.
+    let isPaneActive: Bool
     /// Called when the TextField gains focus so the parent can promote this
     /// pane to active. Without this, clicking a non-active pane's search bar
     /// leaves `WorkspaceStore.activePaneId` unchanged, and ⌘G / ⌘⇧G route
@@ -1521,10 +1520,7 @@ private struct PaneSearchBar: View {
         .onChange(of: focused) { _, isFocused in
             if isFocused { onFocusGained() }
         }
-        .onChange(of: isWorkspaceActive) { _, active in
-            // Workspace became visible again with this bar still open —
-            // re-claim the keyboard (the mount-time grab can't, C2 never
-            // re-mounts on a switch).
+        .onChange(of: isPaneActive) { _, active in
             if active { focused = true }
         }
     }
@@ -1556,11 +1552,13 @@ private struct PaneComposerBar: View {
     let pane: Pane
     let workspace: Workspace
     let store: WorkspaceStore
-    /// Bumped when this composer's workspace becomes visible again — C2 never
-    /// re-mounts on a switch, so the mount-time focus grab can't re-run; the
-    /// token tells the text view to re-claim the caret (Codex P1). The host's
-    /// `syncFocus` yields to open editors for the same reason.
-    @State private var workspaceRefocus = UUID()
+    /// The composer stays mounted across pane/workspace switches. Tell its
+    /// text view to reclaim the caret when this pane becomes active again.
+    @State private var paneRefocus = UUID()
+
+    private var isPaneActive: Bool {
+        store.activeWorkspaceId == workspace.id && workspace.activePaneId == pane.id
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1570,7 +1568,7 @@ private struct PaneComposerBar: View {
                 pane: pane,
                 workspace: workspace,
                 store: store,
-                refocusToken: workspaceRefocus,
+                refocusToken: paneRefocus,
                 onSend: send,
                 onCancel: close
             )
@@ -1614,8 +1612,8 @@ private struct PaneComposerBar: View {
             store.focusPane(pane, in: workspace)
         })
         .onAppear { store.focusPane(pane, in: workspace) }
-        .onChange(of: store.activeWorkspaceId) { _, active in
-            if active == workspace.id { workspaceRefocus = UUID() }
+        .onChange(of: isPaneActive) { _, active in
+            if active { paneRefocus = UUID() }
         }
     }
 
@@ -1725,7 +1723,7 @@ private struct ComposerTextView: NSViewRepresentable {
     let pane: Pane
     let workspace: Workspace
     let store: WorkspaceStore
-    /// Changes when the workspace becomes visible again with this composer
+    /// Changes when the pane becomes active again with this composer
     /// still open — `updateNSView` re-claims first responder for it.
     var refocusToken: UUID
     var onSend: () -> Void
@@ -1781,7 +1779,11 @@ private struct ComposerTextView: NSViewRepresentable {
             context.coordinator.lastRefocusToken = refocusToken
             // Deferred: the container was hidden a beat ago; take the caret
             // once the reveal has settled.
-            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+            DispatchQueue.main.async {
+                guard store.activeWorkspaceId == workspace.id, workspace.activePaneId == pane.id,
+                      !tv.isHiddenOrHasHiddenAncestor else { return }
+                tv.window?.makeFirstResponder(tv)
+            }
         }
         let coordinator = context.coordinator
         tv.onFocusGained = { [weak coordinator] in coordinator?.activatePane() }

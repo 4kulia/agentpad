@@ -10,15 +10,20 @@ enum AllSessionsLive {
             let status: AllSessionStatus = session?.hasCurrentAttentionFailure == true ? .error
                 : entry.state == .attention ? .needsInput : entry.state == .running ? .working : entry.state == .failed ? .error : .idle
             let record = AgentSessionRecord(agentId: entry.agent.rosterId, conversationId: entry.conversationId ?? session?.resumedConversationId ?? "",
-                title: entry.tabTitle, cwd: entry.directory, lastActivity: max(session?.hookStateAt ?? .distantPast, session?.catalogStartedAt ?? .distantPast))
-            return AllSessionItem(id: "own:\(entry.id)", record: record, source: .own(entry.id), status: status, title: entry.tabTitle)
+                title: entry.tabTitle, cwd: entry.directory, lastActivity: .distantPast)
+            let live = session.map { SessionDisplayMetadata.Live(session: $0) }
+                ?? .init(templateTitle: entry.agent.title, terminalTitle: entry.tabTitle)
+            return AllSessionItem(id: "own:\(entry.id)", record: record, source: .own(entry.id), status: status,
+                title: entry.tabTitle, liveMetadata: live)
         }
         result += external.sessions.map { session in
             let record = AgentSessionRecord(agentId: AgentTemplate.claudeCodeID, conversationId: session.sessionId,
-                title: session.displayTitle, cwd: session.cwd, lastActivity: session.statusSince ?? session.startedAt ?? .distantPast,
+                title: session.displayTitle, cwd: session.cwd, lastActivity: .distantPast,
                 automatic: session.kind == "background")
             let status: AllSessionStatus = session.monitorState == .attention ? .needsInput : session.monitorState == .running ? .working : .idle
-            return AllSessionItem(id: "external:" + session.id, record: record, source: .external(session), status: status, title: session.displayTitle)
+            return AllSessionItem(id: "external:" + session.id, record: record, source: .external(session), status: status,
+                title: session.displayTitle, liveMetadata: .init(templateTitle: AgentTemplate.claudeCode.title,
+                    terminalTitle: session.displayTitle, hookStateAt: session.statusSince, startedAt: session.startedAt))
         }
         return result
     }
@@ -109,6 +114,7 @@ struct AllSessionsTab: View {
             .task { if autoload { await model.start() } }
             .onChange(of: live, initial: true) { _, value in model.updateLive(value) }
             .onChange(of: model.catalog.revision) { _, _ in model.refilter() }
+            .onChange(of: model.profiles.bindings) { _, _ in model.refilter() }
             .onChange(of: model.names.values) { _, _ in model.refilter() }
             .onChange(of: model.query) { _, _ in model.refilter(debounce: true) }
             .onChange(of: model.renamingID) { _, id in focus = id.map(Focus.rename) }

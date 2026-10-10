@@ -85,7 +85,7 @@ final class TerminalAttentionTests: XCTestCase {
         AttentionList.items(ledger: ledger.events,
             current: .init(terminals: Dictionary(uniqueKeysWithValues: store.allSessions.map {
                 ($0.id, .init(episode: $0.attentionEpisode, failed: $0.hasCurrentAttentionFailure,
-                             finished: $0.hasCurrentAttentionCompletion, title: "Claude tab"))
+                             finished: $0.hasCurrentAttentionCompletion))
             })), settings: settings, viewed: ledger.viewedAttentionIDs)
     }
 

@@ -298,6 +298,8 @@ final class ChatService {
     }
 
     let files: ChatFiles
+    let orgCurrent = ChatOrgCurrent()
+    let attentionAggregates = AttentionAggregates()
     private let tokens: ChatTokenStore
     private(set) var token: String?
     /// The run journal; nil outside server mode or when it is damaged —
@@ -344,6 +346,8 @@ final class ChatService {
             return request.state.rawValue
         }
         installConversations()
+        attentionAggregates.dmSource = ChatDMAttentionSource(service: self, immediateInitialValue: false)
+        orgCurrent.follow(self)
     }
 
     /// Runs before the session is closed on `disconnect`, in the order added

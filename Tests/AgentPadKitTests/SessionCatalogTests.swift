@@ -116,6 +116,25 @@ final class SessionCatalogTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: namesURL), before)
         let loaded = try await names.load(); XCTAssertEqual(loaded.names[.init("claude-code", identifier("one"))], "Keep this")
     }
+    func testVersionThreeCachedFolderTitleIsReparsedFromClaudeTailTitle() throws {
+        let file = try SessionStoreFixtures.writeFile("\(identifier("ai-title")).jsonl", in: claude.appendingPathComponent("project"), lines: [
+            #"{"type":"user","cwd":"/tmp/project","message":{"content":"<pasted_content>Review the customer follow-up</pasted_content>"}}"#,
+            "{\"type\":\"assistant\",\"message\":{\"content\":\"" + String(repeating: "x", count: 300_000) + "\"}}",
+            #"{"type":"ai-title","aiTitle":"Customer follow-up"}"#
+        ])
+        _ = scan()
+        var old = SessionHeaderCache.load(cache)
+        old.parseVersion = 3
+        old.headers[file.path]?.record?.title = "Session in project"
+        old.headers[file.path]?.record?.agentTitle = nil
+        old.headers[file.path]?.record?.aiTitle = nil
+        try JSONEncoder().encode(old).write(to: cache)
+        let reads = CatalogCounter(), result = scan(reads)
+        XCTAssertEqual(reads.count, 1, "Unchanged transcripts must be reparsed after upgrading the title reader")
+        XCTAssertEqual(result.records.first?.title, "Customer follow-up")
+        XCTAssertEqual(result.records.first?.agentTitle, "Customer follow-up")
+    }
+
     func testSQLiteStoresReadWALAndAreQueriedOnEveryScan() throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let open = root.appendingPathComponent("opencode.db"), kiro = root.appendingPathComponent("kiro.sqlite")

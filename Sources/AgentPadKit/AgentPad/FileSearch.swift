@@ -182,7 +182,7 @@ private struct FileSearchRow: View {
         .onTapGesture { onSelect(hit.url) }
         .onDrag { NSItemProvider(object: hit.url as NSURL) }
         .overlay(RightClickCatcher { _ in isMenuOpen = true })
-        .popover(isPresented: $isMenuOpen, arrowEdge: .trailing) {
+        .attentionPopover(isPresented: $isMenuOpen, arrowEdge: .trailing) {
             VStack(alignment: .leading, spacing: 0) {
                 RevealInFinderMenuRow(url: hit.url) { isMenuOpen = false }
                 AgentPadMenuRow(title: "Copy Path", localizesTitle: false) {

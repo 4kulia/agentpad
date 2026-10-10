@@ -128,7 +128,7 @@ struct ChatMessageRow: View {
             if active && editing == nil { hoverActions.padding(.trailing, inThread ? 8 : 20).offset(y: -12).onHover { toolbarHovering = $0 } }
         }
         .contextMenu { menu }
-        .popover(isPresented: $showingReactions) {
+        .attentionPopover(isPresented: $showingReactions) {
             if let b1 = model.b1, b1.supports("chat.reactions"), b1.state.accessible { ChatReactionPicker(b1: b1, message: message.id) }
         }
         .accessibilityElement(children: .contain)

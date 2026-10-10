@@ -24,6 +24,8 @@ struct SearchEverywhereField: View {
             .onChange(of: model.query) { _, _ in model.update() }
             .onChange(of: [store.active?.id, store.active?.activePaneId, store.active?.activeSession?.id]) { _, _ in model.dismiss() }
             .onChange(of: model.names.values) { _, _ in model.localSearch() }
+            .onChange(of: model.profiles.bindings) { _, _ in model.localSearch() }
+            .onChange(of: model.liveSessions()) { _, _ in model.localSearch() }
             .onChange(of: model.catalog.revision) { _, _ in model.localSearch() }
             .onChange(of: ChatOrgCurrent.identity()) { _, _ in
                 model.connectionChanged()
@@ -83,12 +85,12 @@ struct SearchSuggestionsView: View {
                         heading("Agent sessions")
                         if model.localLoading { ProgressView().controlSize(.small).padding(8) }
                         ForEach(Array(model.local.prefix(3))) { hit in
-                            row("l:" + hit.id) { localRow(hit, names: model.names.values) }
+                            row("l:" + hit.id) { localRow(hit) }
                         }
                         ForEach(Array(model.metadata.prefix(3))) { record in
                             row("d:" + record.id) {
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(record.resolvedTitle(manual: model.names.values[record.nameKey])).lineLimit(1)
+                                    Text(record.title).lineLimit(1)
                                     Text("Metadata · \(record.agentId) · \(record.cwdPath)").font(.caption).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
                                 }
                             }
@@ -115,9 +117,9 @@ struct SearchSuggestionsView: View {
     }
     private func heading(_ text: String) -> some View { Text(text).font(Theme.display(10, weight: .semibold)).foregroundStyle(ChatAppearance.secondary).padding(.horizontal, 9).padding(.top, 9) }
     private func noticeText(_ text: String) -> some View { Text(text).font(.caption).foregroundStyle(ChatAppearance.secondary).padding(9) }
-    private func localRow(_ hit: LocalSearchHit, names: [SessionNameKey: String]) -> some View {
+    private func localRow(_ hit: LocalSearchHit) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(hit.record.resolvedTitle(manual: names[hit.record.nameKey])).font(Theme.display(12, weight: .medium)).lineLimit(1)
+            Text(model.displayMetadata(for: hit.record).title).font(Theme.display(12, weight: .medium)).lineLimit(1)
             SearchSnippetText(text: hit.turn.text, query: model.query)
             Text("\(hit.record.agentId) · Turn \(hit.turn.ordinal)\(hit.record.automatic ? " · Automatic" : "")").font(.caption).foregroundStyle(ChatAppearance.secondary)
         }

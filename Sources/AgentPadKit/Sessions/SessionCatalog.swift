@@ -3,8 +3,8 @@ import GRDB
 import Observation
 
 struct SessionHeaderCache: Codable {
-    // Version 1 could cache I/O failures as non-sessions. Discard those entries.
-    static let parseVersion = 2
+    // Version 4 reads large first-user lines and appended metadata from the tail.
+    static let parseVersion = 4
     struct Fingerprint: Codable, Equatable {
         var inode: UInt64
         var size: Int64
@@ -57,11 +57,12 @@ enum SessionCatalogScanner {
                      onRead: @Sendable (URL) -> Void = { _ in },
                      collect: @Sendable (AgentSessionScanner.Store, URL) -> [AgentSessionRecord] = { $0.collect($1) },
                      progress: @Sendable (Progress) -> Void = { _ in }) -> Progress {
+        let scannedAt = Date()
         let old = SessionHeaderCache.load(cacheURL)
         var cache = SessionHeaderCache(), records: [String: AgentSessionRecord] = [:]
         var discovered: [AgentSessionRecord] = []
         func include(_ record: AgentSessionRecord) {
-            var record = record
+            var record = record.scanned(at: scannedAt)
             if automatic.contains(record.conversationId) { record.automatic = true }
             records[record.id] = record
             discovered.append(record)
@@ -134,7 +135,7 @@ final class SessionCatalog {
     typealias Scan = @Sendable (@escaping @Sendable (SessionCatalogScanner.Progress) -> Void) -> SessionCatalogScanner.Progress
     @ObservationIgnored private let scan: Scan
     @ObservationIgnored private(set) var records: [AgentSessionRecord] = []
-    @ObservationIgnored private var recordKeys: Set<SessionNameKey> = []
+    @ObservationIgnored private var recordsByKey: [SessionNameKey: AgentSessionRecord] = [:]
     private(set) var revision = 0
     private(set) var isScanning = false
     private(set) var scanned = 0
@@ -170,11 +171,16 @@ final class SessionCatalog {
     }
     func count(including live: [AllSessionItem]) -> Int {
         _ = revision
-        return records.count + live.count - Set(live.filter(\.canRename).map { $0.record.nameKey }).intersection(recordKeys).count
+        return records.count + live.count - Set(live.filter(\.canRename).map { $0.record.nameKey }).filter { recordsByKey[$0] != nil }.count
+    }
+    func record(for key: SessionNameKey) -> AgentSessionRecord? {
+        _ = revision
+        return recordsByKey[key]
     }
     private func apply(_ update: SessionCatalogScanner.Progress) {
         do { try profiles?.discover(update.discoveredRecords ?? update.records) } catch { /* Profiles expose discovery/save errors. */ }
-        recordKeys = Set(update.records.map(\.nameKey))
+        recordsByKey = Dictionary(update.records.map { ($0.nameKey, $0) },
+            uniquingKeysWith: { a, b in a.lastActivity >= b.lastActivity ? a : b })
         records = update.records; scanned = update.scanned; total = update.total; skipped = update.skipped; revision += 1
     }
     private func schedule() {

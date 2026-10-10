@@ -62,15 +62,18 @@ enum PaletteItemKind: Hashable, Sendable {
     /// Open a recently used project folder as a new workspace in the
     /// active window (issue #28 — "pick from my projects" without ⌘O).
     case openRecentFolder(path: String)
+    case navigation(LeftNavigationCommand)
+    case attention
 }
 
 struct PaletteItem: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
-    let subtitle: String
+    var subtitle: String
     let kind: PaletteItemKind
     let symbol: String
     let iconAsset: String?
+    var attentionSummary: String? = nil
 }
 
 @MainActor
@@ -93,7 +96,12 @@ enum PaletteIndex {
         recentFolders: [URL] = [],
         bundle: Bundle = .agentPadResources
     ) -> Snapshot {
-        var items: [PaletteItem] = []
+        var items = LeftNavigationCommand.allCases.map {
+            PaletteItem(id: "navigation-\($0.rawValue)", title: $0.title, subtitle: "Navigation in this window",
+                        kind: .navigation($0), symbol: "sidebar.left", iconAsset: nil)
+        }
+        items.append(PaletteItem(id: "needs-attention", title: "Needs attention", subtitle: "Find tabs and workspaces needing attention",
+                                 kind: .attention, symbol: "exclamationmark.circle", iconAsset: nil))
         var worktrees: [UUID: URL] = [:]
         let multiWindow = controllers.count > 1
         for (idx, controller) in controllers.enumerated() {
@@ -128,14 +136,11 @@ enum PaletteIndex {
                 }
                 for pane in ws.root.allPanes {
                     for tab in pane.tabs {
-                        if let ref = tab.channel {
-                            guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key),
-                                  ChatNotifications.allowed(.shared, key, channel: ref.channel) else { continue }
-                        }
-                        if case .directMessage(let ref) = tab.toolRoute, ref.key.map({ ChatService.shared.dmAllowed($0, ref.dm) }) != true { continue }
+                        let prepared = AttentionSidebarModel.shared.projection.tabs[tab.id]
+                        guard prepared?.available ?? tab.hasProcess else { continue }
                         items.append(PaletteItem(
                             id: "tab-\(tab.id.uuidString)",
-                            title: tab.title,
+                            title: AttentionSidebarModel.shared.tabTitle(tab),
                             subtitle: String.localizedStringWithFormat(
                                 String(localized: "tab in %@", bundle: bundle),
                                 ws.title
@@ -223,7 +228,13 @@ enum PaletteIndex {
     /// show on first open. Pure; `nonisolated` so tests can call it without
     /// hopping to the main actor.
     nonisolated static func match(query: String, in items: [PaletteItem], limit: Int = 20) -> [PaletteItem] {
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        var trimmed = query.trimmingCharacters(in: .whitespaces)
+        var items = items
+        let attentionPrefix = "needs attention"
+        if trimmed.lowercased().hasPrefix(attentionPrefix) {
+            items = items.filter { $0.attentionSummary != nil }
+            trimmed = String(trimmed.dropFirst(attentionPrefix.count)).trimmingCharacters(in: .whitespaces)
+        }
         if trimmed.isEmpty {
             return Array(items.prefix(limit))
         }

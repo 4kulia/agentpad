@@ -4,29 +4,33 @@ struct AttentionSidebarSection: View {
     @Bindable var store: WorkspaceStore
     var model = AttentionSidebarModel.shared
     var title = "Needs attention"
+    var alwaysShowsHeader = false
     var body: some View {
-        AttentionSectionContent(title: title, items: model.items,
+        AttentionSectionContent(title: title, items: model.items, alwaysShowsHeader: alwaysShowsHeader,
             collapsed: Binding(get: { store.chatSidebarPreferences.attentionCollapsed ?? false },
                                set: { store.chatSidebarPreferences.attentionCollapsed = $0; store.scheduleSave() }),
             expanded: $store.attentionExpanded,
             activate: { model.activate($0, from: store) }, secondary: model.secondary,
-            settings: { SupportTabs.shared.navigation.open(.settings, from: store, section: .notifications) })
+            settings: { SupportTabs.shared.navigation.open(.settings, from: store, section: .notifications) },
+            itemTitle: model.title)
     }
 }
 
 struct AttentionSectionContent: View {
     var title = "Needs attention"
     var items: [AttentionItem]
+    var alwaysShowsHeader = false
     @Binding var collapsed: Bool
     @Binding var expanded: Bool
     var activate: (AttentionItem) -> Void
     var secondary: (AttentionItem) -> Void
     var settings: () -> Void
+    var itemTitle: (AttentionItem) -> String = { $0.title }
     @FocusState private var focused: String?
     @State private var hovered: String?
 
     var body: some View {
-        if !items.isEmpty {
+        if alwaysShowsHeader || !items.isEmpty {
             let visible = AttentionList.visible(items, expanded: expanded, collapsed: collapsed)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 5) {
@@ -42,11 +46,12 @@ struct AttentionSectionContent: View {
                         .buttonStyle(.plain).help("Needs attention settings").accessibilityLabel("Needs attention settings")
                 }.foregroundStyle(ChatAppearance.attention).padding(.horizontal, 7).padding(.vertical, 6)
                 ForEach(visible) { item in
+                    let title = itemTitle(item)
                     HStack(spacing: 3) {
                         Button { activate(item) } label: {
                             HStack(spacing: 8) {
                                 if let id = item.subjectID, !id.isEmpty {
-                                    ContactAvatar(stableID: id, name: item.subjectName ?? item.title,
+                                    ContactAvatar(stableID: id, name: item.subjectName ?? title,
                                                   kind: item.subjectIsAgent ? .agent : .person, size: 24, localProfileID: item.localProfileID, remote: item.remoteAvatar)
                                 } else {
                                     Image(systemName: item.tier == 3 ? "at" : item.tier == 2 ? "exclamationmark.triangle" : "hand.raised")
@@ -54,14 +59,14 @@ struct AttentionSectionContent: View {
                                         .foregroundStyle(item.tier == 2 ? Color.red : ChatAppearance.attention)
                                 }
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(item.title).font(Theme.display(12, weight: .medium)).lineLimit(1)
+                                    Text(title).font(Theme.display(12, weight: .medium)).lineLimit(1)
                                     Text(item.subtitle.isEmpty ? "Needs your attention" : item.subtitle)
                                         .font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary).lineLimit(2)
                                 }
                                 Spacer(minLength: 0)
                             }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                         }.buttonStyle(.plain).disabled(item.inFlight).focused($focused, equals: item.id)
-                            .accessibilityLabel("\(item.subtitle), \(item.title)").chatFocusRing()
+                            .accessibilityLabel("\(item.subtitle), \(title)").chatFocusRing()
                         if let action = item.secondary {
                             Button { secondary(item) } label: {
                                 Image(systemName: action == .dismiss ? "xmark" : "checkmark").font(.system(size: 10))

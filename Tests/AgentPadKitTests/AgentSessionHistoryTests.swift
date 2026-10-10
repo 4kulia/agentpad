@@ -49,13 +49,31 @@ final class AgentSessionScannerTests: XCTestCase {
         XCTAssertEqual(record.conversationId, file.deletingPathExtension().lastPathComponent)
     }
 
-    func testClaudeRecordPrefersFirstPromptBeforeSummary() throws {
+    func testClaudeRecordUsesLatestAITitleAndAlwaysPrefersCustomTitle() throws {
+        let dir = claudeRoot.appendingPathComponent("-tmp-proj")
+        // The owner's transcript begins with pasted content and reports an
+        // ai-title. Also exercise the parser's fast path after a plain prompt.
+        for prompt in ["<pasted_content>Review the customer follow-up</pasted_content>", "Review the customer follow-up"] {
+            let lines = [claudeUserLine(text: prompt),
+                #"{"type":"ai-title","aiTitle":"Initial title"}"#,
+                #"{"type":"ai-title","aiTitle":"Customer follow-up"}"#]
+            let file = try writeFile("\(UUID()).jsonl", in: dir, lines: lines)
+            let record = try XCTUnwrap(AgentSessionScanner.claudeRecord(file: file, mtime: Date()))
+            XCTAssertEqual(record.title, "Customer follow-up")
+            XCTAssertEqual(record.agentTitle, "Customer follow-up")
+            let renamed = try writeFile("\(UUID()).jsonl", in: dir, lines:
+                [#"{"type":"custom-title","customTitle":"My custom title"}"#] + lines)
+            XCTAssertEqual(AgentSessionScanner.claudeRecord(file: renamed, mtime: Date())?.title, "My custom title")
+        }
+    }
+
+    func testClaudeRecordPrefersSummaryBeforeFirstPrompt() throws {
         let dir = claudeRoot.appendingPathComponent("-tmp-proj")
         let withSummary = try writeFile("\(UUID().uuidString).jsonl", in: dir, lines: [
             #"{"type":"summary","summary":"compact summary"}"#,
             claudeUserLine(text: "raw prompt"),
         ])
-        XCTAssertEqual(AgentSessionScanner.claudeRecord(file: withSummary, mtime: Date())?.title, "raw prompt")
+        XCTAssertEqual(AgentSessionScanner.claudeRecord(file: withSummary, mtime: Date())?.title, "compact summary")
 
         let userOnly = try writeFile("\(UUID().uuidString).jsonl", in: dir, lines: [
             claudeUserLine(text: "raw prompt"),
@@ -97,6 +115,63 @@ final class AgentSessionScannerTests: XCTestCase {
         let title = try XCTUnwrap(AgentSessionScanner.claudeRecord(file: file, mtime: Date())?.title)
         XCTAssertFalse(title.contains("\n"), "interior newlines must not survive into composed UI strings")
         XCTAssertLessThanOrEqual(title.count, 160)
+    }
+
+    func testClaudeTailReadsLatestCustomAITitleAndSummaryAcrossPartialLine() throws {
+        let dir = claudeRoot.appendingPathComponent("-tmp-proj")
+        let filler = "{\"type\":\"assistant\",\"message\":{\"content\":\"" + String(repeating: "x", count: 300_000) + "\"}}"
+        let file = try writeFile("\(UUID()).jsonl", in: dir, lines: [
+            claudeUserLine(text: "Original prompt"),
+            "{\"type\":\"summary\",\"summary\":\"Old summary\"}", filler,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Latest AI\"}",
+            "{\"type\":\"custom-title\",\"customTitle\":\"Custom name\"}",
+            "{\"type\":\"summary\",\"summary\":\"Latest summary\"}"
+        ])
+        let record = try XCTUnwrap(AgentSessionScanner.claudeRecord(file: file, mtime: Date()))
+        XCTAssertEqual(record.title, "Custom name")
+        XCTAssertEqual(record.customTitle, "Custom name")
+        XCTAssertEqual(record.aiTitle, "Latest AI")
+        XCTAssertEqual(record.summary, "Latest summary")
+        XCTAssertEqual(record.firstPrompt, "Original prompt")
+    }
+
+    func testClaudeHeadReadsTitlesAfterFirstPromptOutsideTail() throws {
+        let dir = claudeRoot.appendingPathComponent("-tmp-csm_agent")
+        let filler = "{\"type\":\"assistant\",\"message\":{\"content\":\"" + String(repeating: "x", count: 300_000) + "\"}}"
+        let file = try writeFile("\(UUID()).jsonl", in: dir, lines: [
+            claudeUserLine(text: "Original prompt", cwd: "/tmp/csm_agent"), filler,
+            #"{"type":"custom-title","customTitle":"csm_agent"}"#,
+            #"{"type":"ai-title","aiTitle":"Head AI title"}"#,
+            #"{"type":"summary","summary":"Head summary"}"#, filler,
+            claudeUserLine(text: "Later prompt", cwd: "/wrong")
+        ])
+        let record = try XCTUnwrap(AgentSessionScanner.claudeRecord(file: file, mtime: Date()))
+        XCTAssertEqual(record.customTitle, "csm_agent")
+        XCTAssertEqual(record.aiTitle, "Head AI title")
+        XCTAssertEqual(record.summary, "Head summary")
+        XCTAssertEqual(record.title, "csm_agent")
+        XCTAssertEqual(record.firstPrompt, "Original prompt")
+        XCTAssertEqual(record.cwd.path, "/tmp/csm_agent")
+    }
+
+    func testClaudeHeadIsBoundedAndKeepsFirstDisplayableUser() throws {
+        let dir = claudeRoot.appendingPathComponent("-tmp-proj")
+        let file = try writeFile("\(UUID()).jsonl", in: dir, lines: [
+            claudeUserLine(text: "First prompt"),
+            claudeUserLine(text: "Must not replace first prompt", cwd: "/wrong")
+        ])
+        var visited = 0
+        try AgentSessionScanner.readLines(of: file, limit: AgentSessionScanner.claudeHeadByteLimit) { _ in
+            visited += 1; return false
+        }
+        XCTAssertEqual(visited, 1)
+        let record = try XCTUnwrap(AgentSessionScanner.claudeRecord(file: file, mtime: Date()))
+        XCTAssertEqual(record.firstPrompt, "First prompt")
+        XCTAssertEqual(record.cwd.path, "/tmp/proj")
+        let oversized = try writeFile("\(UUID()).jsonl", in: dir, lines: [
+            String(repeating: "x", count: AgentSessionScanner.claudeHeadByteLimit), claudeUserLine(text: "Outside cap")
+        ])
+        XCTAssertNil(AgentSessionScanner.claudeRecord(file: oversized, mtime: Date()), "The tail must not invent cwd from later user lines")
     }
 
     // MARK: Codex parsing

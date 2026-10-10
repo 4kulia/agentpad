@@ -8,6 +8,7 @@ struct ChatDMEntry: Equatable, Identifiable {
     var roots: ChatUnread.Count
     var replies: Int
     var hasMessages: Bool
+    var readMarks: [String: Int] = [:]
     var id: String { card.dmId }
     var unread: Bool { roots.count > 0 || roots.more || roots.something || replies > 0 }
     var badge: String? {
@@ -34,7 +35,7 @@ struct ChatDMEntry: Equatable, Identifiable {
             let muted = try Bool.fetchOne(db, sql: "SELECT muted FROM dm_preferences WHERE dm_id = ?", arguments: [card.dmId]) ?? false
             return Self(card: card, lastUsed: last,
                 roots: .init(count: roots, more: hasEarlier && mark < oldest, something: pending, muted: muted),
-                replies: replies, hasMessages: !all.isEmpty || hasEarlier)
+                replies: replies, hasMessages: !all.isEmpty || hasEarlier, readMarks: marks)
         }.sorted { $0.lastUsed == $1.lastUsed ? $0.id < $1.id : $0.lastUsed > $1.lastUsed }
     }
 }

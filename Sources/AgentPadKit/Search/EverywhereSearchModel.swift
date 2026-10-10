@@ -72,7 +72,7 @@ final class EverywhereSearchModel {
         if allowedQuickIndex == nil {
             allowedQuickIndex = withObservationTracking {
                 let allowed = quickAllowedIDs(quickIndex)
-                return quickIndex.filter { allowed.contains($0.id) }
+                return quickReadouts(quickIndex.filter { allowed.contains($0.id) })
             } onChange: { [weak self] in
                 // All permission/window dependencies are MainActor state. Drop
                 // both caches synchronously, before another read or activation.
@@ -109,9 +109,12 @@ final class EverywhereSearchModel {
     let indexing: SearchIndexController
     let catalog: SessionCatalog
     let names: SessionNames
+    let profiles: AgentProfileStore
+    @ObservationIgnored var liveSessions: @MainActor () -> [AllSessionItem] = { AllSessionsLive.snapshot() }
     @ObservationIgnored let visibility: @Sendable () -> ChannelConversationFilter
     @ObservationIgnored var quickItems: @Sendable () -> [PaletteItem] = { [] }
     var quickAllowedIDs: ([PaletteItem]) -> Set<String> = { Set($0.map(\.id)) }
+    var quickReadouts: ([PaletteItem]) -> [PaletteItem] = { $0 }
     @ObservationIgnored var matchQuick: (String, [PaletteItem]) -> [PaletteItem] = { PaletteIndex.match(query: $0, in: $1, limit: 6) }
     @ObservationIgnored var activateQuick: (PaletteItem) -> Void = { _ in }
     @ObservationIgnored var openResults: () -> Void = {}
@@ -122,10 +125,10 @@ final class EverywhereSearchModel {
     @ObservationIgnored private var quickTask: Task<Void, Never>?
     @ObservationIgnored private var serial = UUID()
     init(messages: ChatSearchModel = ChatSearchModel(), indexing: SearchIndexController = .shared,
-         catalog: SessionCatalog = .shared, names: SessionNames = .shared,
+         catalog: SessionCatalog = .shared, names: SessionNames = .shared, profiles: AgentProfileStore = .shared,
          visibility: @escaping @Sendable () -> ChannelConversationFilter = { .current() }) {
         self.messages = messages; self.indexing = indexing; self.catalog = catalog; self.names = names
-        self.visibility = visibility
+        self.visibility = visibility; self.profiles = profiles
         messages.onInvalidation = { [weak self] in self?.serverSearch(debounce: true) }
         observeIndex(); indexing.start()
     }
@@ -181,6 +184,7 @@ final class EverywhereSearchModel {
         guard source != .messages, let parsed = try? SearchQuery(query) else { localLoading = false; return }
         let index = indexing.index, filter = filter, cursor = more ? localNext : nil
         let records = catalog.records, names = names.values, metadataLimit = metadataLimit, visibility = visibility
+        let bindings = profiles.bindings.map(\.record), live = liveSessions()
         localLoading = true
         localTask = Task { [weak self] in
             guard let self else { return }
@@ -189,7 +193,8 @@ final class EverywhereSearchModel {
                 let result = try await index.search(parsed, filter: filter, cursor: cursor)
                 let metadata = await Task.detached(priority: .utility) {
                     let policy = visibility()
-                    return Self.metadataMatches(records: policy.apply(records), names: names, query: parsed.text, filter: filter, limit: metadataLimit)
+                    return Self.metadataMatches(records: policy.apply(records), names: names, query: parsed.text, filter: filter, limit: metadataLimit,
+                        bindings: policy.apply(bindings), live: live.filter { policy.allows(agentId: $0.record.agentId, conversationId: $0.record.conversationId) })
                 }.value
                 guard !Task.isCancelled, serial == id else { return }
                 let state = await index.snapshot()
@@ -201,11 +206,28 @@ final class EverywhereSearchModel {
             }
         }
     }
-    nonisolated static func metadataMatches(records: [AgentSessionRecord], names: [SessionNameKey: String], query: String, filter: LocalSearchFilter, limit: Int = 20) -> [AgentSessionRecord] {
+    /// Text-index hits use the same current metadata as catalog-only results.
+    func displayMetadata(for record: AgentSessionRecord) -> SessionDisplayMetadata {
+        let binding = profiles.binding(agentID: record.agentId, conversationID: record.conversationId)?.record
+        var live = liveSessions().first { $0.record.nameKey == record.nameKey }?.liveMetadata ?? .init()
+        live.manualTitle = names.values[record.nameKey]
+        return SessionDisplayMetadata.resolve(catalog: catalog.record(for: record.nameKey) ?? record, binding: binding,
+            live: live, folderName: (binding ?? record).cwd.lastPathComponent)
+    }
+
+    nonisolated static func metadataMatches(records: [AgentSessionRecord], names: [SessionNameKey: String], query: String,
+                                           filter: LocalSearchFilter, limit: Int = 20,
+                                           bindings: [AgentSessionRecord] = [], live: [AllSessionItem] = []) -> [AgentSessionRecord] {
         guard filter.from == nil, filter.to == nil else { return [] }
         var filters = AllSessionsFilterState(); filters.hideAutomatic = false; filters.tool = filter.agent; filters.folder = nil
-        let records = records.filter { record in filter.normalizedFolder.map { $0 == record.cwd.standardizedFileURL.resolvingSymlinksInPath().path } ?? true }
-        return Array(AllSessionsList.filter(records: records, live: [], names: names, query: query, filters: filters).items.prefix(limit).map(\.record))
+        func inFolder(_ record: AgentSessionRecord) -> Bool {
+            filter.normalizedFolder.map { $0 == record.cwd.standardizedFileURL.resolvingSymlinksInPath().path } ?? true
+        }
+        var conversations = Set<SessionNameKey>()
+        let items = AllSessionsList.filter(records: records.filter(inFolder), live: live.filter { $0.canRename && inFolder($0.record) },
+            names: names, query: query, filters: filters, bindings: bindings.filter(inFolder)).items
+        // All sessions has one row per process; search has one per conversation.
+        return Array(items.filter { conversations.insert($0.record.nameKey).inserted }.prefix(limit).map(\.record))
     }
     var choices: [String] {
         quick.map { "q:" + $0.id } + messages.hits.prefix(3).map { "m:" + $0.id } + local.prefix(3).map { "l:" + $0.id } + metadata.prefix(3).map { "d:" + $0.id }

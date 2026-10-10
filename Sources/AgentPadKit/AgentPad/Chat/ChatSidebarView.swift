@@ -21,6 +21,7 @@ struct ChatSidebarModePicker: View {
     let store: WorkspaceStore
     var compact: Bool
     let model: ChatOrgModel?
+    var includesNewWorkspace = false
 
     var body: some View {
         let mentions = model?.mentionsForBadge ?? 0
@@ -28,15 +29,16 @@ struct ChatSidebarModePicker: View {
             Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
             let layout = compact ? AnyLayout(VStackLayout(spacing: 3)) : AnyLayout(HStackLayout(spacing: 3))
             layout {
-                mode(.workspaces, title: "Sessions", icon: "rectangle.stack",
-                     badge: compact && !AttentionSidebarModel.shared.items.isEmpty ? "•" : nil)
+                if includesNewWorkspace { NewWorkspaceDropZone(store: store, isCompact: compact) }
+                if !store.leftNavigation.railVisible {
+                    mode(.workspaces, title: "Workspaces", icon: "rectangle.stack")
+                }
                 mode(.files, title: "Files", icon: "folder")
                 mode(.team, title: "Team", icon: "person.2", badge: teamNeedsAttention ? "•" : nil)
                 mode(.chat, title: "Chat", icon: "bubble.left.and.bubble.right",
-                     badge: compact && !AttentionSidebarModel.shared.items.isEmpty ? "•" : mentions > 0 ? "\(mentions)" : nil)
+                     badge: mentions > 0 ? "\(mentions)" : nil)
             }.padding(.horizontal, compact ? 4 : 9).padding(.top, 9).padding(.bottom, 12)
         }
-        .task(id: ChatOrgCurrent.identity()) { ChatOrgCurrent.shared.refresh() }
     }
 
     private var teamNeedsAttention: Bool {
@@ -46,14 +48,17 @@ struct ChatSidebarModePicker: View {
     }
 
     private func mode(_ content: SidebarContent, title: String, icon: String, badge: String? = nil) -> some View {
-        let active = store.sidebarContent == content
-        return Button { store.setSidebarContent(content) } label: {
+        let active = content != .workspaces && store.sidebarContent == content && store.panelIsPresented
+        return Button {
+            if content == .workspaces { store.openWorkspaceList() }
+            else if let panel = LeftNavigationPreferences.Panel(rawValue: content.rawValue) { store.selectNavigationPanel(panel) }
+        } label: {
             VStack(spacing: 4) {
                 Image(systemName: icon).font(.system(size: 17))
                     .foregroundStyle(active ? ChatSidebarStyle.accent : ChatSidebarStyle.secondary)
                 if !compact { Text(title).font(Theme.display(9, weight: active ? .semibold : .regular)) }
             }
-            .frame(maxWidth: .infinity).frame(height: compact ? 36 : 48)
+            .frame(maxWidth: .infinity).frame(height: compact ? 40 : 48)
             .background(active ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 7))
             .contentShape(Rectangle())
         }
@@ -95,7 +100,6 @@ struct ChatSidebarView: View {
         let snapshot = snapshot
         sidebar(snapshot)
         .task(id: ChatOrgCurrent.identity()) {
-            ChatOrgCurrent.shared.refresh()
             navigation.adopt(ChatOrgCurrent.identity())
             openCreated()
         }
@@ -157,7 +161,7 @@ struct ChatSidebarView: View {
         .padding(.horizontal, 16).padding(.top, 17).padding(.bottom, 15)
         .accessibilityLabel("Organization and connection")
         .accessibilityValue("\(orgName), \(connection.text)")
-        .popover(isPresented: $organizationMenu, arrowEdge: .bottom) {
+        .attentionPopover(isPresented: $organizationMenu, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 12) {
                 if case .ready = snapshot.state, let me = model?.members.first(where: { $0.accountId == model?.me }) {
                     Text("\(me.name) · @\(me.handle)").font(Theme.display(12))
@@ -225,7 +229,7 @@ struct ChatSidebarView: View {
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    AttentionSidebarSection(store: store, model: attention, title: "Attention")
+                    AttentionSidebarSection(store: store, model: attention, alwaysShowsHeader: true)
                     if case .ready = snapshot.state {
                         heading("Channels")
                         savedViews(snapshot)

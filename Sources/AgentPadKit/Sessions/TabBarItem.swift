@@ -15,13 +15,17 @@ struct TabBarItem: View {
     let onMoveToNewWindow: () -> Void
     var onLastAnswer: (Bool) -> Void = { _ in }
 
+    var attention = AttentionSidebarModel.shared
+    private var indicator: AttentionIndicator? { attention.tabIndicators[tab.id] }
+    private var title: String { attention.tabTitle(tab) }
+
     @State private var isHovered = false
     @State private var isContextMenuOpen = false
 
     var body: some View {
         HStack(spacing: 7) {
             HStack(spacing: 7) {
-                commandStatusDot
+                AttentionIndicatorView(indicator: indicator)
                 // AgentPad: saved chat lists have their own navigation symbols.
                 AgentIconView(asset: tab.hasProcess ? tab.displayAgent.iconAsset : nil,
                               fallbackSymbol: tab.toolRoute?.symbol ?? tab.inbox?.kind.symbol ?? tab.displayAgent.symbol, size: 15)
@@ -30,7 +34,7 @@ struct TabBarItem: View {
                         onRename(text); return nil
                     }.frame(minWidth: 100)
                 } else {
-                    Text(tab.title)
+                    Text(title)
                     .font(Theme.display(12, weight: isActive ? .medium : .regular))
                     .lineLimit(1)
                 }
@@ -58,7 +62,9 @@ struct TabBarItem: View {
         .background(rowBackground)
         .clipShape(RoundedRectangle(cornerRadius: Theme.chromeSelectionCornerRadius, style: .continuous))
         .contentShape(Rectangle())
-        .accessibilityLabel(tab.title)
+        .accessibilityLabel("\(title), tab")
+        .accessibilityValue((isActive ? "Selected, " : "Not selected, ") + (indicator?.accessibleSummary ?? "No new marks"))
+        .help(title + (indicator.map { "\n" + attention.tooltip($0) } ?? ""))
         .accessibilityIdentifier("workspace-tab-" + tab.id.uuidString)
         .onTapGesture(perform: onActivate)
         .onHover { isHovered = $0 }
@@ -71,7 +77,7 @@ struct TabBarItem: View {
         .animation(.easeOut(duration: 0.12), value: isHovered)
         .overlay(RightClickCatcher { _ in isContextMenuOpen = true })
         .overlay(MiddleClickCatcher { onClose() })
-        .popover(isPresented: $isContextMenuOpen, arrowEdge: .bottom) {
+        .attentionPopover(isPresented: $isContextMenuOpen, arrowEdge: .bottom) {
             // AgentPad: keep the export explanation inside a bounded tab menu.
             AgentPadTabMenu(tab: tab, canCloseToRight: canCloseToRight,
                 dismiss: { isContextMenuOpen = false }, onClose: onClose,
@@ -88,32 +94,6 @@ struct TabBarItem: View {
         if isActive { return Theme.chromeSelection }
         if isHovered { return Theme.chromeHover }
         return .clear
-    }
-
-    /// Shows only on non-zero exit. Successful runs intentionally leave the
-    /// row clean — a green dot on every command would dominate the chrome.
-    @ViewBuilder
-    private var commandStatusDot: some View {
-        if let exit = tab.lastCommandExit, exit != 0 {
-            Circle()
-                .fill(Theme.activityFailure)
-                .frame(width: 5, height: 5)
-                .help(Self.statusTooltip(exit: exit, duration: tab.lastCommandDuration))
-        }
-    }
-
-    private static func statusTooltip(exit: Int, duration: TimeInterval?) -> String {
-        guard let duration else {
-            return String.localizedStringWithFormat(
-                String(localized: "exit %d", bundle: .agentPadResources),
-                exit
-            )
-        }
-        return String.localizedStringWithFormat(
-            String(localized: "exit %d · %@", bundle: .agentPadResources),
-            exit,
-            formatDuration(duration)
-        )
     }
 
     /// Internal: the Session Info inspector renders the same OSC 133;D

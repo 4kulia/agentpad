@@ -112,6 +112,8 @@ struct AttentionEvent: Identifiable, Equatable, Codable, Sendable {
     var kind: AttentionKind
     var destination: AttentionDestination
     var scope: AttentionScope?
+    /// Kept with the source event so projections can compare episodes without hashing.
+    var episode: String?
     var timestamp: Date
     var isRead = false
     var actionInFlight = false
@@ -124,6 +126,7 @@ struct AttentionEvent: Identifiable, Equatable, Codable, Sendable {
          destination: AttentionDestination, scope: AttentionScope? = nil, timestamp: Date = Date()) {
         self.source = source; self.kind = kind; self.destination = destination
         self.scope = scope; self.timestamp = timestamp
+        self.episode = episode
         id = Self.identifier([scope?.server ?? "", scope?.account ?? "", scope?.organization ?? "",
                               scope?.generation ?? "", source, object, episode])
     }
@@ -132,7 +135,7 @@ struct AttentionEvent: Identifiable, Equatable, Codable, Sendable {
         return "attention:" + SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
     enum CodingKeys: String, CodingKey {
-        case id, source, kind, destination, scope, timestamp, isRead, actionInFlight, suppressesDelivery
+        case id, source, kind, destination, scope, episode, timestamp, isRead, actionInFlight, suppressesDelivery
     }
     var title: String { source == "link-failure" ? "Link could not be opened" : scope == nil ? (localTitle ?? kind.title) : kind.title }
     var body: String { scope == nil ? (localBody ?? "") : "" }

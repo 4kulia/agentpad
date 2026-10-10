@@ -508,6 +508,8 @@ final class Session: Identifiable {
     /// remote), then `lastPathComponent` of the cwd (`~` for $HOME). An empty
     /// cwd path falls back to the agent name so a degenerate URL doesn't
     /// render as blank.
+    @ObservationIgnored var lastActivated = Date.distantPast
+
     var title: String {
         // AgentPad: a channel tab shows its channel's name while it may be seen (DESIGN-F2).
         if case .directMessage(let ref) = toolRoute { return ChatDMTabs.title(ref) }

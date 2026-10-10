@@ -52,6 +52,8 @@ struct ChatOrgView: Equatable, Sendable {
     }
 
     var orgName: String?
+    var generation = ""
+    var pendingGeneration: String?
     var members: [Member] = []
     var teams: [Team] = []
     /// Not accepted or revoked; the model leaves out the expired ones.
@@ -74,6 +76,7 @@ struct ChatOrgView: Equatable, Sendable {
     var creating: [(teamId: String, name: String)] = []
     /// F4: unread of each channel kept, and mentions not read.
     var unread: [String: ChatUnread.Count] = [:]
+    var unreadBoundaries: [String: Int] = [:]
     var mentionsUnread = 0
     var mentionsByChannel: [String: Int] = [:]
     var unreadRepliesByChannel: [String: Int] = [:]
@@ -84,7 +87,8 @@ struct ChatOrgView: Equatable, Sendable {
     var agentsServed = false
 
     static func == (a: ChatOrgView, b: ChatOrgView) -> Bool {
-        guard a.unreadRepliesByChannel == b.unreadRepliesByChannel else { return false }
+        guard a.unreadRepliesByChannel == b.unreadRepliesByChannel,
+              a.generation == b.generation, a.pendingGeneration == b.pendingGeneration, a.unreadBoundaries == b.unreadBoundaries else { return false }
         return a.orgName == b.orgName && a.members == b.members && a.teams == b.teams && a.invitations == b.invitations
             && a.followsAdmin == b.followsAdmin && a.rightsInDoubt == b.rightsInDoubt && a.rightsSession == b.rightsSession
             && a.refusals == b.refusals && a.channels == b.channels && a.channelsServed == b.channelsServed
@@ -126,6 +130,8 @@ struct ChatOrgView: Equatable, Sendable {
         let mentions = try ChatUnread.unreadMentionsByChannel(db)
         return ChatOrgView(
             orgName: try String.fetchOne(db, sql: "SELECT org_name FROM meta WHERE id = 1"),
+            generation: try String.fetchOne(db, sql: "SELECT generation FROM meta WHERE id = 1") ?? "",
+            pendingGeneration: try String.fetchOne(db, sql: "SELECT pending_generation FROM meta WHERE id = 1"),
             members: try Member.read(db),
             teams: try Row.fetchAll(db, sql: "SELECT team_id, name, is_general, archived_at, mine FROM teams ORDER BY is_general DESC, name COLLATE NOCASE").map {
                 let id: String = $0["team_id"]
@@ -148,6 +154,7 @@ struct ChatOrgView: Equatable, Sendable {
             channelsReadOpen: meta?["channels_read_open"] ?? false,
             creating: creating,
             unread: try unread(db),
+            unreadBoundaries: Dictionary(uniqueKeysWithValues: try Row.fetchAll(db, sql: "SELECT channel_id, last_read_seq FROM read_marks").map { ($0["channel_id"] as String, $0["last_read_seq"] as Int) }),
             mentionsUnread: mentions.values.reduce(0, +),
             mentionsByChannel: mentions,
             unreadRepliesByChannel: try ChatUnread.unreadRepliesByChannel(db),
@@ -157,6 +164,12 @@ struct ChatOrgView: Equatable, Sendable {
             agentsServed: meta?["agents_served"] ?? false
         )
     }
+
+    /// Tables read by this snapshot, including the unread and catalog joins.
+    /// Draft edits do not affect organization metadata or attention counts.
+    static let observedTables = ["meta", "members", "teams", "team_members", "invitations", "outbox", "cursors",
+                                 "channels", "channel_windows", "messages", "read_marks", "thread_read_marks", "notified",
+                                 "agent_channels", "agents_catalog", "agent_teams"]
 }
 
 /// The organization for the left panel and the Organization window (C6):
@@ -211,6 +224,9 @@ final class ChatOrgModel {
     var showsOffline: @MainActor () -> Bool = { false }
 
     @ObservationIgnored private var observation: AnyDatabaseCancellable?
+    @ObservationIgnored private var snapshotObservation: ChatSnapshotObservation<ChatOrgView>?
+    @ObservationIgnored private var coalescesSnapshots = false
+    @ObservationIgnored private var observationEpoch = UUID()
     @ObservationIgnored private var expiry: Task<Void, Never>?
     /// Reads of the log: an answer counts only for the latest (review C6 p2-5).
     @ObservationIgnored private var auditGeneration = 0
@@ -234,45 +250,66 @@ final class ChatOrgModel {
     /// Follows the cache: the view is read again after every change of it.
     /// A failed read stops GRDB's observation: the model shows nothing of
     /// the organization until it follows again, after a pause (review C6e p2-3).
-    /// `.immediate`: the first view is read before this returns.
+    /// Direct command callers need the first view immediately. The connection's
+    /// long-lived projection coalesces changes and reads asynchronously instead.
     func follow(_ store: ChatStore) {
+        observationEpoch = UUID()
+        let epoch = observationEpoch
         observationRetry?.cancel()
+        observation?.cancel(); observation = nil
+        snapshotObservation?.cancel(); snapshotObservation = nil
         followed = store
         observedAtFailures = problemEpoch()
         watchFailures()
-        observation = ValueObservation.tracking(ChatOrgView.read)
-            .start(in: store.queue, scheduling: .immediate, onError: { [weak self, weak store] error in
-                guard let self else { return }
-                self.observation = nil
-                self.readFailed = true
-                self.problem = "The organization could not be read here: \(error.localizedDescription)"
-                self.observationFailures += 1
-                let wait = self.observationRetryDelay(self.observationFailures)
-                self.observationRetry = Task { [weak self] in
-                    try? await Task.sleep(for: .seconds(wait))
-                    guard let self, !Task.isCancelled, let store else { return }
-                    self.follow(store)
-                }
-            }, onChange: { [weak self] view in
-                guard let self else { return }
-                if self.observationFailures > 0 {
-                    self.observationFailures = 0
-                    self.problem = nil
-                }
-                self.readFailed = false
-                self.set(view)
-            })
+        let onError: @MainActor (Error) -> Void = { [weak self, weak store] error in
+            guard let self, self.observationEpoch == epoch else { return }
+            self.observation = nil
+            self.snapshotObservation = nil
+            self.readFailed = true
+            self.problem = "The organization could not be read here: \(error.localizedDescription)"
+            self.observationFailures += 1
+            let wait = self.observationRetryDelay(self.observationFailures)
+            self.observationRetry = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(wait))
+                guard let self, !Task.isCancelled, let store else { return }
+                self.follow(store)
+            }
+        }
+        let onChange: @MainActor (ChatOrgView) -> Void = { [weak self] view in
+            guard let self, self.observationEpoch == epoch else { return }
+            if self.observationFailures > 0 {
+                self.observationFailures = 0
+                self.problem = nil
+            }
+            self.readFailed = false
+            self.set(view)
+        }
+        if coalescesSnapshots {
+            snapshotObservation = ChatSnapshotObservation(in: store.queue, tracking: ChatOrgView.observedTables, fetch: ChatOrgView.read,
+                                                         onError: onError, onChange: onChange)
+        } else {
+            observation = ValueObservation.tracking(ChatOrgView.read).removeDuplicates()
+                .start(in: store.queue, scheduling: .immediate, onError: onError, onChange: onChange)
+        }
     }
 
     /// A new view of the organization: what the user may no longer see goes
     /// with it (review C6 group A).
     func set(_ view: ChatOrgView) {
+        guard self.view != view else { return }
         // F4: notices are taken back by the service's reconcile, not here (review F4-A).
         let mentions = mentionsForBadge
         self.view = view
         if mentionsForBadge != mentions { ChatNotifications.badgeChanged() }
         narrow()
         scheduleExpiry()
+    }
+
+    func stop() {
+        observationEpoch = UUID(); observation?.cancel(); observation = nil
+        snapshotObservation?.cancel(); snapshotObservation = nil
+        observationRetry?.cancel(); expiry?.cancel(); followed = nil
+        set(ChatOrgView())
     }
 
     /// A new failure of the doubt's write: the observation begins anew, so
@@ -801,7 +838,7 @@ extension ChatOrgModel {
     /// The model of the connection's organization, following its cache; nil
     /// while there is none. Never makes a session: one the account lost
     /// stays gone (review C6 p1-4, p2-2).
-    static func current(_ service: ChatService = .shared) -> ChatOrgModel? {
+    static func current(_ service: ChatService = .shared, coalescingUpdates: Bool = false) -> ChatOrgModel? {
         guard let connection = service.connection, let key = connection.orgKey,
               let store = service.orgSessions[key]?.store else { return nil }
         let session = connection.sessionId
@@ -844,13 +881,18 @@ extension ChatOrgModel {
             // Perhaps out of the organization: `/v1/me` decides, the core's way.
             if code == "not_found" { service.accountFeed?.readMeAgain() }
         }
-        let api = service.makeAPI(connection.server)
+        // The connection owns this model even with every Chat surface hidden.
+        // An audit transport is only needed when the owner opens the log.
+        var auditAPI: ChatAPI?
         model.readAudit = { [weak service] before in
             guard let service, let token = service.token, isCurrent() else { throw ChatError.notConnected }
+            let api = auditAPI ?? service.makeAPI(connection.server)
+            auditAPI = api
             return try await ChatService.endingOn401(service, session: session, server: key.server) {
                 try await api.audit(key.orgId, before: before, token: token)
             }
         }
+        model.coalescesSnapshots = coalescingUpdates
         model.follow(store)
         return model
     }
@@ -868,18 +910,18 @@ extension ChatDevicesModel {
         }
         let model = ChatDevicesModel()
         model.isCurrent = isCurrent
-        let api = service.makeAPI(connection.server)
-        func token() throws -> String {
-            guard let token = service.token, isCurrent() else { throw ChatError.notConnected }
-            return token
-        }
+        var devicesAPI: ChatAPI?
         let session = connection.sessionId, server = connection.server
-        model.listSessions = {
-            let token = try token()
+        model.listSessions = { [weak service] in
+            guard let service, let token = service.token, isCurrent() else { throw ChatError.notConnected }
+            let api = devicesAPI ?? service.makeAPI(server)
+            devicesAPI = api
             return try await ChatService.endingOn401(service, session: session, server: server) { try await api.sessions(token: token) }
         }
-        model.closeSessionCall = { id in
-            let token = try token()
+        model.closeSessionCall = { [weak service] id in
+            guard let service, let token = service.token, isCurrent() else { throw ChatError.notConnected }
+            let api = devicesAPI ?? service.makeAPI(server)
+            devicesAPI = api
             try await ChatService.endingOn401(service, session: session, server: server) { try await api.closeSession(id, token: token) }
         }
         model.disconnect = { ConnectionTabs.shared.disconnect() }

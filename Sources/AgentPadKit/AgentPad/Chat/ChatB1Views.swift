@@ -74,7 +74,7 @@ struct ChatReactionChip: View {
             .accessibilityValue(reaction.mine ? "Selected" : "Not selected")
             .help(tooltip.isEmpty ? "Who reacted · right-click for the full list" : tooltip)
             .contextMenu { Button("Who reacted") { showing = true } }
-            .popover(isPresented: $showing) { ChatReactorsView(b1: b1, message: message, emoji: reaction.emoji, members: members) }
+            .attentionPopover(isPresented: $showing) { ChatReactorsView(b1: b1, message: message, emoji: reaction.emoji, members: members) }
             .onHover { hovering = $0 }
             .task(id: hovering ? b1.state.versions[message] : nil) {
                 tooltip = ""

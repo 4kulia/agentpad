@@ -24,7 +24,7 @@ struct CodexUsagePill: View {
         .onHover { isHovered = $0 }
         .animation(.easeOut(duration: 0.12), value: isHovered)
         .animation(Theme.chromeTransition, value: detailOpen)
-        .popover(isPresented: $detailOpen, arrowEdge: .top) {
+        .attentionPopover(isPresented: $detailOpen, arrowEdge: .top) {
             CodexUsageDetailPopover(usage: usage)
         }
         .help(String(localized: "Codex usage remaining", bundle: .agentPadResources))

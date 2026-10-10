@@ -89,6 +89,41 @@ final class ChatUnreadBoundaryTests: XCTestCase {
         }
     }
 
+    func testOverlayBlocksChatReadAndClosingRechecksTheCurrentBoundary() async throws {
+        final class KeyWindow: NSWindow {
+            override var isKeyWindow: Bool { true }
+            override var isVisible: Bool { true }
+        }
+        let store = try store()
+        try post(store, "first", seq: 1)
+        let model = model(store)
+        let box = WindowBox(), view = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let window = KeyWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = view; box.view = view
+        let token = UUID()
+        defer {
+            NavigationPresentationGate.setOverlay(token, window: window, presented: false)
+            model.endReading(root: nil); window.contentView = nil; window.close()
+        }
+        NavigationPresentationGate.setOverlay(token, window: window, presented: true)
+        model.readIfLooking(root: nil, appActive: true, shown: box.shown, atBottom: true)
+        XCTAssertEqual(try mark(store), 0)
+        try post(store, "second", seq: 2)
+        try await wait { model.feed.messages.count == 2 }
+        let observer = NotificationCenter.default.addObserver(forName: NavigationPresentationGate.didChange, object: window, queue: .main) { _ in
+            MainActor.assumeIsolated { model.readIfLooking(root: nil, appActive: true, shown: box.shown, atBottom: true) }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        model.canAutomaticallyRead = { false }
+        NavigationPresentationGate.setOverlay(token, window: window, presented: false)
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(try mark(store), 0, "A queued visibility recheck cannot acknowledge an obsolete scope")
+        model.canAutomaticallyRead = { true }
+        NavigationPresentationGate.recheck(window)
+        try await wait { (try? self.mark(store)) == 2 }
+        XCTAssertEqual(try count(store), 0)
+    }
+
     func testOwnPostsFromAnotherMacAdvanceReadAndNeverCreateDivider() async throws {
         let store = try store()
         try post(store, "foreign", seq: 1)

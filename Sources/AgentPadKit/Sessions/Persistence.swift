@@ -36,6 +36,7 @@ struct PersistedState: Codable, Equatable {
     /// 1.1.9 could save agents as terminals while quitting. Repair each saved
     /// window once; later intentional agent exits must remain terminals.
     var agentTabRepair119Applied: Bool?
+    var leftNavigation: LeftNavigationPreferences?
 }
 
 /// Root of the multi-window `state.json`. Each `PersistedWindow` is one

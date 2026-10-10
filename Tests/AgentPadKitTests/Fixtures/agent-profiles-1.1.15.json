@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "createdAt": 813328261.008528,
+      "rosterID": "claude-code",
+      "launchOptions": "",
+      "templateID": "claude-code",
+      "name": "Customer support",
+      "folder": "file:///Users/example/csm_agent/",
+      "id": "11111111-2222-3333-4444-555555555555"
+    }
+  ],
+  "bindings": {
+    "claude-code:legacy": {
+      "record": {
+        "cwdPath": "/Users/example/csm_agent",
+        "conversationId": "legacy",
+        "automatic": false,
+        "cwd": "file:///Users/example/csm_agent/",
+        "title": "csm_agent",
+        "lastActivity": 813328260.968203,
+        "agentId": "claude-code"
+      },
+      "profileID": "11111111-2222-3333-4444-555555555555"
+    },
+    "claude-code:empty-metadata": {
+      "record": {
+        "cwdPath": "/Users/example/csm_agent",
+        "conversationId": "empty-metadata",
+        "automatic": false,
+        "cwd": "file:///Users/example/csm_agent/",
+        "title": "csm_agent",
+        "summary": "",
+        "firstPrompt": " \n",
+        "lastActivity": 813328260.968203,
+        "agentId": "claude-code"
+      },
+      "profileID": "11111111-2222-3333-4444-555555555555"
+    },
+    "claude-code:with-summary": {
+      "record": {
+        "cwdPath": "/Users/example/csm_agent",
+        "conversationId": "with-summary",
+        "automatic": false,
+        "cwd": "file:///Users/example/csm_agent/",
+        "title": "csm_agent",
+        "summary": "A real conversation summary",
+        "lastActivity": 813328260.968203,
+        "agentId": "claude-code"
+      },
+      "profileID": "11111111-2222-3333-4444-555555555555"
+    },
+    "claude-code:with-prompt": {
+      "record": {
+        "cwdPath": "/Users/example/csm_agent",
+        "conversationId": "with-prompt",
+        "automatic": false,
+        "cwd": "file:///Users/example/csm_agent/",
+        "title": "csm_agent",
+        "firstPrompt": "Review the customer follow-up",
+        "lastActivity": 813328260.968203,
+        "agentId": "claude-code"
+      },
+      "profileID": "11111111-2222-3333-4444-555555555555"
+    },
+    "claude-code:named": {
+      "record": {
+        "cwdPath": "/Users/example/csm_agent",
+        "conversationId": "named",
+        "automatic": false,
+        "cwd": "file:///Users/example/csm_agent/",
+        "title": "Actual saved session title",
+        "lastActivity": 813328260.968203,
+        "agentId": "claude-code"
+      },
+      "profileID": "11111111-2222-3333-4444-555555555555"
+    }
+  }
+}

@@ -13,7 +13,8 @@ final class AllSessionsTests: XCTestCase {
               firstPrompt: "Проверить клавиатуру. Release café", automatic: automatic)
     }
     private func live(_ record: AgentSessionRecord, status: AllSessionStatus = .working, id: String = "live") -> AllSessionItem {
-        .init(id: id, record: record, source: .own(UUID()), status: status, title: record.title)
+        .init(id: id, record: record, source: .own(UUID()), status: status, title: record.title,
+              liveMetadata: .init(terminalTitle: record.title, hookStateAt: record.lastActivity))
     }
     func testSearchIsFoldedAllWordsAcrossMetadataAndManualNames() {
         let a = record("one")
@@ -85,9 +86,9 @@ final class AllSessionsTests: XCTestCase {
         let catalog = SessionCatalog { _ in .init(records: records, scanned: records.count, total: records.count, skipped: 0) }
         let model = AllSessionsModel(state: TabState(route: .allSessions), catalog: catalog, names: SessionNames(url: root.appendingPathComponent("names.sqlite")))
         model.visibility = { .init(channelIds: []) }
-        model.filterWork = { records, live, names, query, filters in
+        model.filterWork = { records, live, names, query, filters, bindings in
             XCTAssertFalse(Thread.isMainThread); calls.increment()
-            return AllSessionsList.filter(records: records, live: live, names: names, query: query, filters: filters)
+            return AllSessionsList.filter(records: records, live: live, names: names, query: query, filters: filters, bindings: bindings)
         }
         let watchdog = MainThreadWatchdog(threshold: 0.25) { _ in stalls.increment() }
         watchdog.start(); defer { watchdog.stop(); model.stop() }

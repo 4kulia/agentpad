@@ -56,7 +56,7 @@ extension WorkspaceStore {
               conversationVisibility().allows(agentId: profile.rosterID, conversationId: conversation) else { return }
         do {
             try agentProfiles.bind(AgentSessionRecord(agentId: profile.rosterID, conversationId: conversation,
-                title: session.title, cwd: cwd, lastActivity: max(session.hookStateAt, session.catalogStartedAt)),
+                title: "", cwd: cwd, lastActivity: .distantPast),
                 to: profileID, origin: session.launchOrigin)
         } catch { agentProfileErrors[profileID] = "The session's agent binding could not be saved: \(error.localizedDescription)" }
     }
@@ -78,14 +78,15 @@ extension WorkspaceStore {
         let workspace = active ?? addEmptyWorkspace()
         agentProfileErrors[id] = nil
         let session = addTab(in: workspace, template: template, initialCwd: profile.folder,
-            customTitle: profile.name, connection: .local, profile: profile)
+            connection: .local, profile: profile)
         expandedAgentProfiles.insert(id)
         return .success(session)
     }
 
-    func profileSessionItems(_ profile: AgentProfile) -> [AgentProfileSessionItem] {
+    func profileSessionItems(_ profile: AgentProfile, catalog: SessionCatalog = .shared) -> [AgentProfileSessionItem] {
         AgentProfileSessions.items(profile: profile, profiles: agentProfiles,
-            sessions: profileStores.flatMap(\.allSessions), visibility: conversationVisibility(), names: SessionNames.shared.values)
+            sessions: profileStores.flatMap(\.allSessions), catalog: catalog,
+            visibility: conversationVisibility(), names: SessionNames.shared.values)
     }
 
     @discardableResult

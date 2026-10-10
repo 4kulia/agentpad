@@ -27,6 +27,7 @@ final class ChatChannelSession {
     var showingAgents = false
     private(set) var model: ChatChannelModel?
     private(set) var ownerModel: ChatChannelOwnerModel?
+    private var readScope: AttentionScope?
 
     var pinsShown: Bool {
         !showingAgents && model?.b1?.supports("chat.pins") == true && model?.pins.isPresented == true
@@ -52,6 +53,7 @@ final class ChatChannelSession {
         case .checking: model?.setAccessConfirmed(false)
         case .ready(let card, _, _):
             guard let key, let store else { return }
+            let scope = ChatAttention.scope(key, service)
             if model?.key != key || model?.channel != card.channelId {
                 // ChannelTabEngine has an immutable ref: a different scope
                 // here is a lost identity/access context, never navigation.
@@ -62,9 +64,15 @@ final class ChatChannelSession {
                 made.follow(store)
                 model = made
                 ownerModel = ChatChannelOwnerModel(service: service, key: key, channel: card.channelId)
-            } else if model?.follows(store) != true {
+            } else if model?.follows(store) != true || readScope != scope {
                 model?.setAccessConfirmed(false)
                 model?.follow(store)
+            }
+            readScope = scope
+            model?.canAutomaticallyRead = { [weak service, weak store] in
+                guard let service, let store, service.orgSessions[key]?.store === store,
+                      ChatAttention.sameScope(scope, service) else { return false }
+                return ChatNotifications.allowed(service, key, channel: card.channelId)
             }
             if ownerModel == nil { ownerModel = ChatChannelOwnerModel(service: service, key: key, channel: card.channelId) }
             model?.setAccessConfirmed(true)

@@ -282,6 +282,9 @@ final class ChatDMTests: XCTestCase {
         try write { try $0.execute(sql: "UPDATE dm_cards SET last_activity = ?", arguments: [activity]) }
         let list = try XCTUnwrap(service.dmList(key))
         XCTAssertEqual(list.entries.first?.lastUsed, ChatFeedLayout.date(activity))
+        // The connection snapshot now reads asynchronously. Finish projecting
+        // the fixture's activity write before measuring the draft edit alone.
+        try await wait { self.service.attentionAggregates.dmConversations.first?.time == ChatFeedLayout.date(activity) }
         let queries = DMQueryLog()
         try write { db in db.trace { queries.append($0) } }
         defer { try? write { $0.trace(nil) } }
@@ -302,10 +305,13 @@ final class ChatDMTests: XCTestCase {
             XCTAssertFalse(queries.selects.contains { $0.contains("from \(table)") || $0.contains("join \(table)") }, "Peer observation read \(table)")
         }
         XCTAssertFalse(queries.selects.contains { $0.contains("order by last_activity") })
+        let peerLookup = "$.peer.account_id"
+        XCTAssertTrue(queries.selects.contains { $0.contains(peerLookup) })
         queries.reset()
         try write { try $0.execute(sql: "UPDATE meta SET channels_served = 1") }
         try await Task.sleep(for: .milliseconds(60))
-        XCTAssertTrue(queries.selects.isEmpty, "Channel metadata must not wake the peer observation")
+        XCTAssertEqual(service.orgCurrent.model?.view.channelsServed, true)
+        XCTAssertFalse(queries.selects.contains { $0.contains(peerLookup) }, "The connection snapshot may refresh, but channel metadata must not wake the peer observation")
         let plan = try read { try Row.fetchAll($0, sql: "EXPLAIN QUERY PLAN SELECT dm_id FROM dm_cards WHERE json_extract(CAST(body AS TEXT), '$.peer.account_id') = ? LIMIT 1", arguments: [peer]) }
         XCTAssertTrue(plan.contains { ($0["detail"] as String).contains("dm_card_peer") })
     }
@@ -1078,6 +1084,81 @@ final class ChatDMTests: XCTestCase {
         XCTAssertFalse(ChatDMNotices.valid(notice, service: service))
         try store.setGeneration("different")
         XCTAssertFalse(ChatDMNotices.valid(notice, service: service))
+    }
+
+    func testActivityTabRendersUsePreparedDMMetadataWithoutSQLOrProjectionWork() async throws {
+        try await ready()
+        var message = try decode("dm_message", as: ChatDMMessageWire.self)
+        message.authorAccountId = peer; message.seq = 3; message.messageId = "unread"
+        try write { try ChatDMStore.write($0, message) }
+        let workspace = makeTestStore()
+        let previous = AgentMonitor.shared.storesProvider
+        AgentMonitor.shared.storesProvider = { [workspace] }
+        defer { AgentMonitor.shared.storesProvider = previous; workspace.terminate() }
+        let tab = workspace.openToolTab(.directMessage(ChatDMRef(key, dm: dm)))
+        let draft = workspace.openToolTab(.directMessageDraft(OrgKey(key), peer: peer))
+        let projection = AttentionSidebarModel(ledger: AttentionLedger(), service: service)
+        projection.refresh(service: service)
+        try await wait { projection.tabTitle(tab.id) == "Boris" && projection.tabTitle(draft.id) == "Boris" && projection.tabIndicators[tab.id] != nil }
+        let reason = try XCTUnwrap(projection.tabIndicators[tab.id]?.reasons.first)
+        XCTAssertEqual(reason.conversation, .dm(ChatAttention.scope(key, service), dm))
+        XCTAssertEqual(reason.readMarks[""], 2)
+        let queries = DMQueryLog()
+        try write { db in db.trace { queries.append($0) } }
+        defer { try? write { $0.trace(nil) } }
+        let before = projection.projectionBuildCount
+        func row(_ tab: Session) -> TabBarItem {
+            TabBarItem(tab: tab, store: workspace, isActive: false, canCloseToRight: false,
+                onActivate: {}, onClose: {}, onCloseOthers: {}, onCloseToRight: {}, onDuplicate: {},
+                onRename: { _ in }, onSplit: { _ in }, onMoveToNewWindow: {}, attention: projection)
+        }
+        for _ in 0..<100 {
+            _ = row(tab).body; _ = row(draft).body
+            _ = AttentionIndicatorView(indicator: projection.tabIndicators[tab.id]).body
+            _ = projection.items; _ = projection.workspaceIndicators; _ = projection.windowIndicators
+        }
+        for tab in [tab, draft] {
+            let host = NSHostingView(rootView: row(tab))
+            host.frame = NSRect(x: 0, y: 0, width: 280, height: 40)
+            host.layoutSubtreeIfNeeded()
+        }
+        XCTAssertTrue(queries.selects.isEmpty, "Rendering must not authorize DM titles through SQL")
+        XCTAssertEqual(projection.projectionBuildCount, before)
+    }
+
+    func testRailRefreshPreviewAndActivationUsePreparedDMMetadataWithoutSQL() async throws {
+        try await ready()
+        let workspace = makeTestStore()
+        let previous = AgentMonitor.shared.storesProvider
+        AgentMonitor.shared.storesProvider = { [workspace] }
+        defer { AgentMonitor.shared.storesProvider = previous; workspace.terminate() }
+        let tab = workspace.openToolTab(.directMessage(ChatDMRef(key, dm: dm)))
+        let draft = workspace.openToolTab(.directMessageDraft(OrgKey(key), peer: peer))
+        let projection = AttentionSidebarModel(ledger: AttentionLedger(), service: service)
+        projection.refresh(service: service)
+        try await wait { projection.tabTitle(tab.id) == "Boris" && projection.tabTitle(draft.id) == "Boris" }
+        let owner = try XCTUnwrap(workspace.active)
+        let destination = WorkspaceRailDestination(workspaceID: owner.id, sessionID: tab.id)
+        let queries = DMQueryLog()
+        try write { db in db.trace { queries.append($0) } }
+        defer { try? write { $0.trace(nil) } }
+        let before = projection.projectionBuildCount
+        for index in 0..<100 {
+            owner.root.allPanes.flatMap(\.tabs).first(where: \.hasProcess)?.terminalTitle = "Refresh \(index)"
+            // Both the list refresh and hover preview use this same prepared entry path.
+            let entry = try XCTUnwrap(workspace.workspaceRailEntries(attention: projection).first { $0.id == owner.id })
+            XCTAssertEqual(entry.tabs.first { $0.id == tab.id }?.title, "Boris")
+            XCTAssertEqual(entry.tabs.first { $0.id == draft.id }?.title, "Boris")
+        }
+        XCTAssertTrue(workspace.activateRailDestination(destination, attention: projection))
+        XCTAssertTrue(queries.selects.isEmpty, "Rail navigation must not read DM permissions or titles through SQL")
+        XCTAssertEqual(projection.projectionBuildCount, before)
+        service.orgSessions[key]?.doubtNotWritten = true
+        projection.updateProjection()
+        let revoked = workspace.workspaceRailEntries(attention: projection).flatMap(\.tabs)
+        XCTAssertFalse(revoked.contains { $0.id == tab.id || $0.id == draft.id })
+        XCTAssertFalse(workspace.activateRailDestination(destination, attention: projection))
+        XCTAssertTrue(queries.selects.isEmpty, "A revoked DM must fail closed using the prepared snapshot")
     }
 
     func testDMAttentionSourceMuteReadAndClosedGate() async throws {

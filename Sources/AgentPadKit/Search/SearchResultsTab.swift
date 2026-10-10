@@ -173,7 +173,7 @@ struct SearchResultsTab: View {
             Button { model.show(hit) } label: {
                 VStack(alignment: .leading, spacing: 7) {
                     HStack {
-                        Text(hit.record.resolvedTitle(manual: model.names.values[hit.record.nameKey])).font(Theme.display(13, weight: .semibold)).lineLimit(1)
+                        Text(model.displayMetadata(for: hit.record).title).font(Theme.display(13, weight: .semibold)).lineLimit(1)
                         Spacer(); date(hit.turn.date)
                     }
                     SearchSnippetText(text: hit.turn.text, query: model.query)
@@ -186,7 +186,7 @@ struct SearchResultsTab: View {
         ForEach(model.metadata) { record in
             Button { model.selectedRecord = record; model.selectedHit = nil; model.context = []; model.navigationError = nil } label: {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(record.resolvedTitle(manual: model.names.values[record.nameKey])).font(Theme.display(13, weight: .medium))
+                    Text(record.title).font(Theme.display(13, weight: .medium))
                     Text("Metadata match · \(tool(record.agentId)) · \(record.cwdPath)").font(.caption).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
                 }.resultCard()
             }.buttonStyle(.plain).id("d:" + record.id)
@@ -205,7 +205,7 @@ struct SearchResultsTab: View {
                 Spacer()
                 Button(resumeTitle(record)) { resume(record) }.buttonStyle(.borderedProminent).disabled(resuming)
             }
-            Text(record.resolvedTitle(manual: model.names.values[record.nameKey])).font(Theme.display(22, weight: .semibold))
+            Text(model.displayMetadata(for: record).title).font(Theme.display(22, weight: .semibold))
             Text("\(tool(record.agentId)) · \(record.cwdPath)\(record.automatic ? " · Automatic" : "")").font(.caption).foregroundStyle(ChatAppearance.secondary).textSelection(.enabled)
             if let error = model.navigationError { Text(error).foregroundStyle(ChatAppearance.failure) }
             if model.contextLoading { ProgressView().controlSize(.small) }

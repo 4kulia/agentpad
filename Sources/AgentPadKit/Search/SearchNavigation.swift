@@ -5,7 +5,8 @@ import GRDB
 enum SearchNavigation {
     /// Re-read the actual message at its sequence before opening a destination.
     /// Neither snippets nor read marks are written into the conversation here.
-    static func open(_ hit: ChatSearchHit, model: EverywhereSearchModel, from owner: WorkspaceStore, service: ChatService = .shared) async {
+    static func open(_ hit: ChatSearchHit, model: EverywhereSearchModel, from owner: WorkspaceStore,
+                     service: ChatService = .shared, router: TabRouter = .shared) async {
         model.navigationError = nil
         guard let connection = service.connection, let key = connection.orgKey, let token = service.token,
               let store = service.orgSessions[key]?.store, ChatAttention.personalAllowed(key, service),
@@ -30,7 +31,7 @@ enum SearchNavigation {
                 }
                 guard message.deletedAt == nil else { unavailable(model, deleted: true); return }
                 try SearchCache.write(store.queue) { _ = try ChatMessages.write($0, message) }
-                guard let tab = owner.showChannel(ChannelRef(key, channel: hit.targetID)) else { unavailable(model); return }
+                guard let tab = router.openChannel(ChannelRef(key, channel: hit.targetID), from: owner) else { unavailable(model); return }
                 ChatMessageNavigation.request(.init(key: key, channel: hit.targetID, message: hit.messageID, sequence: hit.messageSeq), key: key, destination: tab.engine.view)
             case .dm:
                 guard service.dmAllowed(key, hit.targetID) else { unavailable(model); return }

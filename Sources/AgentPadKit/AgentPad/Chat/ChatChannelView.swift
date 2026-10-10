@@ -234,8 +234,8 @@ final class WindowBox {
     /// Shown to the user: its window key and visible, and the view itself not
     /// hidden — a tab not selected hides its views (review F4b-1).
     var shown: Bool {
-        guard let view, let window = view.window else { return false }
-        return window.isKeyWindow && window.isVisible && !view.isHiddenOrHasHiddenAncestor && !view.visibleRect.isEmpty
+        guard let view else { return false }
+        return NavigationPresentationGate.allowsAcknowledgement(view, appActive: true)
     }
 }
 

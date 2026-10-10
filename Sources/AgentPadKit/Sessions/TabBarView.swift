@@ -178,7 +178,7 @@ struct AddTabButton: View {
         // hit-area), not on the button itself, so it reads as "tab will land
         // here, after the last one" rather than "drop on +".
         .dropIndicator(active: isTargeted, on: .leading, offset: -3)
-        .popover(isPresented: $isMenuOpen, arrowEdge: .bottom) {
+        .attentionPopover(isPresented: $isMenuOpen, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 0) {
                 // In an SSH workspace every choice opens on the remote — the
                 // suffix keeps that from surprising anyone mid-click.

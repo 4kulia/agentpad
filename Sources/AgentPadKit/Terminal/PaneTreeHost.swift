@@ -106,6 +106,10 @@ final class PaneTreeHostView: FlippedLayoutView {
         }
     }
 
+    /// Explicit navigation back into the active tab uses the same overlay
+    /// guards and native-editor restoration as an ordinary tab switch.
+    func restoreFocus() { syncFocus(force: true) }
+
     private func reconcile() {
         let workspaces = store.workspaces
         let activeId = store.active?.id
@@ -168,7 +172,7 @@ final class PaneTreeHostView: FlippedLayoutView {
         lastFocusKey = key
         guard changed || force else { return }
         guard let window else { return }
-        guard let workspace, let session = pane?.activeTab else {
+        guard let session = pane?.activeTab else {
             // Empty splits are focusable too: never keep typing into the
             // previously selected terminal while an empty pane is active.
             if let responder = window.firstResponder as? NSView,
@@ -177,10 +181,9 @@ final class PaneTreeHostView: FlippedLayoutView {
             }
             return
         }
-        // An open composer / search bar owns the keyboard in its pane. In C2
-        // those editors survive a workspace switch (nothing re-mounts), so on
-        // return they re-claim focus themselves (`PaneComposerBar` /
-        // `PaneSearchBar` observe the workspace becoming visible) — stealing
+        // An open composer / search bar owns the keyboard in the destination
+        // pane. Surviving editors re-claim focus themselves (`PaneComposerBar` /
+        // `PaneSearchBar` observe their pane becoming active) — stealing
         // for the terminal here would put the caret in the shell UNDER a
         // visible editor, where Return executes a command (Codex P1).
         if session.composerActive || session.searchActive { return }
@@ -190,16 +193,8 @@ final class PaneTreeHostView: FlippedLayoutView {
         // applies the swap on its own schedule) — its mount-time grab owns
         // that case.
         guard target.window === window else { return }
-        // Never steal the caret from a text control living in the ACTIVE
-        // workspace's own chrome (composer, search field): switching into
-        // that state must keep the user typing. Text controls elsewhere are
-        // fair game — the switch away is what dismisses them.
-        if let responder = window.firstResponder as? NSView,
-           responder is NSTextView,
-           let container = workspaceViews[workspace.id],
-           responder.isDescendant(of: container) {
-            return
-        }
+        // Other panes may still have open editors in this workspace. Only
+        // the destination's editor guard above may keep the caret from its terminal.
         window.makeFirstResponder(target)
     }
 

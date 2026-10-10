@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 extension Array {
     /// Step `direction` from `current`, wrapping at both ends. Used by tab
@@ -150,15 +150,27 @@ final class WorkspaceStore {
         }
         return nil
     }
-    var sidebarMode: SidebarMode = .full
+    var leftNavigation = LeftNavigationPreferences()
+    var navigationPresentation = LeftNavigationPresentation()
+    @ObservationIgnored var navigationDragTargets: Set<String> = []
+    @ObservationIgnored var navigationDragExit: Task<Void, Never>?
+    @ObservationIgnored weak var navigationWindow: NSWindow?
+    @ObservationIgnored weak var navigationReturnResponder: NSResponder?
+    /// Compatibility for existing callers; new UI uses the independent preferences.
+    var sidebarMode: SidebarMode {
+        get { leftNavigation.legacyMode }
+        set { leftNavigation = .migrate(mode: newValue, content: sidebarContent) }
+    }
     /// Right-side agent-overview sidebar — per-window collapse state, sharing
     /// the left sidebar's three modes (full / compact / hidden). The content is
     /// the global `AgentMonitor`; each window toggles its own panel. Defaults
     /// to hidden since it's opt-in.
     var rightSidebarMode: SidebarMode = .hidden
-    /// Left sidebar's middle content — workspace list or file tree. Persisted
-    /// like `sidebarMode`; the footer toggle in `SidebarView` flips it.
-    var sidebarContent: SidebarContent = .files
+    /// Compatibility entry point for existing panel navigation callers.
+    var sidebarContent: SidebarContent {
+        get { SidebarContent(rawValue: leftNavigation.panelContent.rawValue)! }
+        set { leftNavigation.panelContent = .init(rawValue: newValue.rawValue) ?? .chat }
+    }
     var chatSidebarPreferences = ChatSidebarPreferences()
     let chatNavigation = ChatSidebarNavigation()
     var attentionExpanded = false
@@ -262,7 +274,7 @@ final class WorkspaceStore {
     /// `SidebarView.fullWidth` is the floor (the design width — the sidebar
     /// can only grow); compact stays fixed at `compactWidth` and hidden is
     /// hidden, so this only applies while expanded. Persisted per window.
-    var sidebarWidth: CGFloat = SidebarView.fullWidth
+    var sidebarWidth: CGFloat = LeftNavigationLayout.defaultPanelWidth
 
     /// Full-mode right panel (Agent Panel) width, user-draggable from its
     /// leading edge. `AgentOverviewSidebar.fullWidth` is the floor (the
@@ -302,6 +314,10 @@ final class WorkspaceStore {
     }
     private var fileTreeRootOverride: FileTreeRootOverride?
 
+    func navigationPanelChanged(to panel: LeftNavigationPreferences.Panel) {
+        if panel != leftNavigation.panelContent, panel != .files, fileTreeRootOverride != nil { fileTreeRootOverride = nil }
+    }
+
     /// Drops a root override that no longer matches the active workspace +
     /// session, so a later re-activation of that session can't resurrect it.
     /// Call after ANY direct active-identity write that bypasses
@@ -328,16 +344,16 @@ final class WorkspaceStore {
     /// this to close its window — a window with zero workspaces is empty.
     var onBecameEmpty: (() -> Void)?
 
-    /// Mutate + schedule save. UI sites wrap in `withAnimation(Theme.chromeTransition)`,
-    /// which animates the terminal area's width → per-frame `setFrameSize` on every
-    /// surface. Suspend size propagation for the animation (same as pane zoom) so
-    /// that burst doesn't SIGWINCH-wipe conda scrollback / flicker the terminal
-    /// (issue #29). Gated on a real mode change above, so no-op sets don't suspend.
+    /// Legacy callers can still reveal a panel; new commands toggle each
+    /// surface independently and change widths without animation.
     func setSidebarMode(_ mode: SidebarMode) {
-        guard sidebarMode != mode else { return }
-        suspendSizePropagationForLayoutAnimation(active?.root.allEngines ?? [])
-        sidebarMode = mode
-        scheduleSave()
+        if mode == .full { selectNavigationPanel(leftNavigation.panelContent, toggle: false) }
+        else {
+            closeNavigation()
+            leftNavigation.panelVisible = false
+            leftNavigation.railVisible = mode == .compact
+            scheduleSave()
+        }
     }
 
     func setRightSidebarMode(_ mode: SidebarMode) {
@@ -355,17 +371,10 @@ final class WorkspaceStore {
         scheduleSave()
     }
 
-    /// Navigation changes immediately. Chat keeps its own width; expanding
-    /// the compact rail uses the existing layout-suspension path.
+    /// Workspaces opens the temporary list; other routes reveal their panel.
     func setSidebarContent(_ content: SidebarContent) {
-        if content == .chat, sidebarMode != .full { setSidebarMode(.full) }
-        // Gate on non-nil: `@Observable` notifies on every write, so an
-        // unconditional nil-over-nil here would invalidate `fileTreeRoot`
-        // observers on each no-op content set.
-        if content != .files, fileTreeRootOverride != nil { fileTreeRootOverride = nil }
-        guard sidebarContent != content else { return }
-        sidebarContent = content
-        scheduleSave()
+        if content == .workspaces { openWorkspaceList(); return }
+        selectNavigationPanel(.init(rawValue: content.rawValue) ?? .chat, toggle: false)
     }
 
     func requestRenameActiveTab() {
@@ -373,12 +382,9 @@ final class WorkspaceStore {
         session.nameEdit.begin(session.customTitle ?? session.title)
     }
 
-    var workspaceRenameInHeader: Bool { sidebarMode != .full || sidebarContent != .workspaces }
-
     func requestRenameActiveWorkspace() {
         guard let workspace = active else { return }
-        workspace.nameEdit.begin(workspace.customTitle ?? workspace.title)
-        if !workspaceRenameInHeader { pendingRenameWorkspace = workspace }
+        requestRenameWorkspace(workspace)
     }
 
     /// Diff pill popover's "Show in File Tree": switch the sidebar to files
@@ -1002,6 +1008,7 @@ final class WorkspaceStore {
         invalidateTabConfirmations()
         fileTreeRootOverride = nil
         activeWorkspaceId = workspace.id
+        workspace.activeSession?.lastActivated = Date()
         scheduleSave()
     }
 
@@ -1045,7 +1052,14 @@ final class WorkspaceStore {
         let movingIds = Set(movingIndices.map { workspaces[$0].id })
         let moving = workspaces.filter { movingIds.contains($0.id) }
         var remaining = workspaces.filter { !movingIds.contains($0.id) }
-        let insertAt = min(max(destIndex, 0), remaining.count)
+        let destination = workspaces[destIndex]
+        let destinationRoot = destination.worktreeParentId ?? destination.id
+        let destinationFamily = remaining.indices.filter {
+            remaining[$0].id == destinationRoot || remaining[$0].worktreeParentId == destinationRoot
+        }
+        // Insert at a family boundary, never between another parent and child.
+        let insertAt = sourceIndex < destIndex ? (destinationFamily.last.map { $0 + 1 } ?? remaining.count)
+            : (destinationFamily.first ?? 0)
         remaining.insert(contentsOf: moving, at: insertAt)
         workspaces = remaining
         scheduleSave()
@@ -1514,6 +1528,7 @@ final class WorkspaceStore {
         holdChannelClose(session)
         destPane.activeTabId = session.id
         workspace.activePaneId = destPane.id
+        session.lastActivated = Date()
         if let zoomed = workspace.zoomedPaneId, zoomed != destPane.id { workspace.zoomedPaneId = nil }
         // Promoting to active mirrors `activateTab` so the sidebar title and
         // the next tab's spawn cwd follow the new focus without waiting for
@@ -1576,6 +1591,8 @@ final class WorkspaceStore {
             guard source.tabCloseCoordinator.prepare([candidate], moving: true) else { return false }
             let sourceActive = original.pane.activeTabId
             let sourcePaneID = original.workspace.activePaneId
+            let sourceCwd = original.workspace.workingDirectory
+            let sourceZoom = original.workspace.zoomedPaneId
             let destinationActive = destPane.activeTabId
             let destinationPaneID = workspace.activePaneId
             let destinationCwd = workspace.workingDirectory
@@ -1591,11 +1608,14 @@ final class WorkspaceStore {
                         PersistedWindow(id: right.windowId, state: snapshot(), frame: right.frameProvider?())
                     ]).get()
                 } catch {
-                    // Roll back structure and callbacks; the same live editor survives.
+                    // Surrender every destination monitor before returning the
+                    // live tab, so destination termination cannot delete its records.
+                    teardownSessionMonitors(session, keepForTransfer: true)
                     destPane.tabs.removeAll { $0 === session }
                     source.attachSession(session, to: original.pane, at: index, in: original.workspace)
                     source.configureSession(session, in: original.workspace, codexRolloutId: session.conversationId)
                     original.pane.activeTabId = sourceActive; original.workspace.activePaneId = sourcePaneID
+                    original.workspace.workingDirectory = sourceCwd; original.workspace.zoomedPaneId = sourceZoom
                     destPane.activeTabId = destinationActive; workspace.activePaneId = destinationPaneID
                     workspace.workingDirectory = destinationCwd; workspace.zoomedPaneId = destinationZoom
                     session.tabState?.saveError = "The tab could not be moved. Its original location and edits were kept."
@@ -1874,6 +1894,7 @@ final class WorkspaceStore {
         // flag is lifelong; PaneView's active-tab exclusion is the one
         // consumer gate, so the structure closes the race with no timing.
         guard let pane = pane(containing: session, in: workspace) else { return }
+        session.lastActivated = Date()
         var changed = false
         if pane.activeTabId != session.id || workspace.activePaneId != pane.id { invalidateTabConfirmations() }
         if pane.activeTabId != session.id {
@@ -2022,6 +2043,7 @@ final class WorkspaceStore {
 
     func focusPane(_ pane: Pane, in workspace: Workspace) {
         guard workspace.root.pane(id: pane.id) != nil else { return }
+        pane.activeTab?.lastActivated = Date()
         var changed = false
         if workspace.activePaneId != pane.id {
             invalidateTabConfirmations()
@@ -2393,6 +2415,7 @@ final class WorkspaceStore {
     func terminate() {
         guard !isTerminated else { return }
         isTerminated = true
+        navigationDragExit?.cancel()
         terminationSnapshot = snapshot()
         pendingSave?.cancel()
         pendingSave = nil
@@ -2466,20 +2489,21 @@ final class WorkspaceStore {
         activeWorkspaceId = workspaces.contains(where: { $0.id == state.activeWorkspaceId })
             ? state.activeWorkspaceId
             : workspaces.first?.id
-        sidebarMode = state.sidebarMode ?? .full
+        let legacyContent = state.sidebarSelectedContent.flatMap(SidebarContent.init(rawValue:)) ?? state.sidebarContent
+        leftNavigation = state.leftNavigation ?? .migrate(mode: state.sidebarMode, content: legacyContent)
         rightSidebarMode = state.rightSidebarDefault115Applied == true ? (state.rightSidebarMode ?? .hidden) : .hidden
-        sidebarContent = state.sidebarSelectedContent.flatMap(SidebarContent.init(rawValue:)) ?? state.sidebarContent ?? .files
         chatSidebarPreferences = state.chatSidebarPreferences ?? ChatSidebarPreferences()
         chatSidebarPreferences.width = ChatSidebarPreferences.clampWidth(chatSidebarPreferences.width)
         rightSidebarContent = state.rightSidebarContent ?? .agents
         sidebarWidth = state.sidebarWidth
             .map { SidebarView.clampWidth(CGFloat($0)) }
-            ?? SidebarView.fullWidth
+            ?? LeftNavigationLayout.defaultPanelWidth
         rightSidebarWidth = state.rightSidebarWidth
             .map { AgentOverviewSidebar.clampWidth(CGFloat($0)) }
             ?? AgentOverviewSidebar.fullWidth
         collapsedInfoSections = Set(state.collapsedInfoSections ?? [])
         scheduleAgentProfileAdoption()
+        if state.leftNavigation == nil { scheduleSave() }
     }
 
     private func restorePane(_ persisted: PersistedPaneNode, fm: FileManager, sshRemoteHost: String? = nil) -> PaneNode? {
@@ -2709,6 +2733,7 @@ final class WorkspaceStore {
         target.tabs.append(session)
         target.activeTabId = session.id
         if workspace.activePaneId != target.id { workspace.activePaneId = target.id }
+        session.lastActivated = Date()
         scheduleSave()
         return session
     }
@@ -3467,8 +3492,8 @@ final class WorkspaceStore {
             sidebarMode: sidebarMode,
             rightSidebarMode: rightSidebarMode,
             // Legacy readers do not know Chat (or, before F2, Team).
-            sidebarContent: sidebarContent == .team || sidebarContent == .chat ? .workspaces : sidebarContent,
-            sidebarSelectedContent: sidebarContent.rawValue,
+            sidebarContent: leftNavigation.legacySelectedContent == .files ? .files : .workspaces,
+            sidebarSelectedContent: leftNavigation.legacySelectedContent.rawValue,
             chatSidebarPreferences: chatSidebarPreferences,
             rightSidebarContent: rightSidebarContent,
             sidebarWidth: Double(sidebarWidth),
@@ -3477,7 +3502,8 @@ final class WorkspaceStore {
                 ? nil
                 : collapsedInfoSections.sorted(),
             rightSidebarDefault115Applied: true,
-            agentTabRepair119Applied: true
+            agentTabRepair119Applied: true,
+            leftNavigation: leftNavigation
         )
     }
 

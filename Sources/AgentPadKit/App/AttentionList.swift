@@ -32,6 +32,7 @@ struct AttentionItem: Identifiable, Equatable, Sendable {
     var tier: Int
     var time: Date
     var title: String
+    var titleTabID: UUID?
     var subtitle: String
     var action: Action
     var secondary: Secondary?
@@ -41,12 +42,13 @@ struct AttentionItem: Identifiable, Equatable, Sendable {
     var subjectIsAgent = false
     var localProfileID: UUID?
     var avatarScope: AttentionScope?
+    var indicatorKind: AttentionIndicator.Kind?
 }
 
 /// No message bodies. The future DM client supplies these through the same gate.
 struct AttentionConversation: Equatable, Sendable {
-    var scope: AttentionScope
-    var id: String
+    var scope: AttentionScope { didSet { prepareIDs() } }
+    var id: String { didSet { prepareIDs() } }
     var title: String
     var count: Int
     var time: Date
@@ -57,32 +59,56 @@ struct AttentionConversation: Equatable, Sendable {
     var subjectID: String?
     var subjectName: String?
     var subjectIsAgent = false
+    private(set) var mentionReasonID = ""
+    private(set) var dmReasonID = ""
+    private(set) var unreadReasonID = ""
+    var boundary: Int = 0
+    var readMarks: [String: Int] = [:]
+
+    init(scope: AttentionScope, id: String, title: String, count: Int, time: Date,
+         firstMessage: String = "", firstSequence: Int = 0, unreadLabel: String? = nil,
+         muted: Bool = false, subjectID: String? = nil, subjectName: String? = nil, subjectIsAgent: Bool = false) {
+        self.scope = scope; self.id = id; self.title = title; self.count = count; self.time = time
+        self.firstMessage = firstMessage; self.firstSequence = firstSequence; self.unreadLabel = unreadLabel
+        self.muted = muted; self.subjectID = subjectID; self.subjectName = subjectName; self.subjectIsAgent = subjectIsAgent
+        prepareIDs()
+    }
+
+    private mutating func prepareIDs() {
+        let scope = [scope.server, scope.account, scope.organization, scope.generation]
+        mentionReasonID = AttentionEvent.identifier(scope + ["mention", id])
+        dmReasonID = AttentionEvent.identifier(scope + ["dm", id])
+        unreadReasonID = AttentionEvent.identifier(scope + ["channel-unread", id])
+    }
 }
 
 @MainActor
 protocol AttentionDMSource: AnyObject {
+    var conversations: [AttentionConversation] { get }
     /// Called only inside the open personal gate; stop must discard all metadata.
     func start(scope: AttentionScope, changed: @escaping ([AttentionConversation]) -> Void)
     func stop()
     func refresh()
-    func open(_ conversation: String, scope: AttentionScope)
+    func open(_ conversation: String, scope: AttentionScope, from store: WorkspaceStore?)
     func markRead(_ conversation: String, scope: AttentionScope)
 }
 
-extension AttentionDMSource { func refresh() {} }
+extension AttentionDMSource {
+    var conversations: [AttentionConversation] { [] }
+    func refresh() {}
+}
 
-struct AttentionCurrent: Sendable {
-    struct Label: Sendable {
+struct AttentionCurrent: Equatable, Sendable {
+    struct Label: Equatable, Sendable {
         var title: String
         var subjectID: String?
         var subjectName: String?
         var subjectIsAgent = false
     }
-    struct Terminal: Sendable {
+    struct Terminal: Equatable, Sendable {
         var episode: String
         var failed: Bool
         var finished = false
-        var title: String = ""
         var agentID: String = ""
         var agentName: String = ""
         var profileID: UUID?
@@ -128,8 +154,7 @@ enum AttentionList {
             if event.source == "terminal", event.kind == .failure || event.kind == .completion {
                 guard case .terminal(let id) = event.destination, let tab = current.terminals[id],
                       event.kind == .failure ? tab.failed : tab.finished,
-                      AttentionEvent(source: event.source, object: id.uuidString, episode: tab.episode,
-                                     kind: event.kind, destination: event.destination).id == event.id else { return nil }
+                      event.episode == tab.episode else { return nil }
             }
             if event.source == "run-outcome" || event.source == "launch-help" {
                 guard current.currentRunEvents.contains(event.id) else { return nil }
@@ -140,7 +165,7 @@ enum AttentionList {
                 subtitle: event.actionInFlight ? "Decision is being sent" : event.body,
                 action: .event(event.id), secondary: dismissible ? .dismiss : nil, inFlight: event.actionInFlight)
             if case .terminal(let id) = event.destination, let tab = current.terminals[id] {
-                item.title = tab.title.isEmpty ? event.title : tab.title
+                item.titleTabID = id
                 item.subtitle = event.kind == .completion ? "Finished · waiting for you" : event.kind.title
                 item.subjectID = tab.agentID; item.subjectName = tab.agentName; item.subjectIsAgent = true
                 item.localProfileID = tab.profileID
@@ -151,19 +176,19 @@ enum AttentionList {
                 item.subjectID = label.subjectID; item.subjectName = label.subjectName; item.subjectIsAgent = label.subjectIsAgent
             }
             item.avatarScope = event.scope
+            item.indicatorKind = AttentionIndicator.Kind(event.kind)
             return item
         }
         func append(_ conversations: [AttentionConversation], dm: Bool) {
             for row in conversations where row.count > 0 && row.scope == current.aggregateScope && (!dm || !row.muted) {
                 result.append(AttentionItem(
-                    id: AttentionEvent.identifier([row.scope.server, row.scope.account, row.scope.organization,
-                                                  row.scope.generation, dm ? "dm" : "mention", row.id]),
+                    id: dm ? row.dmReasonID : row.mentionReasonID,
                     tier: 3, time: row.time, title: row.title,
                     subtitle: dm ? "Direct message · \(row.unreadLabel ?? "\(row.count) new")" : "Mentioned you · \(row.count) new",
                     action: dm ? .dm(row.scope, conversation: row.id)
                         : .mention(row.scope, channel: row.id, message: row.firstMessage, sequence: row.firstSequence),
                     secondary: .markRead, subjectID: row.subjectID, subjectName: row.subjectName,
-                    subjectIsAgent: row.subjectIsAgent, avatarScope: row.scope))
+                    subjectIsAgent: row.subjectIsAgent, avatarScope: row.scope, indicatorKind: .unread))
             }
         }
         if settings.mentions { append(mentions, dm: false) }

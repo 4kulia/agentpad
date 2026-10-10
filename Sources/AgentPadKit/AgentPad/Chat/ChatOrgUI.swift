@@ -8,11 +8,33 @@ import SwiftUI
 @MainActor
 @Observable
 final class ChatOrgCurrent {
-    static let shared = ChatOrgCurrent()
+    static var shared: ChatOrgCurrent { ChatService.shared.orgCurrent }
     @ObservationIgnored private var org: (identity: String, model: ChatOrgModel)?
     @ObservationIgnored private var session: (identity: String, model: ChatDevicesModel)?
     /// Moves when a model is made, so views read them again.
     private var revision = 0
+
+    /// Connection ownership also starts the snapshot when no Chat UI is mounted.
+    func follow(_ service: ChatService) {
+        withObservationTracking {
+            _ = service.state
+            refresh(service)
+            let model = model
+            let allowed = model.map { $0.visible && !$0.inDoubt && !$0.snapshotOwed() && $0.view.pendingGeneration == nil } == true
+            let scope = model?.key.map {
+                AttentionScope(server: $0.server.description, account: $0.accountId, organization: $0.orgId,
+                               generation: model?.view.generation ?? "")
+            }
+            service.attentionAggregates.update(scope.map {
+                .init(scope: $0, session: service.connection?.sessionId ?? "", allowed: allowed)
+            }) { service.connection?.orgKey.flatMap { service.orgSessions[$0]?.store } }
+        } onChange: { [weak self, weak service] in
+            Task { @MainActor in
+                guard let self, let service else { return }
+                self.follow(service)
+            }
+        }
+    }
 
     var model: ChatOrgModel? {
         _ = revision
@@ -40,9 +62,11 @@ final class ChatOrgCurrent {
     }
 
     func refresh(_ service: ChatService = .shared) {
-        let orgIdentity = Self.identity(service), sessionIdentity = Self.sessionIdentity(service)
+        let orgIdentity = service.state == .signedIn ? Self.identity(service) : nil
+        let sessionIdentity = Self.sessionIdentity(service)
         if org?.identity != orgIdentity {
-            org = orgIdentity.flatMap { id in ChatOrgModel.current(service).map { (id, $0) } }
+            org?.model.stop()
+            org = orgIdentity.flatMap { id in ChatOrgModel.current(service, coalescingUpdates: true).map { (id, $0) } }
             revision += 1
         }
         if session?.identity != sessionIdentity {

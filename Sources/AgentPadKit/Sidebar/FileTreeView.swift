@@ -184,6 +184,7 @@ private struct FileTreeRowView: View {
 
     @State private var isHovered = false
     @State private var isContextMenuOpen = false
+    @State private var fileDragToken = UUID()
     @State private var lastDirectoryToggle: Date = .distantPast
 
     /// Per-level indent. 14pt keeps ~10 levels readable inside the sidebar's
@@ -284,42 +285,31 @@ private struct FileTreeRowView: View {
         .hoverableRowBackground(isActive: isSelected, isHovered: isHovered)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
-        // Drag carries the raw file URL (public.file-url). The terminal pane's
-        // `performDragOperation` reads exactly this and backslash-escapes the
-        // path, so a tree drag lands identically to a Finder drag.
-        .onDrag {
-            NSItemProvider(object: node.url as NSURL)
-        } preview: {
-            dragPreview(node)
-        }
-        // AgentPad: drop files onto a folder row (file rows aren't targets, so
-        // the highlight never points somewhere the files won't go).
-        .fileTreeDropTarget(directory: node.isDirectory ? node.url : nil, root: model.rootURL, editor: model.nameEdit)
-        // count:2 must attach before count:1 or the double never recognizes.
-        // A double-click on a file also fires the single handler on its
-        // first click — select-then-open, same as Finder.
-        .onTapGesture(count: 2) {
-            if !node.isDirectory { NSWorkspace.shared.open(node.url) }
-        }
-        .onTapGesture {
-            model.selectedId = row.id
-            // AgentPad: a file click previews it under the terminal.
-            if !node.isDirectory { FilePreviewModel.for(store).open(node.url) }
-            guard node.isDirectory else { return }
-            // Whether the single-tap fires once or twice for a double-click
-            // varies across macOS releases; swallow a second toggle inside
-            // the double-click window so a Finder-habit double-click reads
-            // as "expand", never an open-shut flicker.
-            let now = Date()
-            guard now.timeIntervalSince(lastDirectoryToggle) > NSEvent.doubleClickInterval else { return }
-            lastDirectoryToggle = now
-            withAnimation(.easeOut(duration: 0.12)) {
-                model.toggleExpanded(node)
+        .overlay {
+            if model.nameEdit.draft?.path != FileNameEdit.key(node.url) {
+                NavigationDragSource(title: node.name, writers: {
+                    let item = NSPasteboardItem()
+                    item.setString(node.url.absoluteString, forType: .fileURL)
+                    item.setString(fileDragToken.uuidString, forType: InternalFileDrag.type)
+                    return [item]
+                }, click: { count in
+                    model.selectedId = row.id
+                    if !node.isDirectory {
+                        if count == 2 { NSWorkspace.shared.open(node.url) }
+                        else { FilePreviewModel.for(store).open(node.url) }
+                    } else {
+                        let now = Date()
+                        guard now.timeIntervalSince(lastDirectoryToggle) > NSEvent.doubleClickInterval else { return }
+                        lastDirectoryToggle = now
+                        withAnimation(.easeOut(duration: 0.12)) { model.toggleExpanded(node) }
+                    }
+                }, began: { InternalFileDrag.begin(fileDragToken) }, ended: { InternalFileDrag.end(fileDragToken) })
             }
         }
+        .fileTreeDropTarget(directory: node.isDirectory ? node.url : nil, root: model.rootURL, editor: model.nameEdit)
         .onHover { isHovered = $0 }
         .overlay(RightClickCatcher { _ in isContextMenuOpen = true })
-        .popover(isPresented: $isContextMenuOpen, arrowEdge: .trailing) {
+        .attentionPopover(isPresented: $isContextMenuOpen, arrowEdge: .trailing) {
             contextMenu(node)
         }
         .help(node.url.path)

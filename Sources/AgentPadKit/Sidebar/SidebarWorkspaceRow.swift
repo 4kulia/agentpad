@@ -3,7 +3,7 @@ import SwiftUI
 /// Finder-style tag strip for the workspace context menu — a clear slot then
 /// one swatch per colour. The active swatch also clears when clicked, so the
 /// strip toggles whichever way the user reaches for.
-private struct ColorTagStrip: View {
+struct ColorTagStrip: View {
     let current: WorkspaceTag?
     let onPick: (WorkspaceTag?) -> Void
 
@@ -159,7 +159,7 @@ struct SidebarWorkspaceRow: View {
         .onTapGesture(perform: onActivate)
         .onHover { isHovered = $0 }
         .overlay(RightClickCatcher { _ in isContextMenuOpen = true })
-        .popover(isPresented: $isContextMenuOpen, arrowEdge: .trailing) {
+        .attentionPopover(isPresented: $isContextMenuOpen, arrowEdge: .trailing) {
             VStack(alignment: .leading, spacing: 0) {
                 AgentPadMenuRow(
                     title: workspace.worktreeParentId == nil ? "Close Workspace" : "Close Worktree…",

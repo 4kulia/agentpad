@@ -115,6 +115,7 @@ final class ChatChannelModel {
     static let maxBytes = 16 * 1024
 
     @ObservationIgnored var service: ChatService = .shared
+    @ObservationIgnored var canAutomaticallyRead: () -> Bool = { true }
     @ObservationIgnored private var store: ChatStore?
     @ObservationIgnored private var feedObservation: AnyDatabaseCancellable?
     @ObservationIgnored private var threadObservation: AnyDatabaseCancellable?
@@ -842,7 +843,8 @@ final class ChatChannelModel {
     }
 
     func readIfLooking(root: String?, appActive: Bool, shown: Bool, atBottom: Bool) {
-        guard ChatScrollPosition.canMarkRead(appActive: appActive, shown: shown, atBottom: atBottom,
+        guard accessConfirmed, canAutomaticallyRead(),
+              ChatScrollPosition.canMarkRead(appActive: appActive, shown: shown, atBottom: atBottom,
                                              searching: searching || hasNavigationReturn) else { return }
         markConversationRead(root: root, clearingBoundary: false)
     }

@@ -177,6 +177,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         SupportTabs.shared.install()
         TabRouter.shared.ensureHost = { [weak self] in self?.ensureWorkspaceHost()?.store }
         SupportTabs.shared.activateNotice = { [weak self] event in self?.activateFromInbox(event) }
+        _ = AttentionSidebarModel.shared
         restoreWindows()
         SupportTabs.shared.navigation.finishStartup()
 
@@ -346,7 +347,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// `⌘⇧N` default) gets an empty store, which opens one default
     /// workspace; a restored id loads that window's persisted slice.
     @discardableResult
-    private func addWindow(windowId: UUID = UUID(), initiallyEmpty: Bool = false) -> AgentPadWindowController {
+    private func addWindow(windowId: UUID = UUID(), initiallyEmpty: Bool = false, inheriting source: WorkspaceStore? = nil, show: Bool = true) -> AgentPadWindowController {
         precondition(SupportTabs.shared.navigation.configurationLoaded, "Welcome must finish before workspace/runtime construction")
         let persistence = WindowPersistence(windowId: windowId, app: appPersistence)
         let store = WorkspaceStore(
@@ -358,12 +359,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             onSessionWaitingEnded: { AttentionCoordinator.shared.endTerminalWaiting($0) },
             noteRecentFolder: { RecentFolders.shared.note($0) }
         )
-        let controller = AgentPadWindowController(windowId: windowId, store: store)
+        if let source { store.inheritNavigation(from: source) }
+        let controller = AgentPadWindowController(windowId: windowId, store: store,
+                                                   restoring: appPersistence.frame(for: windowId))
         persistence.frameProvider = { [weak controller] in controller?.persistableFrame }
         controller.onShouldClose = { [weak self] in self?.shouldCloseWindow($0) ?? true }
         controller.onWillClose = { [weak self] in self?.handleWindowWillClose($0) }
         controller.onDidBecomeKey = { [weak self] in
             self?.lastKeyController = $0
+            $0.store.active?.activeSession?.lastActivated = Date()
             AttentionLedger.shared.markFocusedAttentionViewed()
         }
         // The window a frame-less newcomer copies its size from: the key
@@ -372,7 +376,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         windowControllers.append(controller)
         if let window = controller.window {
             place(window, restoring: appPersistence.frame(for: windowId), inheritingSizeFrom: reference)
-            window.makeKeyAndOrderFront(nil)
+            if show { window.makeKeyAndOrderFront(nil) }
         }
         return controller
     }
@@ -404,9 +408,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     /// Transfers a live tab into an empty container, without a temporary shell.
     private func moveTabToNewWindow(sessionId: UUID) {
-        let controller = addWindow(initiallyEmpty: true)
-        guard let workspace = controller.store.active, let pane = workspace.activePane else { return }
-        controller.store.handleTabDrop(droppedId: sessionId, to: pane, at: 0, in: workspace)
+        guard let source = windowControllers.first(where: { $0.store.location(ofSessionId: sessionId) != nil }) else { return }
+        NavigationWindowLifecycle.detach(sessionId, from: source, makeDestination: { sourceStore in
+            addWindow(initiallyEmpty: true, inheriting: sourceStore, show: false)
+        }, discard: { controller in
+            // No successful transfer means the atomic writer never admitted its
+            // slot. Terminate first to cancel the newborn's debounced save.
+            controller.store.terminate()
+            controller.onWillClose = nil
+            controller.onShouldClose = nil
+            controller.close()
+            windowControllers.removeAll { $0 === controller }
+            if appPersistence.windowIds.contains(controller.windowId) { appPersistence.removeWindow(controller.windowId) }
+        })
     }
 
     /// No other window is on screen. Evaluated against the live array, which
@@ -420,10 +434,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// and scrollback stay as they are; the next Dock click brings the same
     /// window back. One of several windows, or any window during ⌘Q, really closes.
     private func shouldCloseWindow(_ controller: AgentPadWindowController) -> Bool {
-        guard controller.store.tabCloseCoordinator.prepare(controller.store.allSessions), controller.store.flushPersistence() else { return false }
-        guard isLastWindow(controller), !isTerminating else { return true }
-        controller.hideInsteadOfClose()
-        return false
+        NavigationWindowLifecycle.shouldClose(controller, lastVisible: isLastWindow(controller), terminating: isTerminating) {
+            if case .success = appPersistence.removeWindow(controller.windowId) { return true }
+            return false
+        }
     }
 
     private func handleWindowWillClose(_ controller: AgentPadWindowController) {
@@ -432,7 +446,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // what the next Dock click / launch restores) or when ⌘Q is closing
         // every window. Closing one of several open windows discards just
         // that one.
-        if isTerminating || isLastWindow(controller) {
+        if controller.persistedSlotRemoved {
+            // User-close already removed the slot before AppKit committed close.
+        } else if isTerminating || isLastWindow(controller) {
             controller.store.flushPersistence()
         } else {
             appPersistence.removeWindow(controller.windowId)
@@ -1012,9 +1028,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             guard let scope = event.scope, let key = ChatAttention.key(scope),
                   ChatNotifications.allowed(.shared, key, channel: id) else { return nil }
             let ref = ChannelRef(key, channel: id)
-            let controller = windowControllers.first { $0.store.channelTab(ref) != nil } ?? activeController ?? addWindow()
-            controller.window?.deminiaturize(nil); controller.window?.makeKeyAndOrderFront(nil)
-            return controller.store.showChannel(ref)
+            return TabRouter.shared.openChannel(ref, scope: scope, from: activeStore)
         }
         switch event.destination {
         case .terminal(let id):
@@ -1049,7 +1063,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         case .tabAction(_, let id): return PendingConfirmations.shared.open(id)
         case .directMessage(let dm, _, let thread, _):
             guard let scope = event.scope, ChatAttention.sameScope(scope, .shared), let key = ChatAttention.key(scope),
-                  let tab = ChatDMTabs.open(ChatDMRef(key, dm: dm)) else { return false }
+                  let tab = ChatDMTabs.open(ChatDMRef(key, dm: dm), from: activeStore) else { return false }
             tab.tabState?.dmPendingThread = thread
             tab.tabState?.dmModel?.openThread(thread)
             return true
@@ -1248,7 +1262,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// NSMenu first, so they fire even though `GhosttySurfaceView.keyDown`
     /// captures every other key — the menu system gets first dibs on `⌘x`
     /// before keyDown sees the event.
-    private func installMainMenu() {
+    func installMainMenu() {
         let mainMenu = NSMenu()
 
         // App menu — system-routed selectors via the responder chain. About
@@ -1331,8 +1345,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 tag: MenuTag.workspace(n)
             )
         }
-        let viewEntries: [MenuEntry] = [
-            selfRow("Toggle Sidebar", #selector(handleToggleSidebar), "s", modifiers: [.command, .control]),
+        let navigationRows = LeftNavigationCommand.allCases.map {
+            selfRow($0.title, #selector(handleNavigationCommand(_:)), $0.key, modifiers: $0.modifiers, tag: $0.rawValue)
+        }
+        let viewEntries: [MenuEntry] = navigationRows + [
             // AgentPad: Chat focus commands have no terminal-wide shortcuts.
             .sub(ChatFocusMenu.make(target: self, action: #selector(handleChatFocus(_:)))),
             .separator,
@@ -1607,33 +1623,41 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     func prepareSearch(in store: WorkspaceStore) {
+        AttentionSidebarModel.shared.updateProjection()
         let snapshot = PaletteIndex.snapshot(controllers: windowControllers, model: .shared,
             recentFolders: RecentFolders.shared.paths.map { URL(fileURLWithPath: $0, isDirectory: true) })
         store.search.quickItems = { PaletteIndex.build(snapshot) }
-        store.search.quickAllowedIDs = { [weak self] items in
+        store.search.quickAllowedIDs = { items in
             _ = AgentMonitor.shared.windowGeneration
             let model = ChatOrgCurrent.shared.model, scope = model?.key.map(OrgKey.init)
             let agents = Set(ChatSidebarSnapshot(model: model, active: nil).agents.map(\.id))
-            // DM card changes also invalidate cached tab permissions.
-            if let key = ChatService.shared.connection?.orgKey { _ = ChatService.shared.dmList(key)?.entries }
+            let tabs = AttentionSidebarModel.shared.projection.tabs
             return Set(items.filter { item in
                 switch item.kind {
                 case .channel(let ref):
                     guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key) else { return false }
-                    return ChatNotifications.allowed(.shared, key, channel: ref.channel)
+                    return model?.visibleChannel(ref.channel) != nil
                 case .teamAgent(let itemScope, let id):
                     return itemScope == scope && agents.contains(id)
                 case .tab(let id, let workspace, let window):
-                    guard let ws = self?.windowControllers.first(where: { $0.windowId == window })?.store.workspaces.first(where: { $0.id == workspace }),
-                          let tab = ws.root.pane(containingSessionId: id)?.tabs.first(where: { $0.id == id }) else { return false }
-                    if let ref = tab.channel {
-                        guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key), ChatNotifications.allowed(.shared, key, channel: ref.channel) else { return false }
-                    }
-                    if case .directMessage(let ref) = tab.toolRoute, ref.key.map({ ChatService.shared.dmAllowed($0, ref.dm) }) != true { return false }
-                    return tab.title == item.title
+                    guard let tab = tabs[id], tab.owner == .init(window: window, workspace: workspace) else { return false }
+                    return tab.available && AttentionSidebarModel.shared.tabTitle(id) == item.title
                 default: return true
                 }
             }.map(\.id))
+        }
+        store.search.quickReadouts = { items in
+            let projection = AttentionSidebarModel.shared.projection
+            return items.map { original in
+                var item = original
+                switch item.kind {
+                case .tab(let id, _, _): item.attentionSummary = projection.tabIndicators[id]?.accessibleSummary
+                case .workspace(let id, let window): item.attentionSummary = projection.workspaceIndicators[.init(window: window, workspace: id)]?.accessibleSummary
+                default: break
+                }
+                if let summary = item.attentionSummary { item.subtitle += " · " + summary }
+                return item
+            }
         }
         store.search.activateQuick = { [weak self] item in self?.activate(item) }
     }
@@ -1657,6 +1681,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                   let ws = target.store.workspaces.first(where: { $0.id == wsId }),
                   let pane = ws.root.pane(containingSessionId: sId),
                   let session = pane.tabs.first(where: { $0.id == sId }) else { return }
+            if let ref = session.channel {
+                guard TabRouter.shared.channelScope(ref) != nil else { return }
+            }
+            if case .directMessage(let ref) = session.toolRoute,
+               ref.key.map({ ChatService.shared.dmAllowed($0, ref.dm) }) != true { return }
             revealTab(session, in: ws, controller: target)
         case .createWorktree(let wsId, let winId):
             guard let target = windowControllers.first(where: { $0.windowId == winId }),
@@ -1671,7 +1700,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             store.addTab(in: ws, template: template)
         case .channel(let ref):
             guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key), ChatNotifications.allowed(.shared, key, channel: ref.channel) else { return }
-            _ = activeStore?.showChannel(ref)
+            _ = TabRouter.shared.openChannel(ref, from: activeStore)
         case .teamAgent(let scope, let id):
             guard let model = ChatOrgCurrent.shared.model, model.key.map(OrgKey.init) == scope,
                   ChatSidebarSnapshot(model: model, active: nil).agents.contains(where: { $0.id == id }) else { return }
@@ -1680,6 +1709,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             handleNewSSHWorkspace()
         case .openRecentFolder(let path):
             openRecentFolder(atPath: path)
+        case .attention:
+            guard let store = activeStore else { return }
+            prepareSearch(in: store)
+            store.search.query = "needs attention"
+            store.search.begin()
+        case .navigation(let command):
+            activeStore?.performNavigationCommand(command)
         }
     }
 
@@ -1806,6 +1842,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let tabCount = store?.active?.activePane?.tabs.count ?? 0
         let workspaceCount = store?.workspaces.count ?? 0
         for item in menu.items {
+            if item.action == #selector(handleNavigationCommand(_:)), let command = LeftNavigationCommand(rawValue: item.tag) {
+                if command == .togglePanel { item.title = store?.panelToggleTitle ?? command.title }
+                if command == .toggleRail { item.title = store?.leftNavigation.railVisible == true ? "Hide Workspaces Rail" : "Show Workspaces Rail" }
+            }
             if MenuTag.tabRange.contains(item.tag) {
                 item.isHidden = item.tag > tabCount
             } else if MenuTag.workspaceRange.contains(item.tag) {
@@ -1916,7 +1956,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
         if menuItemMatches(
             menuItem,
-            #selector(handleToggleSidebar),
+            #selector(handleNavigationCommand(_:)),
             #selector(handleCloseWorkspace),
             #selector(handleRenameWorkspace)
         ) {
@@ -1965,11 +2005,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         activeStore?.active?.activeSession?.engine.performAction("jump_to_prompt:1")
     }
 
-    @objc private func handleToggleSidebar() {
-        guard let store = activeStore else { return }
-        withAnimation(Theme.chromeTransition) {
-            store.setSidebarMode(store.sidebarMode.next)
-        }
+    @objc private func handleNavigationCommand(_ sender: NSMenuItem) {
+        guard validateMenuItem(sender), let command = LeftNavigationCommand(rawValue: sender.tag) else { return }
+        activeStore?.performNavigationCommand(command)
     }
 
     // AgentPad: the engine owns the conversation, so another window cannot take focus.

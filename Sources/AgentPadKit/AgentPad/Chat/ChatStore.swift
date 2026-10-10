@@ -545,10 +545,14 @@ final class ChatStore: Sendable {
     /// An RFC 3339 time, its fraction of seconds of any length — the
     /// server's have six digits, the formatter reads three (review D8h-p3-6).
     static func date(_ text: String) -> Date? {
-        guard let dot = text.firstIndex(of: ".") else { return ISO8601DateFormatter().date(from: text) }
+        date(text, formatter: ISO8601DateFormatter())
+    }
+
+    static func date(_ text: String, formatter: ISO8601DateFormatter) -> Date? {
+        guard let dot = text.firstIndex(of: ".") else { return formatter.date(from: text) }
         let end = text[text.index(after: dot)...].firstIndex { !$0.isNumber } ?? text.endIndex
         guard let fraction = Double("0" + text[dot..<end]) else { return nil }
-        return ISO8601DateFormatter().date(from: String(text[..<dot] + text[end...]))?.addingTimeInterval(fraction)
+        return formatter.date(from: String(text[..<dot] + text[end...]))?.addingTimeInterval(fraction)
     }
 
     /// A new generation whose handling has begun and not finished.

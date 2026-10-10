@@ -74,34 +74,51 @@ final class ChatDMAttentionSource: AttentionDMSource {
     private weak var service: ChatService?
     private var scope: AttentionScope?
     private var changed: (([AttentionConversation]) -> Void)?
-    private var observation: AnyDatabaseCancellable?
+    private var observation: ChatSnapshotObservation<[ChatDMEntry]>?
     private var epoch = UUID()
     private var rows: [ChatDMEntry] = []
-    init(service: ChatService = .shared) { self.service = service }
+    private(set) var conversations: [AttentionConversation] = []
+    private let immediateInitialValue: Bool
+    init(service: ChatService = .shared, immediateInitialValue: Bool = true) {
+        self.service = service; self.immediateInitialValue = immediateInitialValue
+    }
     func start(scope: AttentionScope, changed: @escaping ([AttentionConversation]) -> Void) {
         stop(); self.scope = scope; self.changed = changed
         guard let service, let key = ChatAttention.key(scope), let store = service.orgSessions[key]?.store else { changed([]); return }
         let captured = epoch
-        observation = ValueObservation.tracking { db in
-            _ = try Row.fetchOne(db, sql: "SELECT * FROM dm_meta")
+        observation = ChatSnapshotObservation(in: store.queue,
+            tracking: ["meta", "dm_meta", "members", "dm_cards", "dm_marks", "dm_messages", "dm_changes", "outbox", "dm_pending", "dm_preferences"],
+            immediateInitialValue: immediateInitialValue, fetch: { db in
             return try ChatDMEntry.read(db, me: key.accountId)
-        }.start(in: store.queue, scheduling: .immediate, onError: { [weak self] _ in self?.rows = []; self?.refresh() }) { [weak self] rows in
+        }, onError: { [weak self] _ in
+            guard let self, epoch == captured else { return }
+            rows = []; refresh()
+        }, onChange: { [weak self] rows in
             guard let self, epoch == captured else { return }; self.rows = rows; refresh()
-        }
-    }
-    func refresh() {
-        guard let service, let scope, let key = ChatAttention.key(scope), ChatAttention.sameScope(scope, service), service.dmAllowed(key) else { changed?([]); return }
-        changed?(rows.filter { $0.unread && !$0.roots.muted }.map { row in
-            var value = AttentionConversation(scope: scope, id: row.id, title: row.card.peer.name,
-                count: max(1, row.roots.count + row.replies), time: row.lastUsed, subjectID: row.card.peer.accountId, subjectName: row.card.peer.name)
-            value.unreadLabel = row.roots.something ? "Unread activity" : "\(row.roots.count)\(row.roots.more ? "+" : "") roots · \(row.replies) replies"
-            return value
         })
     }
-    func stop() { epoch = UUID(); observation = nil; rows = []; changed?([]); changed = nil; scope = nil }
-    func open(_ conversation: String, scope: AttentionScope) {
+    func refresh() {
+        // The connection may have no DM capability or synchronizer at all.
+        // Reject that in-memory gate before sameScope reads the cache generation.
+        guard let service, let scope, let key = ChatAttention.key(scope), service.dmAllowed(key), ChatAttention.sameScope(scope, service) else {
+            conversations = []; changed?([]); return
+        }
+        let previous = Dictionary(conversations.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        conversations = rows.map { row in
+            var value = previous[row.id] ?? AttentionConversation(scope: scope, id: row.id, title: "", count: 0, time: .distantPast)
+            value.title = row.card.peer.name; value.subjectID = row.card.peer.accountId; value.subjectName = row.card.peer.name
+            value.count = max(row.unread ? 1 : 0, row.roots.count + row.replies)
+            value.time = row.lastUsed; value.muted = row.roots.muted
+            value.readMarks = row.readMarks
+            value.unreadLabel = row.roots.something ? "Unread activity" : "\(row.roots.count)\(row.roots.more ? "+" : "") roots · \(row.replies) replies"
+            return value
+        }
+        changed?(conversations.filter { $0.count > 0 && !$0.muted })
+    }
+    func stop() { epoch = UUID(); observation?.cancel(); observation = nil; rows = []; conversations = []; changed?([]); changed = nil; scope = nil }
+    func open(_ conversation: String, scope: AttentionScope, from store: WorkspaceStore? = nil) {
         guard let service, ChatAttention.sameScope(scope, service), let key = ChatAttention.key(scope) else { return }
-        ChatDMTabs.open(ChatDMRef(key, dm: conversation), service: service)
+        ChatDMTabs.open(ChatDMRef(key, dm: conversation), from: store, service: service)
     }
     func markRead(_ conversation: String, scope: AttentionScope) {
         guard let service, ChatAttention.sameScope(scope, service), let key = ChatAttention.key(scope), service.dmAllowed(key, conversation) else { return }

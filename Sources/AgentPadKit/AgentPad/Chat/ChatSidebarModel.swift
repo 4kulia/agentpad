@@ -14,11 +14,11 @@ struct ChatSidebarPreferences: Codable, Equatable {
     }
 
     var attentionCollapsed: Bool?
-    var width: Double = 248
+    var width: Double = 268
     var collapsed: [Section] = []
 
     static func clampWidth(_ width: Double) -> Double {
-        width.isFinite ? min(320, max(220, width)).rounded() : 248
+        width.isFinite ? min(320, max(220, width)).rounded() : 268
     }
 
     mutating func setCollapsed(_ section: Section, _ value: Bool) {

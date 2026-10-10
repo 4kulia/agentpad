@@ -182,7 +182,7 @@ final class ChatSidebarTests: XCTestCase {
         store.setSidebarMode(.compact)
         store.setSidebarContent(.chat)
         XCTAssertEqual(store.sidebarMode, .full)
-        XCTAssertEqual(store.sidebarDisplayWidth, 248)
+        XCTAssertEqual(store.sidebarDisplayWidth, 268)
         store.setSidebarDisplayWidth(299.5)
         store.setChatSectionCollapsed(.init(key, team: "General"), true)
         store.chatNavigation.query = "private search"
@@ -224,19 +224,20 @@ final class ChatSidebarTests: XCTestCase {
             XCTAssertEqual(old.workspaces.count, store.workspaces.count)
         }
         var legacy = try XCTUnwrap(persistence.saved)
+        legacy.leftNavigation = nil
         legacy.sidebarSelectedContent = "future-mode"
         legacy.sidebarContent = .files
         legacy.chatSidebarPreferences = nil
         let restored = makeStore(InMemoryPersistence(initial: legacy))
         defer { restored.terminate() }
         XCTAssertEqual(restored.sidebarContent, .files)
-        XCTAssertEqual(restored.chatSidebarPreferences.width, 248)
+        XCTAssertEqual(restored.chatSidebarPreferences.width, 268)
     }
 
     func testChatWidthClampsAndSectionsAreScoped() throws {
         XCTAssertEqual(ChatSidebarPreferences.clampWidth(100), 220)
         XCTAssertEqual(ChatSidebarPreferences.clampWidth(900), 320)
-        XCTAssertEqual(ChatSidebarPreferences.clampWidth(.nan), 248)
+        XCTAssertEqual(ChatSidebarPreferences.clampWidth(.nan), 268)
         var prefs = ChatSidebarPreferences()
         let one = ChatSidebarPreferences.Section(key, team: "General")
         var other = one; other.account = "another"

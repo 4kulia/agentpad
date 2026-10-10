@@ -223,10 +223,16 @@ final class AgentProfileStore {
         let binding: AgentProfileBinding
         if var bound = next.bindings[record.id] {
             let old = bound.record
-            bound.record = AgentSessionRecord(agentId: old.agentId, conversationId: old.conversationId,
-                title: record.title, cwd: old.cwd, lastActivity: max(old.lastActivity, record.lastActivity),
-                agentTitle: record.agentTitle, summary: record.summary, firstPrompt: record.firstPrompt,
-                automatic: record.automatic, startedAt: record.startedAt, fileURL: record.fileURL)
+            guard (record.scannedAt ?? .distantPast) >= (old.scannedAt ?? .distantPast) else { return false }
+            bound.record = record.inDirectory(old.cwd)
+            // A bounded scan can miss previously observed text. Only replace
+            // each saved field when the newer scan has a non-empty value.
+            if SessionTitle.nonempty(record.title) == nil { bound.record.title = old.title }
+            if SessionTitle.nonempty(record.agentTitle) == nil { bound.record.agentTitle = old.agentTitle }
+            if SessionTitle.nonempty(record.customTitle) == nil { bound.record.customTitle = old.customTitle }
+            if SessionTitle.nonempty(record.aiTitle) == nil { bound.record.aiTitle = old.aiTitle }
+            if SessionTitle.nonempty(record.summary) == nil { bound.record.summary = old.summary }
+            if SessionTitle.nonempty(record.firstPrompt) == nil { bound.record.firstPrompt = old.firstPrompt }
             binding = bound
         } else {
             // With no matching tool there is no reason to resolve any disk paths.
@@ -248,11 +254,15 @@ final class AgentProfileStore {
         guard let profile = profile(profileID), profile.rosterID == record.agentId else { throw Problem.missingProfile }
         if let origin { try details.remember(origin, conversation: record.conversationId) }
         guard archive.bindings[record.id] == nil else { return }
+        // Discovery may have finished before adoption or the first id report.
+        // Keep the launch folder, but reuse known conversation metadata.
+        let boundRecord = canonicalRecord(seenRecords[record.id] ?? record,
+            cwd: deferred ? record.cwd : canonicalize(record.cwd))
         if deferred {
-            archive.bindings[record.id] = AgentProfileBinding(profileID: profileID, record: record)
+            archive.bindings[record.id] = AgentProfileBinding(profileID: profileID, record: boundRecord)
         } else {
             var next = archive
-            next.bindings[record.id] = AgentProfileBinding(profileID: profileID, record: canonicalRecord(record))
+            next.bindings[record.id] = AgentProfileBinding(profileID: profileID, record: boundRecord)
             try commit(next)
         }
     }
@@ -296,10 +306,7 @@ final class AgentProfileStore {
     }
 
     private func canonicalRecord(_ record: AgentSessionRecord, cwd: URL? = nil) -> AgentSessionRecord {
-        AgentSessionRecord(agentId: record.agentId, conversationId: record.conversationId, title: record.title,
-            cwd: cwd ?? canonicalize(record.cwd), lastActivity: record.lastActivity, agentTitle: record.agentTitle,
-            summary: record.summary, firstPrompt: record.firstPrompt, automatic: record.automatic,
-            startedAt: record.startedAt, fileURL: record.fileURL)
+        record.inDirectory(cwd ?? canonicalize(record.cwd))
     }
     private func commit(_ next: Archive) throws {
         do {

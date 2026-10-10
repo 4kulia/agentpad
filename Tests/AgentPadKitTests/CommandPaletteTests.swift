@@ -109,6 +109,16 @@ final class PaletteIndexMatchTests: XCTestCase {
         XCTAssertTrue(out.contains(where: { $0.id == "3" }))
     }
 
+    func testNeedsAttentionFilterUsesPreparedReadoutAndSupportsTitleQuery() {
+        var marked = items
+        marked[0].attentionSummary = "Needs input: 1"
+        marked[1].attentionSummary = "Failed: 1"
+        XCTAssertEqual(PaletteIndex.match(query: "needs attention", in: marked).map(\.id), ["1", "2"])
+        XCTAssertEqual(PaletteIndex.match(query: "needs attention demo", in: marked).map(\.id), ["2"])
+        marked[1].attentionSummary = nil
+        XCTAssertEqual(PaletteIndex.match(query: "needs attention", in: marked).map(\.id), ["1"])
+    }
+
     func testNoMatchReturnsEmpty() {
         let out = PaletteIndex.match(query: "zzzzzzz", in: items)
         XCTAssertTrue(out.isEmpty)

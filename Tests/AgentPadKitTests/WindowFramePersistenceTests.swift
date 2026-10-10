@@ -78,6 +78,28 @@ final class WindowFramePersistenceTests: XCTestCase {
 
     // MARK: - The controller's persistable frame
 
+    func testSaved800PointThreePaneWindowRestoresWithOverlayPanel() async throws {
+        let store = makeTestStore()
+        defer { store.terminate() }
+        let workspace = try XCTUnwrap(store.active)
+        let second = try XCTUnwrap(store.splitPane(try XCTUnwrap(workspace.activePane), orientation: .horizontal, in: workspace))
+        _ = try XCTUnwrap(store.splitPane(second, orientation: .horizontal, in: workspace))
+        let saved = PersistedFrame(NSRect(x: 50, y: 60, width: 800, height: 600))
+        let controller = AgentPadWindowController(windowId: UUID(), store: store, restoring: saved)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.makeKeyAndOrderFront(nil)
+        try await Task.sleep(for: .milliseconds(150))
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertEqual(window.frame.width, 800)
+        XCTAssertEqual(controller.persistableFrame?.width, 800)
+        XCTAssertTrue(store.navigationPresentation.isNarrow)
+        XCTAssertTrue(store.leftNavigation.panelVisible)
+        store.toggleNavigationPanel()
+        XCTAssertTrue(store.navigationPresentation.narrowPanelOpen)
+        XCTAssertEqual(window.frame.width, 800)
+    }
+
     func testPersistableFrameFollowsTheWindowExceptWhileFullscreen() throws {
         let store = makeTestStore()
         let controller = AgentPadWindowController(windowId: UUID(), store: store)

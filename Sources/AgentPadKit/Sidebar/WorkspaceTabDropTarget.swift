@@ -28,10 +28,13 @@ private struct WorkspaceTabDropTarget: ViewModifier {
         content
             .tabDropHighlight(isTargeted && store.draggedTab.map { store.canDropTab($0.id, in: workspace) } == true)
             .dropDestination(for: String.self) { dropped, _ in
-                defer { store.draggingTabId = nil }
+                defer { store.draggingTabId = nil; store.finishNavigationDrag() }
                 guard let id = dropped.first.flatMap(UUID.init) else { return false }
                 return store.handleTabDrop(droppedId: id, in: workspace)
-            } isTargeted: { isTargeted = $0 }
+            } isTargeted: {
+                isTargeted = $0
+                store.setRailDragTarget(workspace.id.uuidString, entered: $0)
+            }
     }
 }
 
@@ -42,38 +45,35 @@ struct NewWorkspaceDropZone: View {
 
     var body: some View {
         let dragging = store.draggedTab != nil
-        Button { store.addWorkspace() } label: {
-            VStack(spacing: 8) {
-                HStack(spacing: 6) {
-                    Image(systemName: "plus")
-                    if !isCompact { Text("New workspace") }
-                }
-                if !isCompact {
-                    Text(dragging ? "Release to create a workspace\nEsc to cancel" : "Drag a tab here\nto create a workspace")
-                        .font(Theme.display(11))
-                        .multilineTextAlignment(.center)
-                }
+        Button { store.closeNavigation(restoreFocus: false); store.addWorkspace() } label: {
+            VStack(spacing: 4) {
+                Image(systemName: "plus").font(.system(size: 17))
+                if !isCompact { Text("New").font(Theme.display(9)) }
             }
-            .font(Theme.display(12))
             .foregroundStyle(isTargeted && dragging ? Color.accentColor : Theme.chromeMuted)
-            .padding(.vertical, isCompact ? 12 : 18)
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity).frame(height: isCompact ? 40 : 48)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(dragging ? Color.accentColor.opacity(0.65) : Theme.chromeHairline,
-                              style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                .allowsHitTesting(false)
+            if dragging {
+                RoundedRectangle(cornerRadius: 7)
+                    .strokeBorder(Color.accentColor.opacity(0.65), lineWidth: 1)
+                    .allowsHitTesting(false)
+            }
         }
         .tabDropHighlight(isTargeted && dragging)
-        .help("Drag a tab here to create a workspace")
+        .help("New workspace · ⌘N\nDrag a tab here to create a workspace")
+        .accessibilityLabel("New workspace")
         .dropDestination(for: String.self) { dropped, _ in
-            defer { store.draggingTabId = nil }
+            defer { store.draggingTabId = nil; store.finishNavigationDrag() }
             guard let id = dropped.first.flatMap(UUID.init) else { return false }
-            return store.moveTabToNewWorkspace(id) != nil
-        } isTargeted: { isTargeted = $0 }
-        .padding(Theme.space2)
+            guard store.moveTabToNewWorkspace(id) != nil else { return false }
+            store.closeNavigation(restoreFocus: false)
+            return true
+        } isTargeted: {
+            isTargeted = $0
+            store.setRailDragTarget("new-workspace", entered: $0)
+        }
     }
 }

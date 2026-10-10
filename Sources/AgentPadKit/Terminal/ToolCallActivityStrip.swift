@@ -93,7 +93,7 @@ struct ToolCallActivityPill: View {
         .onHover { isHovered = $0 }
         .animation(.easeOut(duration: 0.12), value: isHovered)
         .animation(Theme.chromeTransition, value: historyOpen)
-        .popover(isPresented: $historyOpen, arrowEdge: .top) {
+        .attentionPopover(isPresented: $historyOpen, arrowEdge: .top) {
             ToolCallHistoryPopover(session: session)
         }
         .accessibilityLabel(accessibilityLabel)

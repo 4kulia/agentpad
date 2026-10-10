@@ -8,7 +8,7 @@ import SwiftUI
 enum AgentPadWindowLayout {
     /// Smallest width that keeps the fixed top-chrome controls plus the 28pt
     /// search trigger and its 15pt safety gap on both sides.
-    static let minimumChromeWidth: CGFloat = 301
+    static let minimumChromeWidth: CGFloat = 329
     /// Keeps one terminal useful at the narrowest supported window size while
     /// still leaving the status bar enough room to wrap inside its own pane.
     static let minimumTerminalWidth: CGFloat = 200
@@ -176,6 +176,8 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
     /// than derived from `NSWindow.isVisible`, which ⌘H (Hide AgentPad) and a
     /// just-closed window awaiting its next-tick drop also make false.
     private(set) var hiddenOnClose = false
+    var persistedSlotRemoved = false
+    private var navigationKeyMonitor: Any?
     /// Fires when this window becomes key — lets `AppDelegate` remember the
     /// most-recently-active AgentPad window, so menu actions route there when a
     /// Settings / Update panel is the key window instead.
@@ -192,11 +194,24 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
     }
     private var preFullScreenFrame: NSRect?
 
-    init(windowId: UUID, store: WorkspaceStore) {
+    init(windowId: UUID, store: WorkspaceStore, restoring savedFrame: PersistedFrame? = nil) {
         self.windowId = windowId
         self.store = store
         self.paneHost = PaneTreeHostView(store: store)
         super.init(window: Self.makeWindow())
+        // Choose docked/overlay layout from the saved geometry, before the
+        // hosting view or initial minimum can enlarge the temporary 1100pt window.
+        if let savedFrame, let window,
+           let frame = WindowPlacement.restoredFrame(savedFrame.rect, minSize: window.minSize,
+                                                    screens: NSScreen.screens.map(\.visibleFrame)) {
+            window.setFrame(frame, display: false)
+        }
+        store.navigationWindow = window
+        navigationKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.window === self.window, event.keyCode == 53,
+                  self.store.handleNavigationEscape() else { return event }
+            return nil
+        }
         window?.delegate = self
         window?.contentView = NSHostingView(
             rootView: ContentView(store: store, paneHost: paneHost) { [weak self] expandIfNeeded, animate in
@@ -267,6 +282,7 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let navigationKeyMonitor { NSEvent.removeMonitor(navigationKeyMonitor); self.navigationKeyMonitor = nil }
         onWillClose?(self)
     }
 
@@ -329,13 +345,17 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private var desiredMinimumWindowWidth: CGFloat {
-        AgentPadWindowLayout.minimumWindowWidth(
-            leftMode: store.sidebarMode,
-            expandedLeftWidth: store.sidebarDisplayWidth,
-            rightMode: store.rightSidebarMode,
-            expandedRightWidth: store.rightSidebarWidth,
-            terminalWidth: AgentPadWindowLayout.minimumTerminalTreeWidth(for: store.active?.root)
-        )
+        let right: CGFloat
+        switch store.rightSidebarMode {
+        case .hidden: right = 0
+        case .compact: right = AgentOverviewSidebar.compactWidth + 1
+        case .full: right = store.rightSidebarWidth + 1
+        }
+        let tree = AgentPadWindowLayout.minimumTerminalTreeWidth(for: store.active?.root)
+        // Both the panel and expanded list can overlay. Including their docked
+        // widths here would prevent resizing down far enough to enter that mode.
+        let rail = store.leftNavigation.railVisible ? LeftNavigationLayout.railWidth : 0
+        return max(AgentPadWindowLayout.minimumChromeWidth, rail + tree + right)
     }
 
     private func minimumWindowWidth(on screen: NSScreen?) -> CGFloat {

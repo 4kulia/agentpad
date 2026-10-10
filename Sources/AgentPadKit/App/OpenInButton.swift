@@ -74,7 +74,7 @@ struct OpenInButton: View {
             .animation(.easeOut(duration: 0.12), value: chevronHovered)
             .accessibilityLabel(String(localized: "Open in…", bundle: .agentPadResources))
             .help(String(localized: "Open in…", bundle: .agentPadResources))
-            .popover(isPresented: $isMenuOpen, arrowEdge: .bottom) {
+            .attentionPopover(isPresented: $isMenuOpen, arrowEdge: .bottom) {
                 picker(visible: visible, dir: dir)
             }
         }

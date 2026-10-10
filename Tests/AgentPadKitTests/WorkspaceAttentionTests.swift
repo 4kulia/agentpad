@@ -148,7 +148,7 @@ final class WorkspaceAttentionTests: XCTestCase {
         let ids = Set(ledger.events.filter { $0.destination == .terminal(session.id) }.map(\.id))
         let current = AttentionCurrent(terminals: Dictionary(uniqueKeysWithValues: contexts.flatMap { $0.store.allSessions }.map {
             ($0.id, .init(episode: $0.attentionEpisode, failed: $0.hasCurrentAttentionFailure,
-                         finished: $0.hasCurrentAttentionCompletion, title: $0.title))
+                         finished: $0.hasCurrentAttentionCompletion))
         }))
         return AttentionList.items(ledger: ledger.events, current: current, viewed: ledger.viewedAttentionIDs)
             .filter { ids.contains($0.id) }

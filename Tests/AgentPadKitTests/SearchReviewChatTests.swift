@@ -81,6 +81,81 @@ final class SearchReviewChatTests: XCTestCase {
         try SearchCache.write(store.queue) { try $0.execute(sql: "UPDATE messages SET revision=3, text='changed' WHERE message_id='two'") }
         XCTAssertFalse(model.hits.contains { $0.messageID == "two" }, "A newer cached revision must hide the obsolete snippet")
     }
+
+    func testMessageResultsReuseLocalAndDetachedTabsAndRevealRootsAndReplies() async throws {
+        let isolation = TeamServiceTestScope()
+        defer { isolation.close() }
+        let cache = try await connect()
+        let service = try XCTUnwrap(self.service)
+        try SearchCache.write(cache.queue) {
+            try $0.execute(sql: "INSERT INTO channel_windows (channel_id, epoch, bottom_seq) VALUES ('channel', 1, 100)")
+        }
+        var stores: [WorkspaceStore] = []
+        let origin = WorkspaceStore(persistence: InMemoryPersistence(), engineFactory: { TestEngine() }, peerStores: { stores })
+        let detached = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true,
+                                      engineFactory: { TestEngine() }, peerStores: { stores })
+        stores = [origin, detached]
+        let previous = AgentMonitor.shared.storesProvider
+        AgentMonitor.shared.storesProvider = { stores }
+        defer { AgentMonitor.shared.storesProvider = previous; stores.forEach { $0.terminate() }; stores = [] }
+        let tab = origin.openChannelTab(ChannelRef(key, channel: "channel"), in: try XCTUnwrap(origin.active))
+        let projection = AttentionSidebarModel(ledger: AttentionLedger(), service: service)
+        let router = TabRouter()
+        router.stores = { stores }
+        router.prepareDestinations = { projection.updateProjection() }
+        router.destinations = { projection.projection.tabs }
+        router.channelScope = { [service, key] ref in
+            ref.belongs(to: key) && ChatNotifications.allowed(service, key, channel: ref.channel)
+                ? ChatAttention.scope(key, service) : nil
+        }
+        var revealedWindow: UUID?
+        router.revealWindow = { revealedWindow = $0.windowID }
+        let index = ConversationIndex(directory: root.appendingPathComponent("index"), roots: [:], visibility: { .init(channelIds: []) })
+        let model = EverywhereSearchModel(messages: ChatSearchModel(service: service), indexing: .init(index: index),
+            catalog: .init(scan: { _ in .init(records: [], scanned: 0, total: 0, skipped: 0) }),
+            names: SessionNames(url: root.appendingPathComponent("names.sqlite")), visibility: { .init(channelIds: []) })
+        let channel = ChatChannelModel(key: key, channel: "channel")
+        channel.service = service; channel.canAutomaticallyRead = { false }; channel.follow(cache)
+        let count = stores.flatMap(\.allSessions).count
+        for owner in stores {
+            if owner === detached {
+                // The same live-session transfer used when detaching a tab.
+                let workspace = try XCTUnwrap(detached.active), pane = try XCTUnwrap(workspace.activePane)
+                XCTAssertTrue(detached.handleTabDrop(droppedId: tab.id, to: pane, at: 0, in: workspace))
+                XCTAssertNil(origin.channelTab(ChannelRef(key, channel: "channel")))
+            }
+            _ = owner.addEmptyWorkspace() // The resolver must also select the hidden workspace.
+            for id in ["one", "two"] {
+                var result = hit(id)
+                result.threadRootID = id == "two" ? "one" : nil
+                let wire = try JSONDecoder().decode(ChatMessageWire.self, from: JSONSerialization.data(withJSONObject: [
+                    "message_id": id, "channel_id": "channel", "thread_root_id": result.threadRootID as Any? ?? NSNull(),
+                    "author_account_id": "account", "seq": result.messageSeq, "revision": 3,
+                    "text": "Current server message", "created_at": result.createdAt
+                ]))
+                let page = try JSONEncoder().encode(ChatMessagesPage(messages: [wire], next: nil, head: 100))
+                ChatStubProtocol.reset { _, _ in .success(.init(status: 200, body: page)) }
+                await SearchNavigation.open(result, model: model, from: origin, service: service, router: router)
+                XCTAssertNil(model.navigationError)
+                XCTAssertTrue(model.returnAvailable)
+                XCTAssertEqual(revealedWindow, owner.windowID)
+                XCTAssertTrue(owner.active?.activeSession === tab)
+                XCTAssertEqual(stores.flatMap(\.allSessions).count, count, "Message results must not duplicate a channel tab")
+                let wrongHost = try XCTUnwrap(origin.allSessions.first { $0 !== tab }?.engine.view)
+                XCTAssertNil(ChatMessageNavigation.take(key: key, channel: "channel", from: wrongHost))
+                let link = try XCTUnwrap(ChatMessageNavigation.take(key: key, channel: "channel", from: tab.engine.view))
+                XCTAssertEqual(link.message, id); XCTAssertEqual(link.sequence, result.messageSeq)
+                channel.navigate(to: link)
+                XCTAssertEqual(channel.revealMessageID, id, "The reused tab receives the scroll and highlight target")
+                XCTAssertEqual(channel.threadRoot, result.threadRootID)
+                let messages = id == "one" ? channel.feed.messages : channel.thread
+                XCTAssertEqual(messages.first { $0.id == id }?.text, "Current server message")
+                channel.finishNavigation()
+            }
+        }
+        XCTAssertEqual(try SearchCache.read(cache.queue) { try ChatUnread.readSequence($0, channel: "channel") }, 0)
+    }
+
     func testDMNavigationCacheWriteIncludingActivityPreservesPages() async throws {
         let store = try await connect()
         let card = ChatDMCard(dmId: "dm", peer: .init(accountId: "peer", name: "Peer", handle: "peer", active: true), state: "active",

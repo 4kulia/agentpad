@@ -468,7 +468,7 @@ final class LocalFormTabsTests: XCTestCase {
         let terminal = a.addTab(in: workspace)
         a.setSidebarMode(.hidden)
         a.requestRenameActiveWorkspace()
-        XCTAssertTrue(a.workspaceRenameInHeader)
+        XCTAssertEqual(a.navigationPresentation.list, .peek)
         XCTAssertEqual(a.sidebarMode, .hidden)
         workspace.nameEdit.text = "cancelled"
         workspace.nameEdit.handle(.escape) { a.renameWorkspace(workspace, to: $0); return nil }

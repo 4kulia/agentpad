@@ -144,6 +144,59 @@ final class AttentionViewedTests: XCTestCase {
         XCTAssertTrue(rows(ledger, session: session).isEmpty, "Visible selected tab in the active window counts")
     }
 
+    func testEveryNavigationOverlayAndPopoverDefersUntilFreshLayout() async throws {
+        let isolation = TeamServiceTestScope()
+        defer { isolation.close() }
+        let store = makeTestStore(), ledger = AttentionLedger(), window = window()
+        let controller = AgentPadWindowController(windowId: store.windowID, store: store)
+        controller.window?.contentView = nil
+        controller.window = window; store.navigationWindow = window
+        defer { store.terminate(); window.contentView = nil; window.close() }
+        let session = try XCTUnwrap(store.active?.activeSession)
+        window.contentView = session.engine.view
+        session.engine.view.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+        ledger.isFocused = { event in
+            guard case .terminal(let id) = event.destination else { return false }
+            return AttentionFocus.terminalVisible(id, in: store, window: window, appActive: true)
+        }
+        let observer = NotificationCenter.default.addObserver(forName: NavigationPresentationGate.didChange, object: window, queue: .main) { _ in
+            MainActor.assumeIsolated { ledger.markFocusedAttentionViewed() }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        var expanded = LeftNavigationPresentation(); expanded.list = .expanded; expanded.expandedOverlays = true
+        var peek = LeftNavigationPresentation(); peek.list = .peek
+        var panel = LeftNavigationPresentation(); panel.narrowPanelOpen = true
+        var preview = LeftNavigationPresentation(); preview.previewWorkspaceID = UUID()
+        for presentation in [peek, expanded, panel, preview] {
+            store.navigationPresentation = presentation
+            raise(.input, session: session, store: store)
+            let notice = event(session, kind: .input); ledger.upsert(notice)
+            ledger.markFocusedAttentionViewed()
+            XCTAssertFalse(ledger.viewedAttentionIDs.contains(notice.id))
+            store.navigationPresentation.close()
+            NavigationPresentationGate.recheck(window)
+            for _ in 0..<100 where !ledger.viewedAttentionIDs.contains(notice.id) { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertTrue(ledger.viewedAttentionIDs.contains(notice.id))
+        }
+        let first = UUID(), second = UUID()
+        NavigationPresentationGate.setOverlay(first, window: window, presented: true)
+        NavigationPresentationGate.setOverlay(second, window: window, presented: true)
+        raise(.input, session: session, store: store)
+        let pending = event(session, kind: .input); ledger.upsert(pending)
+        NavigationPresentationGate.setOverlay(first, window: window, presented: false)
+        await Task.yield()
+        XCTAssertFalse(ledger.viewedAttentionIDs.contains(pending.id), "Another popover still covers the window")
+        NavigationPresentationGate.setOverlay(second, window: window, presented: false)
+        // A queued recheck must see the current selection, not a captured tab ID.
+        store.active?.activePane?.activeTabId = nil
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertFalse(ledger.viewedAttentionIDs.contains(pending.id))
+        store.active?.activePane?.activeTabId = session.id
+        NavigationPresentationGate.recheck(window)
+        for _ in 0..<100 where !ledger.viewedAttentionIDs.contains(pending.id) { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(ledger.viewedAttentionIDs.contains(pending.id))
+    }
+
     func testAlreadyVisibleEpisodeIsAcknowledgedWithoutRemovingHistory() throws {
         let store = makeTestStore(), ledger = AttentionLedger()
         defer { store.terminate() }
@@ -156,7 +209,7 @@ final class AttentionViewedTests: XCTestCase {
         XCTAssertEqual(ledger.events.map(\.id), [notice.id])
     }
 
-    func testSidebarProjectionUpdatesOnViewAndLeavesOtherReasonsVisible() throws {
+    func testSidebarProjectionUpdatesOnViewAndLeavesOtherReasonsVisible() async throws {
         let store = makeTestStore(), ledger = AttentionLedger()
         let previousStores = AgentMonitor.shared.storesProvider
         AgentMonitor.shared.storesProvider = { [store] }
@@ -175,7 +228,8 @@ final class AttentionViewedTests: XCTestCase {
         }
         ledger.markAttentionViewed(failure)
         ledger.markAttentionViewed(approval)
-        XCTAssertTrue(changed, "A viewed marker must update the observable sidebar immediately")
+        await Task.yield()
+        XCTAssertTrue(changed, "A viewed marker must publish without a UI read")
         XCTAssertEqual(sidebar.items.map(\.id), [approval.id])
         XCTAssertEqual(Set(ledger.events.map(\.id)), [failure.id, approval.id])
     }

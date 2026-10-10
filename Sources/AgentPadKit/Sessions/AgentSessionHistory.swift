@@ -23,9 +23,14 @@ struct AgentSessionRecord: Identifiable, Hashable, Codable, Sendable {
     /// record per keystroke, and `URL.path` is a fresh String each call.
     let cwdPath: String
     /// Session file's modification date — "when this conversation last moved".
-    let lastActivity: Date
+    var lastActivity: Date
 
     var agentTitle: String?
+    var customTitle: String?
+    var aiTitle: String?
+    /// When disk metadata was observed, independent of conversation activity.
+    /// Adoption records have neither this marker nor a transcript file.
+    var scannedAt: Date?
     var summary: String?
     var firstPrompt: String?
     var automatic: Bool
@@ -34,7 +39,8 @@ struct AgentSessionRecord: Identifiable, Hashable, Codable, Sendable {
 
     init(agentId: String, conversationId: String, title: String, cwd: URL, lastActivity: Date,
          agentTitle: String? = nil, summary: String? = nil, firstPrompt: String? = nil,
-         automatic: Bool = false, startedAt: Date? = nil, fileURL: URL? = nil) {
+         automatic: Bool = false, startedAt: Date? = nil, fileURL: URL? = nil,
+         customTitle: String? = nil, aiTitle: String? = nil, scannedAt: Date? = nil) {
         self.agentId = agentId
         self.conversationId = conversationId
         self.title = title
@@ -44,16 +50,23 @@ struct AgentSessionRecord: Identifiable, Hashable, Codable, Sendable {
         self.agentTitle = agentTitle; self.summary = summary
         self.firstPrompt = SessionTitle.boundedPrompt(firstPrompt)
         self.automatic = automatic; self.startedAt = startedAt; self.fileURL = fileURL
+        self.customTitle = customTitle; self.aiTitle = aiTitle; self.scannedAt = scannedAt
     }
 
     var id: String { "\(agentId):\(conversationId)" }
     var nameKey: SessionNameKey { SessionNameKey(agentId, conversationId) }
+    var hasScanProvenance: Bool { scannedAt != nil || fileURL != nil }
     func resolvedTitle(manual: String? = nil) -> String {
-        SessionTitle.resolve(manual: manual, agentName: agentTitle, firstPrompt: firstPrompt,
-                             summary: summary ?? title, folder: cwd)
+        SessionDisplayMetadata.resolve(catalog: self, binding: nil,
+            live: .init(manualTitle: manual), folderName: cwd.lastPathComponent).title
     }
     func named(_ name: String?) -> Self { var copy = self; copy.title = resolvedTitle(manual: name); return copy }
-
+    func scanned(at date: Date) -> Self { var copy = self; copy.scannedAt = date; return copy }
+    func inDirectory(_ cwd: URL) -> Self {
+        Self(agentId: agentId, conversationId: conversationId, title: title, cwd: cwd, lastActivity: lastActivity,
+             agentTitle: agentTitle, summary: summary, firstPrompt: firstPrompt, automatic: automatic,
+             startedAt: startedAt, fileURL: fileURL, customTitle: customTitle, aiTitle: aiTitle, scannedAt: scannedAt)
+    }
 }
 
 // MARK: - Scanner
@@ -61,9 +74,8 @@ struct AgentSessionRecord: Identifiable, Hashable, Codable, Sendable {
 /// Reads agent session stores off the main actor. Every format here is a
 /// private implementation detail of its agent with no stability promise, so
 /// parsing is defensive throughout: a line that doesn't parse is skipped, a
-/// file that yields no id/cwd is dropped, and only file HEADS are read — a
-/// session transcript can be tens of MB, but everything the list needs
-/// (title, cwd, id) lives in the first lines.
+/// file that yields no id/cwd is dropped. Bounded heads supply identity and
+/// first prompts; Claude's bounded tail supplies appended title updates.
 enum AgentSessionScanner {
     /// One agent's session store: where it lives by default and how to turn
     /// it into records. `scan` iterates this table and `supportedAgentIds`
@@ -115,6 +127,8 @@ enum AgentSessionScanner {
     /// alone can pass 64KB — the M5.iiii lesson) while keeping a 300-file
     /// scan cheap.
     static let headByteLimit = 262_144
+    static let claudeHeadByteLimit = 4 * 1024 * 1024
+    static let tailByteLimit = 256 * 1024
     /// Per-agent record cap. Files are stat'd and mtime-sorted BEFORE any
     /// content is read, so the cap bounds parsing work, not just list length.
     /// This is the ONLY cap — a merged-list cap was tried and removed: it
@@ -168,6 +182,7 @@ enum AgentSessionScanner {
     /// the call synchronous, so the detached refresh task and tests use it
     /// alike.
     static func scan(roots: [String: URL], visibility: ChannelConversationFilter = .current()) -> [AgentSessionRecord] {
+        let scannedAt = Date()
         final class Collector: @unchecked Sendable {
             private let lock = NSLock()
             private var slices: [(index: Int, records: [AgentSessionRecord])] = []
@@ -191,7 +206,7 @@ enum AgentSessionScanner {
             guard let root = roots[store.agentId] else { return }
             collector.add(index, collect(store, root: root, visibility: visibility))
         }
-        return collector.ordered.sorted {
+        return collector.ordered.map { $0.scanned(at: scannedAt) }.sorted {
             $0.lastActivity != $1.lastActivity
                 ? $0.lastActivity > $1.lastActivity
                 : $0.id < $1.id
@@ -299,6 +314,7 @@ enum AgentSessionScanner {
     }
 
     private static let customTitleMarker = Data("custom-title".utf8)
+    private static let aiTitleMarker = Data("ai-title".utf8)
     /// Also gates Gemini's `$set.summary` walk in AgentSessionStores.swift.
     static let summaryMarker = Data("\"summary\"".utf8)
 
@@ -311,59 +327,64 @@ enum AgentSessionScanner {
     static func readClaudeRecord(file: URL, mtime: Date) throws -> AgentSessionRecord? {
         let conversationId = file.deletingPathExtension().lastPathComponent
         var customTitle: String?
+        var aiTitle: String?
         var summary: String?
         var firstUserText: String?
         var cwd: String?
         var automatic = false
         var startedAt: Date?
-        for line in try readHeadLines(of: file) {
-            // Once the first-wins fields are settled, the only lines that can
-            // still change the record are `custom-title` (last wins — a rename
-            // appends rather than rewrites, so the whole head must be walked)
-            // and a first `summary`. Gating the JSON parse on their byte
-            // markers skips the multi-KB assistant/tool lines that dominate
-            // the head — this is the scan's hottest loop. A marker false
-            // positive just parses one extra line.
-            if cwd != nil, firstUserText != nil,
-               line.range(of: customTitleMarker) == nil,
-               summary != nil || line.range(of: summaryMarker) == nil {
-                continue
-            }
-            guard let object = jsonObject(line) else { continue }
-            if object["entrypoint"] as? String == "sdk-cli" { automatic = true }
-            if startedAt == nil { startedAt = (object["timestamp"] as? String).flatMap(ChatStore.date) }
+        func readTitle(_ object: [String: Any]) {
             switch object["type"] as? String {
-            case "custom-title":
-                if let value = object["customTitle"] as? String { customTitle = value }
-            case "summary":
-                if summary == nil, let value = object["summary"] as? String { summary = value }
-            case "user":
-                // Sidechain transcripts are subagent work, not a conversation
-                // the user can meaningfully resume — drop the whole file.
-                // (Checked before the gate can engage: the first user line is
-                // always parsed, because `firstUserText` is still nil then.)
-                if object["isSidechain"] as? Bool == true { return nil }
-                if cwd == nil { cwd = object["cwd"] as? String }
-                if firstUserText == nil,
-                   let message = object["message"] as? [String: Any],
-                   let text = displayableUserText(messageContent(message["content"])) {
-                    firstUserText = text
-                }
-            default:
-                break
+            case "custom-title": customTitle = object["customTitle"] as? String ?? customTitle
+            case "ai-title": aiTitle = object["aiTitle"] as? String ?? aiTitle
+            case "summary": summary = object["summary"] as? String ?? summary
+            default: break
             }
         }
+        func readTitleLine(_ line: Data) {
+            guard line.range(of: customTitleMarker) != nil || line.range(of: aiTitleMarker) != nil
+                    || line.range(of: summaryMarker) != nil,
+                  let object = jsonObject(line) else { return }
+            readTitle(object)
+        }
+        var sidechain = false
+        try readLines(of: file, limit: claudeHeadByteLimit) { line in
+            // Keep looking for titles throughout the bounded head, but avoid
+            // parsing ordinary messages once the first prompt and cwd are known.
+            if cwd != nil, firstUserText != nil {
+                readTitleLine(line)
+                return true
+            }
+            guard let object = jsonObject(line) else { return true }
+            if object["entrypoint"] as? String == "sdk-cli" { automatic = true }
+            if startedAt == nil { startedAt = (object["timestamp"] as? String).flatMap(ChatStore.date) }
+            readTitle(object)
+            guard object["type"] as? String == "user" else { return true }
+            if object["isSidechain"] as? Bool == true { sidechain = true; return false }
+            if cwd == nil { cwd = object["cwd"] as? String }
+            if firstUserText == nil, let message = object["message"] as? [String: Any] {
+                firstUserText = displayableUserText(messageContent(message["content"]))
+            }
+            return true
+        }
+        guard !sidechain else { return nil }
+        // Appended custom/AI titles and summaries are last-wins.
+        for line in try readTailLines(of: file) { readTitleLine(line) }
         // No cwd means no place to resume in — a wrong directory would break
         // every file reference in the conversation, so skip instead.
         guard let cwd else { return nil }
-        return AgentSessionRecord(
+        let agentTitle = SessionTitle.nonempty(customTitle) ?? SessionTitle.nonempty(aiTitle)
+        var record = AgentSessionRecord(
             agentId: AgentTemplate.claudeCodeID,
             conversationId: conversationId,
-            title: SessionTitle.resolve(agentName: customTitle, firstPrompt: firstUserText, summary: summary, folder: URL(fileURLWithPath: cwd)),
+            title: "",
             cwd: URL(fileURLWithPath: cwd),
-            lastActivity: mtime, agentTitle: customTitle, summary: summary, firstPrompt: firstUserText,
-            automatic: automatic, startedAt: startedAt, fileURL: file
+            lastActivity: mtime, agentTitle: agentTitle, summary: summary, firstPrompt: firstUserText,
+            automatic: automatic, startedAt: startedAt, fileURL: file,
+            customTitle: customTitle, aiTitle: aiTitle, scannedAt: Date()
         )
+        record.title = record.resolvedTitle()
+        return record
     }
 
     /// Claude `message.content` is either a plain string or an array of
@@ -467,6 +488,43 @@ enum AgentSessionScanner {
         defer { try? handle.close() }
         guard let data = try handle.read(upToCount: headByteLimit), !data.isEmpty else { return [] }
         return data.split(separator: UInt8(ascii: "\n"))
+    }
+
+    /// Stream complete lines without loading a multi-MB head for ordinary files.
+    /// The cap bounds both I/O and the largest buffered line; truncated lines
+    /// are never parsed. Returning false stops before the next chunk is read.
+    static func readLines(of file: URL, limit: Int, visit: (Data) -> Bool) throws {
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        var pending = Data(), remaining = limit
+        while remaining > 0 {
+            let chunk = try handle.read(upToCount: min(64 * 1024, remaining)) ?? Data()
+            if chunk.isEmpty {
+                if !pending.isEmpty { _ = visit(pending) }
+                return
+            }
+            remaining -= chunk.count
+            let previousCount = pending.count
+            pending.append(chunk)
+            var start = pending.startIndex
+            for index in pending.indices.dropFirst(previousCount) where pending[index] == 10 {
+                if !visit(pending[start..<index]) { return }
+                start = index + 1
+            }
+            if start != pending.startIndex { pending = Data(pending[start...]) }
+        }
+    }
+
+    static func readTailLines(of file: URL) throws -> [Data] {
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let start = size > tailByteLimit ? size - UInt64(tailByteLimit) : 0
+        try handle.seek(toOffset: start > 0 ? start - 1 : 0)
+        let bytes = try handle.read(upToCount: tailByteLimit + (start > 0 ? 1 : 0)) ?? Data()
+        var lines = Array(bytes.split(separator: 10, omittingEmptySubsequences: false))
+        if start > 0, !lines.isEmpty { lines.removeFirst() }
+        return lines
     }
 
     static func jsonObject(_ line: Data) -> [String: Any]? {

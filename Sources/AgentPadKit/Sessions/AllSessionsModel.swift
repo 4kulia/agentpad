@@ -31,6 +31,7 @@ struct AllSessionItem: Identifiable, Equatable, Sendable {
     var source: Source
     var status: AllSessionStatus
     var title: String
+    var liveMetadata: SessionDisplayMetadata.Live? = nil
     var isLive: Bool { source != .disk }
     var critical: Bool { isLive && (status == .needsInput || status == .error) }
     var canRename: Bool { !record.conversationId.isEmpty }
@@ -49,21 +50,34 @@ enum AllSessionsList {
     }
 
     static func filter(records: [AgentSessionRecord], live: [AllSessionItem], names: [SessionNameKey: String],
-                       query: String, filters: AllSessionsFilterState, now: Date = Date(), calendar: Calendar = .current) -> Result {
-        let byKey = Dictionary(records.map { ($0.nameKey, $0) }, uniquingKeysWith: { a, b in a.lastActivity >= b.lastActivity ? a : b })
-        var liveKeys = Set<SessionNameKey>()
-        var items = live.map { item in
+                       query: String, filters: AllSessionsFilterState, now: Date = Date(), calendar: Calendar = .current,
+                       bindings: [AgentSessionRecord] = []) -> Result {
+        let byKey = Dictionary(records.map { ($0.nameKey, $0) }, uniquingKeysWith: { a, b in
+            (a.scannedAt ?? .distantPast) >= (b.scannedAt ?? .distantPast) ? a : b
+        })
+        let boundByKey = Dictionary(bindings.map { ($0.nameKey, $0) }, uniquingKeysWith: { first, _ in first })
+        func resolved(_ item: AllSessionItem, catalog: AgentSessionRecord?, binding: AgentSessionRecord?) -> AllSessionItem {
             var item = item
-            if item.canRename { liveKeys.insert(item.record.nameKey) }
-            if let disk = byKey[item.record.nameKey] {
-                let date = item.record.lastActivity
-                item.record = disk; item.record.lastActivityOverride(date)
-                item.title = disk.resolvedTitle(manual: names[disk.nameKey])
-            } else { item.title = item.record.resolvedTitle(manual: names[item.record.nameKey]) }
+            var live = item.liveMetadata ?? .init()
+            live.manualTitle = names[item.record.nameKey]
+            let metadata = SessionDisplayMetadata.resolve(catalog: catalog, binding: binding, live: live,
+                folderName: (binding ?? catalog ?? item.record).cwd.lastPathComponent)
+            item.record = catalog ?? binding ?? item.record
+            // These are transient row copies. Never feed them back to discovery.
+            item.record.title = metadata.title
+            item.record.lastActivity = metadata.lastActivity
+            item.title = metadata.title
             return item
         }
-        items += records.filter { !liveKeys.contains($0.nameKey) }.map {
-            AllSessionItem(id: "disk:" + $0.id, record: $0, source: .disk, status: .finished, title: $0.resolvedTitle(manual: names[$0.nameKey]))
+        var liveKeys = Set<SessionNameKey>()
+        var items = live.map { item in
+            if item.canRename { liveKeys.insert(item.record.nameKey) }
+            return resolved(item, catalog: byKey[item.record.nameKey], binding: boundByKey[item.record.nameKey])
+        }
+        for key in Set(byKey.keys).union(boundByKey.keys) where !liveKeys.contains(key) {
+            guard let record = byKey[key] ?? boundByKey[key] else { continue }
+            items.append(resolved(AllSessionItem(id: "disk:" + record.id, record: record, source: .disk,
+                status: .finished, title: record.title), catalog: byKey[key], binding: boundByKey[key]))
         }
         var result = Result(total: items.count, tools: Set(items.map { $0.record.agentId }).sorted(), folders: Set(items.map { $0.record.cwdPath }).sorted())
         let words = fold(query).split(whereSeparator: \.isWhitespace).map(String.init)
@@ -114,6 +128,7 @@ final class AllSessionsModel {
     let state: TabState
     let catalog: SessionCatalog
     let names: SessionNames
+    let profiles: AgentProfileStore
     var query = ""
     var folderQuery = ""
     private(set) var result = AllSessionsList.Result()
@@ -130,11 +145,11 @@ final class AllSessionsModel {
     @ObservationIgnored private(set) var resumeTask: Task<Void, Never>?
     @ObservationIgnored private var live: [AllSessionItem] = []
     @ObservationIgnored var visibility: @Sendable () -> ChannelConversationFilter = { .current() }
-    @ObservationIgnored var filterWork: @Sendable ([AgentSessionRecord], [AllSessionItem], [SessionNameKey: String], String, AllSessionsFilterState) -> AllSessionsList.Result = {
-        AllSessionsList.filter(records: $0, live: $1, names: $2, query: $3, filters: $4)
+    @ObservationIgnored var filterWork: @Sendable ([AgentSessionRecord], [AllSessionItem], [SessionNameKey: String], String, AllSessionsFilterState, [AgentSessionRecord]) -> AllSessionsList.Result = {
+        AllSessionsList.filter(records: $0, live: $1, names: $2, query: $3, filters: $4, bindings: $5)
     }
-    init(state: TabState, catalog: SessionCatalog = .shared, names: SessionNames = .shared) {
-        self.state = state; self.catalog = catalog; self.names = names
+    init(state: TabState, catalog: SessionCatalog = .shared, names: SessionNames = .shared, profiles: AgentProfileStore = .shared) {
+        self.state = state; self.catalog = catalog; self.names = names; self.profiles = profiles
     }
     var filters: AllSessionsFilterState {
         get { state.navigation.allSessions ?? .init() }
@@ -145,13 +160,14 @@ final class AllSessionsModel {
     func updateLive(_ value: [AllSessionItem]) { live = value; refilter() }
     func refilter(debounce: Bool = false) {
         filtering?.cancel()
+        let bindings = profiles.bindings.map(\.record)
         let records = catalog.records, live = live, names = names.values, query = query, filters = filters, work = filterWork, visibility = visibility
         filtering = Task { [weak self] in
             if debounce { try? await Task.sleep(for: .milliseconds(200)) }
             guard !Task.isCancelled else { return }
             let worker = Task.detached(priority: .userInitiated) {
                 let policy = visibility()
-                return work(policy.apply(records), live.filter { policy.allows(agentId: $0.record.agentId, conversationId: $0.record.conversationId) }, names, query, filters)
+                return work(policy.apply(records), live.filter { policy.allows(agentId: $0.record.agentId, conversationId: $0.record.conversationId) }, names, query, filters, policy.apply(bindings))
             }
             let value = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
             guard let self, !Task.isCancelled, !state.isClosed else { return }
@@ -192,12 +208,4 @@ final class AllSessionsModel {
         resumeTask = Task { await operation() }
     }
     func stop() { filtering?.cancel(); previewTask?.cancel(); resumeTask?.cancel(); resumeTask = nil }
-}
-
-extension AgentSessionRecord {
-    mutating func lastActivityOverride(_ date: Date) {
-        self = AgentSessionRecord(agentId: agentId, conversationId: conversationId, title: title, cwd: cwd,
-            lastActivity: max(lastActivity, date), agentTitle: agentTitle, summary: summary, firstPrompt: firstPrompt,
-            automatic: automatic, startedAt: startedAt, fileURL: fileURL)
-    }
 }

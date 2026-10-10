@@ -18,6 +18,14 @@ final class TabRouter {
     var ensureHost: () -> WorkspaceStore? = { nil }
     var revealWindow: (WorkspaceStore) -> Void = { _ in }
     var admit: ((@escaping () -> Void) -> Bool)?
+    var prepareDestinations: () -> Void = { AttentionSidebarModel.shared.updateProjection() }
+    var destinations: () -> [UUID: AttentionTabSnapshot] = { AttentionSidebarModel.shared.projection.tabs }
+    var channelScope: (ChannelRef) -> AttentionScope? = { ref in
+        let service = ChatService.shared
+        guard let key = service.connection?.orgKey, ref.belongs(to: key),
+              ChatNotifications.allowed(service, key, channel: ref.channel) else { return nil }
+        return ChatAttention.scope(key, service)
+    }
 
     func owner(of id: TabID) -> Location? {
         for store in stores() where !store.isTerminated {
@@ -33,16 +41,52 @@ final class TabRouter {
     }
     func find(_ route: ToolRoute, windowID: UUID) -> Location? {
         let key = route.key(windowID: windowID)
+        var matches: [Location] = []
         for store in stores() where !store.isTerminated {
             for workspace in store.workspaces {
                 for pane in workspace.root.allPanes {
-                    if let session = pane.tabs.first(where: { $0.toolRoute?.key(windowID: store.windowID) == key }) {
-                        return Location(store: store, workspace: workspace, pane: pane, session: session)
+                    for session in pane.tabs where session.toolRoute?.key(windowID: store.windowID) == key {
+                        matches.append(Location(store: store, workspace: workspace, pane: pane, session: session))
                     }
                 }
             }
         }
-        return nil
+        return preferred(matches, windowID: windowID)
+    }
+
+    /// Conversations prefer the initiating window, then the most recently
+    /// activated tab, with stable IDs breaking ties (including detached windows).
+    private func preferred(_ matches: [Location], windowID: UUID) -> Location? {
+        matches.sorted { a, b in
+            let localA = a.store.windowID == windowID, localB = b.store.windowID == windowID
+            if localA != localB { return localA }
+            if a.session.lastActivated != b.session.lastActivated { return a.session.lastActivated > b.session.lastActivated }
+            if a.store.windowID != b.store.windowID { return a.store.windowID.uuidString < b.store.windowID.uuidString }
+            return a.session.id.uuidString < b.session.id.uuidString
+        }.first
+    }
+
+    @discardableResult
+    func openChannel(_ ref: ChannelRef, scope: AttentionScope? = nil, from initiator: WorkspaceStore? = nil) -> Session? {
+        if let admit, !admit({ [weak self, weak initiator] in self?.openChannel(ref, scope: scope, from: initiator) }) { return nil }
+        guard let store = initiator ?? ensureHost(), !store.isTerminated,
+              let currentScope = channelScope(ref), scope == nil || scope == currentScope else { return nil }
+        prepareDestinations()
+        let target = AttentionTabDestination.channel(currentScope, ref.channel)
+        // A just-opened gate may still be loading display metadata. The prepared
+        // route identity remains usable after the live authorization above.
+        let matches = destinations().values.filter { $0.channel == ref || $0.destinations.contains(target) }.compactMap { tab -> Location? in
+            guard let location = owner(of: tab.id), location.session.channel == ref else { return nil }
+            return location
+        }
+        if let existing = preferred(matches, windowID: store.windowID) {
+            guard channelScope(ref) == currentScope else { return nil }
+            reveal(existing); return existing.session
+        }
+        guard channelScope(ref) == currentScope else { return nil }
+        let session = store.showChannel(ref)
+        revealWindow(store)
+        return session
     }
     @discardableResult
     func open(_ route: ToolRoute, from initiator: WorkspaceStore? = nil, section: SettingsTabSection? = nil,

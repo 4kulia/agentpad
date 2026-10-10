@@ -78,6 +78,9 @@ struct TabDragSource: NSViewRepresentable {
 
         func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
             store?.draggingTabId = nil
+            if let store {
+                for owner in store.profileStores { owner.finishNavigationDrag() }
+            }
         }
     }
 }

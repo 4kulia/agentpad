@@ -160,8 +160,11 @@ struct ChannelTabView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: ChatOrgCurrent.identity()) { current.refresh() }
         .onChange(of: state, initial: true) { _, state in
+            let key = current.model?.key
+            conversation.update(state, key: key, store: key.flatMap { ChatService.shared.orgSessions[$0]?.store }, service: .shared)
+        }
+        .onChange(of: current.model?.view.generation) { _, _ in
             let key = current.model?.key
             conversation.update(state, key: key, store: key.flatMap { ChatService.shared.orgSessions[$0]?.store }, service: .shared)
         }
