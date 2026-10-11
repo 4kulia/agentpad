@@ -47,7 +47,7 @@ final class ProfileAttentionCostTests: XCTestCase {
         }
         var historyReads = 0
         let store = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, agentProfiles: profiles,
-            engineFactory: { TestEngine() }, peerStores: { historyReads += 1; return [] })
+            sessionNames: .testing, engineFactory: { TestEngine() }, peerStores: { historyReads += 1; return [] })
         defer { store.terminate() }
         let history = AgentSessionHistory(profiles: profiles); history.scan = { [] }
         let host = NSHostingView(rootView: AgentProfilesSection(store: store, history: history))
@@ -81,7 +81,7 @@ final class ProfileAttentionCostTests: XCTestCase {
         await Task.yield()
         XCTAssertEqual(sidebar.terminalAttention[first.id]?.count, 2)
         XCTAssertEqual(sidebar.profileAttentionCounts[profile.id], 2, "Two reasons on one surface count as one session")
-        first.customTitle = "Updated live title"
+        first.renameForTesting("Updated live title")
         await Task.yield()
         XCTAssertTrue(sidebar.terminalAttention[first.id]?.allSatisfy { sidebar.title(for: $0) == "Updated live title" } == true)
         first.engine.onUserInput?()

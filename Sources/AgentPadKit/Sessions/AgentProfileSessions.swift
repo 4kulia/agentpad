@@ -33,10 +33,9 @@ enum AgentProfileSessions {
             guard session.profileID == profile.id || (session.launchOrigin?.templateID == profile.templateID && session.agent.rosterId == profile.rosterID && bound != nil),
                   visibility.allows(agentId: profile.rosterID, conversationId: conversation) else { continue }
             if let conversation { liveConversations.insert(conversation) }
-            let name = conversation.flatMap { names[SessionNameKey(profile.rosterID, $0)] }
             let cwd = bound?.cwd ?? session.profileOriginalCwd ?? session.currentDirectory
-            let metadata = SessionDisplayMetadata.resolve(catalog: scanned, binding: bound,
-                live: .init(session: session, manualTitle: name), folderName: cwd.lastPathComponent)
+            let metadata = SessionDisplayMetadata.Sources(catalog: catalog, profiles: profiles)
+                .metadata(for: session, manualNames: names)
             result.append(AgentProfileSessionItem(id: session.id.uuidString, session: session, record: record,
                 title: metadata.title, cwd: cwd, lastActivity: metadata.lastActivity))
         }
@@ -44,7 +43,7 @@ enum AgentProfileSessions {
         for bound in records where !liveConversations.contains(bound.conversationId) {
             let scanned = catalog.record(for: bound.nameKey)
             let metadata = SessionDisplayMetadata.resolve(catalog: scanned, binding: bound,
-                live: .init(templateTitle: template, manualTitle: names[bound.nameKey]), folderName: bound.cwd.lastPathComponent)
+                live: .init(templateTitle: template, explicitName: names[bound.nameKey]), folderName: bound.cwd.lastPathComponent)
             result.append(AgentProfileSessionItem(id: bound.id, session: nil, record: scanned ?? bound,
                 title: metadata.title, cwd: bound.cwd, lastActivity: metadata.lastActivity))
         }

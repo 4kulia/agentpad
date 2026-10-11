@@ -72,8 +72,13 @@ final class ChatPersonalLifecycleTests: XCTestCase {
         // before the main actor applies the hook. Export's TTY snapshot expires.
         processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
         AgentAnswerSource.recordHook(conversation: transcript.id, session: tab, provenance: proof, inspector: processes.inspector)
-        XCTAssertNil(tab.answerBinding)
-        XCTAssertEqual(tab.answerBindingProblem, .changed)
+        XCTAssertEqual(AgentAnswerSource.problem(tab), .checking)
+        tab.answerRefresh?.cancel()
+        await XCTAssertThrowsErrorAsync(try await AgentAnswerSource.refresh(tab, inspector: processes.inspector)) {
+            XCTAssertEqual($0 as? AgentAnswerTranscript.Problem, .changed)
+        }
+        XCTAssertEqual(AgentAnswerSource.problem(tab), .changed)
+        XCTAssertFalse(CompositionTabs.available(tab))
 
         let members = await call(tab)
         XCTAssertTrue(members.ok, members.chatResult ?? "")

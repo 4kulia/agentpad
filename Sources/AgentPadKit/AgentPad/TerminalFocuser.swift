@@ -20,10 +20,10 @@ enum TerminalFocuser {
 
     @MainActor
     static func focus(_ session: ExternalAgentSession) async -> Outcome {
-        guard let app = ProcessInfoReader.hostingApp(of: session.pid) else { return .noTerminalFound }
+        guard let app = await ProcessInfoReader.hostingApp(of: session.pid) else { return .noTerminalFound }
         // Cheap guard against focusing a stranger: the row's process must
         // still be the instance we listed.
-        if let start = session.processStart, ProcessInfoReader.info(of: session.pid)?.startTime != start {
+        if let start = session.processStart, (try? await BackgroundInspection.run({ ProcessInfoReader.info(of: session.pid)?.startTime })) != start {
             return .noTerminalFound
         }
         if let tty = session.tty, let script = script(for: app.bundleIdentifier, tty: "/dev/\(tty)") {

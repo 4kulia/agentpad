@@ -6,6 +6,8 @@ enum AgentAnswerTranscript {
     enum Agent: Sendable { case claude, codex }
     enum Problem: String, Error, LocalizedError {
         // AgentPad: ID discovery alone does not establish export provenance.
+        case checking = "Checking the terminal process…"
+        case inspectionTimeout = "Copy and Forward: process verification timed out. Retry when the terminal responds."
         case unbound = "Copy and Forward: no verified Claude hook has been received for this tab since it opened."
         case hookIdentity = "Copy and Forward: the hook sender or its parent could not be authenticated. Wait for a new Claude answer."
         case hookAncestry = "Copy and Forward: the hook is not a verified descendant of this tab's Claude."

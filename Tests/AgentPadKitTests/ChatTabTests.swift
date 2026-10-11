@@ -30,11 +30,11 @@ final class ChatTabTests: XCTestCase {
         let terminals = ws.root.allPanes.flatMap(\.tabs).count
         a.addTab(in: ws)
         let channel = a.openChannelTab(ref, in: ws)
-        channel.customTitle = "#secret-name"
+        channel.renameForTesting("#secret-name")
         a.flushPersistence()
         let saved = try XCTUnwrap(first.saved)
         let persisted = try XCTUnwrap(tabs(saved).first { $0.channel == ref })
-        XCTAssertNil(persisted.customTitle, "no title kept for a channel tab")
+        XCTAssertNil(persisted.explicitNameKey, "no title kept for a channel tab")
         let data = try JSONEncoder().encode(saved)
         XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("secret-name"))
 
@@ -43,7 +43,7 @@ final class ChatTabTests: XCTestCase {
         let restored = b.workspaces.flatMap { $0.root.allPanes.flatMap(\.tabs) }
         let tab = try XCTUnwrap(restored.first { $0.id == channel.id })
         XCTAssertEqual(tab.channel, ref)
-        XCTAssertNil(tab.customTitle)
+        XCTAssertNil(tab.explicitName)
         XCTAssertEqual((tab.engine as? ChannelTabEngine)?.starts, 0)
         XCTAssertEqual(spawns, terminals + 1, "engines only for terminal tabs")
         XCTAssertEqual(tab.title, "Channel", "no name before its card may be seen")
@@ -60,7 +60,7 @@ final class ChatTabTests: XCTestCase {
         let a = store(InMemoryPersistence())
         let channel = a.openChannelTab(ref, in: a.workspaces[0])
         a.renameTab(channel, to: "mine")
-        XCTAssertNil(channel.customTitle)
+        XCTAssertNil(channel.explicitName)
     }
 
     /// ⌘⇧T brings a channel back a channel, with no title kept.
@@ -72,7 +72,7 @@ final class ChatTabTests: XCTestCase {
         let back = try XCTUnwrap(a.reopenLastClosedTab())
         XCTAssertEqual(back.channel, ref)
         XCTAssertTrue(back.engine is ChannelTabEngine)
-        XCTAssertNil(back.customTitle)
+        XCTAssertNil(back.explicitName)
     }
 
     /// The open tab of a channel is found by the whole ref (review F2b-3).

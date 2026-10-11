@@ -19,15 +19,15 @@ struct ChatDMToolCursor {
 extension ChatSessionTools {
     static func callDM(_ args: [String: ChatJSON], caller: ChatLocalCaller, service: ChatService,
                        isCallerWaiting: @escaping @MainActor () -> Bool,
-                       personalConversation: @escaping @MainActor () throws -> ChatPersonalAccess.Conversation,
-                       revalidate: @escaping @MainActor () throws -> Bool) async throws -> ChatJSON {
+                       personalConversation: @escaping @MainActor () async throws -> ChatPersonalAccess.Conversation,
+                       revalidate: @escaping @MainActor () async throws -> Bool) async throws -> ChatJSON {
         guard service.state == .signedIn, let connection = service.connection else { throw Failure(code: "not_connected") }
         let org = args["org_id"]?.string?.lowercased() ?? connection.orgId
         guard let org else { throw Failure(code: "not_connected") }
         let key = ChatOrgKey(server: connection.server, accountId: connection.accountId, orgId: org)
         guard service.supports("chat.dm", key: key), service.supports("chat.dm.session_signature", key: key) else { throw Failure(code: "unsupported") }
         guard service.dmToolsEnabled() else { service.mcpDownloads.removeDM(); throw Failure(code: "dm_access_disabled") }
-        let personal = try ChatPersonalAccess.Authorization(caller: caller, service: service,
+        let personal = try await ChatPersonalAccess.Authorization(caller: caller, service: service,
             personalConversation: personalConversation, revalidate: revalidate)
         let conversation = personal.conversation
         let dm = args["dm_id"]?.string?.lowercased(), root = args["thread_root_id"]?.string?.lowercased()
@@ -49,7 +49,8 @@ extension ChatSessionTools {
              try dm.flatMap { try ChatDMStore.card(db, $0)?.version })
         }
         guard let generation = stamp.0 else { throw Failure(code: "not_connected") }
-        func current() throws {
+        func current() async throws {
+            try await personal.requireCurrent()
             guard service.dmToolsEnabled() else { service.mcpDownloads.removeDM(); throw Failure(code: "dm_access_disabled") }
             guard service.supports("chat.dm", key: key), service.supports("chat.dm.session_signature", key: key) else { throw Failure(code: "unsupported") }
             if attachment != nil, !attachmentsAvailable() { throw Failure(code: "unsupported") }
@@ -65,14 +66,13 @@ extension ChatSessionTools {
                               && dm.flatMap { try ChatDMStore.windowEpoch(db, $0) } == stamp.2
                               && dm.flatMap { try ChatDMStore.card(db, $0)?.version } == stamp.3))
                   }) else { throw Failure(code: "not_found") }
-            try personal.requireCurrent()
         }
-        func recordUse() throws {
-            try current()
+        func recordUse() async throws {
+            try await current()
             do { try ChatDMHistory(files: service.files).record(conversation.ids) }
             catch { throw Failure(code: "dm_not_allowed") }
         }
-        try current()
+        try await current()
         let api = service.makeAPI(connection.server)
         var result: ChatJSON
         let tool = args["tool"]?.string ?? ""
@@ -95,7 +95,7 @@ extension ChatSessionTools {
                 })])
             } else {
                 let page = try await api.dmPage(org, after: after, token: token)
-                try current()
+                try await current()
                 next = page.next
                 result = .object(["org_id": .string(org), "dms": .array(page.dms.map { card in
                     .object(["kind": .string("dm"), "dm_id": .string(card.dmId), "state": .string(card.state), "can_post": .bool(card.writable),
@@ -113,30 +113,30 @@ extension ChatSessionTools {
         case "chat_read":
             guard let dm else { throw Failure(code: "invalid_args") }
             let page = try await api.dmMessages(org, id: dm, root: root, before: args["before"]?.int, token: token)
-            try current()
+            try await current()
             guard page.messages.count <= 100, page.messages.allSatisfy({ $0.dmId == dm && (root == nil || $0.messageId == root || $0.threadRootId == root) }) else { throw Failure(code: "not_found") }
             if let attachment {
                 guard let message = page.messages.first(where: { $0.deletedAt == nil && $0.attachments.contains(where: { $0.id == attachment }) }),
                       let file = message.attachments.first(where: { $0.id == attachment }),
                       let limits = service.serverAttachmentLimits[key.server], file.size > 0,
                       file.size <= min(limits.fileBytes, 10 * 1024 * 1024) else { throw Failure(code: "not_found") }
-                func fileCurrent() throws {
-                    try current()
+                func fileCurrent() async throws {
+                    try await current()
                     guard try store.dmRead({ try ChatAttachmentManager.dmRevisionCurrent($0, dm: dm, message: message.messageId, revision: message.revision) }) else { throw Failure(code: "not_found") }
                 }
-                try fileCurrent()
+                try await fileCurrent()
                 let reservation = try service.mcpDownloads.reserve(file, surface: caller.surface, key: key, store: store,
                     dmSource: .init(dm: dm, message: message.messageId, revision: message.revision))
                 var completed = false
                 defer { if !completed { service.mcpDownloads.remove(reservation) } }
                 let bytes = try await service.mcpDownloads.transfer(reservation) {
-                    try fileCurrent()
+                    try await fileCurrent()
                     return try await api.attachmentBytes(path: "/v1/orgs/\(org)/attachments/\(attachment)/original", token: token, limit: file.size)
                 }
-                try fileCurrent()
+                try await fileCurrent()
                 let result = try service.mcpDownloads.finish(reservation, bytes: bytes)
-                try fileCurrent()
-                try recordUse()
+                try await fileCurrent()
+                try await recordUse()
                 completed = true
                 return result
             }
@@ -159,9 +159,9 @@ extension ChatSessionTools {
             result = try await postDM(args, key: key, caller: caller, conversation: conversation, generation: generation,
                                       service: service, store: store, api: api, token: token, current: current, recordUse: recordUse)
         }
-        try current()
+        try await current()
         guard try JSONEncoder().encode(result).count <= 1024 * 1024 else { throw Failure(code: "too_large") }
-        try recordUse()
+        try await recordUse()
         return result
     }
 }

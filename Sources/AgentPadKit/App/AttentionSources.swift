@@ -41,7 +41,7 @@ extension AttentionCoordinator {
             ? "\(session.notificationIncarnation):program:\(session.programNotificationEpisode)" : session.attentionEpisode
         var event = AttentionEvent(source: "terminal", object: session.id.uuidString,
             episode: episode, kind: eventKind, destination: .terminal(session.id))
-        event.localBody = "\(session.title) · \(workspaceTitle)"
+        event.localBody = "\(session.publicName) · \(workspaceTitle)"
         if case .programNotification(let title, let body) = kind {
             event.localTitle = title.isEmpty ? session.displayAgent.title : title
             event.localBody = body

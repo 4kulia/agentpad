@@ -83,10 +83,10 @@ extension WorkspaceStore {
         return .success(session)
     }
 
-    func profileSessionItems(_ profile: AgentProfile, catalog: SessionCatalog = .shared) -> [AgentProfileSessionItem] {
+    func profileSessionItems(_ profile: AgentProfile, catalog: SessionCatalog? = nil) -> [AgentProfileSessionItem] {
         AgentProfileSessions.items(profile: profile, profiles: agentProfiles,
-            sessions: profileStores.flatMap(\.allSessions), catalog: catalog,
-            visibility: conversationVisibility(), names: SessionNames.shared.values)
+            sessions: profileStores.flatMap(\.allSessions), catalog: catalog ?? sessionDisplaySources.catalog,
+            visibility: conversationVisibility(), names: sessionDisplaySources.names.values)
     }
 
     @discardableResult
@@ -160,7 +160,8 @@ extension WorkspaceStore {
         agentProfileErrors[id] = nil
         let session = addTab(in: workspace, template: template, initialCwd: record.cwd,
             conversationId: record.conversationId, forceResume: true, claudeResolution: resolution,
-            customTitle: record.title, connection: .local, profile: origin == nil ? nil : profile, launchOrigin: origin)
+            connection: .local, profile: origin == nil ? nil : profile, launchOrigin: origin)
+        session.lastDisplayTitle = .init(key: record.nameKey, title: record.title)
         if origin == nil, let profile, profile.rosterID == template.rosterId {
             session.profileID = profile.id; session.profileOriginalCwd = record.cwd
         }

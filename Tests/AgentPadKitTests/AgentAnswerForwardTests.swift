@@ -69,6 +69,109 @@ final class AgentAnswerForwardTests: XCTestCase {
         await model.loadThreads()
     }
 
+    private func bindSource(_ model: AgentAnswerForward, store: WorkspaceStore,
+                            processes: AnswerProcessFixture, gate: Gate) async throws -> AgentAnswerSource.Answer {
+        let source = try XCTUnwrap(store.active?.activeSession)
+        source.agent = .claudeCode
+        try processes.bind(source, conversation: UUID().uuidString)
+        var inspector = processes.inspector
+        let scan = inspector.scan, process = inspector.kernel.process, image = inspector.kernel.image
+        inspector.scan = { pid in
+            XCTAssertFalse(Thread.isMainThread)
+            gate.pass()
+            return scan(pid)
+        }
+        inspector.kernel.process = { pid in XCTAssertFalse(Thread.isMainThread); return process(pid) }
+        inspector.kernel.image = { pid in XCTAssertFalse(Thread.isMainThread); return image(pid) }
+        let answer = try await AgentAnswerSource.read(session: source, store: store, inspector: inspector,
+            reader: { _, _, _ in "Answer" }, timeout: 0.1)
+        model.sourceIsCurrent = answer.isCurrent
+        model.sourceCanRetry = answer.canRetry
+        model.revalidateSource = answer.revalidate
+        return answer
+    }
+
+    func testTimedOutSessionSendCanRetryWithoutRefreshingDestinations() async throws {
+        let model = try await makeModel(), f = try XCTUnwrap(fixture), store = makeTestStore()
+        let gate = Gate()
+        defer { gate.open(); store.terminate() }
+        let answer = try await bindSource(model, store: store, processes: AnswerProcessFixture(), gate: gate)
+        await prepare(model)
+        gate.close()
+        for _ in 0..<2 {
+            await model.send()
+            XCTAssertEqual(model.problem, AgentAnswerTranscript.Problem.inspectionTimeout.rawValue)
+            XCTAssertFalse(answer.isCurrent(), "A timeout is not verification")
+            XCTAssertTrue(answer.canRetry())
+            XCTAssertTrue(model.canSend, "An explicit send must be able to re-check the source")
+            XCTAssertFalse(model.submitted)
+            XCTAssertTrue(try f.store.outbox.commands().isEmpty)
+        }
+        gate.open()
+        await model.send()
+        XCTAssertNil(model.problem)
+        XCTAssertTrue(answer.isCurrent())
+        XCTAssertEqual(try f.store.outbox.commands().map(\.type), ["message.post_from_session"])
+    }
+
+    func testRefreshDestinationsRechecksTimeoutAndFailedSourceProvenance() async throws {
+        let model = try await makeModel(), f = try XCTUnwrap(fixture), store = makeTestStore()
+        let gate = Gate(), processes = AnswerProcessFixture()
+        defer { gate.open(); store.terminate() }
+        let answer = try await bindSource(model, store: store, processes: processes, gate: gate)
+        await prepare(model)
+        for failure: AgentAnswerTranscript.Problem in [.inspectionTimeout, .changed] {
+            if failure == .inspectionTimeout { gate.close() }
+            else { processes.add(99_999_973, parent: AnswerProcessFixture.shell, name: "claude", trusted: true) }
+            await XCTAssertThrowsErrorAsync(try await answer.revalidate()) {
+                XCTAssertEqual($0 as? AgentAnswerTranscript.Problem, failure)
+            }
+            XCTAssertFalse(answer.isCurrent())
+            if failure == .inspectionTimeout {
+                await model.refreshDestinations()
+                XCTAssertFalse(answer.isCurrent())
+                model.channel = channel
+                XCTAssertTrue(model.canSend, "A repeated timeout must still allow another explicit check")
+                XCTAssertTrue(model.canSendAsUser, "Account destinations do not require source verification")
+            }
+            gate.open(); processes.remove(99_999_973)
+            await model.refreshDestinations()
+            XCTAssertNil(model.problem)
+            XCTAssertTrue(answer.isCurrent(), "Refresh must bypass the cached failure")
+            model.channel = channel
+            XCTAssertTrue(model.canSend)
+            XCTAssertTrue(try f.store.outbox.commands().isEmpty, "Refresh only verifies and discovers")
+        }
+    }
+
+    func testTimedOutSessionAttemptRemainsRetryableWithTheSameMessageID() async throws {
+        let original = try await makeModel(), f = try XCTUnwrap(fixture), store = makeTestStore()
+        let gate = Gate()
+        defer { gate.open(); store.terminate() }
+        var draft = original.draft
+        draft.channelID = channel
+        draft.attemptID = UUID(); draft.attemptAuthor = .session; draft.attemptSessionAuthor = .session(caller.signature)
+        let model = AgentAnswerForward(draft: draft, caller: caller, service: f.service, sourceIsCurrent: { false })
+        let answer = try await bindSource(model, store: store, processes: AnswerProcessFixture(), gate: gate)
+        await model.loadInitialDestinations()
+        gate.close()
+        for _ in 0..<2 {
+            await model.retry()
+            XCTAssertEqual(model.problem, AgentAnswerTranscript.Problem.inspectionTimeout.rawValue)
+            XCTAssertTrue(model.canRetry)
+            XCTAssertFalse(answer.isCurrent())
+            XCTAssertEqual(model.attemptID, draft.attemptID)
+            XCTAssertTrue(try f.store.outbox.commands().isEmpty)
+        }
+        gate.open()
+        await model.retry()
+        XCTAssertNil(model.problem)
+        XCTAssertTrue(answer.isCurrent())
+        let posts = try f.store.outbox.commands()
+        XCTAssertEqual(posts.count, 1)
+        XCTAssertEqual(posts.first.map { ChatService.args($0)["message_id"]?.string }, draft.attemptID?.uuidString.lowercased())
+    }
+
     private func startSender(_ f: ChatChannelExecutionTests.Fixture) throws {
         let session = try XCTUnwrap(f.service.orgSessions[f.key])
         session.startSending(api: f.service.makeAPI(f.key.server), token: "test-only",
@@ -159,6 +262,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         }
         let persisted = try JSONDecoder().decode(ForwardDraft.self, from: JSONEncoder().encode(XCTUnwrap(saved)))
         let restored = AgentAnswerForward(draft: persisted, caller: caller, service: next.service, sourceIsCurrent: { true })
+        await restored.refreshPresentation()
         await restored.refreshDestinations()
         XCTAssertEqual(restored.channel, channel); XCTAssertTrue(restored.canRetry); XCTAssertFalse(restored.canSendAsUser)
         await restored.sendAsUser()
@@ -179,6 +283,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         let draft = try await disconnectWhileSending(original, f)
         let next = try await reconnect()
         let restored = AgentAnswerForward(draft: draft, caller: caller, service: next.service, sourceIsCurrent: { true })
+        await restored.refreshPresentation()
         ChatStubProtocol.reset { request, _ in
             if request.url?.path == "/v1/commands" {
                 return .success(.init(status: 429, headers: ["Retry-After": "60"], body: Data(#"{"error":"rate_limited"}"#.utf8)))
@@ -214,6 +319,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         await prepare(original)
         let draft = try await disconnectWhileSending(original, f)
         let restored = AgentAnswerForward(draft: draft, caller: nil, service: f.service, sourceIsCurrent: { false })
+        await restored.refreshPresentation()
         restored.loadingChannels = true; restored.loadingThreads = true
         XCTAssertNil(f.service.connection); XCTAssertNil(f.service.orgSessions[f.key]?.store)
         XCTAssertFalse(restored.canRetry); XCTAssertTrue(restored.readable)
@@ -233,6 +339,7 @@ final class AgentAnswerForwardTests: XCTestCase {
             return .success(.init(status: 200, body: Data(#"{"messages":[],"next":null,"head":0}"#.utf8)))
         }
         let fresh = AgentAnswerForward(draft: restored.draft, caller: nil, service: next.service, sourceIsCurrent: { false })
+        await fresh.refreshPresentation()
         await fresh.loadInitialDestinations()
         XCTAssertTrue(fresh.canSendAsUser)
         await fresh.sendAsUser()
@@ -269,6 +376,7 @@ final class AgentAnswerForwardTests: XCTestCase {
             let draft = try await disconnectWhileSending(original, f)
             let next = try await reconnect()
             let restored = AgentAnswerForward(draft: draft, caller: caller, service: next.service, sourceIsCurrent: { true })
+            await restored.refreshPresentation()
             await restored.refreshDestinations()
             XCTAssertEqual(restored.channel, channel); XCTAssertEqual(restored.thread, thread)
             XCTAssertEqual(restored.channels.isEmpty, hiddenChannel); XCTAssertTrue(restored.threads.isEmpty)
@@ -307,6 +415,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         var draft = original.draft
         draft.attemptID = UUID(); draft.attemptAuthor = .session; draft.attemptSessionAuthor = .session(caller.signature)
         let restored = AgentAnswerForward(draft: draft, caller: caller, service: f.service, sourceIsCurrent: { true })
+        await restored.refreshPresentation()
         await restored.loadInitialDestinations()
         ChatStubProtocol.reset { _, _ in .failure(URLError(.networkConnectionLost)) }
         await restored.retry()
@@ -325,6 +434,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         let saved = try JSONDecoder().decode(ForwardDraft.self, from: JSONEncoder().encode(original.draft))
         f.service.serverCapabilities[f.key.server] = [] // User sending needs no session tools.
         let restored = AgentAnswerForward(draft: saved, caller: nil, service: f.service, sourceIsCurrent: { false })
+        await restored.refreshPresentation()
         await prepare(restored)
         XCTAssertEqual(restored.snapshot, original.snapshot)
         XCTAssertEqual(restored.text, original.text)
@@ -344,6 +454,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         let author = try await f.store.queue.read { try String.fetchOne($0, sql: "SELECT author_account_id FROM messages WHERE message_id = ?", arguments: [args["message_id"]?.string]) }
         XCTAssertEqual(author, f.key.accountId)
         let again = AgentAnswerForward(draft: restored.draft, caller: nil, service: f.service, sourceIsCurrent: { false })
+        await again.refreshPresentation()
         await prepare(again); await again.sendAsUser()
         XCTAssertFalse(again.canSendAsUser)
         XCTAssertEqual(try f.store.outbox.commands().count, 1)
@@ -353,6 +464,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         let original = try await makeModel(), f = try XCTUnwrap(fixture)
         original.text = "Saved edits before closing source"
         let restored = AgentAnswerForward(draft: original.draft, caller: caller, service: f.service, sourceIsCurrent: { false })
+        await restored.refreshPresentation()
         await prepare(restored)
         await restored.send()
         XCTAssertTrue(try f.store.outbox.commands().isEmpty)
@@ -365,6 +477,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         let original = try await makeModel(), f = try XCTUnwrap(fixture)
         original.text = "Edited old snapshot, not the agent's next answer"
         let restored = AgentAnswerForward(draft: original.draft, caller: caller, service: f.service, sourceIsCurrent: { true })
+        await restored.refreshPresentation()
         await prepare(restored); await restored.send()
         XCTAssertNil(restored.problem)
         let post = try XCTUnwrap(f.store.outbox.commands().first)
@@ -373,6 +486,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         let persisted = try JSONDecoder().decode(ForwardDraft.self, from: JSONEncoder().encode(restored.draft))
         XCTAssertEqual(persisted.attemptAuthor, .session)
         let restarted = AgentAnswerForward(draft: persisted, caller: nil, service: f.service, sourceIsCurrent: { false })
+        await restarted.refreshPresentation()
         await prepare(restarted); await restarted.sendAsUser()
         XCTAssertFalse(restarted.canSendAsUser)
         XCTAssertEqual(restarted.attemptID, restored.attemptID)
@@ -384,6 +498,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         for change in ["connection", "rights", "generation", "archive", "thread", "draft"] {
             let original = try await makeModel(), f = try XCTUnwrap(fixture)
             let model = fromSession ? original : AgentAnswerForward(draft: original.draft, caller: nil, service: f.service, sourceIsCurrent: { false })
+            await model.refreshPresentation()
             await prepare(model)
             if change == "thread" {
                 let thread = thread, channel = channel
@@ -424,6 +539,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         let original = try await makeModel(), f = try XCTUnwrap(fixture)
         original.channel = channel; original.thread = thread; original.text = "Saved draft with selected thread"
         let restored = AgentAnswerForward(draft: original.draft, caller: caller, service: f.service, sourceIsCurrent: { true })
+        await restored.refreshPresentation()
         await restored.loadInitialDestinations()
         XCTAssertTrue(restored.canSend)
         XCTAssertEqual(restored.channel, channel); XCTAssertEqual(restored.thread, thread)
@@ -437,6 +553,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         for fromSession in [false, true] {
         let original = try await makeModel(), f = try XCTUnwrap(fixture)
         let model = fromSession ? original : AgentAnswerForward(draft: original.draft, caller: nil, service: f.service, sourceIsCurrent: { false })
+        await model.refreshPresentation()
         await prepare(model)
         var saved: ForwardDraft?
         model.persist = {
@@ -528,6 +645,38 @@ final class AgentAnswerForwardTests: XCTestCase {
         XCTAssertEqual(envelope.args["text"]?.string, model.outgoingText)
         XCTAssertLessThanOrEqual(try XCTUnwrap(envelope.args["text"]?.string).utf8.count, ChatChannelModel.maxBytes)
         XCTAssertGreaterThan(model.text.utf8.count, ChatChannelModel.maxBytes)
+    }
+
+    func testClosedPrivateTranscriptResumeNeverNamesAForward() async throws {
+        _ = try await makeModel()
+        let f = try XCTUnwrap(fixture)
+        for allSessions in [false, true] {
+            for metadata in ClosedSessionNameFixture.privateMetadata {
+                let closed = try ClosedSessionNameFixture(root: root.appendingPathComponent(UUID().uuidString), metadata: metadata)
+                defer { closed.store.terminate() }
+                let session = try await closed.resume(allSessions: allSessions)
+                XCTAssertTrue(session.displayTitle.contains("PRIVATE-TITLE-MARKER"))
+                XCTAssertNil(session.explicitName)
+                let processes = AnswerProcessFixture()
+                try processes.bind(session, conversation: closed.record.conversationId)
+                let answer = try await AgentAnswerSource.read(session: session, store: closed.store,
+                    inspector: processes.inspector, reader: { _, _, _ in "Public answer" })
+                XCTAssertEqual(answer.caller.signature, "project")
+                let model = AgentAnswerForward(text: answer.text, caller: answer.caller, sourceTitle: answer.title,
+                    service: f.service, sourceIsCurrent: answer.isCurrent)
+                await prepare(model)
+                XCTAssertTrue(model.canSend)
+                await model.send()
+                XCTAssertNil(model.problem)
+                XCTAssertTrue(model.submitted)
+            }
+        }
+        let posts = try f.store.outbox.commands().filter { $0.type == "message.post_from_session" }
+        XCTAssertEqual(posts.count, 8)
+        for post in posts {
+            XCTAssertEqual(ChatService.args(post)["author_session_name"]?.string, "project")
+            XCTAssertFalse(String(decoding: post.bodyBytes, as: UTF8.self).contains("PRIVATE-TITLE-MARKER"))
+        }
     }
 
     func testPublishedAgentAttributionMatchesChatPost() async throws {

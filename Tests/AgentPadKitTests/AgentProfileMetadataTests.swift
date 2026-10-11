@@ -138,10 +138,11 @@ final class AgentProfileMetadataTests: XCTestCase {
         let session = Session(engine: TestEngine(), currentDirectory: profile.folder, agent: .claudeCode, conversationId: "legacy")
         session.profileID = profile.id
         let store = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true,
-            agentProfiles: profiles, engineFactory: { TestEngine() })
+            agentProfiles: profiles, sessionCatalog: catalog, sessionNames: SessionNames(url: root.appendingPathComponent("names.sqlite")),
+            engineFactory: { TestEngine() })
         defer { store.terminate() }
-        store.renameTab(session, to: "csm_agent")
-        XCTAssertEqual(session.customTitle, "csm_agent")
+        try await store.renameTab(session, to: "csm_agent")?.value
+        XCTAssertEqual(session.explicitName, "csm_agent")
         XCTAssertEqual(items(catalog, sessions: [session]).first { $0.session === session }?.title, "csm_agent")
         let live = AllSessionItem(id: session.id.uuidString, record: found, source: .own(session.id), status: .idle,
             title: session.title, liveMetadata: .init(session: session))

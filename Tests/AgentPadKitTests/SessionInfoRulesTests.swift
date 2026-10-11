@@ -34,7 +34,7 @@ final class SessionInfoRulesTests: XCTestCase {
 
     func testTerminalTitleShownOnceARenameHidesIt() {
         session.terminalTitle = "vim README.md"
-        session.customTitle = "notes"
+        session.renameForTesting("notes")
 
         XCTAssertEqual(SessionInfoRules.visibleTerminalTitle(session), "vim README.md")
         XCTAssertTrue(SessionInfoRules.hasRuntimeInfo(session))
@@ -42,7 +42,7 @@ final class SessionInfoRulesTests: XCTestCase {
 
     func testBlankTerminalTitleIsNotARow() {
         session.terminalTitle = "   "
-        session.customTitle = "notes"
+        session.renameForTesting("notes")
         XCTAssertNil(SessionInfoRules.visibleTerminalTitle(session))
         XCTAssertFalse(SessionInfoRules.hasRuntimeInfo(session))
     }

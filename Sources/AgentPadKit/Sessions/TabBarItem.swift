@@ -66,6 +66,15 @@ struct TabBarItem: View {
         .accessibilityValue((isActive ? "Selected, " : "Not selected, ") + (indicator?.accessibleSummary ?? "No new marks"))
         .help(title + (indicator.map { "\n" + attention.tooltip($0) } ?? ""))
         .accessibilityIdentifier("workspace-tab-" + tab.id.uuidString)
+        .task(id: isActive) {
+            guard isActive else { return }
+            // Polling also observes foreground changes the terminal core does
+            // not publish through Observation. Hook/activation requests debounce.
+            while !Task.isCancelled {
+                try? await AgentAnswerSource.refresh(tab)
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            }
+        }
         .onTapGesture(perform: onActivate)
         .onHover { isHovered = $0 }
         // Selection is a discrete navigation state, not a layout transition.
@@ -84,7 +93,7 @@ struct TabBarItem: View {
                 onCloseOthers: onCloseOthers, onCloseToRight: onCloseToRight,
                 onDuplicate: onDuplicate, onRename: {
                     onActivate()
-                    if tab.hasProcess { tab.nameEdit.begin(tab.customTitle ?? tab.title) }
+                    if tab.hasProcess { tab.nameEdit.begin(tab.explicitName ?? tab.title) }
                 },
                 onSplit: onSplit, onMoveToNewWindow: onMoveToNewWindow, onLastAnswer: onLastAnswer)
         }

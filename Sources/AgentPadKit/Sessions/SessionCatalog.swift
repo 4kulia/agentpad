@@ -155,16 +155,16 @@ final class SessionCatalog {
         scanID = UUID(); let id = scanID
         let scan = scan
         Task {
-            let (updates, continuation) = AsyncStream<SessionCatalogScanner.Progress>.makeStream()
+            let (updates, continuation) = AsyncStream<(SessionCatalogScanner.Progress, Bool)>.makeStream()
             Task.detached(priority: .utility) {
-                let result = scan { continuation.yield($0) }
-                continuation.yield(result); continuation.finish()
+                let result = scan { continuation.yield(($0, false)) }
+                continuation.yield((result, true)); continuation.finish()
             }
             // Preserve callback order: dropping a progress snapshot would now
             // also drop its discovery increment.
-            for await update in updates {
+            for await (update, complete) in updates {
                 guard scanID == id else { return }
-                apply(update)
+                apply(update, complete: complete)
             }
             isScanning = false; lastScan = Date()
         }
@@ -177,11 +177,15 @@ final class SessionCatalog {
         _ = revision
         return recordsByKey[key]
     }
-    private func apply(_ update: SessionCatalogScanner.Progress) {
+    private func apply(_ update: SessionCatalogScanner.Progress, complete: Bool) {
         do { try profiles?.discover(update.discoveredRecords ?? update.records) } catch { /* Profiles expose discovery/save errors. */ }
+        scanned = update.scanned; total = update.total; skipped = update.skipped
+        // Progress is not a catalog replacement. Keep the last complete
+        // snapshot searchable until the scanner returns, then swap together.
+        guard complete else { return }
         recordsByKey = Dictionary(update.records.map { ($0.nameKey, $0) },
             uniquingKeysWith: { a, b in a.lastActivity >= b.lastActivity ? a : b })
-        records = update.records; scanned = update.scanned; total = update.total; skipped = update.skipped; revision += 1
+        records = update.records; revision += 1
     }
     private func schedule() {
         guard deferred == nil else { return }

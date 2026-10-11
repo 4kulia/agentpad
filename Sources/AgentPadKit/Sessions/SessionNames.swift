@@ -2,10 +2,11 @@ import Foundation
 import GRDB
 import Observation
 
-struct SessionNameKey: Hashable, Sendable {
+struct SessionNameKey: Codable, Hashable, Sendable {
     var agentID: String
     var conversationID: String
     init(_ agentID: String, _ conversationID: String) { self.agentID = agentID; self.conversationID = conversationID }
+    static func tab(_ id: UUID) -> Self { .init("agentpad-tab", id.uuidString.lowercased()) }
 }
 
 enum SessionTitle {
@@ -105,14 +106,12 @@ actor SessionNamesDatabase {
     func set(_ name: String, for key: SessionNameKey) throws {
         do {
             try open().write { db in
-                if let name = SessionTitle.nonempty(name) {
-                    try db.execute(sql: """
-                        INSERT INTO session_names (agent_id, conversation_id, name, updated_at) VALUES (?, ?, ?, ?)
-                        ON CONFLICT(agent_id, conversation_id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at
-                        """, arguments: [key.agentID, key.conversationID, name, Date().timeIntervalSince1970])
-                } else {
-                    try db.execute(sql: "DELETE FROM session_names WHERE agent_id = ? AND conversation_id = ?", arguments: [key.agentID, key.conversationID])
-                }
+                // Clears are durable decisions, including when a pre-hook
+                // tab Rename is transferred to its conversation key.
+                try db.execute(sql: """
+                    INSERT INTO session_names (agent_id, conversation_id, name, updated_at) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(agent_id, conversation_id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at
+                    """, arguments: [key.agentID, key.conversationID, SessionTitle.nonempty(name) ?? "", Date().timeIntervalSince1970])
             }
         } catch { queue = nil; throw error }
     }
@@ -123,17 +122,71 @@ final class SessionNames {
     static let shared = SessionNames(url: SessionCatalogFiles.directory.appendingPathComponent("session-names.sqlite"))
     private let database: SessionNamesDatabase
     private(set) var values: [SessionNameKey: String] = [:]
+    private var knownKeys: Set<SessionNameKey> = []
     private(set) var problem: String?
+    @ObservationIgnored private var writeTail: Task<Void, Error>?
+    @ObservationIgnored private var revision = 0
+    @ObservationIgnored private var revisions: [SessionNameKey: Int] = [:]
+    @ObservationIgnored private var committed: [SessionNameKey: String] = [:]
     init(url: URL) { database = SessionNamesDatabase(url: url) }
+    func contains(_ key: SessionNameKey) -> Bool { knownKeys.contains(key) }
+    /// Safe defaults for names that may leave the app. Transcript metadata
+    /// deliberately cannot be supplied to this accessor.
+    func explicitNameOrFolder(for key: SessionNameKey, folder: URL) -> String {
+        values[key].map(singleLine) ?? folder.lastPathComponent
+    }
     func load() async {
-        do { let snapshot = try await database.load(); values = snapshot.names; problem = snapshot.notice }
+        let version = revision
+        _ = await writeTail?.result
+        do {
+            let snapshot = try await database.load()
+            guard revision == version else { return }
+            committed = snapshot.names
+            knownKeys = Set(snapshot.names.keys)
+            values = snapshot.names.compactMapValues(SessionTitle.nonempty)
+            problem = snapshot.notice
+        }
         catch { problem = "Session names could not be read. Try again: \(error.localizedDescription)" }
     }
     func rename(_ name: String, for key: SessionNameKey) async throws {
-        do {
-            try await database.set(name, for: key)
-            values[key] = SessionTitle.nonempty(name) // Publish only after the transaction commits.
-            problem = nil
-        } catch { problem = "Session name could not be saved: \(error.localizedDescription)"; throw error }
+        try await beginRename(name, for: key).value
+    }
+
+    /// Transfer only a proven Rename made before the conversation was known.
+    /// Never accept record.title or a legacy window's customTitle here.
+    func bindTabRename(_ tab: SessionNameKey, to key: SessionNameKey) async throws {
+        guard tab.agentID == "agentpad-tab" else { return }
+        await load()
+        guard contains(tab) else { return }
+        if !contains(key) { try await rename(values[tab] ?? "", for: key) }
+        try await rename("", for: tab)
+    }
+
+    /// Both tab Rename and All Sessions use this ordered write. The local UI
+    /// updates immediately; a failed transaction restores the committed name.
+    @discardableResult
+    func beginRename(_ name: String, for key: SessionNameKey) -> Task<Void, Error> {
+        revision += 1
+        let version = revision, previous = writeTail
+        revisions[key] = version
+        values[key] = SessionTitle.nonempty(name)
+        knownKeys.insert(key)
+        let task = Task {
+            _ = await previous?.result
+            do {
+                try await database.set(name, for: key)
+                committed[key] = SessionTitle.nonempty(name) ?? ""
+                if revisions[key] == version { problem = nil }
+            } catch {
+                if revisions[key] == version {
+                    values[key] = SessionTitle.nonempty(committed[key])
+                    if committed[key] == nil { knownKeys.remove(key) }
+                    problem = "Session name could not be saved: \(error.localizedDescription)"
+                }
+                throw error
+            }
+        }
+        writeTail = task
+        return task
     }
 }

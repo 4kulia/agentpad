@@ -28,8 +28,57 @@ struct TerminalFileReference: Equatable {
     let column: Int?
 }
 
+/// File clicks use one app-wide FIFO, independent of process inspections.
+/// A blocked OS call keeps this queue occupied, but never spends the next
+/// click's deadline. Its own late result is discarded after two seconds.
+enum TerminalLinkResolution {
+    private static let queue = DispatchQueue(label: "agentpad.terminal-links", qos: .userInitiated)
+    private static let timers = DispatchQueue(label: "agentpad.terminal-links.timers", qos: .userInitiated)
+
+    static func run(_ resolve: @escaping @Sendable () -> TerminalOpenTarget?) async -> TerminalOpenTarget? {
+        await withCheckedContinuation { continuation in
+            let reply = Reply(continuation)
+            queue.async {
+                timers.asyncAfter(deadline: .now() + 2) { reply.finish(nil) }
+                reply.finish(resolve())
+            }
+        }
+    }
+
+    private final class Reply: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<TerminalOpenTarget?, Never>?
+
+        init(_ continuation: CheckedContinuation<TerminalOpenTarget?, Never>) {
+            self.continuation = continuation
+        }
+
+        func finish(_ target: TerminalOpenTarget?) {
+            let continuation = lock.withLock {
+                defer { self.continuation = nil }
+                return self.continuation
+            }
+            continuation?.resume(returning: target)
+        }
+    }
+}
+
 enum TerminalOpenTargetResolver {
     typealias FileExists = (String) -> Bool
+
+    /// Common schemes need no inspection. Check other schemes with Launch
+    /// Services off-main; unregistered schemes still need the file resolver.
+    static func externalURL(_ rawValue: String, hasHandler: (URL) -> Bool = { _ in false }) -> URL? {
+        let value = unquote(rawValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard let url = URL(string: value), let scheme = url.scheme else { return nil }
+        if scheme.caseInsensitiveCompare("file") == .orderedSame {
+            guard let host = url.host, !host.isEmpty,
+                  host.caseInsensitiveCompare("localhost") != .orderedSame else { return nil }
+        } else if !["http", "https", "mailto", "ftp", "ssh"].contains(scheme.lowercased()), !hasHandler(url) {
+            return nil
+        }
+        return url
+    }
 
     static func resolve(
         _ rawValue: String,

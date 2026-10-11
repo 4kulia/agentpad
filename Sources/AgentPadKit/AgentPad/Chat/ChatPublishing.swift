@@ -573,6 +573,9 @@ extension ChatService: TeamPublishing {
     /// accepted — never written to `agents.json`, and only for an agent this
     /// Mac can run whose local parameters are still the accepted ones
     /// (lead's decision on review D3b-1). Nothing else announces.
+    /// Stored name/description are user-confirmed publication text, including
+    /// legacy values that resemble transcript titles. Replay them unchanged;
+    /// neither Session Rename nor missing source metadata changes that consent.
     func announceAfterNewSession(_ key: ChatOrgKey) {
         guard let journal, let connection, connection.orgKey == key else { return }
         do {

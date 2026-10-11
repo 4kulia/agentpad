@@ -141,6 +141,8 @@ final class CompositionTabs {
         let source = sources[id]
         let model = AgentAnswerForward(draft: fields, caller: source?.caller, service: chat,
             sourceIsCurrent: { source?.isCurrent() ?? false })
+        model.sourceCanRetry = { source?.canRetry() ?? false }
+        model.revalidateSource = { guard let source else { throw AgentAnswerTranscript.Problem.changed }; try await source.revalidate() }
         model.restartConfirmation = state.confirmation
         model.tabID = owner(state)?.session.id ?? id
         state.forwardForm = model

@@ -89,7 +89,7 @@ final class TeamTabs {
                           publicationID: editing.agent.id.uuidString.lowercased()), from: store)
     }
     @discardableResult
-    func publish(sessionID: String? = nil, title: String = "", surfaceID: UUID? = nil,
+    func publish(sessionID: String? = nil, folder: URL? = nil, surfaceID: UUID? = nil,
                  from store: WorkspaceStore? = nil, newDraft: Bool = false) -> Session? {
         guard let scope = currentScope else { return nil }
         let conversation = sessionID?.lowercased()
@@ -111,8 +111,8 @@ final class TeamTabs {
             ?? stores.flatMap { $0.drafts.drafts }.sorted { $0.revision > $1.revision }.map(\.route).first(where: matches)
         let route = existing ?? .publish(scope, draftID: UUID(), sourceSessionID: surfaceID, conversationID: conversation)
         guard let session = open(route, from: store), let state = session.tabState else { return nil }
-        if state.publicationForm == nil, state.draft == nil { state.transient["publicationSourceTitle"] = title }
-        if canRead(scope) { _ = form(state, title: title) }
+        if state.publicationForm == nil, state.draft == nil { state.transient["publicationSourceFolder"] = folder?.path }
+        if canRead(scope) { _ = form(state) }
         return session
     }
     func requestUnpublish(_ agents: [TeamPublishedAgent], state: TabState) {

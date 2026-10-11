@@ -42,7 +42,7 @@ enum ChatSessionIdentity {
 
     struct Tab: Sendable {
         var id: UUID
-        var customTitle: String?
+        var explicitName: String?
         var folderName: String
         var processes: [SessionProcessScanner.Raw]
     }
@@ -54,6 +54,7 @@ enum ChatSessionIdentity {
         let terminal: Int32?
 
         nonisolated static func read(_ pid: Int32) -> Process? {
+            SessionProcessScanner.willInspect()
             guard pid > 1 else { return nil }
             var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
             var info = kinfo_proc(), size = MemoryLayout<kinfo_proc>.stride
@@ -94,9 +95,9 @@ enum ChatSessionIdentity {
         guard case .localProcess(let pid, let start) = origin else { throw VerificationError.processUnavailable }
         // Only AppKit/session state is read here. Kernel walks for every tab,
         // SecCode signature checks and author name formatting run away from the UI.
-        // The action later checks only these PID/image identities synchronously.
+        // Actions revalidate these identities on the same bounded worker.
         let seeds = sessions.filter { $0.hasProcess }.map { (tab($0, processes: []), $0.engine.foregroundPid ?? 0) }
-        return try await Task.detached(priority: .userInitiated) {
+        return try await BackgroundInspection.run {
             func identity(_ pid: Int32, _ start: UInt64) -> Bool {
                 start != 0 && kernel.process(pid)?.startedAtUs == start
             }
@@ -135,33 +136,40 @@ enum ChatSessionIdentity {
                 throw VerificationError.processUnavailable
             }
             return Verification(caller: caller, foreground: foreground, lineage: lineage, signatures: signatures)
-        }.value
+        }
     }
 
-    /// No await and no Security API: this must run in the action's actor turn.
-    static func revalidate(_ verified: Verification, sessions: [Session], kernel: Kernel = Kernel()) throws {
-        guard let peer = verified.lineage.first, let tty = verified.foreground.terminal else { throw VerificationError.processUnavailable }
-        guard kernel.process(peer.pid)?.startedAtUs == peer.startedAtUs,
-              kernel.process(verified.caller.claudePID)?.startedAtUs == verified.caller.claudeStart else { throw VerificationError.processUnavailable }
-        for expected in verified.lineage {
-            guard let now = kernel.process(expected.pid), now.startedAtUs == expected.startedAtUs else { throw VerificationError.processUnavailable }
-            guard now == expected else { throw VerificationError.notInTab }
-            guard let key = verified.signatures[expected.pid], key.pid == now.pid, key.startedAtUs == now.startedAtUs,
-                  kernel.image(now.pid) == key.image else { throw VerificationError.imageChanged }
+    /// Capture UI state, verify kernel identities off-main, then reject any
+    /// tab/foreground changes that happened during that suspension.
+    static func revalidate(_ verified: Verification, sessions: [Session], kernel: Kernel = Kernel(),
+                           currentSessions: (@MainActor () -> [Session])? = nil) async throws {
+        let seeds = sessions.filter { $0.hasProcess }.map { ($0.id, $0.engine.foregroundPid) }
+        try await BackgroundInspection.run {
+            guard let peer = verified.lineage.first, let tty = verified.foreground.terminal else { throw VerificationError.processUnavailable }
+            guard kernel.process(peer.pid)?.startedAtUs == peer.startedAtUs,
+                  kernel.process(verified.caller.claudePID)?.startedAtUs == verified.caller.claudeStart else { throw VerificationError.processUnavailable }
+            for expected in verified.lineage {
+                guard let now = kernel.process(expected.pid), now.startedAtUs == expected.startedAtUs else { throw VerificationError.processUnavailable }
+                guard now == expected else { throw VerificationError.notInTab }
+                guard let key = verified.signatures[expected.pid], key.pid == now.pid, key.startedAtUs == now.startedAtUs,
+                      kernel.image(now.pid) == key.image else { throw VerificationError.imageChanged }
+            }
+            let matches = seeds.filter { _, pid in
+                guard let pid, let foreground = kernel.process(pid), foreground.terminal == tty else { return false }
+                return pid != verified.foreground.pid || foreground.startedAtUs == verified.foreground.startedAtUs
+            }
+            guard matches.count == 1, matches[0].0.uuidString.lowercased() == verified.caller.surface else { throw VerificationError.notInTab }
+            guard TeamProcesses.shared.run(containing: peer.pid) == .notFound else { throw VerificationError.teamRun }
+            guard verified.lineage.allSatisfy({ kernel.process($0.pid) == $0 }) else { throw VerificationError.processUnavailable }
         }
-        let matches = sessions.filter { session in
-            guard session.hasProcess, let pid = session.engine.foregroundPid,
-                  let foreground = kernel.process(pid), foreground.terminal == tty else { return false }
-            return pid != verified.foreground.pid || foreground.startedAtUs == verified.foreground.startedAtUs
-        }
-        guard matches.count == 1, matches[0].id.uuidString.lowercased() == verified.caller.surface else { throw VerificationError.notInTab }
-        guard TeamProcesses.shared.run(containing: peer.pid) == .notFound else { throw VerificationError.teamRun }
-        // Image and tab reads must not outlive either endpoint or its parent links.
-        guard verified.lineage.allSatisfy({ kernel.process($0.pid) == $0 }) else { throw VerificationError.processUnavailable }
+        let now = (currentSessions?() ?? sessions).filter { $0.hasProcess }.map { ($0.id, $0.engine.foregroundPid) }
+        guard seeds.elementsEqual(now, by: { $0 == $1 }) else { throw VerificationError.notInTab }
     }
 
     static func tab(_ session: Session, processes: [SessionProcessScanner.Raw]) -> Tab {
-        Tab(id: session.id, customTitle: session.customTitle, folderName: session.currentDirectory.lastPathComponent, processes: processes)
+        // Public attribution retains the pre-display-title naming rule. Never
+        // consult transcript/catalog titles, even when they name the local tab.
+        Tab(id: session.id, explicitName: session.explicitName, folderName: session.currentDirectory.lastPathComponent, processes: processes)
     }
 
     nonisolated static func resolve(pid: Int32, startedAt: UInt64, tabs: [Tab], identity: (Int32, UInt64) -> Bool,
@@ -221,7 +229,7 @@ enum ChatSessionIdentity {
     }
 
     nonisolated static func name(_ tab: Tab) -> String {
-        for value in [tab.customTitle, tab.folderName] {
+        for value in [tab.explicitName, tab.folderName] {
             if let value, !normalized(value).isEmpty { return normalized(value) }
         }
         return "Claude Code \(tab.id.uuidString.lowercased().prefix(8))"

@@ -8,9 +8,16 @@ final class TeamMCPServerTests: XCTestCase {
     final class FakeApp: @unchecked Sendable {
         private let lock = NSLock()
         var requests: [AgentPadCLIRequest] = []
+        var verifications: [AgentPadCLIRequest] = []
+        var verification = AgentPadCLIResponse(ok: true)
         var answer: (AgentPadCLIRequest) -> AgentPadCLIResponse = { _ in .failure("unscripted") }
         func send(_ request: AgentPadCLIRequest) -> AgentPadCLIResponse {
             let reply = lock.withLock { () -> (AgentPadCLIRequest) -> AgentPadCLIResponse in
+                if request.teamAction == AgentPadCLITeamAction.verifyCaller.rawValue {
+                    verifications.append(request)
+                    let result = verification
+                    return { _ in result }
+                }
                 requests.append(request)
                 return answer
             }
@@ -141,7 +148,9 @@ final class TeamMCPServerTests: XCTestCase {
         let response = makeServer(app, out).callTool("chat_post", arguments: args, requestKey: "open", progressToken: nil)
         XCTAssertFalse(response.1)
         XCTAssertTrue(response.0.contains(dm))
-        let timeout = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { _, _, _ in .failure(.init("timeout")) }, write: { _ in })
+        let timeout = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { request, _, _ in
+            request.teamAction == AgentPadCLITeamAction.verifyCaller.rawValue ? .success(.init(ok: true)) : .failure(.init("timeout"))
+        }, write: { _ in })
         let unknown = timeout.callTool("chat_post", arguments: args, requestKey: "open", progressToken: nil)
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(unknown.0.utf8)) as? [String: Any])
         XCTAssertEqual(json["status"] as? String, "unknown")
@@ -154,7 +163,8 @@ final class TeamMCPServerTests: XCTestCase {
     }
 
     func testAttachmentDownloadUsesItsOwnIPCDeadline() {
-        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { _, seconds, _ in
+        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { request, seconds, _ in
+            if request.teamAction == AgentPadCLITeamAction.verifyCaller.rawValue { return .success(.init(ok: true)) }
             XCTAssertEqual(seconds, 190)
             return .failure(.init("cancelled"))
         }, write: { _ in })
@@ -193,6 +203,7 @@ final class TeamMCPServerTests: XCTestCase {
     func testChatPostTimeoutKeepsItsIDAndRepeatingTheCallKeyCannotDuplicate() throws {
         let app = FakeApp(), out = Output()
         let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { request, timeout, _ in
+            if request.teamAction == AgentPadCLITeamAction.verifyCaller.rawValue { return .success(.init(ok: true)) }
             XCTAssertGreaterThanOrEqual(timeout, 32, "HTTP preflight plus outbox wait")
             _ = app.send(request)
             return .failure(.init("timeout"))
@@ -221,6 +232,7 @@ final class TeamMCPServerTests: XCTestCase {
     func testCancelledPostLogsAlreadyKnownSentOutcome() throws {
         let out = Output(), entered = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
         let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", send: { request, _, cancellation in
+            if request.teamAction == AgentPadCLITeamAction.verifyCaller.rawValue { return .success(.init(ok: true)) }
             entered.signal()
             _ = proceed.wait(timeout: .now() + 5)
             XCTAssertTrue(cancellation?.isCancelled == true)
@@ -591,5 +603,155 @@ final class TeamMCPServerTests: XCTestCase {
         let call = AgentPadCLITeamInfo.Call(id: "c1", address: "a@b", state: "unknown", final: false,
                                             detail: "The server reports a state this AgentPad does not know (“paused”); update AgentPad.")
         XCTAssertTrue(AgentPadHookKit.renderCLITeamProgress(call).contains("does not know"))
+    }
+}
+
+extension TeamMCPServerTests {
+    func testInvalidChatFieldsExplainUUIDLimitsTypesAndAddressConflicts() throws {
+        let id = "00000000-0000-4000-8000-000000000001"
+        let post: [String: Any] = ["org_id": id, "channel_id": id, "text": "hello"]
+        func changed(_ key: String, _ value: Any?) -> [String: Any] {
+            var args = post; args[key] = value; return args
+        }
+        let cases: [(String, [String: Any], String, String)] = [
+            ("chat_post", changed("message_id", "private-invalid-id"), "message_id", "must be a UUID"),
+            ("chat_post", changed("org_id", nil), "org_id", "required"),
+            ("chat_post", changed("text", nil), "text", "required"),
+            ("chat_post", changed("text", 42), "text", "string"),
+            ("chat_post", changed("text", " \n\t"), "text", "whitespace"),
+            ("chat_post", changed("text", String(repeating: "x", count: 16_385)), "text", "16384 UTF-8 bytes"),
+            ("chat_post", changed("text", String(repeating: "😀", count: 4097)), "text", "16384 UTF-8 bytes"),
+            ("chat_post", changed("dm_id", id), "dm_id", "kind is dm"),
+            ("chat_post", changed("kind", 1), "kind", "channel or dm"),
+            ("chat_post", changed("unsupported_field", "private-value"), "unsupported_field", "not a supported argument"),
+            ("chat_post", ["org_id": id, "kind": "dm", "dm_id": id, "peer_account_id": id, "text": "hi"], "dm_id", "exactly one"),
+            ("chat_post", ["org_id": id, "kind": "dm", "peer_account_id": id, "thread_root_id": id, "text": "hi"], "thread_root_id", "requires dm_id"),
+            ("chat_post", ["org_id": id, "kind": "dm", "peer_account_id": id, "open_only": false], "open_only", "must be true"),
+            ("chat_post", ["org_id": id, "kind": "dm", "peer_account_id": id, "open_only": true, "text": "hi"], "text", "must be omitted"),
+            ("chat_read", ["org_id": id, "channel_id": id, "before": true], "before", "positive whole number"),
+            ("chat_read", ["org_id": id, "channel_id": id, "before": 1.5], "before", "positive whole number"),
+            ("chat_read", ["org_id": id, "channel_id": id, "attachment_id": "invalid"], "attachment_id", "must be a UUID"),
+            ("chat_channels", ["scope": "invalid"], "scope", "channels, dms, or members"),
+            ("chat_channels", ["after": String(repeating: "x", count: 513)], "after", "512 UTF-8 bytes"),
+            // Text fits its own limit, but escaping makes the JSON too large.
+            ("chat_post", changed("text", String(repeating: "\u{1}", count: 5000)), "arguments", "24576 bytes"),
+        ]
+        let app = FakeApp(), server = makeServer(app, Output())
+        for (index, item) in cases.enumerated() {
+            let (tool, args, field, reason) = item
+            let (raw, failed) = server.callTool(tool, arguments: args, requestKey: "bad-\(index)", progressToken: nil)
+            XCTAssertTrue(failed, raw)
+            let error = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: String])
+            XCTAssertEqual(error["error"], "invalid_args")
+            XCTAssertEqual(error["field"], field)
+            XCTAssertTrue(error["message"]?.contains(reason) == true, raw)
+            XCTAssertFalse(raw.contains("private-invalid-id"))
+            XCTAssertFalse(raw.contains("private-value"))
+        }
+        XCTAssertTrue(app.requests.isEmpty, "Invalid requests must not execute a tool")
+        XCTAssertEqual(app.verifications.count, cases.count, "Even invalid calls must verify their caller first")
+        XCTAssertTrue(AgentPadChatToolArguments.valid("chat_post", changed("text", String(repeating: "😀", count: 4096))))
+        XCTAssertTrue(AgentPadChatToolArguments.valid("chat_channels", ["after": String(repeating: "x", count: 512)]))
+    }
+
+    func testOtherTeamToolsNameTheInvalidField() throws {
+        let app = FakeApp(), server = makeServer(app, Output())
+        for (tool, args, field) in [
+            ("team_ask", ["prompt": "hi"] as [String: Any], "agent"),
+            ("team_ask", ["agent": "helper", "prompt": false], "prompt"),
+            ("team_ask", ["agent": "helper", "prompt": "hi", "thread_id": 3], "thread_id"),
+            ("team_check", [:], "call_id"),
+            ("team_check", ["call_id": "call", "wait_minutes": true], "wait_minutes"),
+            ("team_cancel", ["call_id": 3], "call_id"),
+            ("team_agents", ["unknown": "value"], "unknown"),
+        ] {
+            let (raw, failed) = server.callTool(tool, arguments: args, requestKey: UUID().uuidString, progressToken: nil)
+            XCTAssertTrue(failed)
+            let error = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: String])
+            XCTAssertEqual(error["error"], "invalid_args")
+            XCTAssertEqual(error["field"], field)
+            XCTAssertTrue(error["message"]?.hasPrefix(field + " ") == true)
+        }
+        XCTAssertTrue(app.requests.isEmpty)
+        XCTAssertEqual(app.verifications.count, 7)
+    }
+
+    func testEveryToolVerifiesBeforeReturningFieldErrorsAndRechecksEachInvocation() throws {
+        let app = FakeApp(), server = makeServer(app, Output())
+        let refusal = #"{"error":"session_not_in_tab","message":"Restart Claude in this tab."}"#
+        var denied = AgentPadCLIResponse.failure("session_not_in_tab")
+        denied.chatResult = refusal
+        app.verification = denied
+        let cases: [(String, Any)] = [
+            ("chat_post", ["message_id": "bad", "text": false]),
+            ("chat_read", ["before": false]),
+            ("chat_channels", ["scope": "bad"]),
+            ("team_ask", ["agent": false]),
+            ("team_check", ["wait_minutes": true]),
+            ("team_cancel", ["call_id": 3]),
+            ("team_agents", ["unknown": "value"]),
+            ("chat_post", "not an object"),
+            ("team_ask", [1, 2]),
+            ("", [String: String]()),
+        ]
+        for (name, args) in cases {
+            let (text, failed) = server.callTool(name, arguments: args, requestKey: "same-key", progressToken: nil)
+            XCTAssertTrue(failed)
+            XCTAssertEqual(text, refusal)
+            XCTAssertFalse(text.contains("invalid_args"))
+            XCTAssertFalse(text.contains("field"))
+        }
+        XCTAssertEqual(app.verifications.count, cases.count)
+        XCTAssertTrue(app.requests.isEmpty)
+        app.verification = .init(ok: true)
+        let verified = server.callTool("team_ask", arguments: [:], requestKey: "same-key", progressToken: nil)
+        XCTAssertTrue(verified.0.contains("\"field\":\"agent\""))
+        app.verification = denied
+        XCTAssertEqual(server.callTool("team_ask", arguments: [:], requestKey: "same-key", progressToken: nil).0, refusal,
+                       "Initialization or an earlier verified call must not cache caller identity")
+    }
+
+    func testJSONRPCArgumentsAndToolNameAreCheckedOnlyAfterVerification() throws {
+        let app = FakeApp(), out = Output(), server = makeServer(app, out)
+        app.verification = .failure("session_process_unavailable")
+        call(server, id: 1, method: "initialize")
+        for (index, params) in [
+            ["name": "chat_post", "arguments": "wrong type"],
+            ["name": false, "arguments": ["message_id": "bad"]],
+            ["name": "team_ask", "arguments": ["prompt": false]],
+        ].enumerated() {
+            call(server, id: index + 2, method: "tools/call", params: params)
+            let response = try wait(out, for: index + 2)
+            XCTAssertEqual(text(response), "session_process_unavailable")
+            XCTAssertNil(response["error"], "Argument shape must not bypass verification through JSON-RPC errors")
+        }
+        XCTAssertEqual(app.verifications.count, 3)
+        XCTAssertTrue(app.requests.isEmpty)
+    }
+
+    func testFolderToolAlsoVerifiesBeforeItsNamedFieldErrors() throws {
+        let app = FakeApp()
+        let server = AgentPadTeamMCPServer(cwd: "/p", version: "1", runCallId: "own-call",
+            send: { request, _, _ in .success(app.send(request)) }, write: { _ in })
+        app.verification = .failure("not available to a team run")
+        XCTAssertEqual(server.callTool("request_folder_access", arguments: ["path": false], requestKey: "1", progressToken: nil).0,
+                       "not available to a team run")
+        XCTAssertEqual(app.verifications.first?.teamCall, "own-call")
+        app.verification = .init(ok: true)
+        let (raw, failed) = server.callTool("request_folder_access", arguments: ["path": false], requestKey: "2", progressToken: nil)
+        XCTAssertTrue(failed)
+        let error = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: String])
+        XCTAssertEqual(error["field"], "path")
+        XCTAssertTrue(app.requests.isEmpty)
+    }
+
+    func testPrivateAccessVerificationUsesOnlyAnAnonymousHint() {
+        let app = FakeApp(), server = makeServer(app, Output())
+        app.verification = .failure("dm_not_allowed")
+        for args: [String: Any] in [["kind": "dm"], ["scope": "members"], ["attachment_id": "private-id"]] {
+            XCTAssertEqual(server.callTool("chat_read", arguments: args, requestKey: UUID().uuidString, progressToken: nil).0, "dm_not_allowed")
+            XCTAssertEqual(app.verifications.last?.chatArguments, #"{"kind":"dm"}"#)
+        }
+        XCTAssertTrue(app.requests.isEmpty)
     }
 }

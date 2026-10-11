@@ -80,11 +80,11 @@ final class PublicationFormState {
 }
 
 extension TeamTabs {
-    func form(_ state: TabState, title: String = "") -> PublicationFormState {
+    func form(_ state: TabState) -> PublicationFormState {
         if let form = state.publicationForm { return form }
         let form = PublicationFormState()
         state.publicationForm = form
-        restore(form, state: state, title: title.isEmpty ? state.transient["publicationSourceTitle"] ?? "" : title)
+        restore(form, state: state)
         form.changed = { [weak state] fields in
             guard let state else { return }
             state.confirmation.invalidate(); state.edit(.publicationForm(fields))
@@ -97,7 +97,7 @@ extension TeamTabs {
         return form
     }
 
-    private func restore(_ form: PublicationFormState, state: TabState, title: String = "") {
+    private func restore(_ form: PublicationFormState, state: TabState) {
         form.error = nil
         if case .publicationForm(let fields) = state.draft?.payload {
             form.fields = fields; form.restoredTargets = targetIDs(fields); return
@@ -116,10 +116,13 @@ extension TeamTabs {
             fields.sourceSurfaceID = surface; fields.sourceConversationID = conversation
             if let conversation {
                 fields.mode = .session; fields.sessionID = conversation
-                fields.sessionTitle = fields.sessionTitle ?? title
-                let name = TeamPublishedAgent.suggestedName(title)
-                if fields.name.isEmpty { fields.name = name.isEmpty ? "session-\(conversation.prefix(6))" : name }
-                if fields.description.isEmpty { fields.description = title }
+                if fields.versions.isEmpty {
+                    let title = initialSessionName(conversation, surface: surface, state: state)
+                    fields.sessionTitle = title
+                    let name = TeamPublishedAgent.suggestedName(title)
+                    fields.name = name.isEmpty ? "session-\(conversation.prefix(6))" : name
+                    fields.description = title
+                }
             } else if scope == .local {
                 fields.access = .readGit
             }
@@ -138,9 +141,24 @@ extension TeamTabs {
         if case .publish = state.route { state.edit(.publicationForm(fields)) }
     }
 
+    /// Defaults are chosen once, when a new form opens. Restored drafts and
+    /// existing publications keep their stored text, independent of session titles.
+    private func initialSessionName(_ conversation: String, surface: UUID?, state: TabState) -> String {
+        let key = SessionNameKey(AgentTemplate.claudeCodeID, conversation)
+        let source = router.stores().flatMap(\.allSessions).first {
+            $0.hasProcess && $0.explicitNameKey == key && (surface == nil || $0.id == surface)
+        }
+        let names = source?.names ?? owner(state)?.store.sessionDisplaySources.names ?? .shared
+        let folder = state.transient["publicationSourceFolder"].map { URL(fileURLWithPath: $0) }
+            ?? source?.currentDirectory
+        return folder.map { TeamSessionPublication.name(conversationID: conversation, folder: $0, session: source, names: names) }
+            ?? names.values[key] ?? "session-\(conversation.prefix(6))"
+    }
+
     func loadSource(_ state: TabState) async {
         let form = form(state)
         guard !form.loaded, !form.loading, let conversation = form.fields.sourceConversationID else { return }
+        if form.fields.sessionID == nil || form.fields.mode == .folder, !form.fields.folder.isEmpty { return }
         form.loading = true
         let root = service.calls.sessionFilesRoot
         let folder = await Task.detached { TeamSessionFiles.workingDirectory(of: conversation, root: root) }.value
@@ -214,7 +232,7 @@ extension TeamTabs {
                 throw TeamError.storage("This publication's teams changed. Your edits have been kept. Review the current version before saving.")
             }
         }
-        if let source = fields.sourceConversationID ?? fields.sessionID {
+        if fields.mode != .folder, let source = fields.sessionID {
             guard service.calls.conversationVisibility().allows(conversationId: source),
                   TeamSessionFiles.workingDirectory(of: source, root: service.calls.sessionFilesRoot) == fields.folder else {
                 throw TeamError.storage("The source conversation is no longer available in the saved folder.")
@@ -268,7 +286,9 @@ extension TeamTabs {
                 try await service.calls.saveAndPublish(batch, teams: fields.teamIDs.sorted(), key: key.chatKey, validate: check, didCommit: committed)
                 for agent in batch { savedFields.teamVersions[agent.id] = chosenTeams(agent.id, key.chatKey)?.sorted() }
                 for agent in batch where agent.isSession && fields.sourceConversationID != nil {
-                    try bindPublication(key.chatKey, agent.id, liveSource(fields))
+                    let source = try await verifiedSource(fields)
+                    try validate(savedFields, scope: scope, identity: identity)
+                    try bindPublication(key.chatKey, agent.id, source)
                 }
             } else { try await service.calls.save(batch, validate: check, didCommit: committed) }
         } catch {
@@ -311,10 +331,16 @@ extension TeamTabs {
 
     /// A restored surface address is not authority to speak as a publication.
     /// Bind only a currently verified process of the pinned conversation.
+    private func verifiedSource(_ fields: PublicationDraft) async throws -> UUID? {
+        guard let surface = fields.sourceSurfaceID, let session = router.owner(of: surface)?.session else { return nil }
+        try await AgentAnswerSource.refresh(session, inspector: sourceInspector)
+        return liveSource(fields)
+    }
+
     func liveSource(_ fields: PublicationDraft) -> UUID? {
         guard let surface = fields.sourceSurfaceID, let session = router.owner(of: surface)?.session,
               session.answerBinding?.conversation.lowercased() == fields.sourceConversationID?.lowercased(),
-              AgentAnswerSource.problem(session, inspector: sourceInspector) == nil else { return nil }
+              AgentAnswerSource.problem(session) == nil else { return nil }
         return surface
     }
 

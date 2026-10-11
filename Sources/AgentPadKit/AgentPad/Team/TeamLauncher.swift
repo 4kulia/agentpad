@@ -588,7 +588,9 @@ final class TeamRunRecovery {
     private(set) var problem: String?
     /// Looks for a blocked run's live processes; nil when that cannot be told
     /// (a read that failed, or no leader recorded). Replaced in tests.
-    var find: (TeamProcessStart?) -> [ProcessIdentity]? = { TeamRunRecovery.processes(leader: $0) }
+    var find: @MainActor (TeamProcessStart?) async -> [ProcessIdentity]? = { leader in
+        try? await BackgroundInspection.run { TeamRunRecovery.processes(leader: leader) }
+    }
     /// How long "Stop These Processes" waits after SIGTERM before SIGKILL.
     var stopGrace: Duration = .seconds(5)
     private var checking: Task<Result<Void, Error>, Never>?
@@ -606,13 +608,13 @@ final class TeamRunRecovery {
         let previous = checking
         let task = Task {
             _ = await previous?.value
-            return self.checkNow()
+            return await self.checkNow()
         }
         checking = task
         return await task.value
     }
 
-    private func checkNow() -> Result<Void, Error> {
+    private func checkNow() async -> Result<Void, Error> {
         let rows: [ChatRunRecord]
         do { rows = try journal.unfinishedRuns() } catch {
             problem = error.localizedDescription
@@ -624,7 +626,7 @@ final class TeamRunRecovery {
         for run in rows where !isLive(run.runId) {
             guard run.processesGoneAt != nil else {
                 let leader = Self.leader(of: run)
-                nowBlocked.append(Blocked(run: run, leader: leader, found: find(leader)))
+                nowBlocked.append(Blocked(run: run, leader: leader, found: await inspect(leader)))
                 continue
             }
             // A quit that was stopping it says why; else the app restarted.
@@ -645,26 +647,32 @@ final class TeamRunRecovery {
         return TeamProcessStart(pid: pid, pgid: run.pgid ?? pid, startTime: start)
     }
 
+    private func inspect(_ leader: TeamProcessStart?) async -> [ProcessIdentity]? {
+        await find(leader)
+    }
+
     /// "Stop These Processes": SIGTERM to what was shown and is found again
     /// now as the same processes — the leader with its group while it is
     /// confirmed, the others by identity — then SIGKILL to those still there
     /// after the grace. Nil when sent; else why not.
     func stopProcesses(_ id: String) async -> String? {
         guard let item = blocked.first(where: { $0.id == id }) else { return nil }
-        guard let found = find(item.leader) else { return "AgentPad cannot look for its processes." }
+        guard let found = await inspect(item.leader) else { return "AgentPad cannot look for its processes." }
         let shown = Set(item.found ?? [])
         let targets = found.filter(shown.contains)
         let leader = item.leader.flatMap { targets.contains($0.identity) ? $0 : nil } ?? TeamProcessStart(pid: 0, pgid: 0, startTime: 0)
         let others = TeamPidSet(targets.filter { $0 != leader.identity })
         let grace = stopGrace
-        await Task.detached {
+        let completed = await TeamProcesses.withDeadline(grace + .seconds(3)) {
             TeamProcesses.signal(leader, SIGTERM, also: others)
             let deadline = ContinuousClock.now + grace
             while ContinuousClock.now < deadline, TeamProcesses.liveness(leader, also: others) == .alive {
                 try? await Task.sleep(for: .milliseconds(100))
             }
             TeamProcesses.signal(leader, SIGKILL, also: others)
-        }.value
+            return true
+        }
+        guard completed == true else { return "Process inspection timed out; the stop could not be confirmed. Try again." }
         await check()
         return nil
     }
@@ -675,7 +683,7 @@ final class TeamRunRecovery {
     func confirmGone(_ id: String) async -> String? {
         guard let item = blocked.first(where: { $0.id == id }) else { return nil }
         if item.leader != nil {
-            guard let found = find(item.leader) else { return "AgentPad could not look for its processes; try again." }
+            guard let found = await inspect(item.leader) else { return "AgentPad could not look for its processes; try again." }
             guard found.isEmpty else {
                 return "Still running: PID " + found.map { String($0.pid) }.sorted().joined(separator: ", ") + "."
             }
@@ -689,7 +697,7 @@ final class TeamRunRecovery {
     /// The live processes of a run's recorded leader: the leader alive as
     /// itself and what this app saw under it. Nil when there is no leader to
     /// look for or a read failed.
-    static func processes(leader: TeamProcessStart?) -> [ProcessIdentity]? {
+    nonisolated static func processes(leader: TeamProcessStart?) -> [ProcessIdentity]? {
         guard let leader else { return nil }
         var found: Set<ProcessIdentity> = []
         switch TeamProcesses.liveness(leader.identity) {
@@ -752,15 +760,15 @@ final class TeamRunStopper {
         await launcher.recovery?.check()
     }
 
-    /// At quit, where nothing can wait: every run's group is killed and its
-    /// row marked as being stopped; the next start confirms it gone and only
+    /// During deferred quit, bounded workers kill each run's group. Its
+    /// row is marked as stopping; the next start confirms it gone and only
     /// then writes the outcome and its fact (review C2-17).
-    func stopAllAtQuit() {
+    func stopAllAtQuit() async {
         launcher.close()
         for (runId, run) in launcher.live {
             try? launcher.journal.markStopping(runId, reason: "stopped_by_owner")
             guard let process = run.process else { continue }
-            TeamProcesses.signal(process, SIGKILL, also: TeamProcesses.shared.seen(of: process))
+            _ = try? await BackgroundInspection.run { TeamProcesses.signal(process, SIGKILL, also: TeamProcesses.shared.seen(of: process)) }
         }
     }
 }

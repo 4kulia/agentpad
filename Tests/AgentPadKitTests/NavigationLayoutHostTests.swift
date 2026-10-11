@@ -216,9 +216,9 @@ final class NavigationLayoutHostTests: XCTestCase {
         window.setContentSize(NSSize(width: 1100, height: 720))
         window.makeKeyAndOrderFront(nil)
         store.renameWorkspace(store.active!, to: "Cedar")
-        store.active?.activeSession?.customTitle = "Build and test"
+        store.active?.activeSession?.renameForTesting("Build and test")
         let second = store.addWorkspace(); store.renameWorkspace(second, to: "API services")
-        store.active?.activeSession?.customTitle = "Release logs"
+        store.active?.activeSession?.renameForTesting("Release logs")
         let content = try XCTUnwrap(window.contentView)
         func settle() async throws {
             try await Task.sleep(for: .milliseconds(150))
@@ -265,7 +265,7 @@ final class NavigationLayoutHostTests: XCTestCase {
         window.sendEvent(enter)
         try await settle()
         XCTAssertEqual(store.activeWorkspaceId, store.workspaces.first?.id)
-        XCTAssertEqual(store.active?.activeSession?.customTitle, "Build and test")
+        XCTAssertEqual(store.active?.activeSession?.explicitName, "Build and test")
         XCTAssertEqual(store.navigationPresentation.list, .closed)
         store.requestRenameActiveWorkspace()
         try await settle()

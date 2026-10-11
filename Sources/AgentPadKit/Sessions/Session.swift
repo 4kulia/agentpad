@@ -66,7 +66,12 @@ final class Session: Identifiable {
     /// agent's hooks fire from a plain `terminal` session — e.g. user types
     /// `claude` inside a Terminal tab → upgraded to `.claudeCode` so the
     /// sidebar / tab icon and agent state-tracking start working.
-    var agent: AgentTemplate
+    var agent: AgentTemplate {
+        willSet {
+            // /exit changes the process, not the user's Rename identity.
+            if newValue.isShell { retainedNameKey = nameKey ?? retainedNameKey }
+        }
+    }
     /// Runtime-only agent reported through the terminal byte stream rather
     /// than the local hook socket. This is primarily for ssh remotes: the
     /// remote side can emit an OSC title marker that AgentPad sees locally,
@@ -91,8 +96,7 @@ final class Session: Identifiable {
     /// re-derives it from disk once Codex starts writing again).
     var codexUsage: CodexUsage?
     /// Per-tab cwd. Initialized from the workspace's cwd at spawn, then kept in
-    /// sync via OSC 7 (`engine.onPwdChange`). Drives the tab title so users see
-    /// where they are, not which agent template the tab was launched from.
+    /// sync via OSC 7 (`engine.onPwdChange`). Also names plain shell tabs.
     var currentDirectory: URL
     /// Frozen per agent launch/restore; refreshed only when a shell upgrades to
     /// an agent. Never persisted or updated by later cwd/conversation reports.
@@ -104,9 +108,14 @@ final class Session: Identifiable {
     /// Runtime state; not persisted. Resets to `.idle` after relaunch.
     let catalogStartedAt = Date()
     var activityState: SessionActivityState = .idle
-    /// Empty / whitespace input via `renameTab` clears this back to `nil` so
-    /// the tab title resumes tracking the cwd.
-    var customTitle: String?
+    /// Only Rename writes
+    /// this store. No transcript, catalog, or window snapshot can supply a name.
+    var explicitName: String? { hasProcess ? names.values[explicitNameKey] : nil }
+    var names: SessionNames { displaySources?.names ?? .shared }
+    /// Persist the address, never a second copy of the name. It survives /exit
+    /// and lets All Sessions Rename keep updating a terminal tab too.
+    var retainedNameKey: SessionNameKey?
+    var explicitNameKey: SessionNameKey { nameKey ?? retainedNameKey ?? .tab(id) }
     /// Title the running program set via `OSC 0` / `OSC 2` (libghostty's
     /// `GHOSTTY_ACTION_SET_TITLE`) — e.g. the `user@host:dir` an `ssh` remote
     /// shell emits. Runtime-only, never persisted. The shell wrapper re-emits
@@ -188,6 +197,10 @@ final class Session: Identifiable {
     var answerBinding: AgentAnswerSource.Binding?
     /// Verified hook owner; personal MCP access rechecks this against its caller.
     var personalBinding: ChatPersonalAccess.Binding?
+    var answerChecked: AgentAnswerSource.Check?
+    var answerCheckProblem: AgentAnswerTranscript.Problem?
+    @ObservationIgnored var answerRefresh: Task<Void, Never>?
+    @ObservationIgnored var environmentRefresh: Task<Void, Never>?
     var answerBindingProblem: AgentAnswerTranscript.Problem?
     /// Exit status of the most recent command — populated from libghostty's
     /// `OSC 133;D` event. `nil` until the shell reports its first finish (or
@@ -503,14 +516,36 @@ final class Session: Identifiable {
         }
     }
 
-    /// Tab-pill name. Precedence: `customTitle` (manual rename) wins, then
-    /// `terminalTitle` (OSC title from the running program, e.g. an `ssh`
-    /// remote), then `lastPathComponent` of the cwd (`~` for $HOME). An empty
-    /// cwd path falls back to the agent name so a degenerate URL doesn't
-    /// render as blank.
     @ObservationIgnored var lastActivated = Date.distantPast
 
-    var title: String {
+    /// Set by the owning window, including after a cross-window transfer.
+    var displaySources: SessionDisplayMetadata.Sources?
+    /// Local display metadata, keyed so /resume cannot inherit another
+    /// conversation's title. Never use this for public attribution.
+    var lastDisplayTitle: SessionDisplayTitle?
+
+    var nameKey: SessionNameKey? {
+        guard hasProcess, !displayAgent.isShell, let conversation = conversationId ?? resumedConversationId else { return nil }
+        return SessionNameKey(displayAgent.rosterId, conversation)
+    }
+
+    var displayTitleKey: SessionNameKey? {
+        hasProcess && explicitNameKey.agentID != "agentpad-tab" ? explicitNameKey : nil
+    }
+
+    var cachedDisplayTitle: String? { lastDisplayTitle?.key == displayTitleKey ? lastDisplayTitle?.title : nil }
+
+    var displayTitleSnapshot: SessionDisplayTitle? {
+        guard let key = displayTitleKey else { return nil }
+        return SessionDisplayTitle(key: key, title: (displaySources ?? .init()).metadata(for: self, includeExplicitName: false).title)
+    }
+
+    /// The single display title for a live tab on every surface. Agent titles
+    /// use the same resolver as archived sessions; folders only name shells.
+    /// Keep this lazy: attention membership must never observe title metadata.
+    var title: String { displayTitle }
+
+    var displayTitle: String {
         // AgentPad: a channel tab shows its channel's name while it may be seen (DESIGN-F2).
         if case .directMessage(let ref) = toolRoute { return ChatDMTabs.title(ref) }
         if case .directMessageDraft(let scope, let peer) = toolRoute {
@@ -520,8 +555,14 @@ final class Session: Identifiable {
         if let toolRoute { return toolRoute.title }
         if let channel { return ChannelTabs.title(channel) }
         if let inbox { return inbox.kind.title }
-        if let custom = customTitle, !custom.isEmpty { return custom }
-        if let reported = terminalTitle, !reported.isEmpty { return reported }
+        if !displayAgent.isShell || displayTitleKey != nil { return (displaySources ?? .init()).metadata(for: self).title }
+        return explicitName ?? SessionTitle.nonempty(terminalTitle) ?? publicName
+    }
+
+    /// Safe for off-machine defaults. Program/OSC titles are local too.
+    /// Chat additionally normalizes this identity and disambiguates duplicates.
+    var publicName: String {
+        if let explicitName { return explicitName }
         if currentDirectory.standardizedFileURL.path == homeDirectoryPath { return "~" }
         let last = currentDirectory.lastPathComponent
         return last.isEmpty ? displayAgent.title : last
@@ -532,7 +573,6 @@ final class Session: Identifiable {
         engine: any TerminalEngine,
         currentDirectory: URL,
         agent: AgentTemplate,
-        customTitle: String? = nil,
         conversationId: String? = nil,
         launchedConversationId: String? = nil,
         profileAdoption: AgentProfileAdoption.Candidate? = nil
@@ -541,7 +581,6 @@ final class Session: Identifiable {
         self.engine = engine
         self.currentDirectory = currentDirectory
         self.agent = agent
-        self.customTitle = customTitle
         self.conversationId = conversationId
         self.launchedConversationId = launchedConversationId
         self.profileAdoption = profileAdoption

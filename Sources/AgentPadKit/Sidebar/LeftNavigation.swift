@@ -7,20 +7,33 @@ struct LeftNavigationPreferences: Codable, Equatable {
     var railVisible = true
     var panelVisible = true
     var panelContent = Panel.chat
+    var collapsedWorkspaceIDs: Set<UUID> = []
 
-    init(railVisible: Bool = true, panelVisible: Bool = true, panelContent: Panel = .chat) {
+    init(railVisible: Bool = true, panelVisible: Bool = true, panelContent: Panel = .chat,
+         collapsedWorkspaceIDs: Set<UUID> = []) {
         self.railVisible = railVisible
         self.panelVisible = panelVisible
         self.panelContent = panelContent
+        self.collapsedWorkspaceIDs = collapsedWorkspaceIDs
     }
 
-    private enum CodingKeys: String, CodingKey { case railVisible, panelVisible, panelContent }
+    private enum CodingKeys: String, CodingKey { case railVisible, panelVisible, panelContent, collapsedWorkspaceIDs }
     init(from decoder: Decoder) throws {
         // A malformed layout must not send an otherwise intact window into recovery.
         guard let values = try? decoder.container(keyedBy: CodingKeys.self) else { return }
         railVisible = (try? values.decode(Bool.self, forKey: .railVisible)) ?? true
         panelVisible = (try? values.decode(Bool.self, forKey: .panelVisible)) ?? true
         panelContent = (try? values.decode(Panel.self, forKey: .panelContent)) ?? .chat
+        collapsedWorkspaceIDs = Set(((try? values.decode([String].self, forKey: .collapsedWorkspaceIDs)) ?? [])
+            .compactMap(UUID.init(uuidString:)))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(railVisible, forKey: .railVisible)
+        try values.encode(panelVisible, forKey: .panelVisible)
+        try values.encode(panelContent, forKey: .panelContent)
+        try values.encode(collapsedWorkspaceIDs.map(\.uuidString).sorted(), forKey: .collapsedWorkspaceIDs)
     }
 
     static func migrate(mode: SidebarMode?, content: SidebarContent?) -> Self {
@@ -95,6 +108,38 @@ struct LeftNavigationLayout: Equatable {
 }
 
 extension WorkspaceStore {
+    var allWorkspaceTabsCollapsed: Bool {
+        !workspaces.isEmpty && workspaces.allSatisfy { leftNavigation.collapsedWorkspaceIDs.contains($0.id) }
+    }
+
+    func setWorkspaceTabsCollapsed(_ collapsed: Bool, workspaceID: UUID) {
+        guard workspaces.contains(where: { $0.id == workspaceID }),
+              leftNavigation.collapsedWorkspaceIDs.contains(workspaceID) != collapsed else { return }
+        if collapsed { leftNavigation.collapsedWorkspaceIDs.insert(workspaceID) }
+        else { leftNavigation.collapsedWorkspaceIDs.remove(workspaceID) }
+        scheduleSave()
+    }
+
+    func toggleWorkspaceTabs(_ workspaceID: UUID, event: NSEvent? = nil) {
+        // VoiceOver's Option modifier is not an Option-click.
+        if let event, event.type == .leftMouseDown || event.type == .leftMouseUp,
+           event.modifierFlags.contains(.option) {
+            toggleAllWorkspaceTabs()
+        } else {
+            setWorkspaceTabsCollapsed(!leftNavigation.collapsedWorkspaceIDs.contains(workspaceID), workspaceID: workspaceID)
+        }
+    }
+
+    /// Use all workspaces in this window, including rows outside the filter.
+    /// A mixed state always collapses all. This never touches attention inputs.
+    func toggleAllWorkspaceTabs() {
+        let ids = Set(workspaces.map(\.id))
+        guard !ids.isEmpty else { return }
+        if allWorkspaceTabsCollapsed { leftNavigation.collapsedWorkspaceIDs.subtract(ids) }
+        else { leftNavigation.collapsedWorkspaceIDs.formUnion(ids) }
+        scheduleSave()
+    }
+
     var panelIsPresented: Bool {
         navigationPresentation.isNarrow ? navigationPresentation.narrowPanelOpen : leftNavigation.panelVisible
     }
@@ -189,6 +234,7 @@ extension WorkspaceStore {
     /// Search, hover, overlays and focus are deliberately fresh.
     func inheritNavigation(from source: WorkspaceStore) {
         leftNavigation = source.leftNavigation
+        leftNavigation.collapsedWorkspaceIDs = []
         sidebarWidth = source.sidebarWidth
         chatSidebarPreferences = source.chatSidebarPreferences
         rightSidebarMode = source.rightSidebarMode

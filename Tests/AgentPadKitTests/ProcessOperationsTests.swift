@@ -47,17 +47,23 @@ final class ProcessOperationsTests: XCTestCase {
     func testKillRechecksPIDAndStartTimeAndSignalsOnlyOnce() async throws {
         let session = Session(engine: TestEngine(), currentDirectory: directory, agent: .terminal)
         let process = SessionProcess(pid: 4242, name: "fixture", depth: 1, isForeground: true, ports: [], cpuPercent: nil, residentMB: nil, startedAtUs: 42)
-        var start: UInt64 = 42
+        final class Start: @unchecked Sendable {
+            let lock = NSLock()
+            private var raw: UInt64 = 42
+            var value: UInt64 { get { lock.withLock { raw } } set { lock.withLock { raw = newValue } } }
+        }
+        let start = Start()
         var signals: [Int32] = []
         func request() {
-            TerminalProcessActions.requestKill(process, session: session, matches: { pid, stamp in pid == 4242 && stamp == start }, signal: { _, signal in signals.append(signal); return 0 })
+            TerminalProcessActions.requestKill(process, session: session, matches: { pid, stamp in pid == 4242 && stamp == start.value }, signal: { _, signal in signals.append(signal); return 0 })
         }
         request(); session.terminalConfirmation.shown(true)
-        start = 43
+        start.value = 43
         session.terminalConfirmation.confirm()
-        XCTAssertEqual(session.terminalConfirmation.phase, .invalidated)
+        try await settle { if case .failed = session.terminalConfirmation.phase { return true }; return false }
+        session.terminalConfirmation.cancel()
         XCTAssertTrue(signals.isEmpty)
-        start = 42; request(); session.terminalConfirmation.shown(true)
+        start.value = 42; request(); session.terminalConfirmation.shown(true)
         session.terminalConfirmation.confirm(); session.terminalConfirmation.confirm()
         try await settle { session.terminalConfirmation.phase == .completed }
         XCTAssertEqual(signals, [SIGTERM])

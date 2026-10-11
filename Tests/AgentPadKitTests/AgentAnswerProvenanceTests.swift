@@ -49,6 +49,11 @@ final class AnswerProcessFixture: @unchecked Sendable {
         (session.engine as? TestEngine)?.foregroundPid = Self.claude
         AgentAnswerSource.recordHook(conversation: conversation, session: session,
             provenance: try XCTUnwrap(capture()), inspector: inspector)
+        session.answerRefresh?.cancel()
+        if let binding = session.answerBinding {
+            session.answerChecked = .init(binding: binding, foreground: session.engine.foregroundPid)
+            session.answerCheckProblem = nil
+        }
         XCTAssertNotNil(session.answerBinding)
     }
 }
@@ -76,14 +81,15 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         let id = UUID().uuidString.lowercased()
         tab.conversationId = id
         tab.resumedConversationId = id // persisted --resume alone is never proof
-        XCTAssertEqual(AgentAnswerSource.problem(tab, inspector: fixture.inspector), .unbound)
+        XCTAssertEqual(AgentAnswerSource.problem(tab), .unbound)
         for terminal: Int32? in [42, nil] {
             fixture.add(46080, parent: 45968, name: "zsh", foreground: terminal != nil, terminal: terminal)
             fixture.add(46081, parent: 46080, name: "agentpad-hook", foreground: terminal != nil, terminal: terminal)
             let proof = try XCTUnwrap(fixture.capture(parent: 46080, origin: .localProcess(pid: 46081, startedAtUs: 100)))
             AgentAnswerSource.recordHook(conversation: id, session: tab, provenance: proof, inspector: fixture.inspector)
             XCTAssertEqual(tab.answerBinding?.process.pid, 45968)
-            XCTAssertNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector))
+            try? await AgentAnswerSource.refresh(tab, inspector: fixture.inspector)
+            XCTAssertNil(AgentAnswerSource.problem(tab))
             fixture.remove(46081); fixture.remove(46080)
             let answer = try await AgentAnswerSource.read(session: tab, store: store, inspector: fixture.inspector) { _, journal, _ in
                 XCTAssertEqual(journal, id)
@@ -139,7 +145,8 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         fixture.remove(second)
         try fixture.bind(tab, conversation: id)
         XCTAssertNil(tab.answerBindingProblem)
-        XCTAssertNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector))
+        try? await AgentAnswerSource.refresh(tab, inspector: fixture.inspector)
+        XCTAssertNil(AgentAnswerSource.problem(tab))
     }
 
     func testDetachedHelpersMayExitButCannotReparentOrExecAfterVerification() throws {
@@ -180,9 +187,11 @@ final class AgentAnswerProvenanceTests: XCTestCase {
             return image(pid)
         }
         AgentAnswerSource.recordHook(conversation: id, session: tab, provenance: proof, inspector: inspector)
+        try await AgentAnswerSource.refresh(tab, inspector: inspector)
         XCTAssertNil(fixture.inspector.kernel.process(AnswerProcessFixture.hook))
         XCTAssertEqual(tab.answerBinding?.conversation, id, "hook exit must not leave Copy/Forward unbound")
-        XCTAssertNil(AgentAnswerSource.problem(tab, inspector: inspector))
+        try? await AgentAnswerSource.refresh(tab, inspector: fixture.inspector)
+        XCTAssertNil(AgentAnswerSource.problem(tab))
         let answer = try await AgentAnswerSource.read(session: tab, store: store, inspector: inspector) { _, journal, _ in
             XCTAssertEqual(journal, id)
             return "This tab's answer"
@@ -207,12 +216,14 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         for terminal: Int32? in [nil, 43] {
             fixture.add(AnswerProcessFixture.hook, parent: 1, name: "unrelated", start: 101, terminal: terminal)
             XCTAssertTrue(answer.isCurrent(), "a new owner of the detached hook PID outside the tab cannot revoke export")
-            XCTAssertNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector))
+            try? await AgentAnswerSource.refresh(tab, inspector: fixture.inspector)
+            XCTAssertNil(AgentAnswerSource.problem(tab))
             XCTAssertEqual(tab.answerBinding?.conversation, id)
         }
         fixture.add(AnswerProcessFixture.hook, parent: AnswerProcessFixture.shell, name: "claude", trusted: true, start: 101)
+        try? await AgentAnswerSource.refresh(tab, inspector: fixture.inspector)
         XCTAssertFalse(answer.isCurrent(), "the reused PID on the tab's TTY still introduces ambiguity")
-        XCTAssertEqual(AgentAnswerSource.problem(tab, inspector: fixture.inspector), .changed)
+        XCTAssertEqual(AgentAnswerSource.problem(tab), .changed)
     }
 
     func testDetachedHookPIDReuseDuringImageReadKeepsEvidenceCurrent() throws {
@@ -291,11 +302,12 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         let id = UUID().uuidString.lowercased()
         tab.conversationId = id
         tab.resumedConversationId = id
-        XCTAssertEqual(AgentAnswerSource.problem(tab, inspector: fixture.inspector), .unbound)
+        XCTAssertEqual(AgentAnswerSource.problem(tab), .unbound)
         let evidence = try XCTUnwrap(fixture.capture(parent: hookShell))
         XCTAssertEqual(evidence.process.pid, AnswerProcessFixture.claude)
         AgentAnswerSource.recordHook(conversation: id, session: tab, provenance: evidence, inspector: fixture.inspector)
-        XCTAssertNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector))
+        try? await AgentAnswerSource.refresh(tab, inspector: fixture.inspector)
+        XCTAssertNil(AgentAnswerSource.problem(tab))
         fixture.remove(AnswerProcessFixture.hook)
         fixture.remove(hookShell)
         let answer = try await AgentAnswerSource.read(session: tab, store: store, inspector: fixture.inspector) { _, journal, _ in
@@ -305,6 +317,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         XCTAssertEqual(answer.text, "This tab's answer")
         XCTAssertTrue(answer.isCurrent())
         fixture.add(wrapper, parent: AnswerProcessFixture.shell, name: "bash", foreground: false)
+        try? await AgentAnswerSource.refresh(tab, inspector: fixture.inspector)
         XCTAssertFalse(answer.isCurrent(), "losing the foreground group revokes the binding")
     }
 
@@ -336,7 +349,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         AgentAnswerSource.recordHook(conversation: UUID().uuidString, session: tab,
             provenance: fixture.capture(), inspector: fixture.inspector)
         XCTAssertNil(tab.answerBinding, "a foreground shell sibling is not the launch wrapper")
-        XCTAssertEqual(AgentAnswerSource.problem(tab, inspector: fixture.inspector), .foregroundMismatch)
+        XCTAssertEqual(AgentAnswerSource.problem(tab), .foregroundMismatch)
         for name in ["tmux", "screen", "zellij"] {
             fixture.add(other, parent: AnswerProcessFixture.shell, name: name)
             fixture.add(AnswerProcessFixture.claude, parent: other, name: "claude")
@@ -379,7 +392,7 @@ final class AgentAnswerProvenanceTests: XCTestCase {
             (tab.engine as? TestEngine)?.foregroundPid = foreground
             AgentAnswerSource.recordHook(conversation: second, session: tab, provenance: fixture.capture(), inspector: fixture.inspector)
             XCTAssertNil(tab.answerBinding, "tmux/shell or another pane's Claude cannot match the hook parent")
-            XCTAssertNotNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector)?.errorDescription)
+            XCTAssertNotNil(AgentAnswerSource.problem(tab)?.errorDescription)
             XCTAssertFalse(CompositionTabs.available(tab))
         }
         try fixture.bind(tab, conversation: first)
@@ -469,7 +482,8 @@ final class AgentAnswerProvenanceTests: XCTestCase {
         XCTAssertTrue(sent)
         await fulfillment(of: [received], timeout: 3)
         XCTAssertEqual(tab.answerBinding?.conversation, id)
-        XCTAssertNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector))
+        try? await AgentAnswerSource.refresh(tab, inspector: fixture.inspector)
+        XCTAssertNil(AgentAnswerSource.problem(tab))
     }
 
     func testImageChangeDuringSignatureCheckCannotProduceEvidence() {

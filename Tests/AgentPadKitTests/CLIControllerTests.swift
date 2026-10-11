@@ -114,6 +114,211 @@ final class CLIControllerTests: XCTestCase {
 
     // MARK: list
 
+    func testListShowsDisplayTitlesToClaudeCodexAndShellTabsWithoutTeamOrBindings() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cli-title-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let files = ChatFiles(directory: root)
+        let service = ChatService(files: files, tokens: FakeTokenStore())
+        for template in [AgentTemplate.claudeCode, .codex, .terminal] {
+            let store = makeStore()
+            defer { store.terminate() }
+            let tab = try XCTUnwrap(store.active?.activeSession)
+            tab.agent = template
+            tab.terminalTitle = "PRIVATE-TITLE-MARKER \(template.id)"
+            let processes = AnswerProcessFixture(), foreground: Int32 = 99_999_973
+            processes.add(foreground, parent: AnswerProcessFixture.shell, name: template.id)
+            processes.add(AnswerProcessFixture.hook, parent: foreground, name: "agentpad-cli")
+            engine(tab).foregroundPid = foreground
+            XCTAssertFalse(processes.inspector.signed(foreground))
+            let controller = makeController(stores: [store])
+            controller.displayTitleAccess = { origin, sessions in
+                await CLIListAccess.allowsDisplayTitles(origin, sessions: sessions, service: service,
+                    executors: .init(files: files), process: processes.inspector.kernel.process)
+            }
+            let origin = AgentPadCallerOrigin.localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100)
+            for conversation: String? in [nil, UUID().uuidString.lowercased()] {
+                tab.conversationId = conversation
+                XCTAssertNil(tab.personalBinding)
+                XCTAssertNil(tab.answerBinding)
+                let response = await withCheckedContinuation { continuation in
+                    controller.handle(.init(verb: .list), origin: origin) { continuation.resume(returning: $0) }
+                }
+                XCTAssertTrue(response.ok)
+                let title = try XCTUnwrap(response.windows?.flatMap(\.workspaces).flatMap(\.tabs).first?.title)
+                XCTAssertEqual(title, tab.displayTitle)
+                XCTAssertTrue(title.contains("PRIVATE-TITLE-MARKER"), template.id)
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: files.journalURL.path), "Personal CLI does not require a Team journal")
+    }
+
+    func testListHidesDisplayTitlesFromExternalCallersAndExecutors() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cli-executor-title-\(UUID())")
+        let store = makeStore()
+        defer { store.terminate(); try? FileManager.default.removeItem(at: root) }
+        let tab = try XCTUnwrap(store.active?.activeSession)
+        tab.agent = .codex
+        tab.conversationId = UUID().uuidString.lowercased()
+        tab.terminalTitle = "PRIVATE-TITLE-MARKER"
+        let processes = AnswerProcessFixture()
+        engine(tab).foregroundPid = AnswerProcessFixture.claude
+        let external: Int32 = 99_999_975
+        processes.add(external, parent: 1, name: "external-cli", terminal: 43)
+        let executors = ExecutorConversations(files: .init(directory: root))
+        let service = ChatService(files: executors.files, tokens: FakeTokenStore())
+        var registeredRun = false
+        let controller = makeController(stores: [store])
+        controller.displayTitleAccess = { origin, sessions in
+            let running = registeredRun
+            return await CLIListAccess.allowsDisplayTitles(origin, sessions: sessions, service: service, executors: executors,
+                run: { _ in running ? .run(callId: "run") : .notFound }, process: processes.inspector.kernel.process)
+        }
+        func listed(_ origin: AgentPadCallerOrigin) async throws -> String {
+            let response = await withCheckedContinuation { continuation in
+                controller.handle(.init(verb: .list), origin: origin) { continuation.resume(returning: $0) }
+            }
+            XCTAssertTrue(response.ok)
+            return try XCTUnwrap(response.windows?.flatMap(\.workspaces).flatMap(\.tabs).first?.title)
+        }
+        let personal = AgentPadCallerOrigin.localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100)
+        let restricted: [AgentPadCallerOrigin] = [.outside, .teamRun(callId: "run"),
+            .localProcess(pid: external, startedAtUs: 100), .localProcess(pid: external, startedAtUs: 101)]
+        for origin in restricted {
+            let title = try await listed(origin)
+            XCTAssertEqual(title, tab.publicName)
+        }
+        registeredRun = true
+        var title = try await listed(personal)
+        XCTAssertEqual(title, tab.publicName, "Recheck the run registry even for a captured local origin")
+        registeredRun = false
+        let executor = UUID().uuidString.lowercased()
+        try executors.record(executor)
+        let conversation = tab.conversationId
+        tab.resumedConversationId = executor
+        title = try await listed(personal)
+        XCTAssertEqual(title, tab.publicName, "Resumed executor history stays restricted")
+        tab.resumedConversationId = nil
+        tab.conversationId = executor
+        title = try await listed(personal)
+        XCTAssertEqual(title, tab.publicName, "Current executor history stays restricted")
+        tab.conversationId = conversation
+        title = try await listed(personal)
+        XCTAssertEqual(title, tab.displayTitle)
+        try await store.renameTab(tab, to: "Explicit public name")?.value
+        for origin in restricted + [personal] {
+            title = try await listed(origin)
+            XCTAssertEqual(title, "Explicit public name")
+        }
+    }
+
+    func testListHidesDisplayTitlesFromPublicationBoundTabs() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cli-published-title-\(UUID())")
+        let store = makeStore(), service = ChatService(files: .init(directory: root), tokens: FakeTokenStore())
+        defer { store.terminate(); try? service.journal?.queue.close(); try? FileManager.default.removeItem(at: root) }
+        try service.resetJournal()
+        let journal = try XCTUnwrap(service.journal), tab = try XCTUnwrap(store.active?.activeSession)
+        tab.agent = .claudeCode
+        tab.terminalTitle = "PRIVATE-TITLE-MARKER"
+        let processes = AnswerProcessFixture()
+        engine(tab).foregroundPid = AnswerProcessFixture.claude
+        let origin = AgentPadCallerOrigin.localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100)
+        let controller = makeController(stores: [store])
+        controller.displayTitleAccess = { origin, sessions in
+            await CLIListAccess.allowsDisplayTitles(origin, sessions: sessions, service: service,
+                executors: journal.executorConversations, run: { _ in .notFound }, process: processes.inspector.kernel.process)
+        }
+        func expectTitle(_ expected: String, file: StaticString = #filePath, line: UInt = #line) async throws {
+            let response = await withCheckedContinuation { continuation in
+                controller.handle(.init(verb: .list), origin: origin) { continuation.resume(returning: $0) }
+            }
+            XCTAssertTrue(response.ok, file: file, line: line)
+            XCTAssertEqual(try XCTUnwrap(response.windows?.flatMap(\.workspaces).flatMap(\.tabs).first?.title), expected, file: file, line: line)
+        }
+        try await expectTitle(tab.displayTitle)
+        let surface = tab.id.uuidString.lowercased()
+        try await journal.queue.write { db in
+            try db.execute(sql: "INSERT INTO publication_surfaces (server, account_id, org_id, agent_id, surface_id, session_id, generation) VALUES ('s', 'a', 'o', 'agent', ?, 'old-session', 'old-generation')",
+                           arguments: [surface])
+        }
+        try await expectTitle(tab.publicName)
+        tab.conversationId = UUID().uuidString.lowercased()
+        try await expectTitle(tab.publicName)
+        try await journal.queue.write { try $0.execute(sql: "DELETE FROM publication_surfaces") }
+        try await expectTitle(tab.displayTitle)
+
+        var agent = TeamPublishedAgent(name: "Published", description: "", folder: root.path)
+        let published = UUID().uuidString.lowercased()
+        agent.sessionId = published.uppercased()
+        agent.enabled = false
+        service.localAgent = { id in id == agent.id.uuidString.lowercased() ? agent : nil }
+        try journal.save(ChatAssignment(server: "s", accountId: "a", orgId: "o", agentId: agent.id.uuidString.lowercased(),
+            state: .active, name: agent.name, description: "", access: "read", teamIds: "[]", createdAt: Date()))
+        try await expectTitle(tab.displayTitle)
+        tab.conversationId = published
+        try await expectTitle(tab.publicName)
+        tab.conversationId = UUID().uuidString.lowercased()
+        tab.resumedConversationId = published
+        try await expectTitle(tab.publicName)
+        let launched = Session(engine: tab.engine, currentDirectory: root, agent: .claudeCode,
+            conversationId: tab.conversationId, launchedConversationId: published)
+        await XCTAssertFalseAsync(await CLIListAccess.allowsDisplayTitles(origin, sessions: [launched], service: service,
+            executors: journal.executorConversations, run: { _ in .notFound }, process: processes.inspector.kernel.process))
+        XCTAssertTrue(try journal.executorConversations.ids().isEmpty)
+    }
+
+    func testListHidesDisplayTitlesForOldOrUnknownHistoryAfterIncompleteSeed() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cli-incomplete-title-\(UUID())")
+        let files = ChatFiles(directory: root), store = makeStore()
+        let service = ChatService(files: files, tokens: FakeTokenStore())
+        defer { store.terminate(); try? service.journal?.queue.close(); try? FileManager.default.removeItem(at: root) }
+        service.claudeProjectsRoot = root.appendingPathComponent("projects")
+        try files.prepareDirectory()
+        try Data("damaged legacy journal".utf8).write(to: files.journalURL)
+        try service.resetJournal()
+        let executors = ExecutorConversations(files: files)
+        let cutoff = try XCTUnwrap(try executors.seedIncompleteBefore())
+        XCTAssertTrue(try executors.ids().isEmpty)
+        let old = UUID().uuidString.lowercased(), new = UUID().uuidString.lowercased(), undated = UUID().uuidString.lowercased()
+        let formatter = ISO8601DateFormatter(), after = cutoff.addingTimeInterval(60)
+        for (id, date) in [(old, cutoff.addingTimeInterval(-60)), (new, after)] {
+            _ = try SessionStoreFixtures.writeFile("\(id).jsonl", in: service.claudeProjectsRoot.appendingPathComponent("-project"), lines: [
+                "{\"type\":\"user\",\"cwd\":\"/tmp\",\"message\":{\"content\":\"fixture\"},\"timestamp\":\"\(formatter.string(from: date))\"}",
+                "{\"type\":\"assistant\",\"timestamp\":\"\(formatter.string(from: after))\"}"
+            ], mtime: after)
+        }
+        _ = try SessionStoreFixtures.writeFile("\(undated).jsonl", in: service.claudeProjectsRoot.appendingPathComponent("-project"),
+            lines: [#"{"type":"user","cwd":"/tmp","message":{"content":"undated"}}"#], mtime: after)
+        let tab = try XCTUnwrap(store.active?.activeSession)
+        tab.terminalTitle = "PRIVATE-TITLE-MARKER"
+        let processes = AnswerProcessFixture()
+        engine(tab).foregroundPid = AnswerProcessFixture.claude
+        let origin = AgentPadCallerOrigin.localProcess(pid: AnswerProcessFixture.hook, startedAtUs: 100)
+        let controller = makeController(stores: [store])
+        controller.displayTitleAccess = { origin, sessions in
+            await CLIListAccess.allowsDisplayTitles(origin, sessions: sessions, service: service, executors: executors,
+                run: { _ in .notFound }, process: processes.inspector.kernel.process)
+        }
+        func expectTitle(_ expected: String, file: StaticString = #filePath, line: UInt = #line) async throws {
+            let response = await withCheckedContinuation { continuation in
+                controller.handle(.init(verb: .list), origin: origin) { continuation.resume(returning: $0) }
+            }
+            XCTAssertTrue(response.ok, file: file, line: line)
+            XCTAssertEqual(try XCTUnwrap(response.windows?.flatMap(\.workspaces).flatMap(\.tabs).first?.title), expected, file: file, line: line)
+        }
+        for id: String? in [nil, old.uppercased(), undated, UUID().uuidString.lowercased()] {
+            tab.conversationId = id
+            try await expectTitle(tab.publicName)
+        }
+        tab.conversationId = new
+        try await expectTitle(tab.displayTitle)
+        tab.resumedConversationId = old
+        try await expectTitle(tab.publicName)
+        let launched = Session(engine: tab.engine, currentDirectory: root, agent: .terminal,
+            conversationId: new, launchedConversationId: old)
+        await XCTAssertFalseAsync(await CLIListAccess.allowsDisplayTitles(origin, sessions: [launched], service: service, executors: executors,
+            run: { _ in .notFound }, process: processes.inspector.kernel.process))
+    }
+
     func testListWalksWindowsWorkspacesAndTabs() async throws {
         let store = makeStore()
         let workspace = store.workspaces[0]
@@ -603,7 +808,7 @@ final class CLIControllerTests: XCTestCase {
         )
         XCTAssertTrue(response.ok)
         let session = try XCTUnwrap(store.active?.activeSession)
-        XCTAssertEqual(session.customTitle, "build watcher", "title normalizes like the rename popover's")
+        XCTAssertEqual(session.explicitName, "build watcher", "title normalizes like the rename popover's")
         XCTAssertEqual(session.title, "build watcher", "the override outranks the cwd-derived title")
     }
 
@@ -942,7 +1147,7 @@ final class CLIControllerTests: XCTestCase {
         )
         XCTAssertTrue(response.ok)
         XCTAssertEqual(response.note, "renamed")
-        XCTAssertEqual(session.customTitle, "deploy log")
+        XCTAssertEqual(session.explicitName, "deploy log")
         XCTAssertTrue(revealed.isEmpty, "rename is pure metadata — it must not front anything")
         XCTAssertEqual(activations, 0)
     }
@@ -950,7 +1155,7 @@ final class CLIControllerTests: XCTestCase {
     func testRenameRefusesUnknownTabAndBlankTitle() async throws {
         let store = makeStore()
         let session = try XCTUnwrap(store.active?.activeSession)
-        session.customTitle = "keep me"
+        session.renameForTesting("keep me")
         let controller = makeController(stores: [store])
 
         let unknown = await respond(
@@ -967,7 +1172,7 @@ final class CLIControllerTests: XCTestCase {
             AgentPadCLIRequest(verb: .rename, tab: session.id.uuidString, title: "   ")
         )
         XCTAssertFalse(blank.ok)
-        XCTAssertEqual(session.customTitle, "keep me")
+        XCTAssertEqual(session.explicitName, "keep me")
     }
 
     // MARK: resume

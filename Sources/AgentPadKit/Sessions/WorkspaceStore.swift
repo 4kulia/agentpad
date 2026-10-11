@@ -120,6 +120,7 @@ enum RightSidebarContent: String, Codable, Equatable, Sendable, CaseIterable {
 @Observable
 final class WorkspaceStore {
     let agentProfiles: AgentProfileStore
+    let sessionDisplaySources: SessionDisplayMetadata.Sources
     var expandedAgentProfiles: Set<UUID> = []
     var revealedAgentProfileID: UUID?
     var agentProfileRevealRevision = 0
@@ -379,7 +380,7 @@ final class WorkspaceStore {
 
     func requestRenameActiveTab() {
         guard let session = active?.activeSession, session.hasProcess else { return }
-        session.nameEdit.begin(session.customTitle ?? session.title)
+        session.nameEdit.begin(session.explicitName ?? session.displayTitle)
     }
 
     func requestRenameActiveWorkspace() {
@@ -493,7 +494,8 @@ final class WorkspaceStore {
     private struct ClosedTabState {
         let agent: AgentTemplate
         let cwd: URL
-        let customTitle: String?
+        let explicitNameKey: SessionNameKey?
+        var lastDisplayTitle: SessionDisplayTitle? = nil
         let workspaceId: UUID
         let paneId: UUID
         /// Captured conversation id so `⌘⇧T` resumes the agent session
@@ -566,6 +568,8 @@ final class WorkspaceStore {
         persistence: any Persistence,
         initiallyEmpty: Bool = false,
         agentProfiles: AgentProfileStore? = nil,
+        sessionCatalog: SessionCatalog = .shared,
+        sessionNames: SessionNames = .shared,
         drafts: DraftRepository? = nil,
         engineFactory: @escaping @MainActor () -> any TerminalEngine = { LibghosttyEngine() },
         optionsProvider: @escaping @MainActor (String) -> String? = { AgentPadSettingsModel.shared.agentOptions[$0] },
@@ -582,6 +586,7 @@ final class WorkspaceStore {
         self.persistence = persistence
         // Test windows use isolated profile stores unless their fixture explicitly shares one.
         self.agentProfiles = agentProfiles ?? (NSClassFromString("XCTestCase") == nil ? .shared : AgentProfileStore())
+        self.sessionDisplaySources = .init(catalog: sessionCatalog, profiles: self.agentProfiles, names: sessionNames)
         self.windowID = (persistence as? WindowPersistence)?.windowId ?? UUID()
         let repository = drafts ?? (persistence as? WindowPersistence)?.app.drafts ?? DraftRepository()
         self.drafts = repository
@@ -695,7 +700,6 @@ final class WorkspaceStore {
         forceResume: Bool = false,
         claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil,
         rawLaunchCommand: String? = nil,
-        customTitle: String? = nil,
         activate: Bool = true,
         spawnInBackground: Bool = false
     ) -> Workspace {
@@ -735,7 +739,6 @@ final class WorkspaceStore {
             claudeResolution: claudeResolution,
             sshRemoteHost: workspace.sshRemoteHost,
             rawLaunchCommand: rawLaunchCommand,
-            customTitle: customTitle,
             spawnInBackground: spawnInBackground
         )
         configureSession(session, in: workspace, codexRolloutId: session.resumedConversationId)
@@ -1141,7 +1144,6 @@ final class WorkspaceStore {
         claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil,
         initialPrompt: String? = nil,
         rawLaunchCommand: String? = nil,
-        customTitle: String? = nil,
         activate: Bool = true,
         spawnInBackground: Bool = false,
         connection: TabConnection = .inheritWorkspace,
@@ -1171,7 +1173,7 @@ final class WorkspaceStore {
         case .local: nil
         case .ssh(let host): host
         }
-        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, claudeResolution: claudeResolution, initialPrompt: initialPrompt, sshRemoteHost: sshHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, spawnInBackground: spawnInBackground, profile: profile, launchOrigin: launchOrigin)
+        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, claudeResolution: claudeResolution, initialPrompt: initialPrompt, sshRemoteHost: sshHost, rawLaunchCommand: rawLaunchCommand, spawnInBackground: spawnInBackground, profile: profile, launchOrigin: launchOrigin)
         configureSession(session, in: workspace, codexRolloutId: session.resumedConversationId)
         target.tabs.append(session)
         // `activate: false` (CLI --no-focus) appends WITHOUT touching the
@@ -1365,7 +1367,6 @@ final class WorkspaceStore {
         forceResume: Bool = false,
         claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil,
         rawLaunchCommand: String? = nil,
-        customTitle: String? = nil,
         activate: Bool = true,
         spawnInBackground: Bool = false
     ) -> (workspace: Workspace, session: Session) {
@@ -1380,7 +1381,6 @@ final class WorkspaceStore {
                 forceResume: forceResume,
                 claudeResolution: claudeResolution,
                 rawLaunchCommand: rawLaunchCommand,
-                customTitle: customTitle,
                 activate: activate,
                 spawnInBackground: spawnInBackground
             )
@@ -1402,7 +1402,6 @@ final class WorkspaceStore {
             forceResume: forceResume,
             claudeResolution: claudeResolution,
             rawLaunchCommand: rawLaunchCommand,
-            customTitle: customTitle,
             activate: activate,
             spawnInBackground: spawnInBackground
         )
@@ -1416,7 +1415,6 @@ final class WorkspaceStore {
             forceResume: forceResume,
             claudeResolution: claudeResolution,
             rawLaunchCommand: rawLaunchCommand,
-            customTitle: customTitle,
             activate: activate,
             spawnInBackground: spawnInBackground
         )
@@ -1458,14 +1456,16 @@ final class WorkspaceStore {
     }
 
     /// Set or clear a user-provided tab title. Empty / whitespace input clears
-    /// the override so the title resumes tracking the working directory.
-    func renameTab(_ session: Session, to newTitle: String) {
+    /// the override so the title resumes tracking session metadata or shell cwd.
+    @discardableResult
+    func renameTab(_ session: Session, to newTitle: String) -> Task<Void, Error>? {
         // AgentPad: a chat tab takes its destination’s name (DESIGN-F2).
-        guard session.hasProcess else { return }
-        let next = normalizedTitle(newTitle)
-        guard session.customTitle != next else { return }
-        session.customTitle = next
+        guard session.hasProcess else { return nil }
+        if session.displaySources == nil { session.displaySources = sessionDisplaySources }
+        let write = session.names.beginRename(normalizedTitle(newTitle) ?? "", for: session.explicitNameKey)
         scheduleSave()
+        Task { [weak self] in _ = await write.result; self?.scheduleSave() }
+        return write
     }
 
     func moveTab(from sourceIndex: Int, to destIndex: Int, in pane: Pane) {
@@ -1528,6 +1528,7 @@ final class WorkspaceStore {
         holdChannelClose(session)
         destPane.activeTabId = session.id
         workspace.activePaneId = destPane.id
+        AgentAnswerSource.scheduleRefresh(session)
         session.lastActivated = Date()
         if let zoomed = workspace.zoomedPaneId, zoomed != destPane.id { workspace.zoomedPaneId = nil }
         // Promoting to active mirrors `activateTab` so the sidebar title and
@@ -1652,7 +1653,7 @@ final class WorkspaceStore {
         let workspace = Workspace(workingDirectory: session.currentDirectory, root: PaneNode(pane: Pane()))
         // Workspace titles are persisted without a channel access check.
         // Never copy the channel's currently visible name into that state.
-        workspace.customTitle = session.hasProcess ? normalizedTitle(session.title) : (session.toolRoute?.title ?? "Channel")
+        workspace.customTitle = session.hasProcess ? normalizedTitle(session.publicName) : (session.toolRoute?.title ?? "Channel")
         workspace.sshRemoteHost = session.sshWorkspaceHost
         workspaces.append(workspace)
         guard handleTabDrop(droppedId: id, in: workspace) else {
@@ -1771,7 +1772,8 @@ final class WorkspaceStore {
         recentlyClosed.append(ClosedTabState(
             agent: session.agent,
             cwd: session.currentDirectory,
-            customTitle: session.hasProcess ? session.customTitle : nil,
+            explicitNameKey: session.hasProcess ? session.explicitNameKey : nil,
+            lastDisplayTitle: session.displayTitleSnapshot,
             workspaceId: workspace.id,
             paneId: pane.id,
             conversationId: session.conversationId,
@@ -1862,9 +1864,8 @@ final class WorkspaceStore {
             connection: state.sshWorkspaceHost.map(TabConnection.ssh) ?? .local,
             profile: profile, launchOrigin: state.launchOrigin
         )
-        if let custom = state.customTitle, !custom.isEmpty {
-            session.customTitle = custom
-        }
+        session.retainedNameKey = state.explicitNameKey
+        session.lastDisplayTitle = state.lastDisplayTitle
         activateWorkspace(workspace)
         activateTab(session, in: workspace)
         return session
@@ -1894,6 +1895,7 @@ final class WorkspaceStore {
         // flag is lifelong; PaneView's active-tab exclusion is the one
         // consumer gate, so the structure closes the race with no timing.
         guard let pane = pane(containing: session, in: workspace) else { return }
+        AgentAnswerSource.scheduleRefresh(session)
         session.lastActivated = Date()
         var changed = false
         if pane.activeTabId != session.id || workspace.activePaneId != pane.id { invalidateTabConfirmations() }
@@ -2130,6 +2132,7 @@ final class WorkspaceStore {
         session.backgroundWork = details.hasBackgroundWork
             ? Session.BackgroundWork(subagents: details.backgroundSubagents, shells: details.backgroundShells)
             : nil
+        AgentAnswerSource.scheduleRefresh(session)
         session.hookStateAt = Date()
         applyNotificationTransition(session, state: event.activityState,
                                     reason: details.reason ?? (event == .turnComplete ? .completion : event == .turnFailure ? .failure : .input),
@@ -2168,9 +2171,20 @@ final class WorkspaceStore {
     /// dedup keeps the debounce loop quiet.
     func applyConversationId(conversationId: String, sessionId: UUID) {
         guard let session = hookSession(id: sessionId) else { return }
+        let previousNameKey = session.explicitNameKey
         if session.conversationId != conversationId {
             session.conversationId = conversationId
             scheduleSave()
+        }
+        if let key = session.nameKey, session.retainedNameKey != key {
+            session.retainedNameKey = key
+            if previousNameKey.agentID == "agentpad-tab" {
+                let names = session.names
+                Task { [weak self] in
+                    try? await names.bindTabRename(previousNameKey, to: key)
+                    self?.scheduleSave()
+                }
+            }
         }
         bindProfileConversation(session)
     }
@@ -2578,7 +2592,8 @@ final class WorkspaceStore {
                     profile: profile, launchOrigin: origin, captureOrigin: false,
                     adoptionCwd: origin?.folder ?? tab.profileOriginalCwd ?? URL(fileURLWithPath: tab.currentDirectoryPath)
                 )
-                session.customTitle = tab.customTitle
+                session.retainedNameKey = tab.explicitNameKey
+                session.lastDisplayTitle = tab.lastDisplayTitle
                 pane.tabs.append(session)
             }
             pane.activeTabId = pane.tabs.contains(where: { $0.id == p.activeTabId })
@@ -2733,6 +2748,7 @@ final class WorkspaceStore {
         target.tabs.append(session)
         target.activeTabId = session.id
         if workspace.activePaneId != target.id { workspace.activePaneId = target.id }
+        AgentAnswerSource.scheduleRefresh(session)
         session.lastActivated = Date()
         scheduleSave()
         return session
@@ -2741,7 +2757,7 @@ final class WorkspaceStore {
     /// Spawns the engine + Session. Caller wires `onPwdChange` / `onFocus`
     /// after a workspace ref is available — `restore` builds sessions before
     /// the workspace exists, so callbacks can't capture it here.
-    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, customTitle: String? = nil, spawnInBackground: Bool = false, profile: AgentProfile? = nil, launchOrigin: AgentLaunchOrigin? = nil, captureOrigin: Bool = true, adoptionCwd: URL? = nil) -> Session {
+    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, spawnInBackground: Bool = false, profile: AgentProfile? = nil, launchOrigin: AgentLaunchOrigin? = nil, captureOrigin: Bool = true, adoptionCwd: URL? = nil) -> Session {
         let engine = engineFactory()
         // Before `engine.start` (and before any view mounts): the flag is
         // what lets the surface come up under a hidden mount (issue #59).
@@ -2819,14 +2835,13 @@ final class WorkspaceStore {
             engine: engine,
             currentDirectory: initialCwd,
             agent: template,
-            customTitle: customTitle,
             conversationId: normalizedConversationId,
             launchedConversationId: (sshHost == nil && rawLaunchCommand == nil) ? resumedConversationId ?? newSessionId : nil,
             profileAdoption: !template.isShell && sshHost == nil && !template.rosterId.isEmpty
                 ? AgentProfileAdoption.Candidate(tabID: sessionId, rosterID: template.rosterId,
                     templateID: launchOrigin?.templateID ?? template.id, launchOptions: extraOptions ?? "",
                     folder: launchOrigin?.folder ?? adoptionCwd ?? initialCwd, conversationID: conversationId ?? newSessionId,
-                    title: customTitle ?? initialCwd.lastPathComponent, createdAt: Date()) : nil
+                    title: initialCwd.lastPathComponent, createdAt: Date()) : nil
         )
         // Resuming an unprovenanced conversation cannot prove its original
         // launch configuration. Only a fresh conversation captures new evidence.
@@ -2867,6 +2882,7 @@ final class WorkspaceStore {
     /// file. AgentPad: this preserves the source monitor's heuristic; it is not
     /// a verified journal binding for answer export.
     private func configureSession(_ session: Session, in workspace: Workspace, codexRolloutId: String?) {
+        session.displaySources = sessionDisplaySources
         guard session.hasProcess else { holdChannelClose(session); return }
         // Initial refresh — without these, the status bar stays empty until
         // the user `cd`s or runs a command. Both fetchers silently hide
@@ -2982,6 +2998,7 @@ final class WorkspaceStore {
             if let command = CommandMarker.parseTitle(title) {
                 session.reportedAgentLaunchExit = false
                 session.lastCommandText = command
+                AgentAnswerSource.scheduleRefresh(session)
                 return
             }
             // A `agentpad-remote-login:*` title is an ssh-destination marker, not
@@ -3084,6 +3101,7 @@ final class WorkspaceStore {
     }
 
     private func finishShellCommand(_ session: Session, exit: Int?, duration: TimeInterval, ranAgent: Bool) {
+        AgentAnswerSource.scheduleRefresh(session)
         // A remote agent surfaced via an OSC marker (transientAgent) emits
         // no `ended` marker when the ssh drops abnormally (network loss,
         // killed connection), so command-finished stays its safety net.
@@ -3452,19 +3470,20 @@ final class WorkspaceStore {
     }
 
     private func refreshEnvironment(for session: Session) {
-        let pid = session.engine.foregroundPid
-        let env: ProjectEnvironment
-        if session.shellEnvironment.isEmpty {
-            env = EnvironmentDetector.detect(cwd: session.currentDirectory, pid: pid)
-        } else {
-            env = EnvironmentDetector.extract(
-                shellEnv: session.shellEnvironment,
-                cwd: session.currentDirectory,
-                allowProjectFallback: false
-            )
+        session.environmentRefresh?.cancel()
+        let pid = session.engine.foregroundPid, cwd = session.currentDirectory, shellEnv = session.shellEnvironment
+        session.environmentRefresh = Task { [weak session] in
+            do {
+                try await Task.sleep(for: .milliseconds(150))
+                let env = try await BackgroundInspection.run {
+                    shellEnv.isEmpty ? EnvironmentDetector.detect(cwd: cwd, pid: pid)
+                        : EnvironmentDetector.extract(shellEnv: shellEnv, cwd: cwd, allowProjectFallback: false)
+                }
+                guard let session, !Task.isCancelled, session.currentDirectory == cwd,
+                      session.engine.foregroundPid == pid, session.shellEnvironment == shellEnv else { return }
+                if session.environment != env { session.environment = env }
+            } catch { /* Keep the last known environment on timeout. */ }
         }
-        guard session.environment != env else { return }
-        session.environment = env
     }
 
     /// Debounced persistence of the whole snapshot — every mutation site and

@@ -171,7 +171,7 @@ final class Legacy117DecodingTests: XCTestCase {
         guard case .pane(let pane) = workspace.root.kind else { return XCTFail("Lost the legacy pane") }
         let tab = try XCTUnwrap(pane.tabs.first)
         XCTAssertNil(tab.sshWorkspaceHost, "Legacy tabs inherit their workspace's connection")
-        XCTAssertEqual(tab.customTitle, "Saved tab")
+        XCTAssertNil(tab.explicitNameKey, "Legacy customTitle has no Rename provenance")
         XCTAssertEqual(tab.conversationId, "conversation")
         XCTAssertEqual(pane.activeTabId, tab.id)
     }

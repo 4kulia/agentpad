@@ -523,7 +523,7 @@ final class TeamCLICommandTests: XCTestCase {
     func testRejectsIncompleteTeamCommands() {
         for args in [["team"], ["team", "fly"], ["team", "status", "--bogus"],
                      ["team", "ask", "backend@masha"], ["team", "check"], ["team", "ask", "a@b", "x", "--wait", "soon"],
-                     ["team", "publish", "x", "--access", "root"], ["team", "status", "extra"]] {
+                     ["team", "publish", "x", "--access", "root"], ["team", "status", "extra"], ["team", "verify-caller"]] {
             if case .success = AgentPadHookKit.parseCLICommand(args) { XCTFail("\(args) must fail") }
         }
     }

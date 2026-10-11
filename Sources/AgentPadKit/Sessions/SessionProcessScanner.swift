@@ -1,5 +1,8 @@
 import Darwin
 import Foundation
+#if DEBUG
+import os
+#endif
 
 /// One process running on a session's terminal.
 struct SessionProcess: Identifiable, Equatable {
@@ -41,6 +44,18 @@ struct SessionProcess: Identifiable, Equatable {
 /// its child, and a tree walk would have to guess which branch belongs to which
 /// tab; every process on the tty belongs to exactly one tab by construction.
 enum SessionProcessScanner {
+    #if DEBUG
+    /// Observes real kernel entry points too, so UI tests detect accidental
+    /// use of the default inspector instead of their injected scanner.
+    static let inspectionObserver = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
+    #endif
+
+    static func willInspect() {
+        #if DEBUG
+        inspectionObserver.withLock { $0 }?()
+        #endif
+    }
+
     /// Flattened kernel row, split out so the tree logic is testable without
     /// a live pty.
     struct Raw: Equatable, Sendable {
@@ -68,6 +83,7 @@ enum SessionProcessScanner {
         foregroundPid: pid_t,
         previousCPU: CPUSamples? = nil
     ) -> (processes: [SessionProcess], cpu: CPUSamples) {
+        willInspect()
         let nowNs = DispatchTime.now().uptimeNanoseconds
         guard foregroundPid > 0, let tty = controllingTerminal(of: foregroundPid) else {
             return ([], CPUSamples(atNs: nowNs, cpuNs: [:]))
@@ -163,8 +179,9 @@ enum SessionProcessScanner {
 
     // MARK: - Kernel
 
-    // AgentPad: cheap kernel-only identity scan for channel MCP provenance.
+    // Background-only kernel identity scan for channel MCP provenance.
     static func identityProcesses(foregroundPID: pid_t) -> [Raw] {
+        willInspect()
         guard let tty = controllingTerminal(of: foregroundPID) else { return [] }
         return processes(onTerminal: tty)
     }
@@ -208,6 +225,7 @@ enum SessionProcessScanner {
     /// Pairing this against a scan-time snapshot is what makes the pid a
     /// durable identity instead of a recyclable number.
     static func startTimeUs(of pid: pid_t) -> UInt64? {
+        willInspect()
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
         var proc = kinfo_proc()
         var size = MemoryLayout<kinfo_proc>.stride

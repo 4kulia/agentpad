@@ -1,6 +1,31 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum WorkspaceRailFocus: Hashable {
+    case search
+    case destination(WorkspaceRailDestination)
+    case disclosure(UUID)
+
+    var destination: WorkspaceRailDestination? {
+        switch self {
+        case .search: nil
+        case .destination(let destination): destination
+        case .disclosure(let id): WorkspaceRailDestination(workspaceID: id)
+        }
+    }
+}
+
+/// Draw the ring from the rail's focus binding without installing a second one.
+private struct WorkspaceRailFocusRing: ViewModifier {
+    let focused: Bool
+    @Environment(\.colorSchemeContrast) private var contrast
+    func body(content: Content) -> some View {
+        content.overlay(RoundedRectangle(cornerRadius: 5)
+            .strokeBorder(focused ? ChatAppearance.accent : .clear, lineWidth: contrast == .increased ? 3 : 2)
+            .allowsHitTesting(false))
+    }
+}
+
 struct WorkspaceRailView: View {
     @Bindable var store: WorkspaceStore
     let width: CGFloat
@@ -9,11 +34,11 @@ struct WorkspaceRailView: View {
     @State private var draggingWorkspaceID: UUID?
     @State private var lastSelection: WorkspaceRailDestination?
     @State private var collapsedParents: Set<UUID> = []
-    @FocusState private var selection: WorkspaceRailDestination?
-    @FocusState private var searchFocused: Bool
+    @FocusState private var focus: WorkspaceRailFocus?
 
     private var matches: [WorkspaceRailSearch.Match] {
-        WorkspaceRailSearch.matches(entries, query: store.navigationPresentation.query, collapsedParents: collapsedParents)
+        WorkspaceRailSearch.matches(entries, query: store.navigationPresentation.query, collapsedParents: collapsedParents,
+                                    collapsedWorkspaceIDs: store.leftNavigation.collapsedWorkspaceIDs)
     }
     private var destinations: [WorkspaceRailDestination] {
         expanded ? WorkspaceRailSearch.destinations(matches)
@@ -40,7 +65,7 @@ struct WorkspaceRailView: View {
                         if expanded {
                             ForEach(matches) { match in
                                 if let workspace = store.workspaces.first(where: { $0.id == match.id }) {
-                                    item(workspace)
+                                    item(workspace, tabsExpanded: match.tabsExpanded)
                                     ForEach(match.tabs) { tab in
                                         tabButton(tab, workspaceID: match.id)
                                     }
@@ -55,12 +80,12 @@ struct WorkspaceRailView: View {
                 .onChange(of: store.activeWorkspaceId, initial: true) { _, id in
                     if let id { proxy.scrollTo(WorkspaceRailDestination(workspaceID: id), anchor: .center) }
                 }
-                .onChange(of: selection) { _, target in
-                    if let target { lastSelection = target; proxy.scrollTo(target, anchor: .center) }
+                .onChange(of: focus) { _, value in
+                    if let target = value?.destination { lastSelection = target; proxy.scrollTo(target, anchor: .center) }
                 }
                 .onChange(of: store.pendingRenameWorkspace?.id, initial: true) { _, id in
                     if let id {
-                        searchFocused = false
+                        focus = nil
                         if let parent = store.pendingRenameWorkspace?.worktreeParentId { collapsedParents.remove(parent) }
                         DispatchQueue.main.async { proxy.scrollTo(WorkspaceRailDestination(workspaceID: id), anchor: .center) }
                         store.pendingRenameWorkspace = nil
@@ -98,6 +123,16 @@ struct WorkspaceRailView: View {
                 Text("Workspaces").font(Theme.display(11, weight: .semibold))
                 Text("\(store.workspaces.count)").font(Theme.display(10)).foregroundStyle(Theme.chromeMuted)
                 Spacer(minLength: 0)
+                Button { store.toggleAllWorkspaceTabs() } label: {
+                    VStack(spacing: 0) {
+                        Image(systemName: store.allWorkspaceTabsCollapsed ? "chevron.up" : "chevron.down")
+                        Image(systemName: store.allWorkspaceTabsCollapsed ? "chevron.down" : "chevron.up")
+                    }.font(.system(size: 8, weight: .medium)).frame(width: 24, height: 40)
+                }.buttonStyle(.plain).chatFocusRing()
+                    .disabled(store.workspaces.isEmpty)
+                    .accessibilityIdentifier("workspace-tabs-toggle-all")
+                    .accessibilityLabel(store.allWorkspaceTabsCollapsed ? "Expand all" : "Collapse all")
+                    .help(store.allWorkspaceTabsCollapsed ? "Expand all" : "Collapse all")
             }
             Button {
                 if expanded { store.closeNavigation() } else { store.openWorkspaceList() }
@@ -114,10 +149,10 @@ struct WorkspaceRailView: View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass").accessibilityHidden(true)
             TextField("Find workspace or tab", text: $store.navigationPresentation.query)
-                .textFieldStyle(.plain).focused($searchFocused)
+                .textFieldStyle(.plain).focused($focus, equals: .search)
                 .accessibilityLabel("Search workspaces and tabs")
                 .onSubmit {
-                    if let target = selection ?? destinations.first { store.activateRailDestination(target) }
+                    if let target = focus?.destination ?? destinations.first { store.activateRailDestination(target) }
                 }
                 .onKeyPress(.downArrow) { moveSelection(1); return .handled }
                 .onKeyPress(.upArrow) { moveSelection(-1); return .handled }
@@ -126,19 +161,20 @@ struct WorkspaceRailView: View {
             .padding(.horizontal, 8).padding(.bottom, 4)
     }
 
-    private func item(_ workspace: Workspace) -> some View {
+    private func item(_ workspace: Workspace, tabsExpanded: Bool = true) -> some View {
         let destination = WorkspaceRailDestination(workspaceID: workspace.id)
         let hasChildren = store.workspaces.contains { $0.worktreeParentId == workspace.id }
         return WorkspaceRailItem(store: store, workspace: workspace, expanded: expanded,
                                  draggingWorkspaceID: $draggingWorkspaceID,
-                                 collapsed: collapsedParents.contains(workspace.id),
-                                 disclosure: hasChildren ? {
+                                 focus: $focus,
+                                 tabsExpanded: tabsExpanded,
+                                 worktreesCollapsed: collapsedParents.contains(workspace.id),
+                                 toggleWorktrees: hasChildren ? {
                                      if collapsedParents.contains(workspace.id) { collapsedParents.remove(workspace.id) }
                                      else { collapsedParents.insert(workspace.id) }
                                  } : nil) {
                 AttentionIndicatorView(indicator: AttentionSidebarModel.shared.workspaceIndicators[.init(window: store.windowID, workspace: workspace.id)])
             }
-            .focused($selection, equals: destination)
             .id(destination)
     }
 
@@ -153,8 +189,10 @@ struct WorkspaceRailView: View {
             }.font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
                 .padding(.leading, 38).padding(.trailing, 8).frame(minHeight: 28)
                 .contentShape(Rectangle())
-        }.buttonStyle(.plain).chatFocusRing()
-            .focused($selection, equals: destination).id(destination)
+        }.buttonStyle(.plain).focusable().focusEffectDisabled()
+            .focused($focus, equals: .destination(destination)).id(destination)
+            .modifier(WorkspaceRailFocusRing(focused: focus == .destination(destination)))
+            .accessibilityIdentifier("workspace-rail-tab-\(tab.id)")
             .accessibilityLabel("\(tab.title), tab, \(tab.detail)")
             .help(tab.title + (AttentionSidebarModel.shared.tabIndicators[tab.id].map { "\n" + AttentionSidebarModel.shared.tooltip($0) } ?? ""))
             .accessibilityValue(AttentionSidebarModel.shared.tabIndicators[tab.id]?.accessibleSummary ?? "No new marks")
@@ -182,14 +220,22 @@ struct WorkspaceRailView: View {
 
     private func focusSearch() {
         if expanded { refreshEntries() }
-        if expanded && !store.navigationPresentation.dragPeek && store.pendingRenameWorkspace == nil
-            && !store.workspaces.contains(where: { $0.nameEdit.isEditing }) {
-            searchFocused = true
+        // Opening the list changes the native key-view tree. Request focus
+        // after that update so its initial key-view assignment cannot replace
+        // the search editor, and discard requests for an already closed list.
+        DispatchQueue.main.async {
+            guard expanded, store.navigationPresentation.list != .closed,
+                  !store.navigationPresentation.dragPeek, store.pendingRenameWorkspace == nil,
+                  !store.workspaces.contains(where: { $0.nameEdit.isEditing }) else { return }
+            lastSelection = nil
+            focus = .search
         }
     }
     private func moveSelection(_ delta: Int) {
-        searchFocused = false
-        selection = WorkspaceRailSearch.moved(selection ?? lastSelection, by: delta, in: destinations)
+        // Search, rows and disclosures share one binding so AppKit receives
+        // one focus transition, without competing field/row focus resets.
+        focus = WorkspaceRailSearch.moved(focus?.destination ?? lastSelection, by: delta, in: destinations)
+            .map(WorkspaceRailFocus.destination)
     }
 }
 
@@ -200,8 +246,10 @@ struct WorkspaceRailItem<Indicator: View>: View {
     @Bindable var workspace: Workspace
     let expanded: Bool
     @Binding var draggingWorkspaceID: UUID?
-    var collapsed = false
-    var disclosure: (() -> Void)?
+    @FocusState.Binding var focus: WorkspaceRailFocus?
+    var tabsExpanded = true
+    var worktreesCollapsed = false
+    var toggleWorktrees: (() -> Void)?
     @ViewBuilder var indicator: () -> Indicator
     @State private var targeted = false
     @State private var hovered = false
@@ -210,30 +258,73 @@ struct WorkspaceRailItem<Indicator: View>: View {
     @State private var preview: WorkspaceRailEntry?
     @State private var previewKeyboard = false
     @State private var hoverTask: Task<Void, Never>?
-    @FocusState private var focused: Bool
 
+    private var destination: WorkspaceRailDestination { .init(workspaceID: workspace.id) }
+    private var tabsCollapsed: Bool { store.leftNavigation.collapsedWorkspaceIDs.contains(workspace.id) }
+    private var tabCount: Int { workspace.root.allPanes.reduce(0) { $0 + $1.tabs.count } }
+    private var tabCountLabel: String { "\(tabCount) \(tabCount == 1 ? "tab" : "tabs")" }
+    private var expansionValue: String { tabsExpanded ? "Expanded" : "Collapsed" }
+    private var disclosureLabel: String {
+        let action = tabsCollapsed ? "Expand tabs" : "Collapse tabs"
+        let searching = !store.navigationPresentation.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return "\(action)\(searching ? " after search" : "") in \(workspace.title)"
+    }
     private var indicatorReadout: AttentionIndicator? { AttentionSidebarModel.shared.workspaceIndicators[.init(window: store.windowID, workspace: workspace.id)] }
     private var active: Bool { workspace.id == store.activeWorkspaceId }
     private var index: Int { store.workspaces.firstIndex(where: { $0.id == workspace.id }) ?? 0 }
     private var acceptsTab: Bool { targeted && store.draggedTab.map { store.canDropTab($0.id, in: workspace) } == true }
     private var activityValue: String {
         let selection = active ? "Selected" : "Not selected"
-        return selection + ", " + (indicatorReadout?.accessibleSummary ?? "No new marks")
+        return selection + (expanded ? ", \(expansionValue), \(tabCountLabel)" : "")
+            + ", " + (indicatorReadout?.accessibleSummary ?? "No new marks")
     }
     private var activityHelp: String {
         if acceptsTab { return "Move tab to \(workspace.title)" }
         return "\(workspace.title)\n\(workspace.workingDirectory.path)" + (indicatorReadout.map { "\n" + $0.accessibleSummary } ?? "")
     }
 
+    private var row: some View {
+        HStack(spacing: 2) {
+            if expanded { tabsDisclosure }
+            actionButton
+            if expanded, let toggleWorktrees {
+                Button(action: toggleWorktrees) {
+                    Image(systemName: worktreesCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 10)).frame(width: 24, height: 40)
+                }.buttonStyle(.plain).chatFocusRing()
+                    .accessibilityLabel(worktreesCollapsed ? "Show worktrees" : "Hide worktrees")
+                    .help(worktreesCollapsed ? "Show worktrees" : "Hide worktrees")
+            }
+        }
+        .padding(.leading, expanded && workspace.worktreeParentId != nil ? 12 : 0)
+        .background(active || hovered ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 7))
+    }
+
+    private var tabsDisclosure: some View {
+        Button { store.toggleWorkspaceTabs(workspace.id, event: NSApp.currentEvent) } label: {
+            Image(systemName: tabsExpanded ? "chevron.down" : "chevron.right")
+                .font(.system(size: 10)).frame(width: 24, height: 40)
+                .contentShape(Rectangle())
+        }.buttonStyle(.plain).focusable().focusEffectDisabled()
+            .focused($focus, equals: .disclosure(workspace.id))
+            .modifier(WorkspaceRailFocusRing(focused: focus == .disclosure(workspace.id)))
+            .accessibilityIdentifier("workspace-tabs-disclosure-\(workspace.id)")
+            .accessibilityLabel(disclosureLabel)
+            .accessibilityValue(expansionValue)
+            // An accessibility press can arrive while currentEvent still holds a previous click.
+            .accessibilityAction { store.toggleWorkspaceTabs(workspace.id) }
+            .help(disclosureLabel + " · ⌥-click to toggle all workspaces")
+    }
+
     var body: some View {
-        actionButton
+        row
         .attentionPopover(isPresented: $menuOpen, arrowEdge: .trailing) { contextMenu }
         .attentionPopover(isPresented: Binding(get: { store.navigationPresentation.previewWorkspaceID == workspace.id },
             set: { if !$0 { closePreview() } }), arrowEdge: .trailing) {
                 if let preview {
                     WorkspaceRailPreview(entry: preview, keyboard: previewKeyboard, activate: { destination in
                         store.activateRailDestination(destination)
-                    }, close: { closePreview(); focused = true })
+                    }, close: { closePreview(); focus = .destination(destination) })
                     .onHover { inside in
                         hoverTask?.cancel()
                         if !inside { closePreview() }
@@ -260,27 +351,31 @@ struct WorkspaceRailItem<Indicator: View>: View {
             store.setRailDragTarget(workspace.id.uuidString, entered: $0)
             if $0 { hoverTask?.cancel(); closePreview() }
         }
-        .accessibilityLabel("\(workspace.title), workspace, \(index + 1) of \(store.workspaces.count)")
-        .accessibilityValue(activityValue)
-        .accessibilityIdentifier("workspace-rail-\(workspace.id)")
-        .accessibilityAction(named: "Rename") { store.requestRenameWorkspace(workspace) }
-        .accessibilityAction(named: "Show tabs") { openPreview(keyboard: true) }
-        .accessibilityAction(named: "Move up") { move(-1) }
-        .accessibilityAction(named: "Move down") { move(1) }
-        .accessibilityAction(named: "Close workspace") { store.requestCloseWorkspace(workspace) }
-        .help(activityHelp)
         .onDisappear { hoverTask?.cancel() }
         .onChange(of: workspace.nameEdit.isEditing) { wasEditing, editing in
-            if wasEditing && !editing { focused = true }
+            if wasEditing && !editing { focus = .destination(destination) }
         }
         .onChange(of: ChatOrgCurrent.identity()) { _, _ in closePreview(); preview = nil }
         .onChange(of: ChatOrgCurrent.shared.model?.channelsVisible) { _, _ in closePreview(); preview = nil }
         .onChange(of: AttentionSidebarModel.shared.projection.tabs) { _, _ in
             if preview != nil { preview = store.workspaceRailEntries().first { $0.id == workspace.id } }
         }
+        .onKeyPress(.rightArrow, phases: [.down, .repeat]) { key in
+            guard key.modifiers.intersection([.shift, .control, .option, .command]).isEmpty,
+                  !workspace.nameEdit.isEditing else { return .ignored }
+            if expanded { store.setWorkspaceTabsCollapsed(false, workspaceID: workspace.id) }
+            else { openPreview(keyboard: true) }
+            return .handled
+        }
+        .onKeyPress(.leftArrow, phases: [.down, .repeat]) { key in
+            guard expanded, key.modifiers.intersection([.shift, .control, .option, .command]).isEmpty,
+                  !workspace.nameEdit.isEditing else { return .ignored }
+            store.setWorkspaceTabsCollapsed(true, workspaceID: workspace.id)
+            return .handled
+        }
     }
 
-    private var actionButton: some View {
+    private var workspaceButton: some View {
         Button { activate() } label: {
             HStack(spacing: 9) {
                 tile
@@ -293,21 +388,41 @@ struct WorkspaceRailItem<Indicator: View>: View {
                         } else {
                             Text(workspace.title).font(Theme.display(12, weight: .medium)).lineLimit(1)
                         }
-                        Text(workspace.workingDirectory.path).font(Theme.display(10))
-                            .foregroundStyle(Theme.chromeMuted).lineLimit(1).truncationMode(.head)
+                        HStack(spacing: 4) {
+                            Text(tabCountLabel + " ·").fixedSize()
+                            Text(workspace.workingDirectory.path).lineLimit(1).truncationMode(.head)
+                        }.font(Theme.display(10)).foregroundStyle(Theme.chromeMuted)
                     }
                     Spacer(minLength: 0)
                     if index < 9 { Text("\(index + 1)").font(Theme.display(10)).foregroundStyle(Theme.chromeMuted) }
-                    if disclosure != nil { Color.clear.frame(width: 24) }
                 }
             }
             .padding(.horizontal, expanded ? 6 : 5)
-            .padding(.leading, expanded && workspace.worktreeParentId != nil ? 12 : 0)
             .frame(maxWidth: .infinity, minHeight: 40)
-            .background(active || hovered ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 7))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain).focused($focused).chatFocusRing()
+        .buttonStyle(.plain).focusable().focusEffectDisabled().focused($focus, equals: .destination(destination))
+        .modifier(WorkspaceRailFocusRing(focused: focus == .destination(destination)))
+    }
+
+    private var accessibleWorkspaceButton: some View {
+        workspaceButton
+        .accessibilityLabel("\(workspace.title), workspace, \(index + 1) of \(store.workspaces.count)")
+        .accessibilityValue(activityValue)
+        .accessibilityIdentifier("workspace-rail-\(workspace.id)")
+        .accessibilityAction(named: "Rename") { store.requestRenameWorkspace(workspace) }
+        .accessibilityAction(named: Text(expanded ? disclosureLabel : "Show tabs")) {
+            if expanded { store.toggleWorkspaceTabs(workspace.id) }
+            else { openPreview(keyboard: true) }
+        }
+        .accessibilityAction(named: "Move up") { move(-1) }
+        .accessibilityAction(named: "Move down") { move(1) }
+        .accessibilityAction(named: "Close workspace") { store.requestCloseWorkspace(workspace) }
+        .help(activityHelp)
+    }
+
+    private var actionButton: some View {
+        accessibleWorkspaceButton
         .overlay(alignment: .leading) {
             if active && !expanded {
                 RoundedRectangle(cornerRadius: 2).fill(Theme.chromeForeground).frame(width: 3, height: 22).offset(x: -9)
@@ -318,42 +433,26 @@ struct WorkspaceRailItem<Indicator: View>: View {
                 NavigationDragSource(title: workspace.title, writers: { [workspace.id.uuidString as NSString] },
                     click: { _ in activate() }, began: { draggingWorkspaceID = workspace.id },
                     ended: { draggingWorkspaceID = nil })
-                    .padding(.trailing, expanded && disclosure != nil ? 24 : 0)
             }
         }
-        .overlay(alignment: .trailing) {
-            if expanded, let disclosure {
-                Button(action: disclosure) {
-                    Image(systemName: collapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 10)).frame(width: 24, height: 40)
-                }.buttonStyle(.plain).accessibilityLabel(collapsed ? "Show worktrees" : "Hide worktrees")
-            }
-        }
-        .onHover { value in
-            hovered = value
-            guard !expanded && !menuOpen && store.draggedTab == nil && draggingWorkspaceID == nil else { return }
-            hoverTask?.cancel()
-            hoverTask = Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(value ? 450 : 280))
-                guard !Task.isCancelled else { return }
-                if value { openPreview(keyboard: false) }
-                else if store.navigationPresentation.previewWorkspaceID == workspace.id { closePreview() }
-            }
-        }
-        .onKeyPress(.rightArrow) {
-            if expanded, collapsed, let disclosure { disclosure() }
-            else { openPreview(keyboard: true) }
-            return .handled
-        }
-        .onKeyPress(.leftArrow) {
-            guard expanded, !collapsed, let disclosure else { return .ignored }
-            disclosure(); return .handled
-        }
+        .onHover { updateHover($0) }
         .onKeyPress(.escape) { closePreview(); return .handled }
         .overlay(RightClickCatcher { _ in openMenu() })
         .onKeyPress(characters: CharacterSet(charactersIn: "\u{F70D}")) { key in
             guard key.modifiers == .shift else { return .ignored }
             openMenu(); return .handled
+        }
+    }
+
+    private func updateHover(_ value: Bool) {
+        hovered = value
+        guard !expanded && !menuOpen && store.draggedTab == nil && draggingWorkspaceID == nil else { return }
+        hoverTask?.cancel()
+        hoverTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(value ? 450 : 280))
+            guard !Task.isCancelled else { return }
+            if value { openPreview(keyboard: false) }
+            else if store.navigationPresentation.previewWorkspaceID == workspace.id { closePreview() }
         }
     }
 
@@ -393,7 +492,7 @@ struct WorkspaceRailItem<Indicator: View>: View {
     private func closePreview() {
         guard store.navigationPresentation.previewWorkspaceID == workspace.id else { return }
         store.closeNavigation()
-        if previewKeyboard { focused = true }
+        if previewKeyboard { focus = .destination(destination) }
     }
     private func openMenu() {
         hoverTask?.cancel(); closePreview()

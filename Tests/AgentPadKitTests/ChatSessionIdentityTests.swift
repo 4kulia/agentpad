@@ -233,7 +233,7 @@ final class ChatSessionIdentityTests: XCTestCase {
         let workspace = makeTestStore(claudeProjectsRoot: f.service.claudeProjectsRoot)
         let tab = try XCTUnwrap(workspace.active?.activeSession)
         let engine = try XCTUnwrap(tab.engine as? TestEngine)
-        tab.customTitle = "Native Claude"
+        tab.renameForTesting("Native Claude")
         let path = root.appendingPathComponent("socket").path
         var caller: ChatLocalCaller?
         var peer: Int32?
@@ -328,7 +328,7 @@ final class ChatSessionIdentityTests: XCTestCase {
             return SessionProcessScanner.Raw(pid: pid, ppid: i == 0 ? 1 : pid - 1, name: name,
                                              isForeground: i >= 2, startedAtUs: UInt64(pid * 10))
         }
-        return .init(id: id, customTitle: "Same title", folderName: "project", processes: rows)
+        return .init(id: id, explicitName: "Same title", folderName: "project", processes: rows)
     }
 
     private func nativeSignature(_ pid: Int32) -> Bool {
@@ -421,5 +421,68 @@ final class ChatSessionIdentityTests: XCTestCase {
         }
         XCTAssertTrue(ChatStubProtocol.seen.isEmpty)
         XCTAssertTrue(try f.store.outbox.commands().isEmpty)
+    }
+
+    func testMCPPreflightVerifiesWithoutExecutingAToolAndKeepsVerifiedFieldErrors() async throws {
+        let f = try await ChatChannelExecutionTests.Fixture(root: root.appendingPathComponent("preflight"))
+        fixture = f
+        let pid = getpid()
+        let started = try await BackgroundInspection.run { SessionProcessScanner.startTimeUs(of: pid) }
+        let start = try XCTUnwrap(started)
+        let engine = TestEngine()
+        engine.foregroundPid = pid
+        let tab = Session(engine: engine, currentDirectory: root, agent: .terminal)
+        let origin = AgentPadCallerOrigin.localProcess(pid: pid, startedAtUs: start)
+        let scan: @Sendable (Int32) -> [SessionProcessScanner.Raw] = { foreground in
+            XCTAssertFalse(Thread.isMainThread)
+            XCTAssertEqual(foreground, pid)
+            return [.init(pid: pid, ppid: 1, name: "claude", isForeground: true, startedAtUs: start)]
+        }
+        let kernel = ChatSessionIdentity.Kernel(process: { candidate in
+            XCTAssertFalse(Thread.isMainThread)
+            guard candidate == pid else { return nil }
+            return .init(pid: pid, parent: 1, startedAtUs: start, terminal: 1)
+        })
+        var request = AgentPadCLIRequest(verb: .team)
+        request.teamAction = AgentPadCLITeamAction.verifyCaller.rawValue
+        let verified = await ChatSessionTools.handle(request, origin: origin, sessions: { [tab] }, service: f.service,
+            signatureVerifier: { _ in true }, scan: scan, kernel: kernel)
+        XCTAssertTrue(verified.ok, verified.error ?? "")
+        XCTAssertNil(verified.chatResult, "Preflight must not execute a chat tool")
+
+        request.teamAction = AgentPadCLITeamAction.chat.rawValue
+        request.chatArguments = #"{"tool":"chat_post","message_id":"bad","org_id":"00000000-0000-4000-8000-000000000001","channel_id":"00000000-0000-4000-8000-000000000001","text":"hello"}"#
+        let invalid = await ChatSessionTools.handle(request, origin: origin, sessions: { [tab] }, service: f.service,
+            signatureVerifier: { _ in true }, scan: scan, kernel: kernel)
+        let details = try JSONDecoder().decode(ChatJSON.self, from: Data(XCTUnwrap(invalid.chatResult).utf8))
+        XCTAssertEqual(details["error"]?.string, "invalid_args")
+        XCTAssertEqual(details["field"]?.string, "message_id")
+        let unverified = await ChatSessionTools.handle(request, origin: origin, sessions: { [tab] }, service: f.service,
+            signatureVerifier: { _ in false }, scan: scan, kernel: kernel)
+        let refusal = try JSONDecoder().decode(ChatJSON.self, from: Data(XCTUnwrap(unverified.chatResult).utf8))
+        XCTAssertEqual(refusal["error"]?.string, "unrecognized_claude_code_signature")
+        XCTAssertNil(refusal["field"])
+        XCTAssertTrue(ChatStubProtocol.seen.isEmpty)
+        XCTAssertTrue(try f.store.outbox.commands().isEmpty)
+    }
+
+    func testTeamPreflightRequiresVerifiedSessionOrTheRunsOwnCall() async {
+        let team = TeamService(storage: TeamStorage(directory: root.appendingPathComponent("team")))
+        var request = AgentPadCLIRequest(verb: .team)
+        request.teamAction = AgentPadCLITeamAction.verifyCaller.rawValue
+        for origin in [AgentPadCallerOrigin.outside, .localProcess(pid: 99_999_999, startedAtUs: 1)] {
+            let reply = await TeamCLIHandler.handle(request, service: team, origin: origin)
+            XCTAssertFalse(reply.ok)
+            XCTAssertEqual(reply.error, "session_process_unavailable")
+        }
+        request.teamCall = "own-call"
+        for origin in [AgentPadCallerOrigin.outside, .localProcess(pid: 99_999_999, startedAtUs: 1),
+                       .teamRun(callId: nil), .teamRun(callId: "other-call")] {
+            let reply = await TeamCLIHandler.handle(request, service: team, origin: origin)
+            XCTAssertFalse(reply.ok)
+            XCTAssertEqual(reply.error, AgentPadCallerOrigin.teamRunRefusal)
+        }
+        let own = await TeamCLIHandler.handle(request, service: team, origin: .teamRun(callId: "own-call"))
+        XCTAssertTrue(own.ok)
     }
 }

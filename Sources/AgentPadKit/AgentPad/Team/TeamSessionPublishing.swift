@@ -5,13 +5,15 @@ import SwiftUI
 struct TeamPublishMenu: View {
     /// The Claude Code conversation; nil for other agents, which shows nothing.
     let sessionId: String?
-    let title: String
+    let folder: URL
     var surfaceId: UUID? = nil
 
     var body: some View {
         if let sessionId, TeamSessionFiles.isValidId(sessionId), ChannelConversationFilter.current().allows(conversationId: sessionId) {
             Menu("Publish to Team") {
-                Button("Publish…") { TeamTabs.shared.publish(sessionID: sessionId, title: title, surfaceID: surfaceId) }
+                Button("Publish…") {
+                    TeamTabs.shared.publish(sessionID: sessionId, folder: folder, surfaceID: surfaceId)
+                }
                 let published = TeamTabs.shared.currentScope.map { TeamTabs.shared.agents($0).filter { $0.sessionId == sessionId.lowercased() } } ?? []
                 if !published.isEmpty {
                     Divider()
@@ -40,6 +42,13 @@ enum TeamPublishMode: String, CaseIterable, Identifiable, Codable {
 /// Target-selection helpers shared by the session form and its regression tests.
 @MainActor
 enum TeamSessionPublication {
+    /// Publication defaults can leave this machine. Archived and external
+    /// sessions use only AgentPad Rename or the folder, never transcript titles.
+    static func name(conversationID: String, folder: URL, session: Session? = nil, names: SessionNames = .shared) -> String {
+        if let session { return session.publicName }
+        return names.explicitNameOrFolder(for: SessionNameKey(AgentTemplate.claudeCodeID, conversationID), folder: folder)
+    }
+
     /// The teams to show when the agents edited are `edited` (they were
     /// `previous`): theirs — General only for a new publication — or nil
     /// when the agent edited did not change, so the owner's own choice stays.

@@ -59,7 +59,7 @@ final class WorkspaceAttentionTests: XCTestCase {
     }
 
     private func makeContext(key: Bool = true) -> Context {
-        let store = WorkspaceStore(persistence: InMemoryPersistence(), engineFactory: { TestEngine() },
+        let store = WorkspaceStore(persistence: InMemoryPersistence(), sessionNames: .testing, engineFactory: { TestEngine() },
             optionsProvider: { _ in nil }, resumeProvider: { false },
             onSessionAlert: { [unowned self] id, kind in
                 guard let workspace = self.contexts.flatMap({ $0.store.workspaces }).first(where: {
@@ -171,7 +171,7 @@ final class WorkspaceAttentionTests: XCTestCase {
         try await render(context)
         let b = context.store.addWorkspace()
         let food = try XCTUnwrap(b.activeSession)
-        food.customTitle = "Food planner"
+        food.renameForTesting("Food planner")
         let foodPane = try XCTUnwrap(b.activePane)
         var targets = [food]
         if split {

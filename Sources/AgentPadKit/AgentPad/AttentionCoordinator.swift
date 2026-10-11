@@ -136,10 +136,10 @@ final class AttentionCoordinator {
         "\(session.id)|\(session.statusSince?.timeIntervalSince1970 ?? 0)"
     }
 
-    static func waitingEvent(_ session: ExternalAgentSession) -> AttentionEvent {
+    static func waitingEvent(_ session: ExternalAgentSession, names: SessionNames = .shared) -> AttentionEvent {
         var event = AttentionEvent(source: "external", object: session.id, episode: episodeKey(session),
                                    kind: .input, destination: .external(session.id), timestamp: session.statusSince ?? Date())
-        event.localTitle = session.displayTitle
+        event.localTitle = names.explicitNameOrFolder(for: .init(AgentTemplate.claudeCodeID, session.sessionId), folder: session.cwd)
         event.localBody = "Claude Code · Needs your input"
         return event
     }

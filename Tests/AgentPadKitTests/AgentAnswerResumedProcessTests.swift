@@ -88,12 +88,12 @@ final class AgentAnswerResumedProcessTests: XCTestCase {
             XCTAssertTrue(proof.snapshots.contains { $0.isShell && $0.process.terminal == nil })
             (tab.engine as? TestEngine)?.foregroundPid = launch?.process.pid
             AgentAnswerSource.recordHook(conversation: id, session: tab, provenance: proof, failure: failure)
-            XCTAssertNil(AgentAnswerSource.problem(tab))
+            XCTAssertEqual(AgentAnswerSource.problem(tab), .checking)
             let caller = ChatLocalCaller(surface: tab.id.uuidString.lowercased(), claudePID: proof.process.pid,
                 claudeStart: proof.process.startedAtUs, signature: "Resumed")
             personalCaller = caller
-            XCTAssertNil(try? ChatPersonalAccess.conversation(caller: caller, sessions: [tab]),
-                         "The hook remains pending until its handler returns")
+            XCTAssertTrue(HookServer.pendingConversations.contains(tab.id),
+                          "The hook remains pending until its handler returns")
         }
         server.start()
         defer { server.stop() }
@@ -159,7 +159,7 @@ final class AgentAnswerResumedProcessTests: XCTestCase {
         defer { try? Data().write(to: release) }
         await fulfillment(of: [received], timeout: 10)
         let caller = try XCTUnwrap(personalCaller)
-        XCTAssertEqual(try ChatPersonalAccess.conversation(caller: caller, sessions: [tab]), .init(journal))
+        await XCTAssertEqualAsync(try await ChatPersonalAccess.conversation(caller: caller, sessions: [tab]), .init(journal))
         if tab.answerBinding != nil {
             do {
                 let answer = try await AgentAnswerSource.read(session: tab, store: store) { _, id, _ in
@@ -176,6 +176,7 @@ final class AgentAnswerResumedProcessTests: XCTestCase {
         await Task.detached { child.waitUntilExit() }.value
         XCTAssertEqual(child.terminationStatus, 0, (try? String(contentsOf: log, encoding: .utf8)) ?? "")
         XCTAssertNotNil(tab.answerBinding, (try? String(contentsOf: log, encoding: .utf8)) ?? "")
+        try? await AgentAnswerSource.refresh(tab)
         XCTAssertEqual(AgentAnswerSource.problem(tab), .changed)
     }
 

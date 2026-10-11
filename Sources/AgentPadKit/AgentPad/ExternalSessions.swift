@@ -172,7 +172,7 @@ enum ExternalSessionParser {
 
 // MARK: - Processes
 
-/// Thin libproc wrappers. Cheap enough to call for every session on every poll.
+/// Blocking libproc wrappers: callers must use a background executor.
 enum ProcessInfoReader {
     struct Info: Equatable {
         let ppid: pid_t
@@ -231,8 +231,9 @@ enum ProcessInfoReader {
     /// The GUI app hosting the session's terminal (Terminal, iTerm2, Ghostty…),
     /// found by walking up the process tree. Nil for tmux/ssh-detached shells.
     @MainActor
-    static func hostingApp(of pid: pid_t) -> NSRunningApplication? {
-        for ancestor in ancestors(of: pid) {
+    static func hostingApp(of pid: pid_t) async -> NSRunningApplication? {
+        guard let ancestors = try? await BackgroundInspection.run({ ancestors(of: pid) }) else { return nil }
+        for ancestor in ancestors {
             if let app = NSRunningApplication(processIdentifier: ancestor),
                app.bundleIdentifier != nil {
                 return app

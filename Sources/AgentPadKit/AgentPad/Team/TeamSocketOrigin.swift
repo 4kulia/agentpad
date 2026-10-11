@@ -42,7 +42,7 @@ enum AgentPadCallerOrigin: Equatable, Sendable {
     }
 
     /// Why this caller may not make `request`; nil when it may. A team run
-    /// may only ask for folders for its own call (`team access`,
+    /// may list safe tab names or ask for folders for its own call (`team access`,
     /// `team access-check` — checked against the call in `TeamCLIHandler`).
     func refusal(for request: AgentPadCLIRequest) -> String? {
         let verb = AgentPadCLIVerb(rawValue: request.verb)
@@ -51,7 +51,9 @@ enum AgentPadCallerOrigin: Equatable, Sendable {
         case .outside, .localProcess:
             return nil
         case .teamRun:
-            guard verb == .team, action == .access || action == .accessCheck else { return Self.teamRunRefusal }
+            // List exposes only explicit names/folder defaults to these callers.
+            if verb == .list { return nil }
+            guard verb == .team, action == .access || action == .accessCheck || action == .verifyCaller else { return Self.teamRunRefusal }
             return nil
         }
     }

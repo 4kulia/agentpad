@@ -88,16 +88,24 @@ enum ConfirmCloseTab {
         // Activation updates AppKit visibility on the next render. Keep the
         // request in the session now; shown/confirm still require a visible host.
         let pid = session.engine.foregroundPid
-        let start = pid.flatMap { ProcessInfoReader.info(of: $0)?.startTime }
-        guard pid == nil || start != nil else { return .windowBusy }
-        let accepted = c.request(.init(tabID: session.id, targetID: "close", revision: start.map(String.init(describing:)), callerWaiting: callerWaiting != nil),
+        let identity = Task {
+            try await BackgroundInspection.run { pid.flatMap { ProcessInfoReader.info(of: $0)?.startTime } }
+        }
+        let accepted = c.request(.init(tabID: session.id, targetID: "close", revision: pid.map(String.init), callerWaiting: callerWaiting != nil),
             title: "Close “\(session.title)”?", consequences: "A process is still running in this tab; closing will terminate it.",
             verb: "Close tab", destructive: true, stillValid: { [weak store, weak session] in
                 guard callerWaiting?() != false, let store, let session, store.location(ofSessionId: session.id) != nil,
                       session.engine.foregroundPid == pid else { return false }
-                return pid.map { ProcessInfoReader.info(of: $0)?.startTime == start } ?? true
+                return true
             }, operation: { [weak store, weak session] in
-                guard let store, let session, let current = store.location(ofSessionId: session.id) else { return }
+                let start = try await identity.value
+                if let pid {
+                    guard let start, try await BackgroundInspection.run({ ProcessInfoReader.info(of: pid)?.startTime == start }) else {
+                        throw ProcessOperationError("The process changed. The tab was not closed.")
+                    }
+                }
+                guard c.isExecuting, callerWaiting?() != false, let store, let session, session.engine.foregroundPid == pid,
+                      let current = store.location(ofSessionId: session.id) else { return }
                 store.closeTab(session, in: current.workspace)
             })
         return accepted ? .presenting : .windowBusy
@@ -124,13 +132,14 @@ enum ConfirmCloseTab {
 @MainActor
 enum TerminalProcessActions {
     static func requestKill(_ process: SessionProcess, session: Session,
-                            matches: @escaping (pid_t, UInt64) -> Bool = SessionProcessScanner.identityMatches,
+                            matches: @escaping @Sendable (pid_t, UInt64) -> Bool = SessionProcessScanner.identityMatches,
                             signal: @escaping (pid_t, Int32) -> Int32 = { Darwin.kill($0, $1) }) {
         session.terminalConfirmation.request(.init(tabID: session.id, targetID: "process:\(process.pid)",
             revision: String(process.startedAtUs)), title: "Stop process \(process.pid)?",
             consequences: "Send SIGTERM to \(process.name). Unsaved work in this process may be lost.", verb: "Stop process", destructive: true,
-            stillValid: { matches(process.pid, process.startedAtUs) }, operation: {
-                guard matches(process.pid, process.startedAtUs) else { throw ProcessOperationError("The process changed. No signal was sent.") }
+            stillValid: { session.hasProcess }, operation: {
+                guard try await BackgroundInspection.run({ matches(process.pid, process.startedAtUs) }) else { throw ProcessOperationError("The process changed. No signal was sent.") }
+                guard session.terminalConfirmation.isExecuting, session.hasProcess else { throw CancellationError() }
                 guard signal(process.pid, SIGTERM) == 0 else { throw ProcessOperationError(String(cString: strerror(errno))) }
             })
     }

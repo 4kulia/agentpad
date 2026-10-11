@@ -32,6 +32,7 @@ final class WorkspaceStoreTests: XCTestCase {
     ) -> WorkspaceStore {
         WorkspaceStore(
             persistence: persistence ?? InMemoryPersistence(initial: initial),
+            sessionNames: .testing,
             engineFactory: { TestEngine() },
             optionsProvider: { _ in nil },
             resumeProvider: { true },
@@ -792,7 +793,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(session.title, "projectA")
     }
 
-    func testShellEnvironmentReportUpdatesSessionEnvironment() {
+    func testShellEnvironmentReportUpdatesSessionEnvironment() async {
         let store = makeStore()
         let ws = store.addWorkspace(workingDirectory: projectA)
         let session = firstPane(ws).tabs[0]
@@ -805,6 +806,7 @@ final class WorkspaceStoreTests: XCTestCase {
             "AGENTPAD_NODE_VERSION": "v22.3.0",
         ], sessionId: session.id)
 
+        await session.environmentRefresh?.value
         XCTAssertEqual(session.environment.pythonVenv, ".venv")
         XCTAssertEqual(session.environment.nodeVersion, "v22.3.0")
         XCTAssertEqual(session.environment.nvmDirectory, "/Users/corey/.nvm")
@@ -931,7 +933,7 @@ final class WorkspaceStoreTests: XCTestCase {
         let store = makeStore()
         let ws = store.addWorkspace(workingDirectory: projectA)
         let session = store.addTab(in: ws, template: .claudeCode, initialCwd: projectB)
-        session.customTitle = "release prep"
+        session.renameForTesting("release prep")
         XCTAssertEqual(firstPane(ws).tabs.count, 2)
 
         store.closeTab(session, in: ws)
@@ -944,7 +946,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(pane.tabs.count, 2)
         XCTAssertEqual(reopened?.agent.id, "claude-code")
         XCTAssertEqual(reopened?.currentDirectory.path, projectB.path)
-        XCTAssertEqual(reopened?.customTitle, "release prep")
+        XCTAssertEqual(reopened?.explicitName, "release prep")
         XCTAssertEqual(pane.activeTabId, reopened?.id)
         XCTAssertFalse(store.canReopenClosedTab)
     }

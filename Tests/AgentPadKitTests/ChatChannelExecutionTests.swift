@@ -1677,7 +1677,7 @@ final class ChatChannelExecutionTests: XCTestCase {
             let kept = try await legacy.read { try ChatApproval.fetchOne($0, key: approval.id) }
             XCTAssertEqual(kept?.params, approval.params)
             let versions = try await legacy.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier") }
-            XCTAssertEqual(versions, ((1...9).map { "release-\($0)" } + ["release-10-ux1", "release-11-notification-diagnostics"]).sorted())
+            XCTAssertEqual(versions, ((1...9).map { "release-\($0)" } + ["release-10-ux1", "release-11-notification-diagnostics", "release-12-publication-text-provenance"]).sorted())
         }
     }
 

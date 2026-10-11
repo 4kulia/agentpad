@@ -68,7 +68,7 @@ enum PaletteItemKind: Hashable, Sendable {
 
 struct PaletteItem: Identifiable, Hashable, Sendable {
     let id: String
-    let title: String
+    var title: String
     var subtitle: String
     let kind: PaletteItemKind
     let symbol: String
@@ -219,6 +219,25 @@ enum PaletteIndex {
                 return FileManager.default.fileExists(atPath: path, isDirectory: &directory) && directory.boolValue
             default: return true
             }
+        }
+    }
+
+    /// Refresh names before matching so a catalog update or Rename does not
+    /// strand a quick match under the title captured when the palette opened.
+    static func readouts(_ items: [PaletteItem], attention: AttentionSidebarModel = .shared) -> [PaletteItem] {
+        let projection = attention.projection
+        return items.map { original in
+            var item = original
+            switch item.kind {
+            case .tab(let id, _, _):
+                item.title = attention.tabTitle(id) ?? item.title
+                item.attentionSummary = projection.tabIndicators[id]?.accessibleSummary
+            case .workspace(let id, let window):
+                item.attentionSummary = projection.workspaceIndicators[.init(window: window, workspace: id)]?.accessibleSummary
+            default: break
+            }
+            if let summary = item.attentionSummary { item.subtitle += " · " + summary }
+            return item
         }
     }
 

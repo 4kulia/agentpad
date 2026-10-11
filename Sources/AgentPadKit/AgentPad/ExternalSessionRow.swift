@@ -99,7 +99,7 @@ struct ExternalSessionRow: View {
             Button("Move Here", action: onTakeOver).disabled(!session.canTakeOver)
             // AgentPad: team work.
             Divider()
-            TeamPublishMenu(sessionId: session.sessionId, title: session.displayTitle)
+            TeamPublishMenu(sessionId: session.sessionId, folder: session.cwd)
         }
         .help(helpText)
     }

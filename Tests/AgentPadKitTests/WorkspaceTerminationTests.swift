@@ -114,10 +114,10 @@ final class WorkspaceTerminationTests: XCTestCase {
         let store = makeTestStore(persistence: persistence)
         let tab = try XCTUnwrap(store.active?.activeSession)
         let engine = try XCTUnwrap(tab.engine as? TestEngine)
-        tab.customTitle = "Before quit"
+        tab.renameForTesting("Before quit")
         XCTAssertTrue(store.flushPersistence())
         let before = try XCTUnwrap(persistence.saved)
-        engine.onTerminate = { [weak tab] in tab?.customTitle = "Teardown callback" }
+        engine.onTerminate = { [weak tab] in tab?.renameForTesting("Teardown callback") }
 
         store.terminate()
         // AppKit may terminate the same store again from windowWillClose.

@@ -10,7 +10,7 @@ struct AgentAnswerProvenance: Equatable, Sendable {
         let image: ChatClaudeProcess.ImageIdentity
         let isForeground: Bool
 
-        var name: String { URL(fileURLWithPath: image.path).lastPathComponent.lowercased() }
+        var name: String { (image.path as NSString).lastPathComponent.lowercased() }
         var isShell: Bool { ["sh", "bash", "zsh", "dash", "ksh", "fish"].contains(name) }
         var isMultiplexer: Bool { ["tmux", "screen", "zellij", "dtach", "abduco"].contains(name) }
     }
@@ -135,10 +135,15 @@ struct AgentAnswerProvenance: Equatable, Sendable {
     /// waiting for Claude. Require that exact live ancestor and foreground set.
     func matchesForeground(_ pid: Int32?, inspector: Inspector = Inspector()) -> Bool {
         guard let pid, isCurrent(inspector: inspector) else { return false }
+        return containsForeground(pid) && inspector.kernel.process(pid) == snapshots.first { $0.process.pid == pid }?.process
+    }
+
+    /// Pure comparison against previously authenticated evidence, for UI state.
+    func containsForeground(_ pid: Int32?) -> Bool {
+        guard let pid else { return false }
         let known = Dictionary(snapshots.map { ($0.process.pid, $0) }, uniquingKeysWith: { a, _ in a })
         guard let lineage = Self.ancestry(of: process.pid, in: known),
               let index = lineage.firstIndex(where: { $0.process.pid == pid }),
-              inspector.kernel.process(pid) == lineage[index].process,
               lineage[0...index].allSatisfy(\.isForeground),
               lineage.prefix(index + 1).dropFirst().allSatisfy(\.isShell) else { return false }
         return true
@@ -154,7 +159,7 @@ struct AgentAnswerProvenance: Equatable, Sendable {
         return result
     }
 
-    /// Only kernel/image metadata on the UI thread, never SecCode. A new
+    /// Background-only kernel/image metadata. A new
     /// process or exec needs a new hook's background verification. Exited
     /// helpers (including the hook itself) need not stay alive for export.
     func isCurrent(inspector: Inspector = Inspector()) -> Bool {

@@ -28,8 +28,9 @@ final class AgentAnswerSourceTests: XCTestCase {
     private func assertRefused(_ session: Session, _ problem: AgentAnswerTranscript.Problem,
                                inspector: AgentAnswerProvenance.Inspector = .init(),
                                file: StaticString = #filePath, line: UInt = #line) async {
+        try? await AgentAnswerSource.refresh(session, inspector: inspector)
         XCTAssertFalse(CompositionTabs.available(session), file: file, line: line)
-        XCTAssertEqual(AgentAnswerSource.problem(session, inspector: inspector), problem, file: file, line: line)
+        XCTAssertEqual(AgentAnswerSource.problem(session), problem, file: file, line: line)
         do {
             _ = try await AgentAnswerSource.read(session: session, store: store, inspector: inspector) { _, _, _ in
                 XCTFail("An unbound export must not read any journal", file: file, line: line)
@@ -114,7 +115,7 @@ final class AgentAnswerSourceTests: XCTestCase {
         let fixture = AnswerProcessFixture()
         try fixture.bind(tab, conversation: id)
         store.applyConversationId(conversationId: UUID().uuidString.lowercased(), sessionId: tab.id)
-        XCTAssertNil(AgentAnswerSource.problem(tab, inspector: fixture.inspector))
+        XCTAssertNil(AgentAnswerSource.problem(tab))
         let root = try XCTUnwrap(root)
         let answer = try await AgentAnswerSource.read(session: tab, store: store, inspector: fixture.inspector) { agent, conversation, directory in
             XCTAssertEqual(agent, .claude)

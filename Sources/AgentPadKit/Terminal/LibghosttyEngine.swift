@@ -404,18 +404,17 @@ private let agentPadActionCb: ghostty_runtime_action_cb = { _, target, action in
         // libghostty sends both real URLs and matched filesystem paths through
         // this action. `URL(string:)` also accepts scheme-less paths, but those
         // are not file URLs and NSWorkspace cannot open them as documents.
-        // Resolve on the originating view so relative paths use that session's
-        // live OSC-7 cwd and SSH paths can be suppressed safely.
+        // Capture the originating view's cwd/pid as the click is accepted.
         let urlAction = action.action.open_url
         guard let cstr = urlAction.url, urlAction.len > 0 else { return false }
         let buffer = UnsafeRawBufferPointer(start: cstr, count: Int(urlAction.len))
         let rawTarget = String(decoding: buffer, as: UTF8.self)
         // A synthetic release must clear the core's latched link click without
-        // opening it. Inspect cancellation synchronously; keep real opens
-        // deferred so they cannot reparent/free a surface inside its C call.
+        // opening it. Enqueue synchronously to preserve order with host links;
+        // defer activation so it cannot reparent/free a surface inside its C call.
         dispatchClipboardToView(userdata) { view in
             guard !view.isCancellingMousePress else { return }
-            DispatchQueue.main.async { [weak view] in view?.open(target: rawTarget) }
+            view.open(target: rawTarget, deferActivation: true)
         }
         return true
     case GHOSTTY_ACTION_MOUSE_SHAPE:
@@ -785,6 +784,9 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     var onDesktopNotification: ((String, String) -> Void)?
     var onLinkHover: ((String?) -> Void)?
     var onOpenFile: ((TerminalFileReference) -> Void)?
+    // File clicks share an activation order across panes; external URLs bypass it.
+    private static var linkOpenTask: Task<Void, Never>?
+    private static var pendingLinkOpens = 0
     /// Injectable URL opener keeps activation tests out of external apps.
     var openExternalURL: (URL) -> Void = { url in
         if url.isWebLink,
@@ -2239,20 +2241,44 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
     }
 
     /// Called only for an explicit link activation, never for output or hover.
-    func open(target rawTarget: String) {
-        guard let target = TerminalOpenTargetResolver.resolve(
-            rawTarget,
-            currentDirectory: TerminalWorkingDirectory.resolve(pid: foregroundPid, fallback: currentDirectory)
-        ) else { return }
-
-        switch target {
-        case .file(let reference):
-            let isRemote = isRemoteSessionProvider?() == true
-                || TerminalRemoteProcessDetector.isRemoteConnection(pid: foregroundPid)
-            guard !isRemote else { return }
-            onOpenFile?(reference)
-        case .url(let url):
-            openExternalURL(url)
+    func open(target rawTarget: String, deferActivation: Bool = false,
+              resolveDirectory: @escaping @Sendable (pid_t?, URL?) throws -> URL? = TerminalWorkingDirectory.resolve,
+              hasURLHandler: @escaping @Sendable (URL) -> Bool = { NSWorkspace.shared.urlForApplication(toOpen: $0) != nil }) {
+        let openURL = openExternalURL
+        if let url = TerminalOpenTargetResolver.externalURL(rawTarget) {
+            // Native callbacks must return before activation can reparent a surface.
+            if deferActivation { Task { openURL(url) } }
+            else { openURL(url) }
+            return
+        }
+        let pid = foregroundPid, cwd = currentDirectory
+        let remote = isRemoteSessionProvider?() == true
+        let openFile = onOpenFile
+        let previous = Self.linkOpenTask
+        Self.pendingLinkOpens += 1
+        Self.linkOpenTask = Task {
+            // Launch Services must not wait for file lookups or their worker pool.
+            let external = await Task.detached(priority: .userInitiated) {
+                TerminalOpenTargetResolver.externalURL(rawTarget, hasHandler: hasURLHandler)
+            }.value
+            if let external { openURL(external) }
+            await previous?.value
+            defer {
+                Self.pendingLinkOpens -= 1
+                if Self.pendingLinkOpens == 0 { Self.linkOpenTask = nil }
+            }
+            guard external == nil else { return }
+            // The dedicated serial queue starts each deadline when the work
+            // actually begins, even if an earlier timed-out lookup is still blocked.
+            guard let target = await TerminalLinkResolution.run({
+                guard !remote, !TerminalRemoteProcessDetector.isRemoteConnection(pid: pid) else { return nil as TerminalOpenTarget? }
+                let directory = (try? resolveDirectory(pid, cwd)) ?? cwd
+                return TerminalOpenTargetResolver.resolve(rawTarget, currentDirectory: directory)
+            }) else { return }
+            switch target {
+            case .file(let reference): openFile?(reference)
+            case .url(let url): openURL(url)
+            }
         }
     }
 

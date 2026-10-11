@@ -193,6 +193,34 @@ final class ChatSessionActionIdentityTests: XCTestCase {
         XCTAssertEqual(ChatStubProtocol.seen.count, 1)
     }
 
+    func testTabRemovalDuringBackgroundRevalidationRefusesCaller() async throws {
+        let table = KernelTable(), tab = tab()
+        let proof = try await ChatSessionIdentity.verify(.localProcess(pid: KernelTable.peer, startedAtUs: 300),
+            sessions: [tab], scan: table.scan, signatureVerifier: table.signature, kernel: table.kernel)
+        let entered = expectation(description: "background identity check")
+        entered.assertForOverFulfill = false
+        let release = DispatchSemaphore(value: 0), original = table.kernel
+        var kernel = original
+        kernel.process = { pid in
+            XCTAssertFalse(Thread.isMainThread)
+            if pid == KernelTable.peer { entered.fulfill(); release.wait() }
+            return original.process(pid)
+        }
+        let delayed = kernel
+        var tabs = [tab]
+        let task = Task {
+            try await ChatSessionIdentity.revalidate(proof, sessions: tabs, kernel: delayed, currentSessions: { tabs })
+        }
+        await fulfillment(of: [entered], timeout: 1)
+        tabs = []
+        // Every read of the peer is released; no process/kernel operation is
+        // needed to notice that its tab disappeared while the check was away.
+        for _ in 0..<8 { release.signal() }
+        await XCTAssertThrowsErrorAsync(try await task.value) {
+            XCTAssertEqual($0 as? ChatSessionIdentity.VerificationError, .notInTab)
+        }
+    }
+
     func testProofIsBoundToLiveTabTTYAndForegroundLifetime() async throws {
         let table = KernelTable(), tab = tab(), foreground: Int32 = 99_999_983
         table.processes[foreground] = .init(pid: foreground, parent: KernelTable.shell, startedAtUs: 400, terminal: 42)
@@ -201,23 +229,23 @@ final class ChatSessionActionIdentityTests: XCTestCase {
         engine.foregroundPid = foreground
         let verified = try await ChatSessionIdentity.verify(.localProcess(pid: KernelTable.peer, startedAtUs: 300),
             sessions: [tab], scan: table.scan, signatureVerifier: table.signature, kernel: table.kernel)
-        try ChatSessionIdentity.revalidate(verified, sessions: [tab], kernel: table.kernel)
+        try await ChatSessionIdentity.revalidate(verified, sessions: [tab], kernel: table.kernel)
         let otherTab = self.tab()
         for tabs in [[], [otherTab], [tab, otherTab]] {
-            XCTAssertThrowsError(try ChatSessionIdentity.revalidate(verified, sessions: tabs, kernel: table.kernel)) {
+            await XCTAssertThrowsErrorAsync(try await ChatSessionIdentity.revalidate(verified, sessions: tabs, kernel: table.kernel)) {
                 XCTAssertEqual($0 as? ChatSessionIdentity.VerificationError, .notInTab)
             }
         }
         table.replace(foreground, start: 401)
-        XCTAssertThrowsError(try ChatSessionIdentity.revalidate(verified, sessions: [tab], kernel: table.kernel)) {
+        await XCTAssertThrowsErrorAsync(try await ChatSessionIdentity.revalidate(verified, sessions: [tab], kernel: table.kernel)) {
             XCTAssertEqual($0 as? ChatSessionIdentity.VerificationError, .notInTab)
         }
         table.replace(foreground, start: 400, terminal: 43)
-        XCTAssertThrowsError(try ChatSessionIdentity.revalidate(verified, sessions: [tab], kernel: table.kernel)) {
+        await XCTAssertThrowsErrorAsync(try await ChatSessionIdentity.revalidate(verified, sessions: [tab], kernel: table.kernel)) {
             XCTAssertEqual($0 as? ChatSessionIdentity.VerificationError, .notInTab)
         }
         engine.foregroundPid = KernelTable.claude
-        try ChatSessionIdentity.revalidate(verified, sessions: [tab], kernel: table.kernel)
+        try await ChatSessionIdentity.revalidate(verified, sessions: [tab], kernel: table.kernel)
     }
 
     func testSignatureResultCannotBeBoundToAnImageChangedDuringVerification() async throws {

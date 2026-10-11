@@ -34,8 +34,8 @@ struct TeamPublicationEditor: View {
                     }
                     TextField("What to ask it", text: $form.fields.description, axis: .vertical).lineLimit(2...6)
                     HStack {
-                        TextField("Folder", text: $form.fields.folder).disabled(form.fields.sourceConversationID != nil || form.fields.sessionID != nil)
-                        if form.fields.sourceConversationID == nil, form.fields.sessionID == nil {
+                        TextField("Folder", text: $form.fields.folder).disabled(form.fields.sessionID != nil && form.fields.mode != .folder)
+                        if form.fields.sessionID == nil || form.fields.mode == .folder {
                             Button("Choose…") { chooseFolder(extra: false) }
                         }
                     }
@@ -112,7 +112,7 @@ struct TeamPublicationEditor: View {
         Button("Published Agents") { tabs.showAgents(from: tabs.owner(state)?.store) }
         if case .publish(_, _, let source, let conversation) = state.route {
             Button("New draft") {
-                tabs.publish(sessionID: conversation, title: form.fields.sessionTitle ?? "", surfaceID: source,
+                tabs.publish(sessionID: conversation, folder: URL(fileURLWithPath: form.fields.folder), surfaceID: source,
                     from: tabs.owner(state)?.store, newDraft: true)
             }
         }

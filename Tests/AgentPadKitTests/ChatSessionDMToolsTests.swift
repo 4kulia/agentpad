@@ -85,6 +85,65 @@ final class ChatSessionDMToolsTests: XCTestCase {
         }
     }
 
+    func testTranscriptTitlesNeverLeaveMachineInChannelOrDMAuthorNames() async throws {
+        let secret = "PRIVATE-TITLE-MARKER"
+        f.service.serverCapabilities[f.key.server]?.formUnion(["chat.session_tools", "chat.channel_ux1"])
+        f.service.isServerKnown = { _, _ in true }
+        let card = card(), dm = dm, account = f.key.accountId
+        ChatStubProtocol.reset { request, bytes in
+            if request.httpMethod == "POST" {
+                let command = try! JSONDecoder().decode(ChatCommandEnvelope.self, from: bytes)
+                var result = ["author_account_id": ChatJSON.string(account), "revision": .number(1), "seq": .number(2)]
+                for key in ["message_id", "channel_id", "thread_root_id", "author_session_name"] {
+                    result[key] = command.args[key] ?? .null
+                }
+                if command.type == "dm.message.post" { result["dm_id"] = .string(dm) }
+                return .success(.init(status: 200, body: try! JSONEncoder().encode(ChatCommandAnswer(events: [], result: .object(result)))))
+            }
+            return .success(.init(status: 200, body: request.url!.path.contains("/dms/") ? card : Data(#"{"messages":[],"next":null,"head":0}"#.utf8)))
+        }
+        for allSessions in [false, true] {
+            for metadata in ClosedSessionNameFixture.privateMetadata {
+                let closed = try ClosedSessionNameFixture(root: root.appendingPathComponent(UUID().uuidString), metadata: metadata)
+                defer { closed.store.terminate() }
+                let tab = try await closed.resume(allSessions: allSessions)
+                let conversation = closed.record.conversationId
+                XCTAssertNil(tab.explicitName)
+                XCTAssertTrue(tab.displayTitle.contains(secret), "The resumed local display must use the private transcript title")
+                let processes = AnswerProcessFixture()
+                processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
+                try processes.bind(tab, conversation: conversation)
+                let message = UUID().uuidString.lowercased()
+                let channelPost = Task {
+                    try await authenticatedCall(["tool": .string("chat_post"), "org_id": .string(f.key.orgId),
+                        "channel_id": .string("f5000000-0000-4000-8000-000000000001"), "message_id": .string(message), "text": .string("hello")], tab: tab, processes: processes)
+                }
+                for _ in 0..<200 {
+                    if try f.store.outbox.commands().contains(where: { ChatService.args($0)["message_id"]?.string == message }) { break }
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                f.send()
+                let channelResult = try await channelPost.value
+                XCTAssertTrue(channelResult.ok, channelResult.chatResult ?? channelResult.error ?? "")
+                let directResult = try await authenticatedCall(["tool": .string("chat_post"), "org_id": .string(f.key.orgId),
+                    "kind": .string("dm"), "dm_id": .string(dm), "text": .string("hello")], tab: tab, processes: processes)
+                XCTAssertTrue(directResult.ok, directResult.chatResult ?? directResult.error ?? "")
+            }
+        }
+        let posts = try ChatStubProtocol.seen.filter { $0.request.httpMethod == "POST" }.map {
+            try JSONDecoder().decode(ChatCommandEnvelope.self, from: $0.body)
+        }
+        XCTAssertEqual(posts.filter { $0.type == "message.post_from_session" }.count, 8)
+        XCTAssertEqual(posts.filter { $0.type == "dm.message.post" }.count, 8)
+        for post in posts {
+            let name = try XCTUnwrap(post.args["author_session_name"]?.string)
+            XCTAssertEqual(name, "project")
+            XCTAssertFalse(name.contains(secret))
+            XCTAssertFalse(String(decoding: try post.encoded(), as: UTF8.self).contains(secret))
+        }
+        f.sender?.hold()
+    }
+
     /// Exercise the real handler, including MCP identity and conversation
     /// binding. The lower-level call() fixture supplies an approved ID and
     /// cannot catch the released app's intermittent hook/export rejection.
@@ -93,9 +152,9 @@ final class ChatSessionDMToolsTests: XCTestCase {
         let processes = AnswerProcessFixture()
         processes.add(mcp, parent: AnswerProcessFixture.claude, name: "agentpad-cli")
         let tab = Session(engine: TestEngine(), currentDirectory: root, agent: .claudeCode)
-        tab.customTitle = "Personal fixture"
-        try processes.bind(tab, conversation: conversation)
         tab.conversationId = conversation
+        tab.renameForTesting("Personal fixture")
+        try processes.bind(tab, conversation: conversation)
         XCTAssertNil(tab.launchedConversationId, "This is a new tab, not a restore")
         serveDM()
         let members = try await authenticatedCall(["tool": .string("chat_channels"), "scope": .string("members")], tab: tab, processes: processes)
@@ -120,8 +179,13 @@ final class ChatSessionDMToolsTests: XCTestCase {
         let proof = try XCTUnwrap(processes.capture())
         processes.add(99_999_981, parent: AnswerProcessFixture.claude, name: "helper")
         AgentAnswerSource.recordHook(conversation: conversation, session: tab, provenance: proof, inspector: processes.inspector)
-        XCTAssertNil(tab.answerBinding)
-        XCTAssertEqual(tab.answerBindingProblem, .changed)
+        XCTAssertEqual(AgentAnswerSource.problem(tab), .checking)
+        tab.answerRefresh?.cancel()
+        await XCTAssertThrowsErrorAsync(try await AgentAnswerSource.refresh(tab, inspector: processes.inspector)) {
+            XCTAssertEqual($0 as? AgentAnswerTranscript.Problem, .changed)
+        }
+        XCTAssertEqual(AgentAnswerSource.problem(tab), .changed)
+        XCTAssertFalse(CompositionTabs.available(tab))
 
         let response = try await authenticatedCall(args, tab: tab, processes: processes)
         XCTAssertTrue(response.ok, response.chatResult ?? "", file: file, line: line)
@@ -440,7 +504,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
         func read() async throws -> ChatJSON {
             try await ChatSessionTools.call(.object(["tool": .string("chat_read"), "org_id": .string(f.key.orgId),
                 "kind": .string("dm"), "dm_id": .string(dm)]), caller: caller, service: f.service,
-                personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
+                personalConversation: { try await ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
         }
         try bind(personal)
         // A manually resumed executor history must stop blocking access once
@@ -489,7 +553,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
                 var args = payload; args["org_id"] = .string(f.key.orgId)
                 await refused("dm_not_allowed") {
                     try await ChatSessionTools.call(.object(args), caller: caller, service: self.f.service,
-                        personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
+                        personalConversation: { try await ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
                 }
             }
         }
@@ -550,7 +614,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
         for args in personalDMOperations + [attachment] {
             await refused("dm_not_allowed") {
                 try await ChatSessionTools.call(.object(args), caller: caller, service: self.f.service,
-                    personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: processes.inspector.kernel) },
+                    personalConversation: { try await ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: processes.inspector.kernel) },
                     revalidate: { true })
             }
         }
@@ -569,13 +633,13 @@ final class ChatSessionDMToolsTests: XCTestCase {
         unrelated.conversationId = old
         var otherCaller = caller
         otherCaller.surface = unrelated.id.uuidString.lowercased()
-        XCTAssertNoThrow(try ChatPersonalAccess.conversation(caller: otherCaller, sessions: [unrelated], kernel: processes.inspector.kernel))
+        await XCTAssertNoThrowAsync(try await ChatPersonalAccess.conversation(caller: otherCaller, sessions: [unrelated], kernel: processes.inspector.kernel))
 
         let next = AgentPadHookKit.buildConversationIdPayload(surface: tab.id.uuidString,
             conversationId: latest, claudeParentPID: AnswerProcessFixture.claude)
         _ = await Task.detached { AgentPadHookKit.sendPayload(next, to: path) }.value
         await fulfillment(of: [applied], timeout: 3)
-        XCTAssertThrowsError(try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: processes.inspector.kernel),
+        await XCTAssertThrowsErrorAsync(try await ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: processes.inspector.kernel),
                              "Applying one hook must not clear another pending hook")
         delayed.resume.signal()
         XCTAssertEqual(tab.personalBinding?.conversation, latest)
@@ -673,7 +737,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
         ChatStubProtocol.reset { _, _ in .success(.init(status: 200, body: Data(#"{"messages":[],"next":null}"#.utf8))) }
         _ = try await ChatSessionTools.call(.object(["tool": .string("chat_read"), "org_id": .string(f.key.orgId),
             "kind": .string("dm"), "dm_id": .string(dm)]), caller: caller, service: f.service,
-            personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
+            personalConversation: { try await ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
         let history = ChatDMHistory(files: f.service.files)
         XCTAssertTrue(try history.contains(resumed))
         XCTAssertTrue(try history.contains(current))
@@ -780,7 +844,7 @@ final class ChatSessionDMToolsTests: XCTestCase {
             "kind": .string("dm"), "dm_id": .string(dm), "message_id": .string(UUID().uuidString.lowercased()), "text": .string("retry this exact message")])
         func post(_ caller: ChatLocalCaller) async throws -> ChatJSON {
             try await ChatSessionTools.call(args, caller: caller, service: f.service,
-                personalConversation: { try ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
+                personalConversation: { try await ChatPersonalAccess.conversation(caller: caller, sessions: [tab], kernel: process.inspector.kernel) }, revalidate: { true })
         }
         let card = card(), dm = dm
         ChatStubProtocol.reset { request, _ in

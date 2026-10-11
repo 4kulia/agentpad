@@ -34,18 +34,17 @@ final class AgentAnswerHookProcessTests: XCTestCase {
             XCTAssertEqual(wrapper?.name, "bash")
             XCTAssertEqual(wrapper?.isForeground, true)
             XCTAssertNotEqual(wrapper?.process.pid, provenance.process.pid)
-            XCTAssertTrue(provenance.isCurrent())
             (tab.engine as? TestEngine)?.foregroundPid = wrapper?.process.pid
             AgentAnswerSource.recordHook(conversation: journal, session: tab, provenance: provenance, failure: failure)
             XCTAssertEqual(tab.answerBinding?.conversation, id)
-            XCTAssertNil(AgentAnswerSource.problem(tab))
+            XCTAssertEqual(AgentAnswerSource.problem(tab), .checking)
         }
         server.start()
         defer { server.stop() }
         // '; :' keeps both shells alive instead of optimizing them into exec.
         // The owner waits after ACK so UI revalidation sees a live session.
         try #"""
-        import json, os, shlex, socket, subprocess, sys, time
+        import json, os, select, shlex, signal, socket, subprocess, sys, time
         mode, script, owner, path, surface, journal = sys.argv[1:]
         def command(mode):
             return shlex.join([sys.executable, script, mode, script, owner, path, surface, journal]) + '; :'
@@ -53,7 +52,20 @@ final class AgentAnswerHookProcessTests: XCTestCase {
             pid, terminal = os.forkpty()
             if pid == 0:
                 os.execl('/bin/bash', 'bash', '--noprofile', '--norc', '-c', command('owner'))
-            _, status = os.waitpid(pid, 0)
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                exited, status = os.waitpid(pid, os.WNOHANG)
+                if exited:
+                    break
+                if select.select([terminal], [], [], 0.1)[0]:
+                    try:
+                        os.read(terminal, 65536)
+                    except OSError:
+                        time.sleep(0.05)
+            else:
+                os.killpg(pid, signal.SIGKILL)
+                os.close(terminal)
+                sys.exit(124)
             os.close(terminal)
             sys.exit(os.waitstatus_to_exitcode(status))
         elif mode == 'owner':
@@ -72,16 +84,21 @@ final class AgentAnswerHookProcessTests: XCTestCase {
                 time.sleep(0.5)
         """#.write(to: script, atomically: true, encoding: .utf8)
         let child = Process()
+        let exited = expectation(description: "PTY fixture exits")
+        child.terminationHandler = { _ in exited.fulfill() }
         child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         child.arguments = [script.path, "launch", script.path, owner.path, path, tab.id.uuidString, id]
         child.environment = ["PATH": "/usr/bin:/bin"]
         child.standardOutput = FileHandle.nullDevice
         child.standardError = FileHandle.nullDevice
         try child.run()
+        defer { if child.isRunning { Darwin.kill(child.processIdentifier, SIGKILL) } }
         await fulfillment(of: [verified], timeout: 6)
-        await Task.detached { child.waitUntilExit() }.value
+        await fulfillment(of: [exited], timeout: 8)
+        guard !child.isRunning else { return }
         XCTAssertEqual(child.terminationStatus, 0)
         XCTAssertNotNil(tab.answerBinding)
+        try? await AgentAnswerSource.refresh(tab)
         XCTAssertEqual(AgentAnswerSource.problem(tab), .changed, "exiting the actual owner revokes export")
     }
 }

@@ -16,7 +16,7 @@ extension ChatCommandRecord {
 extension ChatSessionTools {
     static func postDM(_ input: [String: ChatJSON], key: ChatOrgKey, caller: ChatLocalCaller, conversation: ChatPersonalAccess.Conversation,
                        generation: String, service: ChatService, store: ChatStore, api: ChatAPI, token: String,
-                       current: () throws -> Void, recordUse: () throws -> Void) async throws -> ChatJSON {
+                       current: () async throws -> Void, recordUse: () async throws -> Void) async throws -> ChatJSON {
         let openOnly = input["open_only"] == .bool(true)
         let peer = input["peer_account_id"]?.string?.lowercased()
         let addressedDM = input["dm_id"]?.string?.lowercased()
@@ -66,7 +66,7 @@ extension ChatSessionTools {
             record = prepared.record
             record.state = .unconfirmed; record.error = "mcp_retry_required"
             record.orderKey = "mcp-dm:\(record.commandId)"
-            try current()
+            try await current()
             record = try store.dmWrite { try store.outbox.insert($0, record, seq: record.seq) }
         }
         guard service.dmToolSending.insert(record.commandId).inserted else { throw Failure(code: "busy") }
@@ -77,14 +77,14 @@ extension ChatSessionTools {
                   latest.state != .dropped, latest.error != "dismissed" else { throw Failure(code: "dismissed") }
             return latest
         }
-        func refresh() throws {
-            try current()
+        func refresh() async throws {
+            try await current()
             record = try store.dmRead(liveRecord)
         }
         // Never save the copy held across a network wait. Read and mutate the
         // current row in one transaction so Delete remains authoritative.
-        func save(_ update: (inout ChatCommandRecord) -> Void = { _ in }) throws {
-            try current()
+        func save(_ update: (inout ChatCommandRecord) -> Void = { _ in }) async throws {
+            try await current()
             let bytes = try ChatCommandEnvelope(commandId: record.commandId, org: key.orgId, type: record.type, args: .object(args)).encoded()
             record = try store.dmWrite { db in
                 var latest = try liveRecord(db)
@@ -103,58 +103,58 @@ extension ChatSessionTools {
             if let error { fields["error"] = .string(error) }
             return .object(fields)
         }
-        try refresh()
+        try await refresh()
         if let peer {
             guard peer != key.accountId,
                   try store.dmRead({ try ChatOrgView.Member.read($0, account: peer).first }) != nil else { throw Failure(code: "not_found") }
         }
         do {
             if args["dm_id"] == nil, let peer {
-                try recordUse()
+                try await recordUse()
                 let bytes = try ChatCommandEnvelope(commandId: args["open_command_id"]!.string!, org: key.orgId, type: "dm.open",
                                                     args: .object(["peer_account_id": .string(peer)])).encoded()
-                try refresh()
+                try await refresh()
                 let response = try await api.postCommand(bytes, token: token)
-                try refresh()
+                try await refresh()
                 try ChatAPI.check(response)
                 let ack = try JSONDecoder().decode(ChatCommandAnswer.self, from: response.body)
                 guard let raw = ack.result["dm_id"]?.string, let dm = UUID(uuidString: raw) else { throw Failure(code: "not_found") }
                 args["dm_id"] = .string(dm.uuidString.lowercased())
-                try save()
+                try await save()
             }
             guard let dm = args["dm_id"]?.string else { throw Failure(code: "invalid_args") }
             let card = try await api.dm(key.orgId, id: dm, token: token)
-            try refresh()
+            try await refresh()
             guard card.dmId == dm else { throw Failure(code: "not_found") }
             if openOnly {
-                try save { $0.state = .sent; $0.error = nil }
+                try await save { $0.state = .sent; $0.error = nil }
                 return outcome("opened")
             }
             if record.state == .sent { return outcome("sent") }
             guard card.writable else { return outcome("unknown", error: "dm_read_only") }
-            try recordUse()
+            try await recordUse()
             var wire = args
             wire["_mcp"] = nil; wire["peer_account_id"] = nil; wire["open_command_id"] = nil
             let bytes = try ChatCommandEnvelope(commandId: record.commandId, org: key.orgId, type: "dm.message.post", args: .object(wire)).encoded()
-            try save { $0.attempts += 1 }
+            try await save { $0.attempts += 1 }
             let response = try await api.postCommand(bytes, token: token)
-            try refresh()
+            try await refresh()
             try ChatAPI.check(response)
             let ack = try JSONDecoder().decode(ChatCommandAnswer.self, from: response.body)
             guard ack.result["dm_id"]?.string == dm, ack.result["message_id"]?.string == message,
                   ack.result["author_session_name"] == args["author_session_name"] else { return outcome("unknown") }
-            try save { $0.state = .sent; $0.error = nil; $0.sentGeneration = generation }
+            try await save { $0.state = .sent; $0.error = nil; $0.sentGeneration = generation }
             return outcome("sent")
         } catch let error as Failure { throw error }
         catch let ChatAPIError.server(status, code, retry) {
-            try refresh()
+            try await refresh()
             if status == 403 || status == 404 { throw Failure(code: "not_found") }
             if status == 401 { throw Failure(code: "not_connected") }
             var result = outcome("unknown", error: code)
             if let retry, case .object(var fields) = result { fields["retry_after_seconds"] = .number(ceil(retry)); result = .object(fields) }
             return result
         } catch {
-            try refresh()
+            try await refresh()
             return outcome("unknown")
         }
     }

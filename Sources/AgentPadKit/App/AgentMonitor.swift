@@ -165,7 +165,7 @@ final class AgentMonitor {
                 directory: item.session.currentDirectory,
                 remoteHost: item.session.effectiveRemoteHost,
                 tag: item.workspace.tag,
-                conversationId: item.session.conversationId,
+                conversationId: item.session.conversationId ?? item.session.resumedConversationId,
                 backgroundWork: item.session.backgroundWork
             )
         }

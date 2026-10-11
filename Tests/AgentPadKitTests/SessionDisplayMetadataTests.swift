@@ -68,8 +68,7 @@ final class SessionDisplayMetadataTests: XCTestCase {
         let catalog = record(custom: "Transcript name", ai: "AI title", summary: "Summary", prompt: "Prompt")
         for name in ["csm_agent", "Claude Code", "Session in csm_agent", "  csm_agent \n"] {
             let expected = name.trimmingCharacters(in: .whitespacesAndNewlines)
-            XCTAssertEqual(resolve(catalog, nil, .init(manualTitle: name, customTitle: "Tab name")).title, expected)
-            XCTAssertEqual(resolve(catalog, nil, .init(customTitle: name)).title, expected)
+            XCTAssertEqual(resolve(catalog, nil, .init(explicitName: name)).title, expected)
             XCTAssertEqual(resolve(record(custom: name, ai: "AI title")).title, expected)
             XCTAssertEqual(resolve(record(ai: "AI title"), record(custom: name)).title, expected)
         }

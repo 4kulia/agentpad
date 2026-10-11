@@ -8,8 +8,8 @@ final class WorkspaceRailTests: XCTestCase {
         let store = makeTestStore(); defer { store.terminate() }
         let workspace = try XCTUnwrap(store.active), original = try XCTUnwrap(workspace.activeSession)
         store.renameWorkspace(workspace, to: "Cedar")
-        original.customTitle = "Deploy production"
-        let other = store.addTab(in: workspace); other.customTitle = "Logs"
+        original.renameForTesting("Deploy production")
+        let other = store.addTab(in: workspace); other.renameForTesting("Logs")
         let second = store.addWorkspace(); store.renameWorkspace(second, to: "Other")
         let matches = WorkspaceRailSearch.matches(store.workspaceRailEntries(), query: "  PRODUCTION  ")
         XCTAssertEqual(matches.map(\.id), [workspace.id])
@@ -84,7 +84,7 @@ final class WorkspaceRailTests: XCTestCase {
         let store = makeTestStore(); defer { store.terminate() }
         let parent = try XCTUnwrap(store.active)
         let child = store.addWorkspace(); child.worktreeParentId = parent.id
-        child.activeSession?.customTitle = "Subtask result"
+        child.activeSession?.renameForTesting("Subtask result")
         let other = store.addWorkspace()
         let entries = store.workspaceRailEntries()
         XCTAssertEqual(WorkspaceRailSearch.matches(entries, query: "", collapsedParents: [parent.id]).map(\.id), [parent.id, other.id])

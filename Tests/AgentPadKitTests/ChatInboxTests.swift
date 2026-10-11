@@ -769,8 +769,8 @@ extension ChatInboxTests {
         XCTAssertFalse(a.showInbox(another) === unread)
         XCTAssertTrue(unread.isChat); XCTAssertEqual(unread.title, "Unread"); XCTAssertEqual(mention.title, "Mentions")
         a.renameTab(unread, to: "not allowed")
-        XCTAssertNil(unread.customTitle)
-        unread.customTitle = "sensitive message or channel name"
+        XCTAssertNil(unread.explicitName)
+        unread.renameForTesting("sensitive message or channel name")
         a.flushPersistence()
         let data = try JSONEncoder().encode(XCTUnwrap(saved.saved))
         XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("sensitive"))
@@ -779,7 +779,7 @@ extension ChatInboxTests {
                                       engineFactory: { spawns += 1; return TestEngine() })
         let tabs = restored.workspaces.flatMap { $0.root.allPanes.flatMap(\.tabs) }
         let back = try XCTUnwrap(tabs.first { $0.id == unread.id })
-        XCTAssertEqual(back.inbox, ref); XCTAssertNil(back.customTitle)
+        XCTAssertEqual(back.inbox, ref); XCTAssertNil(back.explicitName)
         XCTAssertEqual((back.engine as? ChatInboxTabEngine)?.starts, 0)
         XCTAssertEqual(spawns, tabs.filter { !$0.isChat }.count)
         let copy = try XCTUnwrap(a.duplicateTab(unread, in: a.workspaces[0]))

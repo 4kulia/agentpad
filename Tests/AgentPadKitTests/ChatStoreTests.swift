@@ -75,7 +75,7 @@ final class ChatStoreTests: XCTestCase {
         }
         try journal.read { db in
             XCTAssertEqual(try String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"),
-                           (1...9).map { "release-\($0)" } + ["release-10-ux1", "release-11-notification-diagnostics"])
+                           (1...9).map { "release-\($0)" } + ["release-10-ux1", "release-11-notification-diagnostics", "release-12-publication-text-provenance"])
             for table in ["channel_authorities", "publication_surfaces", "automatic_request_blocks"] {
                 XCTAssertTrue(try db.tableExists(table), table)
             }

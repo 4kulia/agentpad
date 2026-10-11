@@ -118,14 +118,11 @@ final class ChannelConversationTests: XCTestCase {
         let session = ExternalAgentSession(pid: 100, sessionId: channel, kind: "interactive", cwd: root, name: "private",
             status: .idle, statusSince: nil, startedAt: nil, processStart: 42)
         monitor.snapshotProvider = { [session] }
-        var probed = false
-        monitor.processInfo = { _ in probed = true; return nil }
+        monitor.processInfo = { _ in XCTFail("Rejected conversations must not probe processes"); return nil }
         await monitor.refresh()
         XCTAssertTrue(monitor.sessions.isEmpty)
-        XCTAssertFalse(probed)
         let store = WorkspaceStore(persistence: InMemoryPersistence(), engineFactory: { TestEngine() }, optionsProvider: { _ in nil })
         guard case .failure(.resumeRefused) = await monitor.takeOver(session, into: store) else { return XCTFail("channel takeover admitted") }
-        XCTAssertFalse(probed)
     }
 
     func testResumeRequiresAnExistingFullIdEvenWithAWorkingDirectory() throws {
@@ -212,8 +209,7 @@ final class ChannelConversationTests: XCTestCase {
     func testMoveHereRejectsSearchAndUnknownIdBeforeProbingTheProcess() async {
         let monitor = ExternalSessionMonitor()
         monitor.conversationVisibility = { self.visibility() }
-        var probed = false
-        monitor.processInfo = { _ in probed = true; return nil }
+        monitor.processInfo = { _ in XCTFail("Rejected conversations must not probe processes"); return nil }
         let store = makeTestStore(claudeProjectsRoot: projects)
         for id in ["billing", String(channel.prefix(8)), UUID().uuidString] {
             let session = ExternalAgentSession(pid: 100, sessionId: id, kind: "interactive", cwd: root, name: "fixture",
@@ -222,7 +218,6 @@ final class ChannelConversationTests: XCTestCase {
                 XCTFail("unverified takeover admitted: \(id)"); continue
             }
         }
-        XCTAssertFalse(probed)
     }
 
     func testTranscriptErasureUsesHistoryLayoutBeyondItsCapAndRejectsTraversalAndSymlinkedProjects() throws {

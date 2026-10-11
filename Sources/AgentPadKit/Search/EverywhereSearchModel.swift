@@ -210,7 +210,7 @@ final class EverywhereSearchModel {
     func displayMetadata(for record: AgentSessionRecord) -> SessionDisplayMetadata {
         let binding = profiles.binding(agentID: record.agentId, conversationID: record.conversationId)?.record
         var live = liveSessions().first { $0.record.nameKey == record.nameKey }?.liveMetadata ?? .init()
-        live.manualTitle = names.values[record.nameKey]
+        live.explicitName = names.values[record.nameKey] ?? live.explicitName
         return SessionDisplayMetadata.resolve(catalog: catalog.record(for: record.nameKey) ?? record, binding: binding,
             live: live, folderName: (binding ?? record).cwd.lastPathComponent)
     }

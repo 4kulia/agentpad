@@ -28,6 +28,9 @@ final class AgentAnswerForward {
     let service: ChatService
     private(set) var connection: ChatConnection?
     var text: String { didSet { edited() } }
+    private var presentationAllowed = false
+    private var organizationTitle = "Organization"
+    private var sessionSignature: String?
     var organization = ""
     var channel = "" { didSet { edited() } }
     var thread = "" { didSet { edited() } }
@@ -43,7 +46,9 @@ final class AgentAnswerForward {
     var status: String?
     var problem: String?
     var active = true
+    @ObservationIgnored var revalidateSource: @MainActor () async throws -> Void = {}
     @ObservationIgnored var sourceIsCurrent: @MainActor () -> Bool
+    @ObservationIgnored var sourceCanRetry: @MainActor () -> Bool = { false }
     @ObservationIgnored private var channelRevision = 0
     @ObservationIgnored private var threadRevision = 0
     private(set) var attemptID: UUID?
@@ -86,19 +91,22 @@ final class AgentAnswerForward {
     var key: ChatOrgKey? {
         destination?.chatKey
     }
-    var online: Bool {
-        guard active, isOpen(), let key, let connection, let current = service.connection,
+    private var connectionCurrent: Bool {
+        guard active, isOpen(), service.state == .signedIn, let key, let connection, let current = service.connection,
               current.server == connection.server, current.accountId == connection.accountId,
-              current.orgKey == key, current.sessionId == connection.sessionId, service.isServerKnown(service, key),
-              ChatNotifications.allowed(service, key, channel: nil) else { return false }
+              current.orgKey == key, current.sessionId == connection.sessionId, service.isServerKnown(service, key) else { return false }
         return true
+    }
+    var online: Bool {
+        guard connectionCurrent, presentationAllowed, let key, let session = service.orgSessions[key] else { return false }
+        return !session.doubtNotWritten && !session.snapshotOwed
     }
     var organizations: [Destination] {
         guard online, let key else { return [] }
         // The server client currently connects one organization at a time.
         // Only that confirmed membership is eligible; cached organizations
         // must never become destinations after an account switch.
-        return [.init(id: key.orgId, title: (try? service.orgSessions[key]?.store?.orgName) ?? "Organization")]
+        return [.init(id: key.orgId, title: organizationTitle)]
     }
     var outgoingText: String { AgentAnswerText.forSending(text, maxBytes: ChatChannelModel.maxBytes) }
     // The answer is a local snapshot; copying it needs no destination connection.
@@ -109,7 +117,8 @@ final class AgentAnswerForward {
     }
     var canSendAsUser: Bool { canCompose }
     private var canUseSession: Bool {
-        caller != nil && sourceIsCurrent() && key.map { service.supports("chat.session_tools", key: $0) } == true
+        caller != nil && (sourceIsCurrent() || sourceCanRetry())
+            && key.map { service.supports("chat.session_tools", key: $0) } == true
     }
     private var canCompose: Bool {
         online && !sending && !loading && !submitted
@@ -129,10 +138,42 @@ final class AgentAnswerForward {
         if let author = attemptSessionAuthor {
             return author.field == "author_agent_id" ? (service.localAgent(author.value)?.name ?? author.value) : author.value
         }
-        guard online, let caller, let key, let store = service.orgSessions[key]?.store,
-              let generation = try? store.queue.read({ try String.fetchOne($0, sql: "SELECT generation FROM meta WHERE id = 1") }),
-              let author = try? service.sessionAuthor(key, caller: caller, generation: generation) else { return sourceTitle }
-        return author.field == "author_agent_id" ? (service.localAgent(author.value)?.name ?? caller.signature) : author.value
+        return online ? (sessionSignature ?? sourceTitle) : sourceTitle
+    }
+
+    /// SQL-backed labels and rights are presentation snapshots, never getter IO.
+    func refreshPresentation() async {
+        guard connectionCurrent, let key, let connection, let store = service.orgSessions[key]?.store else {
+            presentationAllowed = false; return
+        }
+        let journal = service.journal, caller = caller
+        do {
+            let snapshot = try await BackgroundInspection.run {
+                let info = try store.queue.read { db in
+                    (try String.fetchOne(db, sql: "SELECT org_name FROM meta WHERE id = 1"),
+                     try String.fetchOne(db, sql: "SELECT generation FROM meta WHERE id = 1"),
+                     try Bool.fetchOne(db, sql: "SELECT NOT rights_in_doubt AND rights_session = ? AND channels_served FROM meta WHERE id = 1",
+                                       arguments: [connection.sessionId]) ?? false)
+                }
+                let agents: [String]
+                if let journal, let caller, let generation = info.1 {
+                    agents = try journal.queue.read { db in
+                        try String.fetchAll(db, sql: """
+                            SELECT b.agent_id FROM publication_surfaces b JOIN assignments a
+                                ON a.server = b.server AND a.account_id = b.account_id AND a.org_id = b.org_id AND a.agent_id = b.agent_id
+                            WHERE b.server = ? AND b.account_id = ? AND b.org_id = ? AND b.surface_id = ? AND b.session_id = ? AND b.generation = ?
+                                AND a.state = 'active' AND a.published_session = b.session_id AND a.requested IS NULL
+                            """, arguments: [key.server.description, key.accountId, key.orgId, caller.surface, connection.sessionId, generation])
+                    }
+                } else { agents = [] }
+                return (info.0, info.2, agents)
+            }
+            guard connectionCurrent else { presentationAllowed = false; return }
+            organizationTitle = snapshot.0 ?? "Organization"
+            presentationAllowed = snapshot.1
+            let agents = snapshot.2.compactMap { service.localAgent($0) }.filter { $0.enabled && $0.isSession }
+            sessionSignature = agents.count == 1 ? agents[0].name : caller?.signature
+        } catch { presentationAllowed = false }
     }
 
     func loadInitialDestinations() async {
@@ -149,6 +190,7 @@ final class AgentAnswerForward {
             channels = []; threads = []; moreChannels = nil; moreThreads = nil
             if !preservingSelection { channel = ""; thread = "" }
         }
+        await refreshPresentation()
         guard online else { loadingChannels = false; return }
         loadingChannels = true; problem = nil
         defer { if channelRevision == ticket { loadingChannels = false } }
@@ -239,7 +281,9 @@ final class AgentAnswerForward {
         } else { destinationVersion = nil }
         return try await ChatSessionTools.call(.object(args), caller: caller, service: service,
             isCallerWaiting: { [weak self] in self?.active == true }, preparePost: preparePost) { [weak self] in
-                guard let self, self.online, self.sourceIsCurrent(), revision == nil || revision == self.editRevision else { throw AgentAnswerTranscript.Problem.changed }
+                guard let self else { throw AgentAnswerTranscript.Problem.changed }
+                try await self.revalidateSource()
+                guard self.online, self.sourceIsCurrent(), revision == nil || revision == self.editRevision else { throw AgentAnswerTranscript.Problem.changed }
                 if let destinationVersion {
                     guard let key = self.key, let store = self.service.orgSessions[key]?.store,
                           try self.destinationRevision(store, channel: self.channel, thread: self.thread) == destinationVersion else { throw AgentAnswerTranscript.Problem.changed }
@@ -292,6 +336,9 @@ final class AgentAnswerForward {
               destination == nil || current.orgKey == destination?.chatKey else { return }
         destination = destination ?? current.orgKey.map(OrgKey.init)
         connection = current; organization = destination?.orgID ?? ""
+        // An inactive source tab no longer polls. Explicit refresh must bypass
+        // its negative cache before destination discovery chooses an author.
+        if caller != nil { try? await revalidateSource() }
         await loadChannels(preservingSelection: attemptID != nil)
     }
     func sendAsUser() async {
@@ -366,6 +413,7 @@ final class AgentAnswerForward {
     }
 
     static func message(_ error: Error) -> String {
+        if let error = error as? BackgroundInspection.TimedOut { return error.localizedDescription }
         if let error = error as? AgentAnswerTranscript.Problem { return error.rawValue }
         if let error = error as? ChatSessionTools.Failure {
             switch error.code {

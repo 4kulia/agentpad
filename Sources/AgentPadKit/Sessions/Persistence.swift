@@ -292,7 +292,10 @@ struct PersistedTab: Codable, Equatable {
     var id: UUID
     var agentId: String
     var currentDirectoryPath: String
-    var customTitle: String?
+    /// The explicit name lives only in SessionNames. Legacy customTitle has
+    /// unknown provenance and is deliberately neither decoded nor migrated.
+    var explicitNameKey: SessionNameKey?
+    var lastDisplayTitle: SessionDisplayTitle?
     /// Optional — only Claude reports it today. Decoded with
     /// `decodeIfPresent` so state.json files written by pre-resume AgentPad
     /// versions still load.
@@ -311,7 +314,7 @@ struct PersistedTab: Codable, Equatable {
     var navigation: TabNavigation?
 
     private enum CodingKeys: String, CodingKey {
-        case id, agentId, currentDirectoryPath, customTitle, conversationId, launchOrigin, profileID, profileOriginalCwd, sshWorkspaceHost, channel, inbox, content, navigation
+        case id, agentId, currentDirectoryPath, explicitNameKey, lastDisplayTitle, conversationId, launchOrigin, profileID, profileOriginalCwd, sshWorkspaceHost, channel, inbox, content, navigation
     }
 
     init(from decoder: Decoder) throws {
@@ -327,7 +330,8 @@ struct PersistedTab: Codable, Equatable {
             }
             agentId = try c.decode(String.self, forKey: .agentId)
             currentDirectoryPath = try c.decode(String.self, forKey: .currentDirectoryPath)
-            customTitle = try c.decodeIfPresent(String.self, forKey: .customTitle)
+            explicitNameKey = try c.decodeIfPresent(SessionNameKey.self, forKey: .explicitNameKey)
+            lastDisplayTitle = try c.decodeIfPresent(SessionDisplayTitle.self, forKey: .lastDisplayTitle)
             conversationId = try c.decodeIfPresent(String.self, forKey: .conversationId)
             launchOrigin = try c.decodeIfPresent(AgentLaunchOrigin.self, forKey: .launchOrigin)
             profileID = try c.decodeIfPresent(UUID.self, forKey: .profileID)
@@ -349,7 +353,8 @@ struct PersistedTab: Codable, Equatable {
         self.agentId = session.agent.id
         self.currentDirectoryPath = session.currentDirectory.path
         // AgentPad: a channel tab keeps no title — its name is its card's (DESIGN-F2).
-        self.customTitle = session.hasProcess ? session.customTitle : nil
+        self.explicitNameKey = session.hasProcess ? session.explicitNameKey : nil
+        self.lastDisplayTitle = session.displayTitleSnapshot
         self.conversationId = session.conversationId
         self.launchOrigin = session.launchOrigin
         self.profileID = session.profileID
@@ -361,11 +366,11 @@ struct PersistedTab: Codable, Equatable {
         self.navigation = session.tabState?.navigation
     }
 
-    init(id: UUID, agentId: String, currentDirectoryPath: String, customTitle: String? = nil, conversationId: String? = nil) {
+    init(id: UUID, agentId: String, currentDirectoryPath: String, explicitNameKey: SessionNameKey? = nil, conversationId: String? = nil) {
         self.id = id
         self.agentId = agentId
         self.currentDirectoryPath = currentDirectoryPath
-        self.customTitle = customTitle
+        self.explicitNameKey = explicitNameKey
         self.conversationId = conversationId
     }
 }

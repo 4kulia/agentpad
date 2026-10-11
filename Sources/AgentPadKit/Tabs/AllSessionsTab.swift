@@ -338,7 +338,7 @@ struct AllSessionsTab: View {
         Button("Copy conversation ID") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(item.record.conversationId, forType: .string) }.disabled(!item.canRename)
         Divider()
         if let key = ChatService.shared.connection?.orgKey, ChatAttention.personalAllowed(key, .shared) {
-            TeamPublishMenu(sessionId: item.record.agentId == AgentTemplate.claudeCodeID ? item.record.conversationId : nil, title: item.title)
+            TeamPublishMenu(sessionId: item.record.agentId == AgentTemplate.claudeCodeID ? item.record.conversationId : nil, folder: item.record.cwd)
         } else { Button("Connect a team…") { ConnectionTabs.shared.show() } }
     }
     private func activate(_ item: AllSessionItem, split: Bool = false) {

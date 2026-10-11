@@ -78,7 +78,7 @@ final class AgentProfileSessionTests: XCTestCase {
         let path = try folder("project"), owner = store()
         let profile = try profiles.add(template: .codex, folder: path, name: "My agent")
         let session = try owner.startAgentProfile(profile.id).get()
-        XCTAssertNil(session.customTitle, "The agent name must not mask terminal session titles")
+        XCTAssertNil(session.explicitName, "The agent name must not mask terminal session titles")
         owner.applyConversationId(conversationId: conversation, sessionId: session.id)
         let binding = try XCTUnwrap(profiles.binding(agentID: "codex", conversationID: conversation))
         XCTAssertEqual(binding.record.title, "")

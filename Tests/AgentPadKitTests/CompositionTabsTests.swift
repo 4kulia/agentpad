@@ -214,6 +214,7 @@ import XCTest
         let session = try XCTUnwrap(host.allSessions.first { if case .forward = $0.toolRoute { true } else { false } })
         let state = try XCTUnwrap(session.tabState), model = try XCTUnwrap(tabs.forwardModel(state))
         model.text = "Keep this edited answer"; model.channels = [.init(id: channel, title: "billing")]; model.channel = channel
+        await model.refreshPresentation()
         let gate = Gate(), entered = expectation(description: "post preflight"); gate.close(); defer { gate.open() }
         ChatStubProtocol.reset { _, _ in
             entered.fulfill(); gate.pass()
@@ -226,6 +227,7 @@ import XCTest
         let restoredState = try XCTUnwrap(tabs.open(state.route, from: host)?.tabState)
         let restored = try XCTUnwrap(tabs.forwardModel(restoredState))
         restored.channels = [.init(id: channel, title: "billing")]
+        await restored.refreshPresentation()
         XCTAssertNil(restored.attemptID); XCTAssertEqual(restored.text, "Keep this edited answer")
         XCTAssertTrue(restored.canSend)
         gate.open(); await task.value
@@ -255,6 +257,10 @@ import XCTest
         let other = host()
         XCTAssertTrue(other.handleTabDrop(droppedId: source.id, in: try XCTUnwrap(other.active)))
         XCTAssertTrue(model.sourceIsCurrent(), "Moving a live source changes its owner, not its authority")
+        source.answerCheckProblem = .inspectionTimeout
+        XCTAssertFalse(model.sourceIsCurrent())
+        XCTAssertTrue(model.sourceCanRetry(), "A live Forward retains its explicit retry after a scan timeout")
+        source.answerCheckProblem = nil
         tabs.forward(session: source, store: other, inspector: processes.inspector, reader: { _, _, _ in "New last answer" })
         try await wait { self.hosts.flatMap(\.allSessions).filter { if case .forward = $0.toolRoute { true } else { false } }.count == 2 }
         XCTAssertEqual(model.snapshot, "Original snapshot"); XCTAssertEqual(model.text, "Saved Markdown edits")
@@ -269,6 +275,9 @@ import XCTest
         owner.store.closeTab(source, in: owner.workspace)
         XCTAssertFalse(restored.sourceIsCurrent())
         XCTAssertFalse(model.sourceIsCurrent())
+        source.answerCheckProblem = .inspectionTimeout
+        XCTAssertFalse(restored.sourceCanRetry(), "A timeout cannot authorize a closed source")
+        XCTAssertFalse(model.sourceCanRetry())
         XCTAssertTrue(try f.store.outbox.commands().isEmpty)
     }
 
@@ -283,6 +292,7 @@ import XCTest
             let state = try XCTUnwrap(host.allSessions.first { if case .forward = $0.toolRoute { true } else { false } }?.tabState)
             let model = try XCTUnwrap(tabs.forwardModel(state))
             model.channels = [.init(id: channel, title: "billing")]; model.channel = channel
+            await model.refreshPresentation()
             let gate = Gate(), entered = expectation(description: change); gate.close()
             ChatStubProtocol.reset { _, _ in
                 entered.fulfill(); gate.pass()

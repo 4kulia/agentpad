@@ -58,7 +58,7 @@ struct AgentSessionRecord: Identifiable, Hashable, Codable, Sendable {
     var hasScanProvenance: Bool { scannedAt != nil || fileURL != nil }
     func resolvedTitle(manual: String? = nil) -> String {
         SessionDisplayMetadata.resolve(catalog: self, binding: nil,
-            live: .init(manualTitle: manual), folderName: cwd.lastPathComponent).title
+            live: .init(explicitName: manual), folderName: cwd.lastPathComponent).title
     }
     func named(_ name: String?) -> Self { var copy = self; copy.title = resolvedTitle(manual: name); return copy }
     func scanned(at date: Date) -> Self { var copy = self; copy.scannedAt = date; return copy }

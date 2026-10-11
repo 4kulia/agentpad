@@ -1,5 +1,10 @@
 import Foundation
 
+struct SessionDisplayTitle: Codable, Equatable, Sendable {
+    var key: SessionNameKey
+    var title: String
+}
+
 /// Display-only reconciliation. No clock reads, I/O, or writes to the profile archive.
 struct SessionDisplayMetadata: Equatable, Sendable {
     var title: String
@@ -8,10 +13,9 @@ struct SessionDisplayMetadata: Equatable, Sendable {
     struct Live: Equatable, Sendable {
         var templateTitle: String? = nil
         /// Explicit name from SessionNames, also available for closed sessions.
-        var manualTitle: String? = nil
-        /// Explicit tab name from AgentPad Rename.
-        var customTitle: String? = nil
+        var explicitName: String? = nil
         var terminalTitle: String? = nil
+        var cachedTitle: String? = nil
         var hookStateAt: Date? = nil
         var startedAt: Date? = nil
     }
@@ -55,16 +59,42 @@ struct SessionDisplayMetadata: Equatable, Sendable {
         let activity = [catalog?.lastActivity,
                         binding.flatMap { $0.hasScanProvenance ? $0.lastActivity : nil },
                         live?.hookStateAt].compactMap { $0 }.filter { $0 > .distantPast }.max()
-        return Self(title: explicitTitle(live?.manualTitle) ?? explicitTitle(live?.customTitle)
-                        ?? custom ?? ai ?? summary ?? prompt ?? terminal ?? template,
+        return Self(title: explicitTitle(live?.explicitName)
+                        ?? custom ?? ai ?? summary ?? prompt ?? explicitTitle(live?.cachedTitle) ?? terminal ?? template,
                     lastActivity: activity ?? live?.startedAt ?? .distantPast)
     }
 }
 
 extension SessionDisplayMetadata.Live {
-    @MainActor init(session: Session, manualTitle: String? = nil) {
-        self.init(templateTitle: session.displayAgent.title, manualTitle: manualTitle,
-                  customTitle: session.customTitle, terminalTitle: session.terminalTitle,
+    @MainActor init(session: Session, explicitName: String? = nil) {
+        self.init(templateTitle: session.displayAgent.title, explicitName: explicitName ?? session.explicitName,
+                  terminalTitle: session.terminalTitle,
+                  cachedTitle: session.cachedDisplayTitle,
                   hookStateAt: session.hookStateAt, startedAt: session.catalogStartedAt)
+    }
+}
+
+extension SessionDisplayMetadata {
+    /// Window-owned references to the existing observable, in-memory stores.
+    /// Reading a title never scans transcripts or opens the names database.
+    @MainActor struct Sources {
+        var catalog: SessionCatalog = .shared
+        var profiles: AgentProfileStore = .shared
+        var names: SessionNames = .shared
+
+        func metadata(for session: Session, manualNames: [SessionNameKey: String]? = nil,
+                      includeExplicitName: Bool = true) -> SessionDisplayMetadata {
+            let key = session.displayTitleKey
+            let catalog = key.flatMap { self.catalog.record(for: $0) }
+            let binding = key.flatMap { profiles.binding(agentID: $0.agentID, conversationID: $0.conversationID)?.record }
+            let name = key.flatMap { (manualNames ?? names.values)[$0] }
+            var live = Live(session: session, explicitName: name)
+            // Persist the automatic title separately from explicit Rename so
+            // clearing a restored manual name reveals the last known title.
+            if !includeExplicitName { live.explicitName = nil }
+            return .resolve(catalog: catalog, binding: binding,
+                live: live,
+                folderName: (binding?.cwd ?? session.profileOriginalCwd ?? session.currentDirectory).lastPathComponent)
+        }
     }
 }

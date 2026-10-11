@@ -64,6 +64,23 @@ final class SessionNamesTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: notDirectory), Data("keep me".utf8))
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: directory.path).contains { $0.contains("broken") })
     }
+    func testQueuedRenamesKeepLatestValueAndExplicitClearAcrossRestore() async throws {
+        let names = SessionNames(url: url), key = SessionNameKey("claude-code", "conversation")
+        let a = names.beginRename("A", for: key)
+        let b = names.beginRename("B", for: key)
+        XCTAssertEqual(names.values[key], "B")
+        await names.load() // A load racing the queued writes cannot restore A.
+        try await a.value; try await b.value
+        XCTAssertEqual(names.values[key], "B")
+        try await names.rename("", for: key)
+        let restored = SessionNames(url: url); await restored.load()
+        XCTAssertTrue(restored.contains(key), "A clear must mask legacy per-tab names")
+        XCTAssertNil(restored.values[key])
+        let session = Session(engine: TestEngine(), currentDirectory: directory, agent: .claudeCode,
+            conversationId: key.conversationID)
+        session.displaySources = .init(names: restored)
+        XCTAssertNil(session.explicitName)
+    }
     func testTitlePrioritySentenceBoundaryAndUnicodeLimit() {
         let folder = URL(fileURLWithPath: "/work/project")
         XCTAssertEqual(SessionTitle.resolve(manual: "Manual", agentName: "Agent", firstPrompt: "Prompt. Rest", summary: "Summary", folder: folder), "Manual")

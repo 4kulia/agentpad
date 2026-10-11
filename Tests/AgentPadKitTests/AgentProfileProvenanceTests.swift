@@ -19,7 +19,7 @@ final class AgentProfileProvenanceTests: XCTestCase {
     }
     private func store(_ persistence: InMemoryPersistence = .init()) -> WorkspaceStore {
         let store = WorkspaceStore(persistence: persistence, initiallyEmpty: true, agentProfiles: profiles,
-            engineFactory: { TestEngine() }, optionsProvider: { _ in "--model original" }, resumeProvider: { false },
+            sessionNames: .testing, engineFactory: { TestEngine() }, optionsProvider: { _ in "--model original" }, resumeProvider: { false },
             peerStores: { [weak self] in self?.stores ?? [] })
         stores.append(store); return store
     }
@@ -145,7 +145,7 @@ final class AgentProfileProvenanceTests: XCTestCase {
         settings.customAgents = [CustomAgentData(id: "corp", baseAgentId: "codex", env: "API_URL=https://new.invalid")]
         let profile = try profiles.add(template: old, folder: root), conversation = UUID().uuidString
         let memory = InMemoryPersistence(initial: legacyState(agentID: old.id, profile: profile, conversation: conversation))
-        let owner = WorkspaceStore(persistence: memory, agentProfiles: profiles, engineFactory: { TestEngine() },
+        let owner = WorkspaceStore(persistence: memory, agentProfiles: profiles, sessionNames: .testing, engineFactory: { TestEngine() },
             optionsProvider: { _ in nil }, resumeProvider: { true })
         stores.append(owner)
         let tab = try XCTUnwrap(owner.active?.activeSession)
@@ -188,7 +188,7 @@ final class AgentProfileProvenanceTests: XCTestCase {
         let profile = try profiles.add(template: custom, folder: root, launchOptions: "--model profile-only")
         let conversation = UUID().uuidString
         let owner = WorkspaceStore(persistence: InMemoryPersistence(initial: legacyState(agentID: "codex", profile: profile, conversation: conversation)),
-            agentProfiles: profiles, engineFactory: { TestEngine() }, optionsProvider: { _ in nil }, resumeProvider: { true })
+            agentProfiles: profiles, sessionNames: .testing, engineFactory: { TestEngine() }, optionsProvider: { _ in nil }, resumeProvider: { true })
         stores.append(owner)
         let tab = try XCTUnwrap(owner.active?.activeSession)
         XCTAssertEqual(tab.agent.id, "codex")
@@ -229,7 +229,7 @@ final class AgentProfileProvenanceTests: XCTestCase {
             let memory = InMemoryPersistence(), owner = store(memory)
             let session = owner.addTab(in: owner.active!, template: template)
             session.currentDirectory = currentDirectory
-            session.customTitle = "Build shell"
+            session.renameForTesting("Build shell")
             XCTAssertTrue(owner.flushPersistence())
             owner.terminate()
             // Hiding a preset only removes it from the launcher, not saved tabs.
@@ -239,7 +239,7 @@ final class AgentProfileProvenanceTests: XCTestCase {
             let terminal = try XCTUnwrap(restored.active?.activeSession)
             XCTAssertEqual(terminal.id, session.id)
             XCTAssertEqual(terminal.agent, template)
-            XCTAssertEqual(terminal.customTitle, "Build shell")
+            XCTAssertEqual(terminal.explicitName, "Build shell")
             XCTAssertTrue(terminal.hasProcess)
             XCTAssertNil(terminal.toolRoute)
             XCTAssertNil(terminal.unavailableTab)

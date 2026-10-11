@@ -100,7 +100,7 @@ struct UnifiedSessionsView: View {
                     TeamPublishMenu(
                         sessionId: (entry.agent.id == AgentTemplate.claudeCodeID || entry.agent.baseAgentId == AgentTemplate.claudeCodeID)
                             ? entry.conversationId : nil,
-                        title: entry.tabTitle, surfaceId: entry.id
+                        folder: entry.directory, surfaceId: entry.id
                     )
                 }
         case .external(let session):
@@ -120,7 +120,7 @@ struct UnifiedSessionsView: View {
                 .contextMenu {
                     TeamPublishMenu(
                         sessionId: record.agentId == AgentTemplate.claudeCodeID ? record.conversationId : nil,
-                        title: record.title
+                        folder: record.cwd
                     )
                 }
         }
@@ -200,12 +200,9 @@ enum SessionListModel {
         var live = Set<String>()
         var result: [SessionListItem] = []
         let titles = Dictionary(history.map { ($0.nameKey, $0.title) }, uniquingKeysWith: { first, _ in first })
-        for original in own where visibility.allows(agentId: original.agent.rosterId, conversationId: original.conversationId) {
-            var entry = original
-            if let id = entry.conversationId {
-                let key = SessionNameKey(entry.agent.rosterId, id)
-                entry.tabTitle = names[key] ?? titles[key] ?? entry.tabTitle
-            }
+        // Live names already come from Session.title. A capped history window
+        // must not replace them (in particular, an explicit tab Rename).
+        for entry in own where visibility.allows(agentId: entry.agent.rosterId, conversationId: entry.conversationId) {
             if let id = entry.conversationId { live.insert(id) }
             result.append(SessionListItem(
                 id: "own:\(entry.id.uuidString)",

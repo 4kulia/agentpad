@@ -266,6 +266,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             }
         }
         ExternalSessionMonitor.shared.start()
+        // Titles are needed even when history/search panels have never opened.
+        // Populate the shared caches once, away from any view's render path.
+        SessionCatalog.shared.refresh()
+        Task { await SessionNames.shared.load() }
         let agentMenuBarController = AgentMenuBarController(
             monitor: .shared,
             settings: settings,
@@ -487,22 +491,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             if tabs.count == 1, let only = tabs.first {
                 // Single tab: click the workspace to jump straight to it,
                 // no submenu to drill through.
-                menu.addItem(dockTabItem(title: dockMenuTitle(for: workspace), sessionId: only.id))
+                menu.addItem(dockTabItem(title: DockTabMenuFiller.workspaceTitle(workspace, singleTab: only), sessionId: only.id))
             } else {
-                let item = NSMenuItem(title: dockMenuTitle(for: workspace), action: nil, keyEquivalent: "")
+                let item = NSMenuItem(title: DockTabMenuFiller.workspaceTitle(workspace), action: nil, keyEquivalent: "")
                 item.submenu = dockTabSubmenu(for: tabs)
                 menu.addItem(item)
             }
         }
         return menu
-    }
-
-    /// A worktree's branch disambiguates two workspaces sharing a folder name.
-    private func dockMenuTitle(for workspace: Workspace) -> String {
-        if let branch = workspace.worktreeBranch, !branch.isEmpty {
-            return "\(workspace.title) (\(branch))"
-        }
-        return workspace.title
     }
 
     /// One item per tab; used when a workspace has more than one. AgentPad:
@@ -1166,6 +1162,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         return false
     }
 
+    private var terminationProcesses: Task<Void, Never>?
+
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if terminationReplyPending { return .terminateLater }
         // Save every editor before stopping even the first process.
@@ -1182,12 +1180,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         for controller in windowControllers {
             controller.store.terminate()
         }
-        guard !SurfaceTeardownCoordinator.shared.isDrained else { return .terminateNow }
+        if SurfaceTeardownCoordinator.shared.isDrained, !TeamProcesses.shared.hasRegisteredRuns,
+           (ChatService.shared.launcher?.pendingLaunches ?? 0) == 0,
+           ChatService.shared.launcher?.live.isEmpty != false { return .terminateNow }
+        terminationProcesses = Task {
+            await ChatService.shared.stopper?.stopAllAtQuit()
+            _ = try? await BackgroundInspection.run { TeamProcesses.shared.killAll() }
+        }
 
         terminationReplyPending = true
         terminatingApplication = sender
         SurfaceTeardownCoordinator.shared.whenDrained { [weak self] in
-            self?.finishDeferredTermination()
+            Task { @MainActor [weak self] in
+                await self?.terminationProcesses?.value
+                self?.finishDeferredTermination()
+            }
         }
         terminationFallback = Task { @MainActor [weak self] in
             // Foreground shutdown now precedes native shell shutdown; each
@@ -1210,11 +1217,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     public func applicationWillTerminate(_ notification: Notification) {
         MainThreadWatchdog.shared.stop()
+        ChatService.shared.launcher?.close()
+        TeamProcesses.shared.closeRegistration()
         // AgentPad: a colleague's call running here must not outlive the app
         // that enforces its time limit and Stop button.
         // AgentPad: server-mode runs end with their outcome and fact in the journal (D11).
-        ChatService.shared.stopper?.stopAllAtQuit()
-        TeamProcesses.shared.killAll()
         TeamService.shared.calls.saveNow()
         // New sessions in a still-open terminal (tmux) must not get the
         // tools of an app that is gone.
@@ -1641,24 +1648,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                     return itemScope == scope && agents.contains(id)
                 case .tab(let id, let workspace, let window):
                     guard let tab = tabs[id], tab.owner == .init(window: window, workspace: workspace) else { return false }
-                    return tab.available && AttentionSidebarModel.shared.tabTitle(id) == item.title
+                    return tab.available
                 default: return true
                 }
             }.map(\.id))
         }
-        store.search.quickReadouts = { items in
-            let projection = AttentionSidebarModel.shared.projection
-            return items.map { original in
-                var item = original
-                switch item.kind {
-                case .tab(let id, _, _): item.attentionSummary = projection.tabIndicators[id]?.accessibleSummary
-                case .workspace(let id, let window): item.attentionSummary = projection.workspaceIndicators[.init(window: window, workspace: id)]?.accessibleSummary
-                default: break
-                }
-                if let summary = item.attentionSummary { item.subtitle += " · " + summary }
-                return item
-            }
-        }
+        store.search.quickReadouts = { PaletteIndex.readouts($0) }
         store.search.activateQuick = { [weak self] item in self?.activate(item) }
     }
 
@@ -2195,6 +2190,13 @@ final class DockTabMenuFiller: NSObject, NSMenuDelegate {
         self.item = item
     }
 
+    static func workspaceTitle(_ workspace: Workspace, singleTab: Session? = nil) -> String {
+        if let tab = singleTab, tab.hasProcess, !tab.displayAgent.isShell { return tab.title }
+        // Group headers and non-agent workspaces keep their existing names.
+        if let branch = workspace.worktreeBranch, !branch.isEmpty { return "\(workspace.title) (\(branch))" }
+        return workspace.title
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         for session in sessions.compactMap({ $0() }) {
@@ -2329,7 +2331,7 @@ extension AppDelegate {
             try await AgentPadFirstLaunchSelfCheck.until("the first terminal foreground process") { terminal.engine.foregroundPid != nil }
             terminal.engine.sendInput("/usr/bin/vi -u NONE -i NONE \(directory.path)/scratch.txt\r")
             try await AgentPadFirstLaunchSelfCheck.until("the editor to require quit confirmation") {
-                guard let pid = terminal.engine.foregroundPid, let info = ProcessInfoReader.info(of: pid) else { return false }
+                guard let pid = terminal.engine.foregroundPid, let info = try? await BackgroundInspection.run({ ProcessInfoReader.info(of: pid) }) else { return false }
                 return ["vi", "vim"].contains(info.name) && terminal.engine.needsConfirmQuit
             }
             events.append("surface")
@@ -2340,7 +2342,7 @@ extension AppDelegate {
                 controller.window?.isKeyWindow == true && terminal.engine.view.window === controller.window
             }
             let close = ConfirmCloseTab.request(terminal, in: workspace, store: store)
-            try require(close == .presenting, "first terminal close: \(close), pid \(pid), process \(String(describing: ProcessInfoReader.info(of: pid))), host \(terminal.engine.view.window != nil), phase \(terminal.terminalConfirmation.phase)")
+            try require(close == .presenting, "first terminal close: \(close), pid \(pid), process \(String(describing: terminal.engine.foregroundPid)), host \(terminal.engine.view.window != nil), phase \(terminal.terminalConfirmation.phase)")
             try await AgentPadFirstLaunchSelfCheck.until("inline close confirmation to become visible") { terminal.terminalConfirmation.isVisible }
             terminal.terminalConfirmation.cancel()
             try require(store.allSessions.contains { $0 === terminal }, "Cancel closed the first terminal")

@@ -25,18 +25,22 @@ enum WorkspaceRailSearch {
         var entry: WorkspaceRailEntry
         var workspaceMatches: Bool
         var tabs: [WorkspaceRailEntry.Tab]
+        var tabsExpanded: Bool
         var id: UUID { entry.id }
     }
 
-    static func matches(_ entries: [WorkspaceRailEntry], query: String, collapsedParents: Set<UUID> = []) -> [Match] {
+    static func matches(_ entries: [WorkspaceRailEntry], query: String, collapsedParents: Set<UUID> = [],
+                        collapsedWorkspaceIDs: Set<UUID> = []) -> [Match] {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         return entries.compactMap { entry in
             if query.isEmpty, let parent = entry.parentID, collapsedParents.contains(parent) { return nil }
             let workspaceMatches = query.isEmpty || entry.title.localizedStandardContains(query)
             let tabs = entry.tabs.filter { query.isEmpty || $0.title.localizedStandardContains(query) }
             guard workspaceMatches || !tabs.isEmpty else { return nil }
+            let matchingTabs = workspaceMatches ? entry.tabs : tabs
+            let expanded = !collapsedWorkspaceIDs.contains(entry.id) || (!query.isEmpty && !matchingTabs.isEmpty)
             return Match(entry: entry, workspaceMatches: workspaceMatches,
-                         tabs: workspaceMatches ? entry.tabs : tabs)
+                         tabs: expanded ? matchingTabs : [], tabsExpanded: expanded)
         }
     }
 

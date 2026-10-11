@@ -13,7 +13,7 @@ final class WorkspaceTabTransferTests: XCTestCase {
 
     func testSplittingAnAgentAllocatesNoEngineAndCanSplitAnEmptyPane() throws {
         var engines: [TestEngine] = []
-        let store = WorkspaceStore(persistence: InMemoryPersistence(), engineFactory: {
+        let store = WorkspaceStore(persistence: InMemoryPersistence(), sessionNames: .testing, engineFactory: {
             let engine = TestEngine(); engines.append(engine); return engine
         }, optionsProvider: { _ in nil })
         defer { store.terminate() }
@@ -38,7 +38,7 @@ final class WorkspaceTabTransferTests: XCTestCase {
         let session = try XCTUnwrap(source.activeSession)
         let terminal = engine(session)
         let view = terminal.view
-        session.customTitle = "Review"
+        session.renameForTesting("Review")
         session.activityState = .running
         session.conversationId = UUID().uuidString
         session.lastCommandText = "swift test"
@@ -54,7 +54,7 @@ final class WorkspaceTabTransferTests: XCTestCase {
         XCTAssertEqual(terminal.terminateCount, 0)
         XCTAssertEqual(session.activityState, .running)
         XCTAssertEqual(session.lastCommandText, "swift test")
-        XCTAssertEqual(session.customTitle, "Review")
+        XCTAssertEqual(session.explicitName, "Review")
         XCTAssertTrue(sourcePane.tabs.isEmpty)
         XCTAssertNil(sourcePane.activeTabId)
         XCTAssertTrue(store.workspaces.contains { $0 === source })
@@ -75,7 +75,7 @@ final class WorkspaceTabTransferTests: XCTestCase {
         defer { store.terminate() }
         let source = try XCTUnwrap(store.active)
         let session = try XCTUnwrap(source.activeSession)
-        session.customTitle = "Build logs"
+        session.renameForTesting("Build logs")
         let terminal = engine(session)
         let created = try XCTUnwrap(store.moveTabToNewWorkspace(session.id))
         XCTAssertEqual(created.title, "Build logs")

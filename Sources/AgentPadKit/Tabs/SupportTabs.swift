@@ -191,7 +191,7 @@ final class SupportTabs {
         let template = AgentTemplate(id: "agentpad-settings-editor", title: "settings.json", symbol: "doc.text", iconAsset: nil,
             tintHex: nil, initialCommand: "${EDITOR:-vi} \(AgentPadShellIntegration.quote(AgentPadSettings.url.path))")
         let session = location.store.addTab(in: location.workspace, pane: location.pane, template: template)
-        session.customTitle = "settings.json"
+        session.applyTerminalTitle("settings.json")
     }
 }
 

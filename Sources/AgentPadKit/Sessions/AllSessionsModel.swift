@@ -59,7 +59,7 @@ enum AllSessionsList {
         func resolved(_ item: AllSessionItem, catalog: AgentSessionRecord?, binding: AgentSessionRecord?) -> AllSessionItem {
             var item = item
             var live = item.liveMetadata ?? .init()
-            live.manualTitle = names[item.record.nameKey]
+            live.explicitName = names[item.record.nameKey] ?? live.explicitName
             let metadata = SessionDisplayMetadata.resolve(catalog: catalog, binding: binding, live: live,
                 folderName: (binding ?? catalog ?? item.record).cwd.lastPathComponent)
             item.record = catalog ?? binding ?? item.record

@@ -130,6 +130,9 @@ final class AgentPadCLIController {
     /// presets. One roster serves both the lookup and the error hint, so
     /// the ids an error lists are exactly the ids the lookup accepts.
     private let templates: @MainActor () -> [AgentTemplate]
+    var displayTitleAccess: @MainActor (AgentPadCallerOrigin, [Session]) async -> Bool = {
+        await CLIListAccess.allowsDisplayTitles($0, sessions: $1)
+    }
     private let resume: @MainActor (
         _ agentId: String,
         _ conversationId: String,
@@ -195,13 +198,19 @@ final class AgentPadCLIController {
         case .status:
             completion(ok())
         case .list:
-            completion(ok(windows: listWindows()))
+            Task {
+                let before = windows().flatMap { $0.store.allSessions }
+                let personal = await displayTitleAccess(origin, before)
+                guard isCallerWaiting() else { return }
+                let sameTabs = before.map(\.id) == windows().flatMap { $0.store.allSessions.map(\.id) }
+                completion(ok(windows: listWindows(personal: personal && sameTabs)))
+            }
         case .focus:
             completion(handleFocus(request))
         case .close:
             Task { completion(await handleClose(request, isCallerWaiting: isCallerWaiting)) }
         case .rename:
-            completion(handleRename(request))
+            Task { completion(await handleRename(request)) }
         case .open:
             handleOpen(request, isCallerWaiting: isCallerWaiting, completion: completion)
         case .resume:
@@ -272,7 +281,7 @@ final class AgentPadCLIController {
     /// non-empty at the parser; the guard here keeps a direct caller's
     /// blank title from CLEARING the tab's name (renameTab's blank = clear
     /// is the popover's affordance, not this verb's).
-    private func handleRename(_ request: AgentPadCLIRequest) -> AgentPadCLIResponse {
+    private func handleRename(_ request: AgentPadCLIRequest) async -> AgentPadCLIResponse {
         guard let id = sessionUUID(request) else {
             return refuse("rename needs --tab <session-uuid>")
         }
@@ -284,7 +293,8 @@ final class AgentPadCLIController {
         }
         // AgentPad: DESIGN-F2.
         guard hit.session.hasProcess else { return refuse("a chat tab takes its destination’s name") }
-        hit.context.store.renameTab(hit.session, to: title)
+        do { try await hit.context.store.renameTab(hit.session, to: title)?.value }
+        catch { return refuse("Session name could not be saved: \(error.localizedDescription)") }
         return ok(note: "renamed")
     }
 
@@ -486,10 +496,10 @@ final class AgentPadCLIController {
                 template: template,
                 initialCwd: cwd,
                 rawLaunchCommand: command,
-                customTitle: title,
                 activate: !noFocus,
                 spawnInBackground: noFocus
             )
+            if let title { match.context.store.renameTab(session, to: title) }
             landed = (match.context, match.workspace, session)
         } else {
             let host: WindowContext
@@ -525,10 +535,10 @@ final class AgentPadCLIController {
                 cwd: cwd,
                 cwdIsConfirmed: true,
                 rawLaunchCommand: command,
-                customTitle: title,
                 activate: !noFocus,
                 spawnInBackground: noFocus
             )
+            if let title { host.store.renameTab(spawned.session, to: title) }
             // A whole WINDOW built for this call arrives with a seed tab of
             // its own, which `localSpawn` lands beside rather than replaces
             // (it reuses that window's workspace instead of making one).
@@ -671,7 +681,7 @@ final class AgentPadCLIController {
         return nil
     }
 
-    private func listWindows() -> [AgentPadCLIWindowInfo] {
+    private func listWindows(personal: Bool) -> [AgentPadCLIWindowInfo] {
         windows().enumerated().map { index, context in
             let store = context.store
             return AgentPadCLIWindowInfo(
@@ -702,7 +712,7 @@ final class AgentPadCLIController {
                                 }
                                 return AgentPadCLITabInfo(
                                     id: tab.id.uuidString,
-                                    title: tab.title,
+                                    title: personal || !tab.hasProcess ? tab.title : tab.publicName,
                                     cwd: tab.currentDirectory.path,
                                     isActive: pane.activeTabId == tab.id,
                                     agent: tab.displayAgent.isShell ? "terminal" : tab.displayAgent.id,

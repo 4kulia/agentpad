@@ -435,6 +435,10 @@ final class ChatUX1Tests: XCTestCase {
             var socketWaiting: (@MainActor () -> Bool)?
             var completed = 0
             hook.onCLIRequest = { request, _, waiting, completion in
+                if request.teamAction == AgentPadCLITeamAction.verifyCaller.rawValue {
+                    completion(AgentPadCLIResponse(ok: true))
+                    return
+                }
                 socketWaiting = waiting
                 Task {
                     do {
@@ -790,7 +794,7 @@ final class ChatUX1Tests: XCTestCase {
             .init(pid: 10, ppid: 1, name: "zsh", isForeground: false, startedAtUs: 100),
             .init(pid: 11, ppid: 10, name: "claude", isForeground: true, startedAtUs: 110),
             .init(pid: 12, ppid: 11, name: "agentpad-cli", isForeground: true, startedAtUs: 120)]
-        let tab = ChatSessionIdentity.Tab(id: surface, customTitle: "Mine", folderName: "project", processes: rows)
+        let tab = ChatSessionIdentity.Tab(id: surface, explicitName: "Mine", folderName: "project", processes: rows)
         XCTAssertEqual(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [tab], identity: { _, _ in true }, signatureVerifier: { $0 == 11 })?.surface, surface.uuidString.lowercased())
         XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 121, tabs: [tab], identity: { _, _ in true }, signatureVerifier: { $0 == 11 }), "reused PID")
         XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [tab], identity: { _, _ in false }, signatureVerifier: { $0 == 11 }), "ended process")
@@ -799,11 +803,11 @@ final class ChatUX1Tests: XCTestCase {
         XCTAssertNil(ChatSessionIdentity.resolve(pid: 12, startedAt: 120, tabs: [noClaude], identity: { _, _ in true }, signatureVerifier: { $0 == 11 }), "a stale hook UUID cannot prove Claude")
     }
 
-    func testSignatureUsesOnlyManualTitleFolderAndSafeShortFallback() {
+    func testSignatureNormalizesExplicitNameThenFolderAndUsesSafeShortFallback() {
         let id = UUID()
-        var tab = ChatSessionIdentity.Tab(id: id, customTitle: "\u{202E}  My\nTab\u{0000}", folderName: "folder", processes: [])
+        var tab = ChatSessionIdentity.Tab(id: id, explicitName: "\u{202E}  My\nTab\u{0000}", folderName: "project", processes: [])
         XCTAssertEqual(ChatSessionIdentity.name(tab), "MyTab")
-        tab.customTitle = nil; XCTAssertEqual(ChatSessionIdentity.name(tab), "folder")
+        tab.explicitName = ""; XCTAssertEqual(ChatSessionIdentity.name(tab), "project")
         tab.folderName = ""; XCTAssertTrue(ChatSessionIdentity.name(tab).hasPrefix("Claude Code "))
         XCTAssertEqual(ChatSessionIdentity.normalized(String(repeating: "a", count: 200)).count, 120)
         XCTAssertEqual(ChatSessionIdentity.normalized(String(repeating: "e\u{301}", count: 120)).unicodeScalars.count, 120)
@@ -1168,7 +1172,7 @@ final class ChatUX1Tests: XCTestCase {
     func testForgedHookUUIDFromGenuineTabCannotChoosePublishedAuthor() async throws {
         let f = try await fixture(), workspace = makeTestStore(claudeProjectsRoot: f.service.claudeProjectsRoot)
         let tab = try XCTUnwrap(workspace.active?.activeSession)
-        tab.customTitle = "Tab B"
+        tab.renameForTesting("Tab B")
         f.agent.sessionId = UUID().uuidString.lowercased()
         let publishedSurface = UUID()
         try f.service.bindPublication(f.key, agent: CallJSON.agent, surface: publishedSurface)

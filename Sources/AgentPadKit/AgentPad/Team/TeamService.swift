@@ -60,7 +60,7 @@ final class TeamService {
 
     /// The move to a server is not possible while a run of this app is not
     /// confirmed gone, or a call still runs.
-    var canMoveToServer: Bool { !calls.hasRunningCalls && TeamProcesses.shared.runs().isEmpty }
+    var canMoveToServer: Bool { !calls.hasRunningCalls && !TeamProcesses.shared.hasRegisteredRuns }
 
     func enterServerMode() {
         mode = .server

@@ -69,37 +69,28 @@ final class ExternalSessionMonitor {
     func refresh() async {
         let raw = await snapshotProvider()
         let visibility = conversationVisibility()
-        titleCache = titleCache.filter { visibility.allows(conversationId: $0.key) }
-        let ownPid = getpid()
-        var result: [ExternalAgentSession] = []
-        var own: [ExternalAgentSession] = []
-        for var session in raw {
-            guard visibility.allows(conversationId: session.sessionId) else { continue }
-            // Session files outlive crashed processes; only keep the ones whose
-            // PID still is that session's claude.
-            guard let info = processInfo(session.pid),
-                  ProcessInfoReader.matchesClaudeSession(info, startedAt: session.startedAt)
-            else { continue }
-            // Sessions in our own tabs are already listed by AgentMonitor.
-            if ProcessInfoReader.ancestors(of: session.pid).contains(ownPid) {
-                own.append(session)
-                continue
+        let ownPid = getpid(), previousSessions = sessions, lookup = processInfo
+        let cachedIDs = Array(titleCache.keys)
+        guard let scanned = try? await BackgroundInspection.run({
+            var result: [ExternalAgentSession] = [], own: [ExternalAgentSession] = []
+            for var session in raw {
+                guard visibility.allows(conversationId: session.sessionId), let info = lookup(session.pid),
+                      ProcessInfoReader.matchesClaudeSession(info, startedAt: session.startedAt) else { continue }
+                if ProcessInfoReader.ancestors(of: session.pid).contains(ownPid) { own.append(session); continue }
+                session.tty = info.tty; session.processStart = info.startTime
+                result.append(session)
             }
-            session.tty = info.tty
-            session.processStart = info.startTime
-            session.title = cachedTitle(for: session.sessionId)
-            result.append(session)
-        }
-        // A session file is rewritten in place, so one poll can catch it
-        // half-written and drop it. Keep the last good row while its exact
-        // process is still alive, instead of flickering (and re-notifying).
-        let seen = Set(result.map(\.id))
-        for previous in sessions where !seen.contains(previous.id) && visibility.allows(conversationId: previous.sessionId) {
-            if let start = previous.processStart, processInfo(previous.pid)?.startTime == start,
-               !raw.contains(where: { $0.pid == previous.pid }) {
-                result.append(previous)
+            let seen = Set(result.map(\.id))
+            for previous in previousSessions where !seen.contains(previous.id) && visibility.allows(conversationId: previous.sessionId) {
+                if let start = previous.processStart, lookup(previous.pid)?.startTime == start,
+                   !raw.contains(where: { $0.pid == previous.pid }) { result.append(previous) }
             }
-        }
+            return (result, own, Set(cachedIDs.filter { visibility.allows(conversationId: $0) }))
+        }) else { return }
+        guard !Task.isCancelled else { return }
+        titleCache = titleCache.filter { scanned.2.contains($0.key) }
+        var result = scanned.0.map { item in var item = item; item.title = cachedTitle(for: item.sessionId); return item }
+        let own = scanned.1
         let ended = sessions.filter { old in !result.contains { $0.id == old.id } }
         result.sort(by: Self.order)
         if result != sessions { sessions = result }
@@ -120,7 +111,7 @@ final class ExternalSessionMonitor {
     }
 
     /// Injectable for tests: process lookup by PID.
-    var processInfo: (pid_t) -> ProcessInfoReader.Info? = { ProcessInfoReader.info(of: $0) }
+    var processInfo: @Sendable (pid_t) -> ProcessInfoReader.Info? = { ProcessInfoReader.info(of: $0) }
 
     private func cachedTitle(for sessionId: String) -> String? {
         titleCache[sessionId]?.parts.best
@@ -227,8 +218,8 @@ final class ExternalSessionMonitor {
         }).value else {
             return .failure(.noTranscript)
         }
-        // The last await. From the fresh status check to the signal below
-        // everything is synchronous, so the user can't slip a prompt in between.
+        // Read fresh status, then verify the listed process instance off-main
+        // before signalling it. Neither inspection may stall the UI.
         let snapshot = await snapshotProvider()
         if let refusal = WorkspaceStore.resumeRefusal(
             agentId: AgentTemplate.claudeCodeID, conversationId: session.sessionId,
@@ -243,7 +234,8 @@ final class ExternalSessionMonitor {
         guard fresh.status == .idle else { return .failure(.notIdle) }
         // Same process instance as the one we listed, checked right before
         // the signal so a recycled PID is never hit.
-        guard let info = processInfo(session.pid),
+        let lookup = processInfo
+        guard let info = try? await BackgroundInspection.run({ lookup(session.pid) }),
               info.startTime == expectedStart,
               ProcessInfoReader.matchesClaudeSession(info, startedAt: session.startedAt)
         else {
@@ -275,13 +267,13 @@ final class ExternalSessionMonitor {
     /// True once that process INSTANCE is gone — a new process reusing the
     /// PID counts as gone.
     static func waitForExit(_ pid: pid_t, startTime: TimeInterval, timeout: Duration) async -> Bool {
-        func gone() -> Bool { ProcessInfoReader.info(of: pid)?.startTime != startTime }
+        func gone() async -> Bool { (try? await BackgroundInspection.run { ProcessInfoReader.info(of: pid)?.startTime != startTime }) == true }
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         while clock.now < deadline {
-            if gone() { return true }
+            if await gone() { return true }
             try? await Task.sleep(for: .milliseconds(200))
         }
-        return gone()
+        return await gone()
     }
 }

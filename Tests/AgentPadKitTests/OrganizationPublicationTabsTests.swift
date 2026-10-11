@@ -54,7 +54,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         teamScope.close(); teamScope = nil
     }
     private func store() -> WorkspaceStore {
-        let store = WorkspaceStore(persistence: InMemoryPersistence(), drafts: drafts,
+        let store = WorkspaceStore(persistence: InMemoryPersistence(), sessionNames: .testing, drafts: drafts,
             engineFactory: { TestEngine() }, optionsProvider: { _ in nil }, peerStores: { [weak self] in self?.stores ?? [] })
         stores.append(store); router.ensureHost = { [weak store] in store }
         return store
@@ -105,7 +105,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         let state = try XCTUnwrap(first.tabState)
         tabs.form(state).fields.budgetText = "invalid budget"
         XCTAssertTrue(tabs.showPublication(editing, from: b) === first)
-        XCTAssertTrue(tabs.publish(sessionID: conversation, title: "New title", surfaceID: UUID(), from: b) === first)
+        XCTAssertTrue(tabs.publish(sessionID: conversation, folder: root, surfaceID: UUID(), from: b) === first)
         XCTAssertTrue(b.handleTabDrop(droppedId: first.id, in: try XCTUnwrap(b.active)))
         XCTAssertTrue(router.owner(of: first.id)?.store === b)
         XCTAssertEqual(tabs.form(state).fields.budgetText, "invalid budget")
@@ -113,9 +113,120 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         XCTAssertEqual(stores.flatMap(\.allSessions).filter { $0.toolRoute == first.toolRoute }.count, 1)
     }
 
+    func testResumedPrivateTitlesNeverSeedNewPublications() async throws {
+        for allSessions in [false, true] {
+            for metadata in ClosedSessionNameFixture.privateMetadata {
+                let closed = try ClosedSessionNameFixture(root: root.appendingPathComponent(UUID().uuidString), metadata: metadata)
+                stores.append(closed.store)
+                let source = try await closed.resume(allSessions: allSessions)
+                XCTAssertTrue(source.displayTitle.contains("PRIVATE-TITLE-MARKER"))
+                let state = try XCTUnwrap(tabs.publish(sessionID: closed.record.conversationId,
+                    folder: closed.record.cwd, surfaceID: source.id, from: closed.store)?.tabState)
+                let form = tabs.form(state)
+                XCTAssertEqual(form.fields.name, "project")
+                XCTAssertEqual(form.fields.description, "project")
+                XCTAssertEqual(form.fields.sessionTitle, "project")
+                service.calls.sessionFilesRoot = closed.store.claudeProjectsRoot
+                await tabs.loadSource(state)
+                XCTAssertFalse(String(decoding: try JSONEncoder().encode(tabs.batch(form.fields)), as: UTF8.self)
+                    .contains("PRIVATE-TITLE-MARKER"))
+                let publicName = "public-" + String(closed.record.conversationId.prefix(8))
+                form.fields.name = publicName
+                try await save(state)
+                XCTAssertNil(source.explicitName, "Publication input does not Rename the source session")
+                XCTAssertEqual(service.calls.agents.first { $0.sessionId == closed.record.conversationId }?.name, publicName)
+            }
+        }
+    }
+
+    func testRenameDoesNotRefreshOpenSavedOrRestoredPublicationText() async throws {
+        let closed = try ClosedSessionNameFixture(root: root.appendingPathComponent("rename"),
+            metadata: ClosedSessionNameFixture.privateMetadata[2])
+        stores.append(closed.store)
+        let source = try await closed.resume(allSessions: true)
+        try await closed.names.rename("public-a", for: closed.record.nameKey)
+        service.calls.sessionFilesRoot = closed.store.claudeProjectsRoot
+        let state = try XCTUnwrap(tabs.publish(sessionID: closed.record.conversationId,
+            folder: closed.record.cwd, surfaceID: source.id, from: closed.store)?.tabState)
+        await tabs.loadSource(state)
+        let initial = tabs.form(state).fields
+        XCTAssertEqual(initial.name, "public-a")
+        XCTAssertEqual(initial.description, "public-a")
+        try await closed.store.renameTab(source, to: "")?.value
+        XCTAssertEqual(tabs.form(state).fields, initial)
+        try await save(state)
+        let saved = try XCTUnwrap(service.calls.agents.first)
+        try await closed.store.renameTab(source, to: "Refactor auth")?.value
+        XCTAssertEqual(service.calls.agents.first, saved)
+        XCTAssertEqual(tabs.form(state).fields.name, "public-a")
+        XCTAssertEqual(tabs.form(state).fields.description, "public-a")
+        state.publicationForm = nil
+        XCTAssertEqual(tabs.form(state).fields.name, "public-a")
+        XCTAssertEqual(tabs.form(state).fields.description, "public-a")
+
+        var draft = initial
+        draft.name = "review"
+        draft.description = "PRIVATE-TITLE-MARKER " + String(repeating: "confirmed details ", count: 8)
+        let restored = TabState(route: state.route)
+        restored.edit(.publicationForm(try JSONDecoder().decode(PublicationDraft.self, from: JSONEncoder().encode(draft))))
+        XCTAssertEqual(tabs.form(restored).fields, draft, "Saved drafts are restored verbatim, without title heuristics")
+    }
+
+    func testLegacyPublicationPrefixAndDescriptionArePreserved() async throws {
+        let closed = try ClosedSessionNameFixture(root: root.appendingPathComponent("legacy"),
+            metadata: #"{"type":"custom-title","customTitle":"review logs"}"#)
+        stores.append(closed.store)
+        _ = try await closed.resume(allSessions: true)
+        let agent = TeamPublishedAgent(name: "review", description: "review logs", folder: closed.record.cwd.path)
+        try await service.calls.save(agent)
+        let state = try XCTUnwrap(tabs.showPublication(.init(agent: agent, key: nil), from: closed.store)?.tabState)
+        let form = tabs.form(state)
+        XCTAssertEqual(form.fields.name, "review")
+        XCTAssertEqual(form.fields.description, "review logs")
+        try await save(state)
+        XCTAssertEqual(service.calls.agents.first?.name, "review")
+        XCTAssertEqual(service.calls.agents.first?.description, "review logs")
+    }
+
+    func testFolderPublicationRemainsEditableAfterSourceConversationIsDeleted() async throws {
+        let a = store(), id = try conversation()
+        let state = try XCTUnwrap(tabs.publish(sessionID: id, folder: root, from: a)?.tabState)
+        await tabs.loadSource(state)
+        let form = tabs.form(state)
+        form.fields.mode = .folder
+        form.fields.folderName = "folder-agent"
+        // A folder agent does not need the source even while saving its draft.
+        let transcript = try XCTUnwrap(TeamSessionFiles.file(for: id, root: service.calls.sessionFilesRoot))
+        try FileManager.default.removeItem(at: transcript)
+        try await save(state)
+        let saved = try XCTUnwrap(service.calls.agents.first)
+        XCTAssertNil(saved.sessionId)
+        state.publicationForm = nil
+        let editing = tabs.form(state)
+        XCTAssertNil(editing.fields.sourceConversationID)
+        // A draft saved by the earlier implementation may still carry this ID.
+        editing.fields.sourceConversationID = id
+        await tabs.loadSource(state)
+        XCTAssertNil(editing.error)
+        editing.fields.description = "Updated after the source was deleted"
+        editing.fields.access = .editFiles
+        try await save(state)
+        XCTAssertEqual(service.calls.agents.first?.description, editing.fields.description)
+        XCTAssertEqual(service.calls.agents.first?.access, .editFiles)
+        XCTAssertEqual(service.calls.agents.first?.id, saved.id)
+    }
+
+    func testNewPublicationUsesShortIDWhenNameAndFolderAreUnknown() throws {
+        let id = UUID().uuidString.lowercased()
+        let state = try XCTUnwrap(tabs.publish(sessionID: id, from: store())?.tabState)
+        let form = tabs.form(state)
+        XCTAssertEqual(form.fields.name, "session-\(id.prefix(6))")
+        XCTAssertEqual(form.fields.description, "session-\(id.prefix(6))")
+    }
+
     func testInvalidDraftRestartsWithAllFieldsAndPinnedSourceWithoutSending() async throws {
         let a = store(), id = try conversation(), surface = UUID()
-        let session = try XCTUnwrap(tabs.publish(sessionID: id, title: "Source", surfaceID: surface, from: a))
+        let session = try XCTUnwrap(tabs.publish(sessionID: id, folder: root, surfaceID: surface, from: a))
         let state = try XCTUnwrap(session.tabState), form = tabs.form(state)
         await tabs.loadSource(state)
         form.fields.name = "bad name"; form.fields.budgetText = "not a number"
@@ -127,7 +238,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         let expected = form.fields, route = state.route
         tabs.requestSave(state)
         XCTAssertNotNil(form.error); XCTAssertFalse(state.confirmation.isAwaiting)
-        XCTAssertTrue(tabs.publish(sessionID: id, title: "Changed", surfaceID: surface, from: a) === session)
+        XCTAssertTrue(tabs.publish(sessionID: id, folder: root, surfaceID: surface, from: a) === session)
         try a.tabCloseCoordinator.save(state)
         let saved = try XCTUnwrap(state.draft)
         a.closeTab(session, in: try XCTUnwrap(a.active))
@@ -254,7 +365,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         a.closeTab(first, in: try XCTUnwrap(a.active))
         tabs.connectionIdentity = { "session-2" }
 
-        let session = try XCTUnwrap(tabs.publish(sessionID: conversation, title: "Live source", surfaceID: source.id, from: a))
+        let session = try XCTUnwrap(tabs.publish(sessionID: conversation, folder: root, surfaceID: source.id, from: a))
         let state = try XCTUnwrap(session.tabState), form = tabs.form(state)
         XCTAssertEqual(form.fields.sourceSurfaceID, source.id)
         XCTAssertEqual(form.fields.sourceConversationID, conversation)
@@ -286,7 +397,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
                 agent.access = .read; agent.sessionId = conversation
                 try await service.calls.save(agent)
             }
-            let state = try XCTUnwrap(tabs.publish(sessionID: conversation, title: "New source", from: a, newDraft: true)?.tabState)
+            let state = try XCTUnwrap(tabs.publish(sessionID: conversation, folder: root, from: a, newDraft: true)?.tabState)
             await tabs.loadSource(state)
             let form = tabs.form(state)
             form.fields.mode = mode; form.fields.folderName = folder.name
@@ -333,7 +444,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
 
     func testPinnedSourceSurvivesMoveAndSaveWithoutReauthorizingAStoredSurface() async throws {
         try server(); let a = store(), b = store(), conversation = try conversation(), surface = UUID()
-        let session = try XCTUnwrap(tabs.publish(sessionID: conversation, title: "Conversation", surfaceID: surface, from: a))
+        let session = try XCTUnwrap(tabs.publish(sessionID: conversation, folder: root, surfaceID: surface, from: a))
         let state = try XCTUnwrap(session.tabState)
         await tabs.loadSource(state)
         let form = tabs.form(state), folder = form.fields.folder
@@ -367,7 +478,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
 
     func testBindingFailureAfterPublicationCanRetryWithTheSameSavedVersion() async throws {
         try server(); let a = store(), conversation = try conversation()
-        let state = try XCTUnwrap(tabs.publish(sessionID: conversation, title: "Conversation", surfaceID: UUID(), from: a)?.tabState)
+        let state = try XCTUnwrap(tabs.publish(sessionID: conversation, folder: root, surfaceID: UUID(), from: a)?.tabState)
         await tabs.loadSource(state)
         let form = tabs.form(state), id = form.fields.agentID
         tabs.bindPublication = { _, _, _ in throw ChatError.storage("Binding could not be saved") }

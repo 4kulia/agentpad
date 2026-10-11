@@ -43,7 +43,7 @@ final class AgentTabRepairTests: XCTestCase {
         let codexId = UUID().uuidString.lowercased()
         try rollout(codexId, root: fixture.root.appendingPathComponent("codex"))
         var claude = tab(fixture.id.uppercased())
-        claude.customTitle = "Keep my title"
+        claude.explicitNameKey = SessionNameKey("claude-code", fixture.id)
         claude.content = .terminal
         var duplicate = claude; duplicate.id = UUID()
         var saved = state([claude, duplicate])
@@ -58,7 +58,7 @@ final class AgentTabRepairTests: XCTestCase {
         XCTAssertEqual(tabs(saved).map(\.conversationId), [fixture.id, fixture.id, codexId])
         XCTAssertEqual(saved.agentTabRepair119Applied, true)
         XCTAssertEqual(tabs(saved).map(\.id), tabs(original).map(\.id))
-        XCTAssertEqual(tabs(saved).map(\.customTitle), tabs(original).map(\.customTitle))
+        XCTAssertEqual(tabs(saved).map(\.explicitNameKey), tabs(original).map(\.explicitNameKey))
         XCTAssertEqual(tabs(saved).map(\.currentDirectoryPath), tabs(original).map(\.currentDirectoryPath))
         XCTAssertEqual(tabs(saved).map(\.content), tabs(original).map(\.content))
         XCTAssertEqual(saved.activeWorkspaceId, original.activeWorkspaceId)

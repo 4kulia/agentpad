@@ -211,10 +211,6 @@ private struct SessionProcessesSection: View {
 
     @State private var processes: [SessionProcess] = []
 
-    /// Slow enough to be free, fast enough that a command you just started
-    /// shows up before you go looking for it.
-    private static let pollInterval = Duration.seconds(2)
-
     var body: some View {
         SessionInfoSection(title: SessionInfoRules.processesTitle, store: store) {
             if processes.isEmpty {
@@ -241,29 +237,41 @@ private struct SessionProcessesSection: View {
         // cancels the loop, so other right-panel pages never pay for polling.
         .task(id: session.id) {
             processes = []
-            // Loop-carried, deliberately not @State: nothing renders this
-            // sample window, so changing it must not invalidate the section.
-            var previousCPU: SessionProcessScanner.CPUSamples?
-            while !Task.isCancelled {
+            await SessionProcessPolling.run(foregroundPID: {
                 // Off screen (window closed-but-alive) the sysctl/fd walk paints nothing.
-                if store.isOnScreen,
-                   !store.collapsedInfoSections.contains(SessionInfoRules.processesTitle) {
-                    // The port walk can cost milliseconds on a connection-
-                    // heavy child; keep every kernel query off the main actor.
-                    let pid = session.engine.foregroundPid ?? 0
-                    let window = previousCPU
-                    let scanned = await Task.detached {
-                        SessionProcessScanner.scan(foregroundPid: pid, previousCPU: window)
-                    }.value
+                guard store.isOnScreen,
+                      !store.collapsedInfoSections.contains(SessionInfoRules.processesTitle) else { return nil }
+                return session.engine.foregroundPid ?? 0
+            }, update: { scanned in
+                if scanned != processes { processes = scanned }
+            })
+        }
+    }
+}
+
+@MainActor
+enum SessionProcessPolling {
+    static func run(interval: Duration = .seconds(2), timeout: TimeInterval = 2,
+                    foregroundPID: () -> pid_t?,
+                    scan: @escaping @Sendable (pid_t, SessionProcessScanner.CPUSamples?) throws
+                        -> (processes: [SessionProcess], cpu: SessionProcessScanner.CPUSamples) = {
+                            SessionProcessScanner.scan(foregroundPid: $0, previousCPU: $1)
+                        },
+                    update: ([SessionProcess]) -> Void) async {
+        // Loop-carried, not view state: failed scans preserve the CPU window.
+        var previousCPU: SessionProcessScanner.CPUSamples?
+        while !Task.isCancelled {
+            if let pid = foregroundPID() {
+                let window = previousCPU
+                if let scanned = try? await BackgroundInspection.run(timeout: timeout, { try scan(pid, window) }) {
+                    // Never let an old tab's late scan update the new section.
+                    guard !Task.isCancelled else { return }
                     previousCPU = scanned.cpu
-                    // Detached work does not inherit cancellation. Never let
-                    // an old tab's late scan overwrite the new tab's section.
-                    if !Task.isCancelled, scanned.processes != processes {
-                        processes = scanned.processes
-                    }
+                    update(scanned.processes)
                 }
-                try? await Task.sleep(for: Self.pollInterval)
             }
+            // An explicit UI deadline skips one sample, not the polling task.
+            do { try await Task.sleep(for: interval) } catch { return }
         }
     }
 }

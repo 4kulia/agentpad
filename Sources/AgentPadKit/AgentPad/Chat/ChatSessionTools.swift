@@ -15,45 +15,80 @@ enum ChatSessionAuthor: Codable, Equatable {
 
 @MainActor
 enum ChatSessionTools {
-    struct Failure: Error { var code: String; var retryAfter: Int? = nil }
+    struct Failure: Error {
+        var code: String
+        var retryAfter: Int? = nil
+        var message: String? = nil
+        var field: String? = nil
+    }
+
+    private static func invalid(_ field: String, _ reason: String) -> Failure {
+        Failure(code: "invalid_args", message: "\(field) \(reason)", field: field)
+    }
+
+    /// Return field diagnostics only after the socket caller is verified,
+    /// and before any network calls or writes.
+    private static func arguments(_ json: ChatJSON) throws -> [String: ChatJSON] {
+        guard case .object(let args) = json else { throw invalid("arguments", "must be a JSON object") }
+        guard let tool = args["tool"]?.string else { throw invalid("tool", "is required and must be a string") }
+        var payload = args; payload["tool"] = nil
+        let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ChatJSON.object(payload))) as! [String: Any]
+        if let problem = AgentPadChatToolArguments.problem(tool, object) { throw invalid(problem.field, problem.reason) }
+        return args
+    }
 
     static func handle(_ request: AgentPadCLIRequest, origin: AgentPadCallerOrigin,
-                       sessions: @escaping @MainActor () -> [Session], service: ChatService = .shared,
+                       sessions: @escaping @MainActor () -> [Session], service: ChatService? = nil,
                        isCallerWaiting: @escaping @MainActor () -> Bool = { true },
                        signatureVerifier: @escaping @Sendable (Int32) -> Bool = ChatClaudeProcess.hasTrustedSignature,
                        scan: @escaping @Sendable (Int32) -> [SessionProcessScanner.Raw] = SessionProcessScanner.identityProcesses,
                        kernel: ChatSessionIdentity.Kernel = .init()) async -> AgentPadCLIResponse {
         var privateAccess = false
         do {
-            guard let raw = request.chatArguments, raw.utf8.count <= 24 * 1024,
-                  let json = try? JSONDecoder().decode(ChatJSON.self, from: Data(raw.utf8)) else { throw Failure(code: "invalid_args") }
-            privateAccess = json["attachment_id"] != nil || json["kind"]?.string == "dm" || ["dms", "members"].contains(json["scope"]?.string ?? "")
+            // Decode a bounded payload only to keep private-access refusals
+            // anonymous. No argument diagnostic may precede caller verification.
+            let json = request.chatArguments.flatMap { raw in
+                raw.utf8.count <= AgentPadChatToolArguments.payloadLimit
+                    ? try? JSONDecoder().decode(ChatJSON.self, from: Data(raw.utf8)) : nil
+            }
+            privateAccess = json?["attachment_id"] != nil || json?["kind"]?.string == "dm" || ["dms", "members"].contains(json?["scope"]?.string ?? "")
             let verified = try await ChatSessionIdentity.verify(origin, sessions: sessions(), scan: scan,
                                                                 signatureVerifier: signatureVerifier, kernel: kernel)
+            if request.teamAction == AgentPadCLITeamAction.verifyCaller.rawValue {
+                try await ChatSessionIdentity.revalidate(verified, sessions: sessions(), kernel: kernel, currentSessions: sessions)
+                return AgentPadCLIResponse(ok: true)
+            }
+            guard let raw = request.chatArguments else { throw invalid("arguments", "is required") }
+            guard raw.utf8.count <= AgentPadChatToolArguments.payloadLimit else {
+                throw invalid("arguments", "must encode as JSON within \(AgentPadChatToolArguments.payloadLimit) bytes")
+            }
+            guard let json else { throw invalid("arguments", "must be valid JSON") }
+            _ = try arguments(json)
             if privateAccess {
                 try await ChatPersonalAccess.waitForConversation(verified, sessions: sessions, kernel: kernel, isCallerWaiting: isCallerWaiting)
             }
-            let result = try await call(json, caller: verified.caller, service: service, isCallerWaiting: isCallerWaiting,
-                personalConversation: { try ChatPersonalAccess.conversation(caller: verified.caller, sessions: sessions(), kernel: kernel) }) {
-                try ChatSessionIdentity.revalidate(verified, sessions: sessions(), kernel: kernel)
+            let result = try await call(json, caller: verified.caller, service: service ?? .shared, isCallerWaiting: isCallerWaiting,
+                personalConversation: { try await ChatPersonalAccess.conversation(caller: verified.caller, sessions: sessions(), kernel: kernel, currentSessions: sessions) }) {
+                try await ChatSessionIdentity.revalidate(verified, sessions: sessions(), kernel: kernel, currentSessions: sessions)
                 return true
             }
-            try ChatSessionIdentity.revalidate(verified, sessions: sessions(), kernel: kernel)
             var response = AgentPadCLIResponse(ok: true)
             response.chatResult = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
             return response
         } catch let problem as ChatSessionIdentity.VerificationError {
             return privateAccess ? failure("dm_not_allowed") : failure(problem.rawValue, message: problem.message)
         }
-        catch let problem as Failure { return failure(problem.code, retryAfter: problem.retryAfter) }
+        catch let problem as BackgroundInspection.TimedOut { return failure("process_inspection_timeout", message: problem.localizedDescription) }
+        catch let problem as Failure { return failure(problem.code, retryAfter: problem.retryAfter, message: problem.message, field: problem.field) }
         catch let ChatAPIError.server(_, code, retryAfter) { return failure(code, retryAfter: retryAfter.map { Int(ceil($0)) }) }
         catch { return failure("not_connected") }
     }
 
-    static func failure(_ code: String, retryAfter: Int? = nil, message: String? = nil) -> AgentPadCLIResponse {
+    static func failure(_ code: String, retryAfter: Int? = nil, message: String? = nil, field: String? = nil) -> AgentPadCLIResponse {
         var result: [String: ChatJSON] = ["error": .string(code)]
         if let retryAfter { result["retry_after_seconds"] = .number(Double(retryAfter)) }
         if let message { result["message"] = .string(message) }
+        if let field { result["field"] = .string(field) }
         var response = AgentPadCLIResponse.failure(code)
         response.chatResult = String(decoding: (try? JSONEncoder().encode(ChatJSON.object(result))) ?? Data(), as: UTF8.self)
         return response
@@ -61,9 +96,9 @@ enum ChatSessionTools {
 
     static func call(_ json: ChatJSON, caller: ChatLocalCaller, service: ChatService,
                      isCallerWaiting: @escaping @MainActor () -> Bool = { true },
-                     personalConversation: @escaping @MainActor () throws -> ChatPersonalAccess.Conversation = { throw Failure(code: "dm_not_allowed") },
+                     personalConversation: @escaping @MainActor () async throws -> ChatPersonalAccess.Conversation = { throw Failure(code: "dm_not_allowed") },
                      preparePost: @escaping @MainActor (String) throws -> ChatSessionAuthor? = { _ in nil },
-                     revalidate: @escaping @MainActor () throws -> Bool) async throws -> ChatJSON {
+                     revalidate: @escaping @MainActor () async throws -> Bool) async throws -> ChatJSON {
         let operation: @MainActor () async throws -> ChatJSON = {
             try await callChecked(json, caller: caller, service: service, isCallerWaiting: isCallerWaiting,
                                   personalConversation: personalConversation, preparePost: preparePost, revalidate: revalidate)
@@ -76,26 +111,29 @@ enum ChatSessionTools {
 
     private static func callChecked(_ json: ChatJSON, caller: ChatLocalCaller, service: ChatService,
                      isCallerWaiting: @escaping @MainActor () -> Bool = { true },
-                     personalConversation: @escaping @MainActor () throws -> ChatPersonalAccess.Conversation = { throw Failure(code: "dm_not_allowed") },
+                     personalConversation: @escaping @MainActor () async throws -> ChatPersonalAccess.Conversation = { throw Failure(code: "dm_not_allowed") },
                      preparePost: @escaping @MainActor (String) throws -> ChatSessionAuthor? = { _ in nil },
-                     revalidate: @escaping @MainActor () throws -> Bool) async throws -> ChatJSON {
-        guard case .object(let args) = json, let tool = args["tool"]?.string else { throw Failure(code: "invalid_args") }
-        var payload = args; payload["tool"] = nil
-        guard let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ChatJSON.object(payload))) as? [String: Any],
-              AgentPadChatToolArguments.valid(tool, object) else { throw Failure(code: "invalid_args") }
+                     revalidate: @escaping @MainActor () async throws -> Bool) async throws -> ChatJSON {
+        let privateAccess = json["attachment_id"] != nil || json["kind"]?.string == "dm"
+            || ["dms", "members"].contains(json["scope"]?.string ?? "")
+        guard try await revalidate(), isCallerWaiting(), !Task.isCancelled else {
+            throw Failure(code: privateAccess ? "dm_not_allowed" : "not_connected")
+        }
+        let args = try arguments(json)
+        let tool = args["tool"]!.string!
         let privateDM = args["kind"]?.string == "dm" || ["dms", "members"].contains(args["scope"]?.string ?? "")
         if privateDM {
             return try await callDM(args, caller: caller, service: service, isCallerWaiting: isCallerWaiting,
                                     personalConversation: personalConversation, revalidate: revalidate)
         }
-        guard try revalidate(), isCallerWaiting(), !Task.isCancelled, let connection = service.connection,
+        guard let connection = service.connection,
               service.state == .signedIn, let token = service.token else { throw Failure(code: "not_connected") }
         func uuid(_ key: String, optional: Bool = false) throws -> String? {
             guard let value = args[key] else {
                 if optional { return nil }
-                throw Failure(code: "invalid_args")
+                throw invalid(key, "is required and must be a UUID")
             }
-            guard let raw = value.string, let id = UUID(uuidString: raw) else { throw Failure(code: "invalid_args") }
+            guard let raw = value.string, let id = UUID(uuidString: raw) else { throw invalid(key, "must be a UUID") }
             return id.uuidString.lowercased()
         }
         let org = try uuid("org_id", optional: tool == "chat_channels") ?? connection.orgId
@@ -109,7 +147,7 @@ enum ChatSessionTools {
         let attachment = args["attachment_id"]?.string?.lowercased()
         var downloadConversation: ChatPersonalAccess.Conversation?
         if attachment != nil {
-            let conversation = try personalConversation()
+            let conversation = try await personalConversation()
             try ChatPersonalAccess.require(conversation, caller: caller, service: service)
             downloadConversation = conversation
             guard service.supports("chat.attachments", key: key), service.serverAttachmentLimits[key.server]?.valid == true else { throw Failure(code: "unsupported") }
@@ -128,25 +166,23 @@ enum ChatSessionTools {
                     && Int.fetchOne(db, sql: "SELECT channel_access_epoch FROM meta WHERE id = 1") == stamp.1
             }) == true
         }
-        func current() throws -> Bool {
-            guard cacheIsCurrent() else { return false }
+        func current() async throws -> Bool {
+            guard try await revalidate() else { return false }
             if let downloadConversation {
                 guard service.attachmentEpoch == attachmentEpoch, service.supports("chat.attachments", key: key),
-                      try personalConversation() == downloadConversation else { return false }
+                      try await personalConversation() == downloadConversation else { return false }
                 try ChatPersonalAccess.require(downloadConversation, caller: caller, service: service)
             }
-            // Kernel identity follows the synchronous rights/DB read:
-            // no suspension between this guard and queuing/returning data.
-            return try revalidate()
+            // Recheck UI/access state after every background verification.
+            return cacheIsCurrent()
         }
-        guard try current() else { throw Failure(code: "not_found") }
+        guard try await current() else { throw Failure(code: "not_found") }
         let api = service.makeAPI(connection.server)
         var result: ChatJSON
         switch tool {
         case "chat_channels":
-            if let after = args["after"], after.string == nil || (after.string?.utf8.count ?? 0) > 512 { throw Failure(code: "invalid_args") }
             let page = try await api.channelsPage(org, after: args["after"]?.string, token: token)
-            guard try current() else { throw Failure(code: "not_found") }
+            guard try await current() else { throw Failure(code: "not_found") }
             let names = try await store.queue.read { db -> [String: String] in
                 Dictionary(uniqueKeysWithValues: try Row.fetchAll(db, sql: "SELECT team_id, name FROM teams WHERE mine = 1").map { ($0["team_id"], $0["name"]) })
             }
@@ -156,14 +192,16 @@ enum ChatSessionTools {
                     "name": .string(c.name), "archived": .bool(c.archived), "can_post": .bool(!c.archived)])
             }), "next": page.next.map(ChatJSON.string) ?? .null])
         case "chat_read":
-            guard let channel else { throw Failure(code: "invalid_args") }
+            guard let channel else { throw invalid("channel_id", "is required when kind is channel") }
             var before: Int?
             if let value = args["before"] {
-                guard case .number(let number) = value, number > 0, number < Double(Int.max), number.rounded() == number else { throw Failure(code: "invalid_args") }
+                guard case .number(let number) = value, number > 0, number < Double(Int.max), number.rounded() == number else {
+                    throw invalid("before", "must be a positive whole number less than \(Int.max)")
+                }
                 before = Int(number)
             }
             let page = try await api.messagesPage(org, channel: channel, root: root, before: before, token: token)
-            guard try current(), page.messages.count <= 100 else { throw Failure(code: "not_found") }
+            guard try await current(), page.messages.count <= 100 else { throw Failure(code: "not_found") }
             if let attachment {
                 guard page.messages.allSatisfy({ $0.channelId == channel && (root == nil || $0.messageId == root || $0.threadRootId == root) }),
                       let file = page.messages.filter({ $0.deletedAt == nil }).flatMap(\.attachments).first(where: { $0.id == attachment }),
@@ -172,12 +210,12 @@ enum ChatSessionTools {
                 var completed = false
                 defer { if !completed { service.mcpDownloads.remove(reservation) } }
                 let bytes = try await service.mcpDownloads.transfer(reservation) {
-                    guard try current() else { throw Failure(code: "not_found") }
+                    guard try await current() else { throw Failure(code: "not_found") }
                     return try await api.attachmentBytes(path: "/v1/orgs/\(org)/attachments/\(attachment)/original", token: token, limit: file.size)
                 }
-                guard try current() else { throw Failure(code: "not_found") }
+                guard try await current() else { throw Failure(code: "not_found") }
                 let result = try service.mcpDownloads.finish(reservation, bytes: bytes)
-                guard try current() else { throw Failure(code: "not_found") }
+                guard try await current() else { throw Failure(code: "not_found") }
                 completed = true
                 return result
             }
@@ -187,8 +225,9 @@ enum ChatSessionTools {
                 "messages": try attachmentProjection(page.messages),
                 "next": page.next.map { .number(Double($0)) } ?? .null])
         default:
-            guard let channel, let text = args["text"]?.string, ChatChannelModel.textProblem(text) == nil,
-                  let generation = stamp.0 else { throw Failure(code: "invalid_args") }
+            guard let channel else { throw invalid("channel_id", "is required when kind is channel") }
+            guard let text = args["text"]?.string else { throw invalid("text", "is required and must be a string") }
+            guard let generation = stamp.0 else { throw Failure(code: "not_connected") }
             let id = try uuid("message_id", optional: true) ?? UUID().uuidString.lowercased()
             // A fresh authenticated read makes access current even on an exact
             // repeat; the post command itself validates the root/author atomically.
@@ -196,20 +235,20 @@ enum ChatSessionTools {
             if let root, !page.messages.contains(where: { $0.messageId == root && $0.threadRootId == nil && $0.deletedAt == nil }) {
                 throw Failure(code: "not_found")
             }
-            guard try current() else { throw Failure(code: "not_found") }
+            guard try await current() else { throw Failure(code: "not_found") }
             let author = try preparePost(generation)
             let command = try service.queueSessionPost(key, caller: caller, generation: generation, message: id,
                                                        channel: channel, root: root, text: text, author: author)
             let until = Date().addingTimeInterval(2)
             repeat {
-                guard try current() else { throw Failure(code: "not_found") }
+                guard try await current() else { throw Failure(code: "not_found") }
                 if let outcome = try service.sessionPostOutcome(key, message: id, command: command) { return outcome }
                 try await Task.sleep(for: .milliseconds(50))
             } while Date() < until
             result = .object(["status": .string("pending"), "message_id": .string(id), "org_id": .string(org),
                 "channel_id": .string(channel), "thread_root_id": root.map(ChatJSON.string) ?? .null])
         }
-        guard try current() else { throw Failure(code: "not_found") }
+        guard try await current() else { throw Failure(code: "not_found") }
         guard try JSONEncoder().encode(result).count <= 1024 * 1024 else { throw Failure(code: "too_large") }
         return result
     }

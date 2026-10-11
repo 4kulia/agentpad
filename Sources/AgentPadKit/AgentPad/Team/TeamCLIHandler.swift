@@ -38,6 +38,14 @@ enum TeamCLIHandler {
         do {
             var extra: (inout AgentPadCLITeamInfo) -> Void = { _ in }
             switch action {
+            case .verifyCaller:
+                if let call = request.teamCall {
+                    guard case .teamRun(let own) = origin, own?.lowercased() == call.lowercased() else {
+                        return .failure(AgentPadCallerOrigin.teamRunRefusal)
+                    }
+                    return AgentPadCLIResponse(ok: true)
+                }
+                return await ChatSessionTools.handle(request, origin: origin, sessions: chatSessions, isCallerWaiting: isCallerWaiting)
             case .chat:
                 return await ChatSessionTools.handle(request, origin: origin, sessions: chatSessions, isCallerWaiting: isCallerWaiting)
             case .status:

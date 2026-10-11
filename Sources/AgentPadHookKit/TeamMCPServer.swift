@@ -149,7 +149,7 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
             guard admitted else { return reply(id: id, error: (-32000, "too many team calls at once, or a repeated id; try again")) }
             let token = (params["_meta"] as? [String: Any])?["progressToken"]
             queue.async {
-                let (text, isError) = self.callTool(name, arguments: params["arguments"] as? [String: Any] ?? [:],
+                let (text, isError) = self.callTool(name, arguments: params["arguments"],
                                                     requestKey: key, progressToken: token)
                 let (wasCancelled, goesOn, why, status): (Bool, String?, String?, [String: Any]?) = self.lock.withLock {
                     if waits { self.waiting -= 1 } else { self.quick -= 1 }
@@ -288,20 +288,25 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
         }
     }
 
+    private func invalidArguments(_ field: String, _ reason: String) -> (String, Bool) {
+        let result = ["error": "invalid_args", "field": field, "message": "\(field) \(reason)"]
+        let bytes = try! JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+        return (String(decoding: bytes, as: UTF8.self), true)
+    }
+
     private func chatTool(_ name: String, arguments: [String: Any], requestKey: String) -> (String, Bool) {
-        guard let schema = Self.chatTools.first(where: { $0["name"] as? String == name })?["inputSchema"] as? [String: Any],
-              let properties = schema["properties"] as? [String: Any], arguments.keys.allSatisfy({ properties[$0] != nil }),
-              (schema["required"] as? [String] ?? []).allSatisfy({ arguments[$0] != nil }) else { return ("invalid_args", true) }
-        guard AgentPadChatToolArguments.valid(name, arguments) else { return ("invalid_args", true) }
+        if let problem = AgentPadChatToolArguments.problem(name, arguments) {
+            return invalidArguments(problem.field, problem.reason)
+        }
         let openOnly = arguments["open_only"] as? Bool == true
         var payload = arguments
         payload["tool"] = name
         if name == "chat_post", let explicit = payload["message_id"] {
-            guard let raw = explicit as? String, let id = UUID(uuidString: raw) else { return ("invalid_args", true) }
+            guard let raw = explicit as? String, let id = UUID(uuidString: raw) else { return invalidArguments("message_id", "must be a UUID") }
             payload["message_id"] = id.uuidString.lowercased()
         }
         guard let original = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
-              original.count <= 24 * 1024 else { return ("invalid_args", true) }
+              original.count <= AgentPadChatToolArguments.payloadLimit else { return invalidArguments("arguments", "must encode as JSON within \(AgentPadChatToolArguments.payloadLimit) bytes") }
         if name == "chat_post", !openOnly {
             let fingerprint = SHA256.hash(data: original)
             let message: String? = lock.withLock {
@@ -313,7 +318,7 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
             guard let message else { return ("message_conflict", true) }
             payload["message_id"] = message
         }
-        guard let bytes = try? JSONSerialization.data(withJSONObject: payload), bytes.count <= 24 * 1024 else { return ("invalid_args", true) }
+        guard let bytes = try? JSONSerialization.data(withJSONObject: payload), bytes.count <= AgentPadChatToolArguments.payloadLimit else { return invalidArguments("arguments", "must encode as JSON within \(AgentPadChatToolArguments.payloadLimit) bytes, including message_id") }
         var request = AgentPadCLIRequest(verb: .team)
         request.teamAction = AgentPadCLITeamAction.chat.rawValue
         request.chatArguments = String(decoding: bytes, as: UTF8.self)
@@ -408,13 +413,44 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
         }
     }
 
-    func callTool(_ name: String, arguments: [String: Any], requestKey: String, progressToken: Any?) -> (String, Bool) {
+    /// Every invocation verifies the socket caller before parsing fields or
+    /// allocating retry state. Initialization is not proof of caller identity.
+    private func verifyCaller(arguments: Any?, requestKey: String) -> (String, Bool)? {
+        var request = AgentPadCLIRequest(verb: .team)
+        request.teamAction = AgentPadCLITeamAction.verifyCaller.rawValue
+        request.teamCall = runCallId
+        // Private-access refusals stay anonymous, just as at the app endpoint.
+        // These hints select the refusal only; no argument is validated here.
+        if let args = arguments as? [String: Any], args["attachment_id"] != nil
+            || args["kind"] as? String == "dm" || ["dms", "members"].contains(args["scope"] as? String ?? "") {
+            request.chatArguments = "{\"kind\":\"dm\"}"
+        }
+        let cancellation = lock.withLock { chatCancellations[requestKey] }
+        switch send(request, 45, cancellation) {
+        case .failure(let error): return (error.message, true)
+        case .success(let response):
+            guard !response.ok else { return nil }
+            if let raw = response.chatResult,
+               let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] {
+                lock.withLock { statusOf[requestKey] = object }
+                return (raw, true)
+            }
+            return (response.error ?? "The calling process could not be verified. Restart Claude in this tab and retry.", true)
+        }
+    }
+
+    func callTool(_ name: String, arguments rawArguments: Any?, requestKey: String, progressToken: Any?) -> (String, Bool) {
+        if let refusal = verifyCaller(arguments: rawArguments, requestKey: requestKey) { return refusal }
+        guard !name.isEmpty else { return invalidArguments("name", "is required and must be a nonempty string") }
+        guard rawArguments == nil || rawArguments is [String: Any] else { return invalidArguments("arguments", "must be a JSON object") }
+        let arguments = rawArguments as? [String: Any] ?? [:]
         if let runCallId {
             guard name == "request_folder_access" else { return ("Unknown tool \(name).", true) }
-            guard let path = arguments["path"] as? String, !path.isEmpty,
-                  let reason = arguments["reason"] as? String,
-                  arguments.keys.allSatisfy({ ["path", "reason"].contains($0) })
-            else { return ("request_folder_access needs path and reason.", true) }
+            if let extra = arguments.keys.sorted().first(where: { !["path", "reason"].contains($0) }) {
+                return invalidArguments(extra, "is not a supported argument for request_folder_access")
+            }
+            guard let path = arguments["path"] as? String, !path.isEmpty else { return invalidArguments("path", "is required and must be a nonempty string") }
+            guard let reason = arguments["reason"] as? String else { return invalidArguments("reason", "is required and must be a string") }
             return requestFolderAccess(callId: runCallId, path: path, reason: String(reason.prefix(1000)), requestKey: requestKey)
         }
         let allowed: Set<String>
@@ -428,8 +464,8 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
         case "team_cancel": allowed = ["call_id"]
         default: return ("Unknown tool \(name).", true)
         }
-        if let extra = arguments.keys.first(where: { !allowed.contains($0) }) {
-            return ("Unknown argument \(extra).", true)
+        if let extra = arguments.keys.sorted().first(where: { !allowed.contains($0) }) {
+            return invalidArguments(extra, "is not a supported argument for \(name)")
         }
         func string(_ key: String) -> String? { (arguments[key] as? String).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } }
 
@@ -437,15 +473,16 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
         case "team_agents":
             return agents()
         case "team_ask":
-            guard let agent = string("agent"), !agent.isEmpty, let prompt = arguments["prompt"] as? String,
-                  !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            else { return ("team_ask needs agent and prompt.", true) }
-            if arguments["thread"] != nil, string("thread") == nil { return ("thread must be a string.", true) }
-            if arguments["thread_id"] != nil, string("thread_id") == nil { return ("thread_id must be a string.", true) }
+            guard let agent = string("agent"), !agent.isEmpty else { return invalidArguments("agent", "is required and must be a nonempty string") }
+            guard let prompt = arguments["prompt"] as? String, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return invalidArguments("prompt", "is required and must be a nonempty string")
+            }
+            if arguments["thread"] != nil, string("thread") == nil { return invalidArguments("thread", "must be a string") }
+            if arguments["thread_id"] != nil, string("thread_id") == nil { return invalidArguments("thread_id", "must be a string") }
             return ask(agent: agent, prompt: prompt, thread: (string("thread_id") ?? string("thread")).flatMap { $0.isEmpty ? nil : $0 },
                        requestKey: requestKey, progressToken: progressToken)
         case "team_check":
-            guard let id = string("call_id"), !id.isEmpty else { return ("team_check needs call_id.", true) }
+            guard let id = string("call_id"), !id.isEmpty else { return invalidArguments("call_id", "is required and must be a nonempty string") }
             var minutes = 0
             if let raw = arguments["wait_minutes"] {
                 // `is Bool` is true for any NSNumber 0 or 1; ask Core Foundation.
@@ -453,13 +490,13 @@ public final class AgentPadTeamMCPServer: @unchecked Sendable {
                       number.doubleValue == number.doubleValue.rounded(),
                       case let value = number.intValue, (0...Self.maxCheckWaitMinutes).contains(value)
                 else {
-                    return ("wait_minutes is a whole number from 0 to \(Self.maxCheckWaitMinutes).", true)
+                    return invalidArguments("wait_minutes", "must be a whole number from 0 to \(Self.maxCheckWaitMinutes)")
                 }
                 minutes = value
             }
             return follow(callId: id, minutes: minutes, requestKey: requestKey, progressToken: progressToken, first: nil)
         default:
-            guard let id = string("call_id"), !id.isEmpty else { return ("team_cancel needs call_id.", true) }
+            guard let id = string("call_id"), !id.isEmpty else { return invalidArguments("call_id", "is required and must be a nonempty string") }
             var request = AgentPadCLIRequest(verb: .team)
             request.teamAction = AgentPadCLITeamAction.cancel.rawValue
             request.teamCall = id

@@ -938,6 +938,11 @@ final class TeamProcesses: @unchecked Sendable {
     /// Every run now: its leader while confirmed (nil once its number is gone
     /// or another's), the processes seen under it and its call. A run whose
     /// leader is gone still has the processes it was seen with (review C5-5).
+    var hasRegisteredRuns: Bool { lock.withLock { !entries.isEmpty } }
+
+    /// In-memory quit barrier; safe even when all inspection workers are stuck.
+    func closeRegistration() { lock.withLock { closed = true } }
+
     func runs() -> [(leader: pid_t?, seen: TeamPidSet, callId: String?)] {
         let all = lock.withLock { Array(entries.values) }
         return all.map { entry in

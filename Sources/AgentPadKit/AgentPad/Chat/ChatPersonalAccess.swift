@@ -68,46 +68,52 @@ enum ChatPersonalAccess {
     @MainActor
     struct Authorization {
         let conversation: Conversation
-        private let check: @MainActor () throws -> Conversation
+        private let check: @MainActor () async throws -> Conversation
 
         init(caller: ChatLocalCaller, service: ChatService,
-             personalConversation: @escaping @MainActor () throws -> Conversation,
-             revalidate: @escaping @MainActor () throws -> Bool) throws {
-            let check: @MainActor () throws -> Conversation = {
+             personalConversation: @escaping @MainActor () async throws -> Conversation,
+             revalidate: @escaping @MainActor () async throws -> Bool) async throws {
+            let check: @MainActor () async throws -> Conversation = {
                 do {
-                    let conversation = try personalConversation()
+                    guard try await revalidate() else { throw ChatSessionTools.Failure(code: "dm_not_allowed") }
+                    let conversation = try await personalConversation()
                     try ChatPersonalAccess.require(conversation, caller: caller, service: service)
-                    // Check the live caller last, after the synchronous journal
-                    // and publication reads, immediately before using access.
-                    guard try revalidate() else { throw ChatSessionTools.Failure(code: "dm_not_allowed") }
                     return conversation
                 } catch { throw ChatSessionTools.Failure(code: "dm_not_allowed") }
             }
-            self.conversation = try check()
+            self.conversation = try await check()
             self.check = check
         }
 
-        func requireCurrent() throws {
-            guard try check() == conversation else { throw ChatSessionTools.Failure(code: "dm_not_allowed") }
+        func requireCurrent() async throws {
+            guard try await check() == conversation else { throw ChatSessionTools.Failure(code: "dm_not_allowed") }
         }
     }
 
     /// Called only after live process verification. Hook routing/history UUIDs
     /// by themselves cannot establish the binding to that signed Claude process.
     static func conversation(caller: ChatLocalCaller, sessions: [Session],
-                             kernel: ChatSessionIdentity.Kernel = .init()) throws -> Conversation {
+                             kernel: ChatSessionIdentity.Kernel = .init(),
+                             currentSessions: (@MainActor () -> [Session])? = nil) async throws -> Conversation {
         let matches = sessions.filter { $0.id.uuidString.lowercased() == caller.surface && $0.hasProcess }
         guard matches.count == 1, let tab = matches.first, tab.effectiveRemoteHost == nil,
               !HookServer.pendingConversations.contains(tab.id),
               let binding = tab.personalBinding,
               binding.owner.process.pid == caller.claudePID, binding.owner.process.startedAtUs == caller.claudeStart,
-              kernel.process(caller.claudePID) == binding.owner.process,
-              kernel.image(caller.claudePID) == binding.owner.image,
               let id = UUID(uuidString: binding.conversation),
               tab.conversationId?.lowercased() == id.uuidString.lowercased() else {
             throw ChatSessionTools.Failure(code: "dm_not_allowed")
         }
-        return Conversation(id.uuidString, launchId: tab.launchedConversationId)
+        let launch = tab.launchedConversationId
+        let valid = try await BackgroundInspection.run {
+            kernel.process(caller.claudePID) == binding.owner.process && kernel.image(caller.claudePID) == binding.owner.image
+        }
+        guard valid, (currentSessions?() ?? sessions).contains(where: { $0 === tab }), tab.hasProcess, tab.effectiveRemoteHost == nil, !HookServer.pendingConversations.contains(tab.id),
+              tab.personalBinding?.owner == binding.owner, tab.personalBinding?.conversation == binding.conversation,
+              tab.conversationId?.lowercased() == id.uuidString.lowercased(), tab.launchedConversationId == launch else {
+            throw ChatSessionTools.Failure(code: "dm_not_allowed")
+        }
+        return Conversation(id.uuidString, launchId: launch)
     }
 
     /// Hook authentication is off-main and can finish after MCP verification.
@@ -120,8 +126,8 @@ enum ChatPersonalAccess {
         while true {
             try Task.checkCancellation()
             guard isCallerWaiting() else { throw ChatSessionTools.Failure(code: "dm_not_allowed") }
-            try ChatSessionIdentity.revalidate(verified, sessions: sessions(), kernel: kernel)
-            if (try? conversation(caller: verified.caller, sessions: sessions(), kernel: kernel)) != nil { return }
+            try await ChatSessionIdentity.revalidate(verified, sessions: sessions(), kernel: kernel, currentSessions: sessions)
+            if (try? await conversation(caller: verified.caller, sessions: sessions(), kernel: kernel, currentSessions: sessions)) != nil { return }
             guard ContinuousClock.now < deadline else { throw ChatSessionTools.Failure(code: "dm_not_allowed") }
             try await Task.sleep(for: .milliseconds(25))
         }

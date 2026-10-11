@@ -134,6 +134,8 @@ public enum AgentPadCLITeamAction: String, Sendable, CaseIterable {
     case access, accessCheck = "access-check"
     /// Internal transport for ordinary Claude tabs' channel tools.
     case chat
+    /// Internal, read-only caller verification before MCP argument diagnostics.
+    case verifyCaller = "verify-caller"
 }
 
 /// `team <action>` with its values.
@@ -257,7 +259,7 @@ extension AgentPadHookKit {
             guard let minutes = Int(wait), minutes >= 0, minutes <= 24 * 60 else { return failure("--wait takes minutes, 0 to 1440.") }
             command.waitMinutes = minutes
         }
-        if action == .access || action == .accessCheck || action == .chat {
+        if action == .access || action == .accessCheck || action == .chat || action == .verifyCaller {
             return failure("\(action.rawValue) is used by AgentPad itself.")
         }
         let expected: Int

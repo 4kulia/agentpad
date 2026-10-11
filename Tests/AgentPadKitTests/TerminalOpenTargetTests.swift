@@ -39,6 +39,42 @@ final class TerminalOpenTargetTests: XCTestCase {
         XCTAssertEqual(resolve(expected.absoluteString), .url(expected))
     }
 
+    func testExternalURLRequiresAKnownSchemeOrRegisteredHandler() {
+        for raw in ["https://example.com", "HTTP://localhost:3000", "mailto:hello@example.com",
+                    "ftp://example.com/file", "ssh://example.com", "file://server/share/a"] {
+            XCTAssertEqual(TerminalOpenTargetResolver.externalURL(raw, hasHandler: { _ in
+                XCTFail("Known schemes need no Launch Services lookup")
+                return false
+            }), URL(string: raw))
+        }
+        for raw in ["Makefile:42", "main.swift:42", "myapp:42", "custom://item"] {
+            XCTAssertNil(TerminalOpenTargetResolver.externalURL(raw))
+            XCTAssertNil(TerminalOpenTargetResolver.externalURL(raw, hasHandler: { _ in false }))
+            XCTAssertEqual(TerminalOpenTargetResolver.externalURL(raw, hasHandler: { _ in true }), URL(string: raw))
+        }
+        for raw in ["file:///tmp/a", "file://localhost/tmp/a", "./a.swift", "Makefile"] {
+            XCTAssertNil(TerminalOpenTargetResolver.externalURL(raw, hasHandler: { _ in
+                XCTFail("Local files do not need Launch Services")
+                return true
+            }))
+        }
+    }
+
+    func testExtensionlessFilenameWithLocationUsesExistingFile() {
+        let path = cwd.appendingPathComponent("Makefile").path
+        let reference = fileReference("Makefile:42:7", existing: [path], currentDirectory: cwd)
+        XCTAssertEqual(reference?.url.path, path)
+        XCTAssertEqual(reference?.line, 42)
+        XCTAssertEqual(reference?.column, 7)
+    }
+
+    func testSchemeLookingLiteralFilenameStillWinsOverSourceLocation() {
+        let path = cwd.appendingPathComponent("notes:2026").path
+        let reference = fileReference("notes:2026", existing: [path], currentDirectory: cwd)
+        XCTAssertEqual(reference?.url.path, path)
+        XCTAssertNil(reference?.line)
+    }
+
     func testOnlyHTTPAndHTTPSUseBrowserPreference() {
         XCTAssertTrue(URL(string: "https://example.com")!.isWebLink)
         XCTAssertTrue(URL(string: "http://localhost:3000")!.isWebLink)

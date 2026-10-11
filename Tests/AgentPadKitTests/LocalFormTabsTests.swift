@@ -26,7 +26,7 @@ final class LocalFormTabsTests: XCTestCase {
         }
     }
     private func store(drafts: DraftRepository? = nil) -> WorkspaceStore {
-        let store = WorkspaceStore(persistence: InMemoryPersistence(), drafts: drafts ?? sharedDrafts,
+        let store = WorkspaceStore(persistence: InMemoryPersistence(), sessionNames: .testing, drafts: drafts ?? sharedDrafts,
             engineFactory: { TestEngine() }, optionsProvider: { _ in nil },
             peerStores: { [weak self] in self?.stores ?? [] })
         stores.append(store)
@@ -484,11 +484,11 @@ final class LocalFormTabsTests: XCTestCase {
         a.requestRenameActiveTab()
         terminal.nameEdit.text = "Build"
         terminal.nameEdit.handle(.enter) { a.renameTab(terminal, to: $0); return nil }
-        XCTAssertEqual(terminal.customTitle, "Build")
+        XCTAssertEqual(terminal.explicitName, "Build")
         a.requestRenameActiveTab()
         terminal.nameEdit.text = "Don't save"
         terminal.nameEdit.handle(.escape) { a.renameTab(terminal, to: $0); return nil }
-        XCTAssertEqual(terminal.customTitle, "Build")
+        XCTAssertEqual(terminal.explicitName, "Build")
     }
 
     func testFilesPinnedAfterTransferAndCwdChangeAndInvalidNameRestores() throws {

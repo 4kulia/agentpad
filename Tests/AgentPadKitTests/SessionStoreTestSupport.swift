@@ -1,4 +1,5 @@
 import Foundation
+import XCTest
 @testable import AgentPadKit
 
 /// The canonical zero-config test store: TestEngine (no libghostty/PTY),
@@ -10,6 +11,7 @@ func makeTestStore(persistence: any Persistence = InMemoryPersistence(), claudeP
     WorkspaceStore(
         persistence: persistence,
         agentProfiles: agentProfiles,
+        sessionNames: .testing,
         engineFactory: { TestEngine() },
         optionsProvider: { _ in nil },
         resumeProvider: { true },
@@ -73,4 +75,73 @@ enum SessionStoreFixtures {
         }
         return roots
     }
+}
+
+/// One disposable store for fixtures that do not supply a per-test database.
+@MainActor extension SessionNames {
+    static let testing = SessionNames(url: FileManager.default.temporaryDirectory
+        .appendingPathComponent("agentpad-test-names-\(UUID()).sqlite"))
+}
+
+@MainActor extension Session {
+    func renameForTesting(_ name: String) {
+        if displaySources == nil { displaySources = .init(names: .testing) }
+        if displaySources?.names === SessionNames.shared { displaySources?.names = .testing }
+        names.beginRename(name, for: explicitNameKey)
+    }
+}
+
+/// Real closed transcript + profile binding. Both UI resume paths used to
+/// promote this private record.title into the public author signature.
+@MainActor final class ClosedSessionNameFixture {
+    let record: AgentSessionRecord
+    let catalog: SessionCatalog
+    let names: SessionNames
+    let profiles: AgentProfileStore
+    let profile: AgentProfile
+    let store: WorkspaceStore
+
+    init(root: URL, metadata: String) throws {
+        let folder = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let projects = root.appendingPathComponent("projects")
+        let file = try SessionStoreFixtures.writeFile("\(UUID().uuidString.lowercased()).jsonl",
+            in: projects.appendingPathComponent("-project"), lines: [
+                "{\"type\":\"user\",\"cwd\":\"\(folder.path)\",\"message\":{\"content\":\"PRIVATE-TITLE-MARKER first prompt\"}}",
+                metadata
+            ])
+        record = try XCTUnwrap(AgentSessionScanner.readClaudeRecord(file: file, mtime: Date()))
+        let record = record
+        catalog = SessionCatalog { _ in .init(records: [record], scanned: 1, total: 1, skipped: 0) }
+        names = SessionNames(url: root.appendingPathComponent("names.sqlite"))
+        profiles = AgentProfileStore(canonicalize: { $0 })
+        profile = try profiles.add(template: .claudeCode, folder: folder)
+        try profiles.bind(record, to: profile.id)
+        store = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true,
+            agentProfiles: profiles, sessionCatalog: catalog, sessionNames: names,
+            engineFactory: { TestEngine() }, optionsProvider: { _ in nil }, resumeProvider: { true },
+            conversationVisibility: { .init(channelIds: []) }, peerStores: { [] }, claudeProjectsRoot: projects)
+        store.profileTemplates = { [.claudeCode] }
+    }
+
+    func resume(allSessions: Bool) async throws -> Session {
+        catalog.refresh()
+        for _ in 0..<200 where catalog.isScanning { try await Task.sleep(for: .milliseconds(5)) }
+        if allSessions {
+            let model = AllSessionsModel(state: TabState(route: .allSessions), catalog: catalog,
+                names: names, profiles: profiles)
+            let item = AllSessionItem(id: record.id, record: record, source: .disk, status: .finished, title: record.title)
+            let monitor = AgentMonitor(); monitor.storesProvider = { [] }
+            await AllSessionsActions.activate(item, model: model, store: store, monitor: monitor)
+            XCTAssertNil(model.resumeError)
+            return try XCTUnwrap(store.allSessions.first)
+        }
+        let item = try XCTUnwrap(store.profileSessionItems(profile).first)
+        return try store.openProfileSession(item, profileID: profile.id).get()
+    }
+
+    static let privateMetadata = ["",
+        #"{"type":"summary","summary":"PRIVATE-TITLE-MARKER summary"}"#,
+        #"{"type":"ai-title","aiTitle":"PRIVATE-TITLE-MARKER AI title"}"#,
+        #"{"type":"custom-title","customTitle":"PRIVATE-TITLE-MARKER transcript custom title"}"#]
 }

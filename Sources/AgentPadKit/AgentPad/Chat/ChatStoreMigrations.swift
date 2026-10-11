@@ -739,6 +739,9 @@ enum ChatStoreMigrations {
         migrator.registerMigration("release-11-notification-diagnostics") { db in
             try db.alter(table: "runs") { t in t.add(column: "launch_failure", .text) }
         }
+        // Retain the identifier so journals opened by the earlier naming attempt
+        // are not rejected as newer. Its optional columns are no longer used.
+        migrator.registerMigration("release-12-publication-text-provenance") { _ in }
         return migrator
     }
 
