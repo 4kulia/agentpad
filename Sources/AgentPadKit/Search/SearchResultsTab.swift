@@ -57,6 +57,7 @@ struct SearchResultsTab: View {
                     Text("All").tag(SearchSource.all)
                     if model.hasTeam { Text("Messages").tag(SearchSource.messages) }
                     Text("Agent sessions").tag(SearchSource.sessions)
+                    Text("Telegram").tag(SearchSource.telegram)
                 }.pickerStyle(.segmented).frame(maxWidth: 360)
                 Spacer()
                 Picker("Date", selection: $model.period) { ForEach(SearchDatePeriod.allCases, id: \.self) { Text($0.rawValue).tag($0) } }.fixedSize()
@@ -84,7 +85,7 @@ struct SearchResultsTab: View {
             .onChange(of: model.person) { _, _ in model.serverSearch(debounce: true) }
     }
     @ViewBuilder private var sourceFilters: some View {
-        if model.hasTeam, model.source != .sessions {
+        if model.hasTeam, model.source != .sessions, model.source != .telegram {
             Picker("Place", selection: Binding(get: { model.scope.rawValue + ":" + (model.target ?? "") }, set: { value in
                 let parts = value.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
                 model.scope = ChatSearchRequest.Scope(rawValue: String(parts[0])) ?? .all
@@ -102,7 +103,7 @@ struct SearchResultsTab: View {
                 ForEach(org?.members ?? []) { Text($0.name).tag(Optional($0.accountId)) }
             }.frame(maxWidth: 210)
         }
-        if model.source != .messages {
+        if model.source != .messages, model.source != .telegram {
             Picker("Agent type", selection: $model.filter.agent) {
                 Text("All agents").tag(nil as String?)
                 ForEach(AgentSessionScanner.supportedAgentIds.sorted(), id: \.self) { id in Text(AgentTemplate.builtin(id: id)?.title ?? id).tag(Optional(id)) }
@@ -121,14 +122,27 @@ struct SearchResultsTab: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 12) {
                 if let error = model.navigationError { Text(error).foregroundStyle(ChatAppearance.failure).padding(10) }
-                if !model.hasTeam {
+                if !model.hasTeam, model.source != .telegram {
                     HStack {
-                        Text("Local results only.").foregroundStyle(ChatAppearance.secondary)
+                        Text("Agent sessions on this Mac.").foregroundStyle(ChatAppearance.secondary)
                         Button("Connect a team…") { ConnectionTabs.shared.show() }
                     }.font(.caption)
                 }
-                if model.hasTeam, model.source != .sessions { messageResults }
-                if model.source != .messages { localResults }
+                if model.source == .all || model.source == .telegram {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Telegram").font(.headline)
+                        ForEach(model.telegram.hits) { hit in
+                            Button { model.activate("t:" + hit.id) } label: {
+                                Label(hit.row.title + " · " + hit.row.displayKind, systemImage: hit.row.symbol)
+                            }.buttonStyle(.plain)
+                        }
+                        if model.telegram.value.searching { Text("Searching Telegram…").font(.caption) }
+                        if let notice = model.telegram.value.notice { Text(notice).font(.caption) }
+                        if !model.telegram.chats.connected { Button("Connect Telegram…") { SupportTabs.shared.settings(.telegram) } }
+                    }.padding(20)
+                }
+                if model.hasTeam, model.source != .sessions, model.source != .telegram { messageResults }
+                if model.source != .messages, model.source != .telegram { localResults }
                 if model.query.isEmpty { Text("Search session names, messages and saved conversations.").foregroundStyle(ChatAppearance.secondary).padding(.vertical, 30) }
                 else if (try? SearchQuery(model.query)) == nil { Text(SearchProblem.invalidQuery.localizedDescription).foregroundStyle(ChatAppearance.secondary) }
             }.scrollTargetLayout().padding(20)

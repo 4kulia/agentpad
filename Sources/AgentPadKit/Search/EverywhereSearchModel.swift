@@ -1,7 +1,8 @@
 import Foundation
 import Observation
+import AgentPadTelegram
 
-enum SearchSource: String, CaseIterable, Sendable { case all = "All", messages = "Messages", sessions = "Agent sessions" }
+enum SearchSource: String, CaseIterable, Sendable { case all = "All", messages = "Messages", sessions = "Agent sessions", telegram = "Telegram" }
 
 @MainActor @Observable
 final class SearchIndexController {
@@ -45,7 +46,7 @@ final class SearchIndexController {
 final class EverywhereSearchModel {
     var query = "" {
         didSet {
-            if query != oldValue { focusState.queryChanged(isEmpty: query.isEmpty) }
+            if query != oldValue { focusState.queryChanged(isEmpty: query.isEmpty && source != .telegram) }
         }
     }
     var source = SearchSource.all
@@ -106,6 +107,7 @@ final class EverywhereSearchModel {
     var contextLoading = false
     var navigationError: String?
     let messages: ChatSearchModel
+    let telegram: TelegramSearchModel
     let indexing: SearchIndexController
     let catalog: SessionCatalog
     let names: SessionNames
@@ -119,6 +121,9 @@ final class EverywhereSearchModel {
     @ObservationIgnored var activateQuick: (PaletteItem) -> Void = { _ in }
     @ObservationIgnored var openResults: () -> Void = {}
     @ObservationIgnored var openMessage: (ChatSearchHit) -> Void = { _ in }
+    @ObservationIgnored var openTelegram: (TelegramSearchHit, Bool, Bool) -> Void = { _, _, _ in }
+    @ObservationIgnored private var queryIdentity: String?
+    @ObservationIgnored private var telegramSelectionLost = false
     @ObservationIgnored private var localTask: Task<Void, Never>?
     @ObservationIgnored private var historyTask: Task<Void, Never>?
     @ObservationIgnored private var validationTask: Task<Void, Never>?
@@ -126,10 +131,13 @@ final class EverywhereSearchModel {
     @ObservationIgnored private var serial = UUID()
     init(messages: ChatSearchModel = ChatSearchModel(), indexing: SearchIndexController = .shared,
          catalog: SessionCatalog = .shared, names: SessionNames = .shared, profiles: AgentProfileStore = .shared,
+         telegram: TelegramSearchModel? = nil,
          visibility: @escaping @Sendable () -> ChannelConversationFilter = { .current() }) {
         self.messages = messages; self.indexing = indexing; self.catalog = catalog; self.names = names
+        self.telegram = telegram ?? TelegramSearchModel(chats: TelegramService.chats)
         self.visibility = visibility; self.profiles = profiles
         messages.onInvalidation = { [weak self] in self?.serverSearch(debounce: true) }
+        self.telegram.changed = { [weak self] in self?.telegramChanged() }
         observeIndex(); indexing.start()
     }
     var hasTeam: Bool { messages.availability() != .noTeam }
@@ -167,21 +175,35 @@ final class EverywhereSearchModel {
     }
     func dismiss(restoreFocus: Bool = true) {
         focusState.dismiss(); selected = nil
+        // The results tab shares this provider. Focus changes and field
+        // teardown cancel opening intent, not the retained query's search.
+        telegram.cancelOpening()
         if restoreFocus { fieldFocus.field?.endSearchEditing() }
     }
     func update(debounce: Bool = true) {
-        selected = nil; scrollID = nil
+        let identity = source.rawValue + ":" + query
+        if identity != queryIdentity {
+            queryIdentity = identity; selected = nil; scrollID = nil; telegramSelectionLost = false
+        }
         localSearch(debounce: debounce); serverSearch(debounce: debounce)
+        if source == .all || source == .telegram { telegram.search(query) } else { telegram.stop() }
+    }
+    private func telegramChanged() {
+        guard source == .all || source == .telegram else { return }
+        if let selected, selected.hasPrefix("t:"), !telegram.hits.contains(where: { "t:" + $0.id == selected }) {
+            self.selected = nil; telegramSelectionLost = true
+        }
+        if source == .telegram, selected == nil, !telegramSelectionLost { selected = telegram.hits.first.map { "t:" + $0.id } }
     }
     func serverSearch(debounce: Bool) {
-        guard source != .sessions, (try? SearchQuery(query)) != nil else { messages.invalidate(); return }
+        guard source != .sessions, source != .telegram, (try? SearchQuery(query)) != nil else { messages.invalidate(); return }
         messages.search(serverRequest, debounce: debounce)
     }
     func localSearch(more: Bool = false, debounce: Bool = true) {
         localTask?.cancel(); serial = UUID(); let id = serial
         if !more { local = []; metadata = []; localNext = nil }
         localError = nil
-        guard source != .messages, let parsed = try? SearchQuery(query) else { localLoading = false; return }
+        guard source != .messages, source != .telegram, let parsed = try? SearchQuery(query) else { localLoading = false; return }
         let index = indexing.index, filter = filter, cursor = more ? localNext : nil
         let records = catalog.records, names = names.values, metadataLimit = metadataLimit, visibility = visibility
         let bindings = profiles.bindings.map(\.record), live = liveSessions()
@@ -230,15 +252,21 @@ final class EverywhereSearchModel {
         return Array(items.filter { conversations.insert($0.record.nameKey).inserted }.prefix(limit).map(\.record))
     }
     var choices: [String] {
-        quick.map { "q:" + $0.id } + messages.hits.prefix(3).map { "m:" + $0.id } + local.prefix(3).map { "l:" + $0.id } + metadata.prefix(3).map { "d:" + $0.id }
+        let chats = source == .all || source == .telegram ? telegram.hits.map { "t:" + $0.id } : []
+        if source == .telegram { return chats }
+        return quick.map { "q:" + $0.id } + chats + messages.hits.prefix(3).map { "m:" + $0.id } + local.prefix(3).map { "l:" + $0.id } + metadata.prefix(3).map { "d:" + $0.id }
     }
     func move(_ delta: Int) {
         let values = choices; guard !values.isEmpty else { selected = nil; return }
         let position = selected.flatMap { values.firstIndex(of: $0) } ?? (delta > 0 ? -1 : values.count)
         selected = values[min(values.count - 1, max(0, position + delta))]
     }
-    func activate(_ id: String? = nil) {
+    func activate(_ id: String? = nil, beside: Bool = false, pin: Bool = false) {
         let id = id ?? selected
+        if let hit = telegram.hits.first(where: { "t:" + $0.id == id }), source == .all || source == .telegram {
+            openTelegram(hit, beside, pin); return
+        }
+        if id?.hasPrefix("t:") == true || (source == .telegram && id == nil) { return }
         dismiss()
         if let item = quick.first(where: { "q:" + $0.id == id }) { activateQuick(item) }
         else if let item = messages.hits.first(where: { "m:" + $0.id == id }) { openMessage(item) }
@@ -270,7 +298,8 @@ final class EverywhereSearchModel {
     }
     private func clearHistory() {
         historyTask?.cancel(); validationTask?.cancel()
-        selectedHit = nil; selectedRecord = nil; context = []; contextLoading = false; selected = nil
+        selectedHit = nil; selectedRecord = nil; context = []; contextLoading = false
+        if selected?.hasPrefix("t:") != true { selected = nil }
     }
     func indexChanged() {
         validationTask?.cancel()
@@ -298,6 +327,10 @@ extension WorkspaceStore {
             Task { await SearchNavigation.open(hit, model: model, from: self) }
         }
         model.openResults = { [weak self] in guard let self else { return }; SupportTabs.shared.navigation.open(.search, from: self) }
+        model.openTelegram = { [weak self, weak model] hit, beside, pin in
+            guard let self, let model else { return }
+            Task { if await model.telegram.open(hit, from: self, beside: beside, pin: pin) { model.dismiss() } }
+        }
         return model
     }
 }

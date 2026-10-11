@@ -1,11 +1,6 @@
 import AppKit
 import SwiftUI
 
-private struct ChatTimelineFrames: PreferenceKey {
-    static let defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) { value.merge(nextValue(), uniquingKeysWith: { _, rhs in rhs }) }
-}
-
 /// Shared geometry and keyboard behavior; channel and each thread keep separate
 /// positions in the tab model. No network or read marks come from row appearance.
 struct ChatTimelineView: View {
@@ -23,6 +18,7 @@ struct ChatTimelineView: View {
     @State private var nativeViewport = ChatScrollViewport()
     @State private var started = false
     @State private var visibleIDs = Set<String>()
+    @State private var presentationRevision: UInt64 = 0
     @FocusState private var focused: Bool
     private let bottomID = "chat-timeline-bottom"
 
@@ -30,6 +26,7 @@ struct ChatTimelineView: View {
     private var position: ChatScrollPosition { model.positions[root ?? ""] ?? ChatScrollPosition() }
     private var place: String { model.notificationPlace(root: root) }
     private var rows: [ChatFeedLayout.Row] { ChatFeedLayout.rows(messages, unreadID: root == nil ? model.feed.unreadID : model.threadUnreadID) }
+    private var presentation: ConversationSnapshot { model.presentation(root: root, epoch: box.id, revision: presentationRevision) }
 
     var body: some View {
         GeometryReader { viewport in
@@ -40,7 +37,7 @@ struct ChatTimelineView: View {
                             Text("There are earlier unread messages").font(Theme.display(11)).foregroundStyle(ChatAppearance.attention)
                                 .frame(maxWidth: .infinity).padding(8)
                         }
-                        if root == nil ? model.feed.hasOlder : model.threadHasEarlier {
+                        if presentation.hasOlder {
                             Button(root == nil ? "Load earlier messages" : "Earlier replies") {
                                 loadingAnchor = position.anchor ?? messages.first?.id
                                 nativeViewport.stopFollowing()
@@ -70,7 +67,7 @@ struct ChatTimelineView: View {
                             }
                             .id(row.id)
                             .background(GeometryReader { geometry in
-                                Color.clear.preference(key: ChatTimelineFrames.self, value: [row.id: geometry.frame(in: .named(coordinate))])
+                                Color.clear.preference(key: ConversationFrames.self, value: [row.id: geometry.frame(in: .named(coordinate))])
                             })
                         }
                         if root != nil {
@@ -92,7 +89,7 @@ struct ChatTimelineView: View {
                         readIfLooking()
                     })
                     .background(GeometryReader { geometry in
-                        Color.clear.preference(key: ChatTimelineFrames.self, value: [bottomID: geometry.frame(in: .named(coordinate))])
+                        Color.clear.preference(key: ConversationFrames.self, value: [bottomID: geometry.frame(in: .named(coordinate))])
                     })
                 }
                 .coordinateSpace(name: coordinate)
@@ -107,10 +104,12 @@ struct ChatTimelineView: View {
                 .onKeyPress(.escape) {
                     model.dismissTransient() ? .handled : .ignored
                 }
-                .onPreferenceChange(ChatTimelineFrames.self) { frames in
+                .onPreferenceChange(ConversationFrames.self) { frames in
                     guard started else { return }
                     let bottom = nativeViewport.atBottom
-                    let visible = frames.filter { $0.key != bottomID && $0.value.maxY > 0 && $0.value.minY < viewport.size.height }
+                    let measured = frames.filter { $0.key != bottomID }
+                    let visibleKeys = ConversationFrames.visible(measured, viewport: CGRect(origin: .zero, size: viewport.size))
+                    let visible = measured.filter { visibleKeys.contains($0.key) }
                     visibleIDs = Set(visible.keys)
                     let anchor = visible.min { $0.value.minY < $1.value.minY }?.key
                     var state = position
@@ -120,6 +119,7 @@ struct ChatTimelineView: View {
                     readIfLooking()
                 }
                 .onChange(of: messages) { old, new in
+                    presentationRevision &+= 1
                     var state = position
                     let follow = state.update(new, me: me) || nativeViewport.following
                     model.positions[root ?? ""] = state

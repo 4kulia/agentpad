@@ -136,6 +136,9 @@ enum PaletteIndex {
                 }
                 for pane in ws.root.allPanes {
                     for tab in pane.tabs {
+                        // Telegram's provider owns chat identity/ranking and
+                        // resolves an existing tab across all windows on open.
+                        if case .telegram = tab.toolRoute { continue }
                         let prepared = AttentionSidebarModel.shared.projection.tabs[tab.id]
                         guard prepared?.available ?? tab.hasProcess else { continue }
                         items.append(PaletteItem(

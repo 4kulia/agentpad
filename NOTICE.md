@@ -72,6 +72,17 @@ SOFTWARE.
 
 ## Pulled at build time
 
+### TDLib and TDLibFramework
+- Telegram API client, used locally by AgentPad (an independent, unofficial client).
+- TDLib: <https://github.com/tdlib/td/tree/42e6a5259551178d1dab54a22ad96d14bd906e20>, version 1.8.67; Boost Software License 1.0 (`licenses/TDLib-BSL-1.0.txt`).
+- Copyright Aliaksei Levin and Arseny Smirnov, 2014–2026.
+- Swiftgram package: <https://github.com/Swiftgram/TDLibFramework/tree/9ebb0e55a3607f10f24b3fc3e663bd38e7743ad2>; MIT (`licenses/TDLibFramework-MIT.txt`).
+- Static artifact: `1.8.67-42e6a525/TDLibFramework.zip`, SHA-256 `98789e70d89654414a1415cf778a5071c93cf96501c98fc25d7ef8d12d18fdf5`.
+- Vendor build recipe: the pinned package's `.github/workflows/build.yml`, `builder/` patches and the TDLib Apple example. It builds OpenSSL separately, then combines the static libraries in the framework. The supplied binary identifies OpenSSL 3.1.5; Apache 2.0 (`licenses/OpenSSL-3.1.5-Apache-2.0.txt`). Copyright The OpenSSL Project Authors.
+- System zlib and libc++ are linked dynamically; zlib notice in `licenses/zlib.txt`. No TDLibKit Swift DTOs are included.
+- The vendor publishes build recipes, not a complete object-level provenance attestation. Pin/checksum verification does not establish the provenance of every object.
+- License files accompany the installed app in `Contents/Resources/licenses`.
+
 ### libghostty
 - Source: <https://github.com/ghostty-org/ghostty>
 - License: MIT

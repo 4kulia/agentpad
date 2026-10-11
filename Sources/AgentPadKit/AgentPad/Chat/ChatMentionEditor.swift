@@ -39,6 +39,7 @@ struct ChatMentionEditor: NSViewRepresentable {
     var attachments: ((NSPasteboard) -> Bool)? = nil
     var dropAttachments: ((NSPasteboard) -> Bool)? = nil
     var dropTarget: ((Bool) -> Void)? = nil
+    var suppressCommandReturnRepeat = false
     var key: (UInt16, NSEvent.ModifierFlags) -> Bool
 
     final class Editor: NSTextView {
@@ -74,6 +75,7 @@ struct ChatMentionEditor: NSViewRepresentable {
         }
         var navigationTarget: ChannelRef?
         var consume: ((UInt16, NSEvent.ModifierFlags) -> Bool)?
+        var suppressCommandReturnRepeat = false
         var focusOnAttach = false
         var placeholder = "" { didSet { needsDisplay = true } }
         private var didAutofocus = false
@@ -122,6 +124,7 @@ struct ChatMentionEditor: NSViewRepresentable {
             }
         }
         override func keyDown(with event: NSEvent) {
+            if suppressCommandReturnRepeat, event.isARepeat, [36, 76].contains(event.keyCode), event.modifierFlags.contains(.command) { return }
             if hasMarkedText() || consume?(event.keyCode, event.modifierFlags) != true { super.keyDown(with: event) }
         }
     }
@@ -185,6 +188,7 @@ struct ChatMentionEditor: NSViewRepresentable {
         defer { context.coordinator.updating = false }
         control?.view = view
         view.consume = key
+        view.suppressCommandReturnRepeat = suppressCommandReturnRepeat
         view.attachments = attachments; view.dropAttachments = dropAttachments; view.dropTarget = dropTarget
         if attachments != nil { view.registerForDraggedTypes(ChatAttachmentPaste.types) }
         view.navigationTarget = navigationTarget

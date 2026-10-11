@@ -18,10 +18,17 @@ final class NotificationNavigation {
     var validate: (AttentionEvent) -> Bool = { _ in false }
     var open: (AttentionEvent) -> Bool = { _ in false }
     var unavailable: () -> Void = {}
+    var telegramActivate: (String) -> Bool = { TelegramNotifications.shared.activate($0) }
+    var telegramReady: () -> Bool = { TelegramNotifications.shared.initialized }
     private var pending: [String] = []
     init(ledger: AttentionLedger) { self.ledger = ledger }
     func activate(_ id: String) {
         guard ready else { if !pending.contains(id) { pending.append(id) }; return }
+        if id.hasPrefix("telegram:") {
+            guard telegramReady() else { if !pending.contains(id), pending.count < 250 { pending.append(id) }; return }
+            if !telegramActivate(id) { unavailable() }
+            return
+        }
         if let event = ledger.event(id), shouldWait(event) {
             if !pending.contains(id) { pending.append(id) }; return
         }
@@ -58,11 +65,11 @@ enum AttentionFocus {
     static func window(for destination: AttentionDestination) -> NSWindow? {
         places.values.first { $0.destinations.contains(destination) && $0.view.view?.window != nil }?.view.view?.window
     }
-    static func focused(_ destination: AttentionDestination) -> Bool {
-        guard NSApp?.isActive == true else { return false }
+    static func focused(_ destination: AttentionDestination, appActive: Bool = NSApp?.isActive == true) -> Bool {
+        guard appActive else { return false }
         return places.values.contains { entry in
             guard entry.destinations.contains(destination), let view = entry.view.view,
-                  NavigationPresentationGate.allowsAcknowledgement(view, appActive: NSApp?.isActive == true) else { return false }
+                  NavigationPresentationGate.allowsAcknowledgement(view, appActive: appActive) else { return false }
             return true
         }
     }

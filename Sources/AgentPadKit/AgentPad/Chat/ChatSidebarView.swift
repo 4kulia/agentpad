@@ -240,6 +240,7 @@ struct ChatSidebarView: View {
                     } else if snapshot.state == .noChannels {
                         caption("This server has no channels.")
                     }
+                    TelegramSidebarSection(store: store, model: TelegramService.chats)
                     AgentProfilesSection(store: store, history: profileHistory, sharedProfiles: localPublications(snapshot).profiles,
                         disconnected: snapshot.state == .notConnected || snapshot.state == .checking,
                         selection: focus == .tree ? navigation.selection : nil, select: { navigation.selection = $0 })

@@ -109,6 +109,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        // Local Telegram restoration/configuration runs asynchronously. Capture
+        // and scrub optional provisioning env before launching helper children.
+        TelegramService.start()
         MainThreadWatchdog.shared.start()
         MainThreadWatchdog.shared.checkpoint()
         AgentPadFonts.registerOnce()
@@ -241,6 +244,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // AgentPad: Claude Code sessions running in other terminals, plus the
         // Dock badge / banners / ⌘⇧U that cover them and our own tabs.
         AttentionCoordinator.shared.notificationManager = notificationManager
+        TelegramNotifications.shared.manager = notificationManager
+        TelegramNotifications.shared.receive(TelegramService.chats.snapshot, provider: TelegramService.chats.provider)
         AttentionCoordinator.shared.activateOwn = { [weak self] sessionId in
             self?.activateFromNotification(sessionId)
         }
@@ -1064,6 +1069,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             tab.tabState?.dmModel?.openThread(thread)
             return true
         case .invitation, .publicationProposal: return false
+        case .telegram: return false // TDLib locators use the bounded local adapter.
         }
     }
 
@@ -1181,11 +1187,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             controller.store.terminate()
         }
         if SurfaceTeardownCoordinator.shared.isDrained, !TeamProcesses.shared.hasRegisteredRuns,
+           !TelegramService.settings.needsShutdown,
            (ChatService.shared.launcher?.pendingLaunches ?? 0) == 0,
            ChatService.shared.launcher?.live.isEmpty != false { return .terminateNow }
         terminationProcesses = Task {
+            async let telegramClosed: Void = TelegramService.shutdown()
             await ChatService.shared.stopper?.stopAllAtQuit()
             _ = try? await BackgroundInspection.run { TeamProcesses.shared.killAll() }
+            await telegramClosed
         }
 
         terminationReplyPending = true

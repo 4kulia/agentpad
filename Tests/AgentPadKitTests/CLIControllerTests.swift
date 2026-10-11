@@ -925,7 +925,7 @@ final class CLIControllerTests: XCTestCase {
         let controller = makeController(stores: [makeStore()])
         let response = await respond(controller, AgentPadCLIRequest(verb: .focus, tab: UUID().uuidString))
         XCTAssertFalse(response.ok)
-        XCTAssertTrue(response.error?.contains("no tab with id") == true)
+        XCTAssertTrue(response.error?.contains("no tab with that id") == true)
         XCTAssertTrue(revealed.isEmpty)
     }
 
@@ -1132,7 +1132,7 @@ final class CLIControllerTests: XCTestCase {
         let controller = makeController(stores: [makeStore()])
         let response = await respond(controller, AgentPadCLIRequest(verb: .close, tab: UUID().uuidString))
         XCTAssertFalse(response.ok)
-        XCTAssertTrue(response.error?.contains("no tab with id") == true)
+        XCTAssertTrue(response.error?.contains("no tab with that id") == true)
     }
 
     // MARK: rename
@@ -1163,7 +1163,7 @@ final class CLIControllerTests: XCTestCase {
             AgentPadCLIRequest(verb: .rename, tab: UUID().uuidString, title: "x")
         )
         XCTAssertFalse(unknown.ok)
-        XCTAssertTrue(unknown.error?.contains("no tab with id") == true)
+        XCTAssertTrue(unknown.error?.contains("no tab with that id") == true)
 
         // A direct caller's blank title must refuse, never CLEAR the name
         // (renameTab's blank-clears is the in-app popover's affordance).

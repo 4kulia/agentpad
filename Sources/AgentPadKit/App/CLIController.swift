@@ -199,10 +199,10 @@ final class AgentPadCLIController {
             completion(ok())
         case .list:
             Task {
-                let before = windows().flatMap { $0.store.allSessions }
+                let before = cliSessions()
                 let personal = await displayTitleAccess(origin, before)
                 guard isCallerWaiting() else { return }
-                let sameTabs = before.map(\.id) == windows().flatMap { $0.store.allSessions.map(\.id) }
+                let sameTabs = before.map(\.id) == cliSessions().map(\.id)
                 completion(ok(windows: listWindows(personal: personal && sameTabs)))
             }
         case .focus:
@@ -219,7 +219,7 @@ final class AgentPadCLIController {
             // AgentPad: team work (Team/TeamCLIHandler.swift).
             // AgentPad: re-resolve live tab identity before and after channel MCP awaits.
             Task { @MainActor in completion(await TeamCLIHandler.handle(request, service: teamService(), origin: origin,
-                chatSessions: { self.windows().flatMap { $0.store.workspaces.flatMap { $0.root.allPanes.flatMap(\.tabs) } }.filter { !$0.isDirectMessageTab } },
+                chatSessions: { self.cliSessions() },
                 isCallerWaiting: isCallerWaiting)) }
         }
     }
@@ -231,7 +231,7 @@ final class AgentPadCLIController {
             return refuse("focus needs --tab <session-uuid>")
         }
         guard let hit = locate(id) else {
-            return refuse("no tab with id \(id.uuidString) — run `agentpad-cli list`")
+            return refuse("no tab with that id — run `agentpad-cli list`")
         }
         activateApp()
         hit.context.reveal(hit.session, hit.workspace)
@@ -243,7 +243,7 @@ final class AgentPadCLIController {
             return refuse("close needs --tab <session-uuid>")
         }
         guard let hit = locate(id) else {
-            return refuse("no tab with id \(id.uuidString) — run `agentpad-cli list`")
+            return refuse("no tab with that id — run `agentpad-cli list`")
         }
         // A last-worktree close needs the directory choices in Workspace details.
         if hit.workspace.closingLastTabCascadesIntoWorktreeRemoval {
@@ -289,7 +289,7 @@ final class AgentPadCLIController {
             return refuse("rename needs --title <title>")
         }
         guard let hit = locate(id) else {
-            return refuse("no tab with id \(id.uuidString) — run `agentpad-cli list`")
+            return refuse("no tab with that id — run `agentpad-cli list`")
         }
         // AgentPad: DESIGN-F2.
         guard hit.session.hasProcess else { return refuse("a chat tab takes its destination’s name") }
@@ -650,11 +650,15 @@ final class AgentPadCLIController {
         return folded.count == 1 ? folded[0] : nil
     }
 
+    private func cliSessions() -> [Session] {
+        windows().flatMap { $0.store.allSessions }.filter(CLIListAccess.allowsSession)
+    }
+
     private func locate(_ id: UUID) -> (context: WindowContext, workspace: Workspace, session: Session)? {
         for context in windows() {
             for workspace in context.store.workspaces {
                 if let pane = workspace.root.pane(containingSessionId: id),
-                   let session = pane.tabs.first(where: { $0.id == id && !$0.isDirectMessageTab }) {
+                   let session = pane.tabs.first(where: { $0.id == id && CLIListAccess.allowsSession($0) }) {
                     return (context, workspace, session)
                 }
             }
@@ -690,11 +694,11 @@ final class AgentPadCLIController {
                 workspaces: store.workspaces.map { workspace in
                     AgentPadCLIWorkspaceInfo(
                         id: workspace.id.uuidString,
-                        title: workspace.title,
+                        title: workspaceTitle(workspace),
                         path: workspace.diskPath.path,
                         isActive: store.activeWorkspaceId == workspace.id,
                         tabs: workspace.root.allPanes.flatMap { pane in
-                            pane.tabs.filter { !$0.isDirectMessageTab }.map { tab in
+                            pane.tabs.filter(CLIListAccess.allowsSession).map { tab in
                                 // AgentPad: a channel tab tells its channel only while it may be seen (DESIGN-F2).
                                 if let channel = tab.channel {
                                     let state = ChannelTabs.state(channel)
@@ -726,6 +730,17 @@ final class AgentPadCLIController {
                 }
             )
         }
+    }
+
+    /// Workspace.title can inherit metadata from its active tab. A hidden
+    /// surface must not reappear through that aggregate's title either.
+    private func workspaceTitle(_ workspace: Workspace) -> String {
+        guard let active = workspace.activeSession, !CLIListAccess.allowsSession(active) else { return workspace.title }
+        if let title = workspace.customTitle, !title.isEmpty { return title }
+        if let host = workspace.sshRemoteHost { return host }
+        if workspace.workingDirectory.path == homeDirectoryPath { return "Home" }
+        let last = workspace.workingDirectory.lastPathComponent
+        return last.isEmpty ? workspace.workingDirectory.path : last
     }
 
     /// Wire-stable state words — deliberately NOT `AgentMonitor.State.label`

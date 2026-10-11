@@ -546,6 +546,7 @@ final class Session: Identifiable {
     var title: String { displayTitle }
 
     var displayTitle: String {
+        if case .telegram = toolRoute { return tabState?.telegramTopicTitle ?? tabState?.telegramRow?.title ?? "Telegram" }
         // AgentPad: a channel tab shows its channel's name while it may be seen (DESIGN-F2).
         if case .directMessage(let ref) = toolRoute { return ChatDMTabs.title(ref) }
         if case .directMessageDraft(let scope, let peer) = toolRoute {

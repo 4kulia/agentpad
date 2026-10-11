@@ -23,7 +23,7 @@ cat <<APPCAST
       <pubDate>$(LC_ALL=C date -u "+%a, %d %b %Y %H:%M:%S +0000")</pubDate>
       <sparkle:version>${VERSION}</sparkle:version>
       <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
-      <sparkle:minimumSystemVersion>14.5</sparkle:minimumSystemVersion>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
       ${RELEASE_NOTES}
       <enclosure url="${DMG_URL}" type="application/octet-stream" ${ED_ATTRS} />
     </item>

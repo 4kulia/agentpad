@@ -22,6 +22,7 @@ struct SearchEverywhereField: View {
             .background(SearchInteractionRegion(focus: model.fieldFocus, suggestions: false))
             .padding(.horizontal, 12)
             .onChange(of: model.query) { _, _ in model.update() }
+            .onChange(of: model.telegram.chats.snapshot.account) { _, _ in model.update() }
             .onChange(of: [store.active?.id, store.active?.activePaneId, store.active?.activeSession?.id]) { _, _ in model.dismiss() }
             .onChange(of: model.names.values) { _, _ in model.localSearch() }
             .onChange(of: model.profiles.bindings) { _, _ in model.localSearch() }
@@ -60,9 +61,10 @@ struct SearchSuggestionsView: View {
     @Bindable var model: EverywhereSearchModel
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    if !model.quick.isEmpty {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    if model.source != .telegram, !model.quick.isEmpty {
                         heading("Quick matches")
                         ForEach(model.quick) { item in
                             row("q:" + item.id) {
@@ -73,7 +75,30 @@ struct SearchSuggestionsView: View {
                             }
                         }
                     }
-                    if model.hasTeam, model.source != .sessions {
+                    if (model.source == .all && model.telegram.chats.connected) || model.source == .telegram {
+                        heading("Telegram")
+                        ForEach(model.telegram.hits) { hit in
+                            row("t:" + hit.id) {
+                                HStack(spacing: 10) {
+                                    Image(systemName: hit.row.symbol).frame(width: 20)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(hit.row.title).lineLimit(1)
+                                        Text("Telegram · \(hit.row.displayKind)\(hit.row.inArchive ? " · Archive" : "")\(hit.row.hidden ? " · Hidden here" : "")")
+                                            .font(.caption).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
+                                    }
+                                }
+                            }.id("t:" + hit.id)
+                        }
+                        if model.telegram.value.searching { noticeText("Searching Telegram…") }
+                        if model.telegram.opening { noticeText("Opening Telegram chat…") }
+                        if let notice = model.telegram.value.notice { noticeText(notice) }
+                        if !model.telegram.chats.connected {
+                            Button("Connect Telegram…") { model.dismiss(); SupportTabs.shared.settings(.telegram) }.buttonStyle(.plain).padding(9)
+                        } else if model.telegram.hits.isEmpty && !model.telegram.value.searching {
+                            noticeText("No matches in available Telegram sources")
+                        }
+                    }
+                    if model.hasTeam, model.source != .sessions, model.source != .telegram {
                         heading("Messages")
                         if model.messages.loading { ProgressView().controlSize(.small).padding(8) }
                         ForEach(Array(model.messages.hits.prefix(3))) { hit in
@@ -81,7 +106,7 @@ struct SearchSuggestionsView: View {
                         }
                         if let notice = model.messages.error ?? model.messages.availability().message { noticeText(notice) }
                     }
-                    if model.source != .messages {
+                    if model.source != .messages, model.source != .telegram {
                         heading("Agent sessions")
                         if model.localLoading { ProgressView().controlSize(.small).padding(8) }
                         ForEach(Array(model.local.prefix(3))) { hit in
@@ -99,12 +124,25 @@ struct SearchSuggestionsView: View {
                         if let error = model.localError { noticeText(error) }
                     }
                     if !model.query.isEmpty, (try? SearchQuery(model.query)) == nil { noticeText(SearchProblem.invalidQuery.localizedDescription) }
-                    if !model.hasTeam { noticeText(ChatSearchAvailability.noTeam.message!) }
+                    if !model.hasTeam, model.source != .telegram { noticeText(ChatSearchAvailability.noTeam.message!) }
+                    if model.source == .all, !model.telegram.chats.connected {
+                        Button("Connect Telegram…") { model.dismiss(); SupportTabs.shared.settings(.telegram) }.buttonStyle(.plain).padding(9)
+                    }
                 }.padding(8)
             }.frame(maxHeight: 490)
+                .onChange(of: model.selected) { _, selected in if let selected { proxy.scrollTo(selected) } }
+                .onChange(of: model.telegram.hits.map(\.id)) { _, _ in
+                    if let selected = model.selected, selected.hasPrefix("t:") { proxy.scrollTo(selected) }
+                }
+            }
             Divider()
-            Button { model.showResults() } label: { HStack { Text("View all results"); Spacer(); Text("⌘↵").foregroundStyle(ChatAppearance.secondary) }.padding(12) }
-                .buttonStyle(.plain)
+            HStack {
+                Button { model.showResults() } label: { HStack { Text("View all results"); Text("⌘↵").foregroundStyle(ChatAppearance.secondary) }.padding(12) }
+                    .buttonStyle(.plain)
+                Spacer()
+                Button("All") { model.source = .all; model.update() }
+                Button("Telegram") { model.source = .telegram; model.update() }
+            }.buttonStyle(.borderless).padding(.trailing, 12)
         }.background(ChatAppearance.surface, in: RoundedRectangle(cornerRadius: 10))
             .background(SearchInteractionRegion(focus: model.fieldFocus, suggestions: true))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.chromeSeparator))
@@ -114,6 +152,7 @@ struct SearchSuggestionsView: View {
         Button { model.activate(id) } label: { content().frame(maxWidth: .infinity, alignment: .leading).padding(9).contentShape(Rectangle()) }
             .buttonStyle(.plain).background(model.selected == id ? ChatAppearance.accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
             .accessibilityAddTraits(model.selected == id ? [.isSelected] : [])
+            .id(id)
     }
     private func heading(_ text: String) -> some View { Text(text).font(Theme.display(10, weight: .semibold)).foregroundStyle(ChatAppearance.secondary).padding(.horizontal, 9).padding(.top, 9) }
     private func noticeText(_ text: String) -> some View { Text(text).font(.caption).foregroundStyle(ChatAppearance.secondary).padding(9) }

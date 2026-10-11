@@ -48,14 +48,17 @@ import UniformTypeIdentifiers
 /// Dragging a screenshot thumbnail can promise a file instead of a file URL.
 /// Keep receipt inside the manager's import lifetime, so Send, revocation and
 /// quotas behave exactly like a file that already exists on disk.
-@MainActor private final class ChatAttachmentFilePromises {
+@MainActor final class ChatAttachmentFilePromises {
     let receivers: [NSFilePromiseReceiver]
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("agentpad-paste-" + UUID().uuidString, isDirectory: true)
+    let directory: URL
     private var remaining = 0
     private var files: AsyncThrowingStream<URL, Error>?
-    init(_ receivers: [NSFilePromiseReceiver]) { self.receivers = receivers }
-    func start() throws {
-        try ChatAttachmentStorage.secureDirectory(directory)
+    init(_ receivers: [NSFilePromiseReceiver], directory: URL? = nil) {
+        self.receivers = receivers
+        self.directory = directory ?? FileManager.default.temporaryDirectory.appendingPathComponent("agentpad-paste-" + UUID().uuidString, isDirectory: true)
+    }
+    func start(directoryReady: Bool = false) throws {
+        if !directoryReady { try ChatAttachmentStorage.secureDirectory(directory) }
         // AppKit requires this call synchronously inside performDragOperation;
         // neither a clipboard paste nor a later Task may call in a file promise.
         files = AsyncThrowingStream<URL, Error> { continuation in

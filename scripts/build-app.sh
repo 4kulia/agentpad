@@ -15,6 +15,8 @@
 # This is local-distribution-only. Codesigning + notarization for public
 # release is a separate step (requires Apple Developer ID).
 
+# Credentials must never appear in shell tracing, even under bash -x.
+set +x
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,6 +33,13 @@ fi
 BUNDLE_ID="com.4kulia.agentpad"
 APP_NAME="AgentPad"
 APP="dist/${APP_NAME}.app"
+
+TELEGRAM_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agentpad-telegram-build.XXXXXX")"
+chmod 700 "$TELEGRAM_BUILD_DIR"
+trap 'rm -rf "$TELEGRAM_BUILD_DIR"' EXIT
+python3 -I scripts/telegram-build-config.py --prepare "$TELEGRAM_BUILD_DIR/TelegramCredentials.plist"
+# Do not pass build credentials to SwiftPM/compiler processes or their caches.
+unset AGENTPAD_TELEGRAM_API_ID AGENTPAD_TELEGRAM_API_HASH TELEGRAM_API_ID TELEGRAM_API_HASH TG_API_ID TG_API_HASH API_ID API_HASH
 
 echo "==> Building release config"
 swift build -c release
@@ -62,11 +71,19 @@ cp -R .build/release/AgentPad_AgentPadKit.bundle "${APP}/Contents/Resources/"
 # AgentPad: the MIT license and notices (kooky's copyright among them) travel
 # with every copy of the app.
 cp LICENSE NOTICE.md "${APP}/Contents/Resources/"
+cp -R licenses "${APP}/Contents/Resources/"
+if [ -f "$TELEGRAM_BUILD_DIR/TelegramCredentials.plist" ]; then
+    python3 -I scripts/telegram-build-config.py --bundle "$TELEGRAM_BUILD_DIR/TelegramCredentials.plist" "${APP}/Contents/Resources/TelegramCredentials.plist"
+fi
+# TDLibFramework is static: its code is in AgentPad, never copy the archive,
+# other platform slices, or the XCFramework into Contents/Frameworks.
 # AgentPad: Sparkle (in-app updates). SwiftPM leaves the binary framework next
 # to the products; the app finds it through the @executable_path/../Frameworks
 # rpath set in Package.swift.
-SPARKLE_FW="$(find .build -path '*release*' -name Sparkle.framework -type d -not -path '*/Sparkle.framework/*' | head -1)"
-[ -n "$SPARKLE_FW" ] || { echo "missing Sparkle.framework in .build" >&2; exit 1; }
+# Use SwiftPM's product alias. Swift 6.4's Swift Build backend puts the real
+# directory in out/Products/Release; a lowercase find glob misses that layout.
+SPARKLE_FW=".build/release/Sparkle.framework"
+[ -d "$SPARKLE_FW" ] || { echo "missing Sparkle.framework beside release products" >&2; exit 1; }
 mkdir -p "${APP}/Contents/Frameworks"
 ditto "$SPARKLE_FW" "${APP}/Contents/Frameworks/Sparkle.framework"
 
@@ -214,7 +231,7 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     <key>SUScheduledCheckInterval</key>
     <integer>21600</integer>
     <key>LSMinimumSystemVersion</key>
-    <string>14.5</string>
+    <string>15.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSPrincipalClass</key>
@@ -324,6 +341,8 @@ codesign "${APP_SIGN_FLAGS[@]}" "${APP}/Contents/MacOS/${APP_NAME}"
 codesign "${SIGN_FLAGS[@]}" "${APP}/Contents/MacOS/AgentPadHook"
 codesign "${SIGN_FLAGS[@]}" "${APP}/Contents/MacOS/agentpad-cli"
 codesign "${APP_SIGN_FLAGS[@]}" "${APP}" 2>&1 | tail -3
+codesign --verify --deep --strict "${APP}"
+python3 -I scripts/verify-app-linkage.py "${APP}"
 
 echo ""
 echo "✓ Built ${APP} (v${VERSION})"

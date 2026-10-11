@@ -3,6 +3,22 @@ import GRDB
 
 @MainActor
 enum CLIListAccess {
+    /// The agent boundary has no Telegram access, including for personal
+    /// callers. Filter surfaces before reading any of their metadata. Search
+    /// and Notifications can mix Telegram into their contents, so neither is
+    /// exportable even when its current results happen to be empty.
+    static func allowsSession(_ session: Session) -> Bool {
+        guard !session.isDirectMessageTab else { return false }
+        switch session.toolRoute {
+        case .telegram, .search, .notifications:
+            return false
+        case .settings:
+            return session.tabState?.navigation.settingsSection != .telegram
+        default:
+            return true
+        }
+    }
+
     /// Local tab callers can see display titles without Claude signatures,
     /// conversation bindings or a Team connection. Published tabs, executor
     /// history, live runs and unverified history receive only names/fallbacks.

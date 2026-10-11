@@ -147,6 +147,7 @@ extension AttentionCoordinator {
         ledger.upsert(events, live: { $0.kind != .dm && ($0.scope == nil || live || $0.kind.needsDecision) })
         ledger.validateAll()
         AttentionSidebarModel.shared.refresh(service: service, ledger: ledger)
+        TelegramNotifications.shared.settingsChanged(provider: TelegramService.chats.provider)
         navigation?.retryPending()
         refreshBadge()
     }
@@ -155,6 +156,9 @@ extension AttentionCoordinator {
         guard sourcesReady, let manager = notificationManager else { return }
         let ledger = AttentionLedger.shared
         for id in await manager.identifiers() {
+            // TDLib's initial snapshot owns this reconciliation, including
+            // snapshots arriving before getMe/options finish.
+            if id.hasPrefix("telegram:") { continue }
             if let event = ledger.event(id), valid(event) { continue }
             ledger.resolve(id)
             manager.remove(ids: [id])

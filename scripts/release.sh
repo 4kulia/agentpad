@@ -30,6 +30,7 @@
 # Note: this rebuilds dist/AgentPad.app in place. Quit an AgentPad that is
 # running from dist/ first, or run your everyday copy from /Applications.
 
+set +x
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -85,6 +86,9 @@ notarize() {
     fi
 }
 
+# This builder reads the external private config only in memory. No credential
+# enters argv, SwiftPM inputs, or compiler caches. Missing config fails release.
+export AGENTPAD_TELEGRAM_REQUIRE_CONFIG=1
 ./scripts/build-app.sh
 
 echo "==> Verifying the app signature"

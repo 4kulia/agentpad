@@ -51,6 +51,7 @@ final class ChatDMModel: ChatConversationPresentation {
     var focusRequest: ChatFocusRequest?
     var readingPositionRestored = 0
     let isDM = true
+    func destination(root: String?) -> ConversationDestination { .directMessage(ref, thread: root) }
     var searching: Bool { false }
     var hasNavigationReturn: Bool { false }
     var b1: ChatB1Channel? { nil }

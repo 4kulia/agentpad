@@ -42,6 +42,14 @@ final class ChatScrollViewport {
     }
 
     func stopFollowing() { following = false }
+    func preserveContentOffset(_ delta: CGFloat) {
+        guard !following, abs(delta) > 0.5, let scroll, let document = scroll.documentView else { return }
+        let clip = scroll.contentView
+        let offset = document.isFlipped ? delta : -delta
+        let y = min(max(document.bounds.minY, clip.bounds.minY + offset), max(document.bounds.minY, document.bounds.maxY - clip.bounds.height))
+        clip.scroll(to: CGPoint(x: clip.bounds.minX, y: y)); scroll.reflectScrolledClipView(clip)
+        measure()
+    }
     private func boundsChanged() {
         guard let scroll, let document = scroll.documentView else { return }
         let resized = document.bounds.size != documentSize || scroll.contentView.bounds.size != viewportSize

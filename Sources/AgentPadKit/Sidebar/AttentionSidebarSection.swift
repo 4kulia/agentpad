@@ -5,6 +5,8 @@ struct AttentionSidebarSection: View {
     var model = AttentionSidebarModel.shared
     var title = "Needs attention"
     var alwaysShowsHeader = false
+    @State private var interactionID = UUID()
+    @State private var interactionHeld = false
     var body: some View {
         AttentionSectionContent(title: title, items: model.items, alwaysShowsHeader: alwaysShowsHeader,
             collapsed: Binding(get: { store.chatSidebarPreferences.attentionCollapsed ?? false },
@@ -12,7 +14,27 @@ struct AttentionSidebarSection: View {
             expanded: $store.attentionExpanded,
             activate: { model.activate($0, from: store) }, secondary: model.secondary,
             settings: { SupportTabs.shared.navigation.open(.settings, from: store, section: .notifications) },
-            itemTitle: model.title)
+            itemTitle: model.title, interactionChanged: { held in
+                interactionHeld = held
+                let id = interactionID
+                Task { await TelegramService.chats.hold(held, owner: id) }
+            })
+            .onDisappear { let id = interactionID; Task { await TelegramService.chats.hold(false, owner: id) } }
+            .onChange(of: store.panelIsPresented) { _, presented in
+                let id = interactionID, held = presented && interactionHeld
+                Task { await TelegramService.chats.hold(held, owner: id) }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { notification in
+                if (notification.object as? NSWindow) === store.active?.activeSession?.engine.view.window {
+                    let id = interactionID; Task { await TelegramService.chats.hold(false, owner: id) }
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
+                if (notification.object as? NSWindow) === store.active?.activeSession?.engine.view.window {
+                    let id = interactionID, held = interactionHeld && store.panelIsPresented
+                    Task { await TelegramService.chats.hold(held, owner: id) }
+                }
+            }
     }
 }
 
@@ -26,6 +48,7 @@ struct AttentionSectionContent: View {
     var secondary: (AttentionItem) -> Void
     var settings: () -> Void
     var itemTitle: (AttentionItem) -> String = { $0.title }
+    var interactionChanged: (Bool) -> Void = { _ in }
     @FocusState private var focused: String?
     @State private var hovered: String?
 
@@ -69,7 +92,7 @@ struct AttentionSectionContent: View {
                             .accessibilityLabel("\(item.subtitle), \(title)").chatFocusRing()
                         if let action = item.secondary {
                             Button { secondary(item) } label: {
-                                Image(systemName: action == .dismiss ? "xmark" : "checkmark").font(.system(size: 10))
+                                Image(systemName: action == .dismiss ? "xmark" : action == .snooze ? "moon" : "checkmark").font(.system(size: 10))
                             }.buttonStyle(.plain).help(action.rawValue).accessibilityLabel(action.rawValue)
                                 .opacity(hovered == item.id || focused == item.id ? 1 : 0)
                         }
@@ -88,6 +111,8 @@ struct AttentionSectionContent: View {
                 .background(ChatAppearance.attention.opacity(0.045), in: RoundedRectangle(cornerRadius: 7))
                 .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(ChatAppearance.attention.opacity(0.25)))
                 .padding(.horizontal, 8).padding(.bottom, 7)
+                .onChange(of: focused) { _, _ in interactionChanged(focused != nil || hovered != nil) }
+                .onChange(of: hovered) { _, _ in interactionChanged(focused != nil || hovered != nil) }
                 .onMoveCommand { direction in
                     guard direction == .up || direction == .down, !visible.isEmpty else { return }
                     let index = visible.firstIndex { $0.id == focused } ?? (direction == .down ? -1 : visible.count)

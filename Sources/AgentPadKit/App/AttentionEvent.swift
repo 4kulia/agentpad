@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import AgentPadTelegram
 
 /// Metadata only. Channel contents and execution permissions stay in their sources.
 struct AttentionScope: Codable, Hashable, Sendable {
@@ -87,6 +88,7 @@ enum AttentionOrganizationSection: String, Codable, Hashable, Sendable {
 }
 
 enum AttentionDestination: Codable, Hashable, Sendable {
+    case telegram(TelegramChatID, message: Int64)
     case terminal(UUID)
     case external(String)
     case team(request: String?, outgoing: Bool)
@@ -123,11 +125,11 @@ struct AttentionEvent: Identifiable, Equatable, Codable, Sendable {
     var localBody: String?
 
     init(source: String, object: String, episode: String = "", kind: AttentionKind,
-         destination: AttentionDestination, scope: AttentionScope? = nil, timestamp: Date = Date()) {
+         destination: AttentionDestination, scope: AttentionScope? = nil, timestamp: Date = Date(), id: String? = nil) {
         self.source = source; self.kind = kind; self.destination = destination
         self.scope = scope; self.timestamp = timestamp
         self.episode = episode
-        id = Self.identifier([scope?.server ?? "", scope?.account ?? "", scope?.organization ?? "",
+        self.id = id ?? Self.identifier([scope?.server ?? "", scope?.account ?? "", scope?.organization ?? "",
                               scope?.generation ?? "", source, object, episode])
     }
     static func identifier(_ components: [String]) -> String {

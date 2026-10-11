@@ -74,6 +74,7 @@ final class SupportTabs {
 
     func content(_ state: TabState) -> AnyView {
         switch state.route {
+        case .telegram(let id): return AnyView(TelegramConversationView(state: state, id: id).id(id))
         case .directMessage(let ref): return AnyView(ChatDMTab(state: state, ref: ref))
         case .directMessageDraft(let key, let peer): return AnyView(ChatDMPeerTab(state: state, scope: key, peer: peer))
         case .newDM(let key): return AnyView(ChatDMNewView(state: state, scope: key))

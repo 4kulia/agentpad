@@ -1310,6 +1310,7 @@ struct AgentPadSettingsView: View {
             switch selected {
             case .general: generalDetail
             case .profile: AccountProfileSettings()
+            case .telegram: TelegramSettingsView(model: TelegramService.settings)
             case .appearance: appearanceDetail
             case .agents: codingAgentsDetail
             case .terminals: terminalPresetsDetail

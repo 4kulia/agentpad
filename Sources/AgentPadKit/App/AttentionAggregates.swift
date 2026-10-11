@@ -1,3 +1,4 @@
+import AgentPadTelegram
 import Foundation
 import GRDB
 import Observation
@@ -87,6 +88,8 @@ final class AttentionSidebarModel {
     var serverCurrent = AttentionCurrent()
     var dismissalRevision = 0
     struct Projection: Equatable {
+        var telegram = TelegramChatSnapshot()
+        var telegramPages: [Int: [TelegramChatRow]] = [:]
         var items: [AttentionItem] = []
         var terminals: [UUID: [AttentionItem]] = [:]
         var profileCounts: [UUID: Int] = [:]
@@ -97,6 +100,8 @@ final class AttentionSidebarModel {
         var windowIndicators: [UUID: AttentionIndicator] = [:]
     }
     private struct Input: Equatable {
+        var telegram: TelegramChatSnapshot
+        var telegramPages: [Int: [TelegramChatRow]]
         var current: AttentionCurrent
         var tabs: [AttentionTabSnapshot]
         var events: [AttentionEvent]
@@ -127,11 +132,12 @@ final class AttentionSidebarModel {
     @ObservationIgnored private var observationEpoch = UUID()
     @ObservationIgnored private var channelConversations: [String: AttentionConversation] = [:]
     @ObservationIgnored private var service: ChatService
+    @ObservationIgnored private let telegram: TelegramChatsModel
     @ObservationIgnored private let storesProvider: @MainActor () -> [WorkspaceStore]
     @ObservationIgnored private(set) var projectionBuildCount = 0
-    init(ledger: AttentionLedger = .shared, service: ChatService = .shared,
+    init(ledger: AttentionLedger = .shared, service: ChatService = .shared, telegram: TelegramChatsModel = TelegramService.chats,
          storesProvider: @escaping @MainActor () -> [WorkspaceStore] = { AgentMonitor.shared.storesProvider() }) {
-        self.ledger = ledger; self.service = service
+        self.ledger = ledger; self.service = service; self.telegram = telegram
         self.storesProvider = storesProvider
         updateProjection()
     }
@@ -244,6 +250,10 @@ final class AttentionSidebarModel {
                         } else if case .directMessageDraft(let draftScope, let peer) = session.toolRoute {
                             available = dmReady && scopeKey.map { draftScope == OrgKey($0) } == true && peers[peer] != nil
                             title = available ? peers[peer] ?? "Direct message" : "Direct message"
+                        } else if case .telegram(let id) = session.toolRoute {
+                            available = telegram.snapshot.account?.account == id.account && telegram.snapshot.account?.environment == id.environment
+                            title = available ? session.tabState?.telegramTopicTitle ?? session.tabState?.telegramRow?.title ?? "Telegram" : "Telegram"
+                            if available { destinations.append(.telegram(id)) }
                         } else if case .request(let requestScope, let id) = session.toolRoute {
                             available = requestScope == .local || scope.flatMap(ChatAttention.key).map { requestScope == .server(OrgKey($0)) } == true
                             if available { destinations.append(.request(requestScope, id)) }
@@ -269,7 +279,8 @@ final class AttentionSidebarModel {
             }
         }
         _ = dismissalRevision
-        return (Input(current: current, tabs: tabs, events: ledger.events,
+        telegram.observeAttention(Set(tabs.flatMap(\.destinations).compactMap { if case .telegram(let id) = $0 { id } else { nil } }))
+        return (Input(telegram: telegram.snapshot, telegramPages: telegram.pages, current: current, tabs: tabs, events: ledger.events,
             mentions: aggregates.mentions, dms: dms, channels: channels,
             settings: AgentPadSettingsModel.shared.attentionSettings,
             dismissed: Set(ledger.metadata.markers.filter { $0.value.hidden }.keys), viewed: ledger.viewedAttentionIDs), names)
@@ -279,7 +290,15 @@ final class AttentionSidebarModel {
         let items = AttentionList.items(ledger: input.events, current: input.current,
             mentions: input.mentions, dms: input.dms, settings: input.settings,
             dismissed: input.dismissed, viewed: input.viewed)
-        var result = Projection(items: items)
+        var result = Projection(telegram: input.telegram, telegramPages: input.telegramPages.mapValues { $0.filter { $0.attention == nil } }, items: items)
+        for offset in input.telegramPages.keys.sorted() {
+            for row in input.telegramPages[offset] ?? [] {
+                guard let summary = row.attention else { continue }
+                result.items.append(.init(id: "telegram-row:" + summary.identity, tier: 3,
+                    time: Date(timeIntervalSince1970: Double(summary.lastDate)), title: row.title,
+                    subtitle: summary.caption + (row.pinned ? " · Pinned here" : ""), action: .telegram(summary), secondary: .snooze, indicatorKind: .unread))
+            }
+        }
         var destinations: [AttentionTabDestination: [UUID]] = [:]
         for tab in input.tabs {
             result.tabs[tab.id] = tab
@@ -305,6 +324,7 @@ final class AttentionSidebarModel {
                 }
             case .mention(let scope, let channel, _, _): targets = [.channel(scope, channel)]
             case .dm(let scope, let id): targets = [.dm(scope, id)]
+            case .telegram: continue // marks include overflow below, independent of sidebar pagination
             }
             var reason = AttentionIndicator.Reason(id: item.id, kind: kind,
                 summary: item.titleTabID == nil ? item.title + ": " + item.subtitle : item.subtitle, titleTabID: item.titleTabID)
@@ -316,6 +336,16 @@ final class AttentionSidebarModel {
             append(.init(id: row.unreadReasonID, kind: .unread, summary: row.title + ": " + (row.unreadLabel ?? "Unread activity"),
                          conversation: .channel(row.scope, row.id), readMarks: ["": row.boundary]),
                    to: [.channel(row.scope, row.id)])
+        }
+        for (destination, summaries) in input.telegram.attention.destinations {
+            for summary in summaries {
+                append(.init(id: "telegram-reason:" + summary.identity, kind: .unread, summary: "Telegram · " + summary.caption,
+                             conversation: .telegram(destination)), to: [.telegram(destination)])
+            }
+        }
+        for (destination, count) in input.telegram.attention.channelUnread where input.telegram.attention.destinations[destination] == nil {
+            append(.init(id: "telegram-channel:\(destination.environment.rawValue):\(destination.account):\(destination.chat)", kind: .unread,
+                         summary: "Telegram channel · \(count) unread", conversation: .telegram(destination)), to: [.telegram(destination)])
         }
         var workspaces: [AttentionWorkspaceID: [AttentionIndicator.Reason]] = [:]
         var windows: [UUID: [AttentionIndicator.Reason]] = [:]
@@ -384,6 +414,8 @@ final class AttentionSidebarModel {
         case .dm(let scope, let conversation):
             guard ChatAttention.sameScope(scope, service) else { return }
             aggregates.dmSource?.open(conversation, scope: scope, from: store)
+        case .telegram(let summary):
+            TelegramTabs.openAttention(summary, from: store, router: router)
         }
     }
 
@@ -404,6 +436,8 @@ final class AttentionSidebarModel {
         case .dm(let scope, let conversation):
             guard ChatAttention.sameScope(scope, service) else { return }
             aggregates.dmSource?.markRead(conversation, scope: scope)
+        case .telegram(let summary):
+            Task { await telegram.provider?.snoozeAttention(summary.destination, undo: false) }
         }
     }
 }

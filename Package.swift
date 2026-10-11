@@ -5,10 +5,8 @@ let package = Package(
     name: "AgentPad",
     defaultLocalization: "en",
     platforms: [
-        // .v14 floor — `@Observable` macro requires Sonoma+. Dropping further
-        // would mean reverting all session models to ObservableObject + @Published.
-        // AgentPad: 14.5, as released (LSMinimumSystemVersion).
-        .macOS("14.5")
+        // The pinned TDLib macOS binary requires macOS 15.
+        .macOS("15.0")
     ],
     dependencies: [
         // AgentPad: in-app updates ("Install and Relaunch"), verified with an
@@ -17,6 +15,10 @@ let package = Package(
         // AgentPad: the server mode's local cache and run journal (SQLite,
         // docs/agentpad/CHAT-PLAN.md C4). MIT. Pinned like the others.
         .package(url: "https://github.com/groue/GRDB.swift", exact: "7.11.1"),
+        // TDLib 1.8.67 / 42e6a525, static XCFramework. The pinned manifest
+        // verifies ZIP SHA-256 98789e70d89654414a1415cf778a5071c93cf96501c98fc25d7ef8d12d18fdf5.
+        .package(url: "https://github.com/Swiftgram/TDLibFramework",
+                 revision: "9ebb0e55a3607f10f24b3fc3e663bd38e7743ad2"),
     ],
     targets: [
         // Thin executable: main.swift only. Everything else lives in AgentPadKit so
@@ -61,9 +63,16 @@ let package = Package(
             path: "Sources/AgentPadHookKit"
         ),
         .target(
+            name: "AgentPadTelegram",
+            dependencies: [.product(name: "TDLibFramework", package: "TDLibFramework"),
+                           .product(name: "GRDB", package: "GRDB.swift")],
+            linkerSettings: [.linkedFramework("Security")]
+        ),
+        .target(
             name: "AgentPadKit",
             dependencies: [
                 "GhosttyKit",
+                "AgentPadTelegram",
                 // CLI wire types (AgentPadCLIRequest/Response) — compiled into
                 // both ends so the protocol can't drift. One-way dependency;
                 // AgentPadHookKit stays Foundation/Darwin-only.
@@ -106,6 +115,10 @@ let package = Package(
             // AgentPad: the server's API samples, read from disk by the
             // chat tests (scripts/sync-chat-fixtures.sh).
             exclude: ["Fixtures"]
+        ),
+        .testTarget(
+            name: "AgentPadTelegramTests",
+            dependencies: ["AgentPadTelegram"]
         ),
         .testTarget(
             name: "AgentPadHookKitTests",

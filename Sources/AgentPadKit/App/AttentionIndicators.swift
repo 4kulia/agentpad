@@ -1,4 +1,5 @@
 import Foundation
+import AgentPadTelegram
 
 /// A readout of eligible reasons, never an acknowledgement store.
 struct AttentionIndicator: Equatable, Sendable {
@@ -70,6 +71,7 @@ enum AttentionTabDestination: Hashable, Sendable {
     case channel(AttentionScope, String)
     case dm(AttentionScope, String)
     case request(TeamScope, String)
+    case telegram(TelegramChatID)
 
     @MainActor static func event(_ event: AttentionEvent) -> [Self] {
         switch event.destination {

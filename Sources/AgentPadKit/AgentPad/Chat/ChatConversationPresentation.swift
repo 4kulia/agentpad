@@ -25,6 +25,7 @@ protocol ChatConversationPresentation: AnyObject {
     var sourceStatuses: [ChatSourceStatus] { get }
     var threadRequests: [ChatChannelRequests.Card] { get }
     func notificationPlace(root: String?) -> String
+    func destination(root: String?) -> ConversationDestination
     func message(_ id: String) -> ChatMessage?
     func conversationMessages(root: String?) -> [ChatMessage]
     func openThread(_ id: String?)
@@ -61,6 +62,7 @@ extension ChatConversationPresentation {
 extension ChatChannelModel: ChatConversationPresentation {
     var isDM: Bool { false }
     func notificationPlace(root: String?) -> String { root.map { "t:\($0)" } ?? "c:\(channel)" }
+    func destination(root: String?) -> ConversationDestination { .channel(key, chat: channel, thread: root) }
     func canRetry(_ message: ChatMessage) -> Bool { service.canRetryPost(key, row: message) }
     func canDelete(_ message: ChatMessage) -> Bool {
         message.authorAccountId == key.accountId && message.hasFixed && !message.deleted && !message.changing && message.localState == nil

@@ -1,4 +1,5 @@
 import Foundation
+import AgentPadTelegram
 
 /// Addresses contain identifiers, never display names or authorization.
 struct OrgKey: Codable, Hashable, Sendable {
@@ -19,7 +20,7 @@ struct OrgKey: Codable, Hashable, Sendable {
 enum TeamScope: Codable, Hashable, Sendable { case local, server(OrgKey) }
 
 enum SettingsTabSection: String, CaseIterable, Codable, Sendable {
-    case general, profile, appearance, agents, terminals, openIn, statusBar, notifications, search, advanced, about, updates
+    case general, profile, telegram, appearance, agents, terminals, openIn, statusBar, notifications, search, advanced, about, updates
     var title: String {
         switch self {
         case .openIn: "Open in"
@@ -36,6 +37,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
     case notifications
     case allSessions
     case search
+    case telegram(TelegramChatID)
     case directMessage(ChatDMRef)
     case directMessageDraft(OrgKey, peer: String)
     case newDM(OrgKey)
@@ -85,6 +87,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         case .notifications: "Notifications"
         case .allSessions: "All sessions"
         case .search: "Search results"
+        case .telegram: "Telegram"
         case .directMessage, .directMessageDraft: "Direct message"
         case .newDM: "New message"
         case .linkFailure: "Link could not be opened"
@@ -118,6 +121,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         case .notifications: "bell"
         case .allSessions: "clock"
         case .search: "magnifyingglass"
+        case .telegram: "paperplane"
         case .linkFailure, .unavailable: "exclamationmark.triangle"
         default: "rectangle.on.rectangle"
         }
@@ -168,6 +172,9 @@ final class TabState {
     let settingsScreen = SettingsScreenState()
     var allSessionsModel: AllSessionsModel?
     var dmSearchTarget: String?
+    var telegramRow: TelegramChatRow?
+    var telegramTopicTitle: String?
+    var telegramModel: TelegramConversationModel?
     var dmPendingThread: String?
     var dmModel: ChatDMModel?
     var dmPeerModel: ChatDMPeerModel?

@@ -87,6 +87,17 @@ Click a file to preview it under the terminal. Drag the divider to resize the pr
 - **Live reload:** the preview follows the file as the agent rewrites it.
 - **Large files:** text files over 5 MB show their first 5 MB.
 
+## Telegram
+
+Connect your personal Telegram account in **Settings → Telegram**: scan the QR code with your phone, or sign in with your phone number; two-step verification is supported. AgentPad is an independent, unofficial client built on TDLib.
+
+- **Chats:** private chats, groups, forums with topics, channels, bots and Saved Messages, most recent first, with pinned chats on top and **N more** for ten more at a time; archived chats separately. <kbd>⌘</kbd><kbd>P</kbd> finds any chat or contact, including ones you have not opened.
+- **Read and reply:** history, replies, attachments, sending with <kbd>⌘</kbd><kbd>Return</kbd>. Drafts are kept encrypted and can be restored after a restart.
+- **Forums and bots:** topics open separately; bot commands, keyboards and buttons act only when you click them.
+- **Channels:** read the channels you follow. Sponsored messages appear as Telegram requires, labeled and reportable, and count as seen only when they are on screen.
+- **Attention:** unread messages, mentions and replies get the same marks as the rest of AgentPad; muted chats stay quiet.
+- **Agents have no access to Telegram.** Telegram chats are never shown to agents, the command line or published agents.
+
 ## Team
 
 Team features need an AgentPad server your team shares. Local session browsing needs no account and works offline.
@@ -96,7 +107,7 @@ Team features need an AgentPad server your team shares. Local session browsing n
 ### Chat
 
 - **Channels** with threads, mentions, reactions, pinned messages and Markdown.
-- **Attachments:** channels and threads accept supported images, PDFs and UTF-8 text files. Paste a screenshot (<kbd>⌘</kbd><kbd>V</kbd>) or drop files; images show in the feed. The server sets size and count limits. Image location and camera metadata are removed before upload. DMs do not support attachments.
+- **Attachments:** channels and threads accept supported images, PDFs and UTF-8 text files. Paste a screenshot (<kbd>⌘</kbd><kbd>V</kbd>) or drop files; images show in the feed. The server sets size and count limits. Image location and camera metadata are removed before upload. Direct messages accept the same attachments.
 - **Direct messages** with anyone in the organization: threads, editing and deleting. Everyone is listed under *Direct messages*; people you talked to recently are on top. Notifications for direct messages show neither the name nor the text.
 - **Unread** and **Mentions** list the messages themselves, including thread replies. A channel's counter counts messages in the channel itself; thread replies are marked "new" on the thread.
 - Queued messages retry after a temporary network outage. Choosing **Disconnect** clears the local channel cache. Unsent DMs stay on your Mac and need confirmation before resending after sign-in.
@@ -128,20 +139,12 @@ Claude Code's session files are an internal format. AgentPad treats them defensi
 There is no telemetry. Local session browsing needs no account. Shared team content and files sent to SSH workspaces leave your Mac. Agents and terminal commands may also use the network independently.
 
 - **Updates.** AgentPad checks GitHub's release feed every six hours by default, and when you choose **Check for Updates…**. GitHub receives your IP address, AgentPad and Sparkle versions, and other normal request metadata.
+- **Telegram.** Your Telegram session, messages and files stay on this Mac, encrypted with a key in your keychain, and go only to Telegram's servers. Nothing from Telegram is sent to the AgentPad server.
 - **Team.** Your chosen server receives account and device information, including your email and device name. It also receives published agent profiles, messages and attachments, call requests and results, and collaboration metadata such as run activity. AgentPad does not automatically upload local transcripts. Shared answers may include content from conversations and project files.
-
-## Roadmap
-
-Planned next, in this order:
-
-- **1.1.13 — agents in direct messages.** Agents in your own tabs can read and send direct messages when you ask them to, signed with the session's name; and read images and documents attached in channels. Published agents and colleagues' calls never get access to your direct messages.
-- **1.1.14 — search everywhere.** One field for channels and direct messages (on the server) and the text of your agent conversations (indexed only on your Mac, never uploaded).
-- **1.1.15 — agents as contacts.** Agent profiles and one list of people and agents; **New agent** (agent type and folder, its sessions show up underneath); your own avatars.
-- **1.1.16 — Telegram.** Bring the Telegram conversations that matter into AgentPad and answer from either side.
 
 ## Install
 
-Download the latest `AgentPad-v….dmg` from [Releases](https://github.com/4kulia/agentpad/releases), open it and drag AgentPad to Applications. It needs macOS 14.5 or later on Apple Silicon.
+Download the latest `AgentPad-v….dmg` from [Releases](https://github.com/4kulia/agentpad/releases), open it and drag AgentPad to Applications. It needs macOS 15 or later on Apple Silicon.
 
 Releases from 1.0.5 on are signed with a Developer ID and notarized by Apple, so they open like any other app.
 
@@ -151,7 +154,7 @@ Releases from 1.0.5 on are signed with a Developer ID and notarized by Apple, so
 
 Requirements:
 
-- macOS 14.5 or later on Apple Silicon;
+- macOS 15 or later on Apple Silicon;
 - Xcode 26 or later (Swift 6.2).
 
 ```sh
@@ -161,6 +164,8 @@ cd agentpad
 ./scripts/build-app.sh               # writes dist/AgentPad.app
 cp -R dist/AgentPad.app /Applications
 ```
+
+Telegram is off in source builds unless you provide your own Telegram API credentials from <https://my.telegram.org>: put them in a private (`chmod 600`) env file and point `AGENTPAD_TELEGRAM_CONFIG_FILE` at it before building.
 
 On first use, macOS asks for a few permissions, each when it is first needed:
 

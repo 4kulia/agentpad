@@ -80,8 +80,10 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     var onActivateLocator: ((String) -> Void)?
     private var client: (any NotificationCenterClient)?
     private var revisions: [String: Int] = [:]
+    private var nextRevision = 0
     private var tasks: [String: Task<Void, Never>] = [:]
     private var queued: [String: NotificationPayload] = [:]
+    private var presentationChecks: [String: @MainActor () -> Bool] = [:]
     private var authorizationTask: Task<Bool, Never>?
     private var requestedAuthorization = false
     private(set) var status: NotificationAuthorization = .unknown {
@@ -135,12 +137,22 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             body: event.body, sound: sound)
         if queued[event.id] != nil { return }
         queued[event.id] = payload
-        let revision = (revisions[event.id] ?? 0) + 1
+        presentationChecks[event.id] = isCurrent
+        nextRevision += 1
+        let revision = nextRevision
         revisions[event.id] = revision
         let previous = tasks[event.id]
         tasks[event.id] = Task { [weak self] in
             await previous?.value
             guard let self, let client = self.client else { return }
+            defer {
+                if self.revisions[event.id] == revision || self.revisions[event.id] == nil {
+                    self.tasks[event.id] = nil
+                    if self.queued[event.id] == nil {
+                        self.revisions[event.id] = nil; self.presentationChecks[event.id] = nil
+                    }
+                }
+            }
             guard self.revisions[event.id] == revision, isCurrent(), await self.authorized(),
                   self.revisions[event.id] == revision, isCurrent() else {
                 if self.revisions[event.id] == revision { self.queued[event.id] = nil }
@@ -159,7 +171,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     }
 
     func remove(ids: [String]) {
-        for id in ids { revisions[id, default: 0] += 1; queued[id] = nil }
+        for id in ids { revisions[id] = nil; queued[id] = nil; presentationChecks[id] = nil }
         client?.remove(ids)
     }
     func identifiers() async -> [String] { await client?.identifiers() ?? [] }
@@ -168,11 +180,20 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         // This center belongs to AgentPad. Legacy UUID/Team/chat IDs have no safe route.
         remove(ids: ids.filter { !keeping.contains($0) })
     }
+    func drain(id: String) async { await tasks[id]?.value }
     func drain() async { for task in tasks.values { await task.value } }
 
+    func presentationOptions(id: String, sound: Bool) -> UNNotificationPresentationOptions {
+        guard presentationChecks[id]?() == true else { return [] }
+        return sound ? [.banner, .sound] : [.banner]
+    }
+
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler(notification.request.content.sound == nil ? [.banner] : [.banner, .sound])
+        withCompletionHandler completionHandler: @escaping @Sendable (UNNotificationPresentationOptions) -> Void) {
+        let id = notification.request.identifier, sound = notification.request.content.sound != nil
+        Task { @MainActor [weak self] in
+            completionHandler(self?.presentationOptions(id: id, sound: sound) ?? [])
+        }
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void) {

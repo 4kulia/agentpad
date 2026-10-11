@@ -1,4 +1,5 @@
 import Foundation
+import AgentPadTelegram
 
 /// Sidebar preferences are independent of banner delivery and decision ownership.
 struct AttentionListSettings: Equatable, Sendable {
@@ -26,8 +27,9 @@ struct AttentionItem: Identifiable, Equatable, Sendable {
         case event(String)
         case mention(AttentionScope, channel: String, message: String, sequence: Int)
         case dm(AttentionScope, conversation: String)
+        case telegram(TelegramAttentionSummary)
     }
-    enum Secondary: String, Sendable { case dismiss = "Dismiss", markRead = "Mark read" }
+    enum Secondary: String, Sendable { case dismiss = "Dismiss", markRead = "Mark read", snooze = "Hide until next message" }
     var id: String
     var tier: Int
     var time: Date
@@ -203,8 +205,11 @@ enum AttentionList {
 
     static func visible(_ items: [AttentionItem], expanded: Bool, collapsed: Bool = false) -> [AttentionItem] {
         if expanded && !collapsed { return items }
-        return items.enumerated().compactMap { index, item in
-            item.tier <= 1 || (!collapsed && index < 5) ? item : nil
+        var ordinaryIndex = 0
+        return items.compactMap { item in
+            if case .telegram = item.action { return collapsed ? nil : item }
+            defer { ordinaryIndex += 1 }
+            return item.tier <= 1 || (!collapsed && ordinaryIndex < 5) ? item : nil
         }
     }
 }

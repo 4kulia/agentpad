@@ -6,13 +6,15 @@ import Quartz
 final class QuickLookPanel: NSObject, QLPreviewPanelDataSource {
     static let shared = QuickLookPanel()
     private var url: URL?
+    private var owner: UUID?
 
     /// Whether a preview was requested; the app delegate only takes panel
     /// control while this is set.
     var hasItem: Bool { url != nil }
 
-    static func show(_ url: URL) {
+    static func show(_ url: URL, owner: UUID? = nil) {
         shared.url = url
+        shared.owner = owner
         guard let panel = QLPreviewPanel.shared() else { return }
         NSApp.activate()
         if panel.isVisible {
@@ -22,6 +24,12 @@ final class QuickLookPanel: NSObject, QLPreviewPanelDataSource {
             // delegate, see AppDelegate+QuickLook), which installs the data source.
             panel.makeKeyAndOrderFront(nil)
         }
+    }
+
+    static func dismiss(owner: UUID) {
+        guard shared.owner == owner else { return }
+        QLPreviewPanel.shared()?.orderOut(nil)
+        shared.url = nil; shared.owner = nil
     }
 
     func begin(_ panel: QLPreviewPanel) {

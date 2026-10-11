@@ -164,7 +164,7 @@ final class AttentionCoordinator {
     func refreshBadge() { updateBadge(external: ExternalSessionMonitor.shared.sessions) }
 
     private func updateBadge(external: [ExternalAgentSession]) {
-        let count = AttentionLedger.shared.pendingCount + ChatNotifications.mentionsForBadge()
+        let count = AttentionLedger.shared.pendingCount + ChatNotifications.mentionsForBadge() + TelegramService.chats.snapshot.attention.totalCount
         let label = count > 0 ? "\(count)" : nil
         if NSApp?.dockTile.badgeLabel != label { NSApp?.dockTile.badgeLabel = label }
     }
