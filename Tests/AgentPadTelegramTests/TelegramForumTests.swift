@@ -244,6 +244,10 @@ final class TelegramForumTests: XCTestCase {
     func testReadAndLiveUpdatesAreTopicScopedWithOneChatVisibilityRegistration() throws {
         let f = TelegramForumHarness(), h = f.h, a = f.open(7), b = f.open(9)
         let pa = a.observers.keys.first!, pb = b.observers.keys.first!
+        for feed in [a, b] {
+            h.session.load(feed, latest: true)
+            try h.answer("getForumTopicHistory", TDLibMessage("messages", ["messages": .array([])]))
+        }
         h.update("updateNewMessage", ["message": .object(f.message(20, topic: 7).fields)])
         h.update("updateNewMessage", ["message": .object(f.message(30, topic: 9).fields)])
         h.observe(a.snapshot.destination, .init(pane: pa, epoch: h.epoch, active: true, shown: true, ordinaryIDs: [20, 30])); try h.answer("openChat")

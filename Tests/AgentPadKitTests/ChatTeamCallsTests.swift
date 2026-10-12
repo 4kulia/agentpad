@@ -259,8 +259,8 @@ final class ChatTeamCallsTests: XCTestCase {
         let store = try ChatStore.open(files: files, key: anna).store
         func old(_ id: String, _ state: String, version: Int) -> [String: Any] {
             var body = CallJSON.request(id, state: state, version: version)
-            body["created_at"] = "2026-01-01T00:00:00Z"
-            body["updated_at"] = "2026-01-01T00:00:00Z"
+            body["created_at"] = CallJSON.timestamp(-60 * CallJSON.day)
+            body["updated_at"] = CallJSON.timestamp(-60 * CallJSON.day)
             return body
         }
         try store.apply(ChatSnapshot(cursors: [:], requests: [
@@ -269,12 +269,12 @@ final class ChatTeamCallsTests: XCTestCase {
         ].map(CallJSON.wire)))
         try store.apply(CallJSON.event(member, 1, "result.deliver", [
             "request_id": "r-result", "run_id": "run-1", "text": "late", "truncated": false, "thread_id": NSNull(),
-            "delivered_at": "2026-10-04T18:25:00Z",
+            "delivered_at": CallJSON.timestamp(),
         ]))
         try store.queue.write { db in try db.execute(sql: "UPDATE requests SET run_id = 'run-1' WHERE request_id = 'r-result'") }
         try store.apply(CallJSON.event(member, 2, "run.failed", CallJSON.request("r-moved", state: "failed", version: 6, fixed: false)))
         try store.apply(ChatSnapshot(cursors: [:], requests: [CallJSON.wire(old("r-moved", "failed", version: 6))]))
-        let now = try XCTUnwrap(ChatStore.date("2026-10-05T00:00:00Z"))
+        let now = CallJSON.now
         try store.calls.trim(now: now)
         XCTAssertEqual(Set(try store.calls.historyIds(now: now)), ["r-result", "r-moved"])
         XCTAssertEqual(Set(try store.calls.requestIds()), ["r-result", "r-moved", "r-waiting", "r-gone"], "rows stay")
@@ -287,7 +287,7 @@ final class ChatTeamCallsTests: XCTestCase {
     func testHistoryKeepsItsBoundAfterSnapshotAndPages() async throws {
         func final(_ i: Int) -> [String: Any] {
             var body = CallJSON.request(String(format: "00000000-0000-4000-8000-%012d", i), state: "declined", version: 3)
-            body["updated_at"] = String(format: "2026-10-03T%02d:%02d:00Z", i / 60, i % 60)
+            body["updated_at"] = CallJSON.timestamp(-2 * CallJSON.day + TimeInterval(i * 60))
             return body
         }
         let (service, _) = try await started(requests: (300..<600).map(final), next: "page", pages: ["page": (0..<300).map(final)])
@@ -514,7 +514,7 @@ final class ChatTeamCallsTests: XCTestCase {
     func testHistoryBoundHoldsAfterAMove() async throws {
         func final(_ i: Int) -> [String: Any] {
             var body = CallJSON.request(String(format: "00000000-0000-4000-8000-%012d", i), state: "declined", version: 3)
-            body["updated_at"] = String(format: "2026-10-03T%02d:%02d:00Z", i / 60, i % 60)
+            body["updated_at"] = CallJSON.timestamp(-2 * CallJSON.day + TimeInterval(i * 60))
             return body
         }
         let open = CallJSON.request(req, state: "awaiting_decision", version: 2)
@@ -522,7 +522,7 @@ final class ChatTeamCallsTests: XCTestCase {
         let store = try XCTUnwrap(service.orgSessions[anna]?.store)
         try await waitUntil { try store.calls.historyIds().count == 301 }
         let decided = Self.text(CallJSON.request(req, state: "declined", version: 3, fixed: false))
-        transports.all[0].frame(#"{"frame":"event","stream":"\#(member)","seq":5,"id":"e-5","type":"request.decide","actor":null,"body":\#(decided),"command_id":null,"at":"2026-10-04T18:20:00Z","sig":null,"sig_alg":null,"enc":null}"#)
+        transports.all[0].frame(#"{"frame":"event","stream":"\#(member)","seq":5,"id":"e-5","type":"request.decide","actor":null,"body":\#(decided),"command_id":null,"at":"\#(CallJSON.timestamp())","sig":null,"sig_alg":null,"enc":null}"#)
         try await waitUntil { try store.calls.request(self.req)?.state == .declined }
         XCTAssertEqual(try store.calls.historyIds().count, 300)
         XCTAssertEqual(try store.calls.requestIds().count, 301, "no row goes")
@@ -607,7 +607,7 @@ final class ChatTeamCallsTests: XCTestCase {
             body["agent_id"] = agent.id.uuidString.lowercased()
             body["thread_id"] = UUID().uuidString.lowercased()
             // Past its deadline: the queue's own sweep would expire it.
-            body["deliver_by"] = "2026-01-01T00:00:00Z"
+            body["deliver_by"] = CallJSON.timestamp(-CallJSON.day)
             return CallJSON.wire(body)
         }
         let store = try ChatStore.open(files: files, key: anna).store
@@ -1052,10 +1052,10 @@ final class ChatTeamCallsTests: XCTestCase {
 
     // MARK: Review D8d group A: history and its tombstones
 
-    private func finals(_ n: Int, day: String = "2026-10-03") -> [ChatRequestWire] {
+    private func finals(_ n: Int) -> [ChatRequestWire] {
         (0..<n).map { i in
             var body = CallJSON.request(String(format: "00000000-0000-4000-8000-%012d", i), state: "declined", version: 3)
-            body["updated_at"] = String(format: "\(day)T%02d:%02d:00Z", i / 60, i % 60)
+            body["updated_at"] = CallJSON.timestamp(-2 * CallJSON.day + TimeInterval(i * 60))
             return CallJSON.wire(body)
         }
     }
@@ -1074,13 +1074,13 @@ final class ChatTeamCallsTests: XCTestCase {
     func testATrimmedRequestKeepsOldWordsOut() throws {
         let store = try ChatStore.open(files: files, key: anna).store
         var old = CallJSON.request(req, state: "declined", version: 3, onThisDevice: true)
-        old["updated_at"] = "2026-10-01T00:00:00Z"
+        old["updated_at"] = CallJSON.timestamp(-4 * CallJSON.day)
         try store.apply(ChatSnapshot(cursors: [:], requests: [CallJSON.wire(old)] + finals(300)))
         try store.queue.write { db in
             try db.execute(sql: "INSERT INTO actions (request_id, kind, state, created_at, updated_at) VALUES (?, 'notify_decision', 'done', 0, 0)",
                            arguments: [self.req])
         }
-        let now = try XCTUnwrap(ChatStore.date("2026-10-04T00:00:00Z"))
+        let now = CallJSON.now
         try store.calls.trim(now: now)
         XCTAssertFalse(try store.calls.historyIds(now: now).contains(req))
         try store.apply(requests: [CallJSON.wire(CallJSON.request(req, state: "awaiting_decision", version: 2, onThisDevice: true))],
@@ -1099,8 +1099,8 @@ final class ChatTeamCallsTests: XCTestCase {
         func old(_ id: String) -> ChatRequestWire {
             var body = CallJSON.request(id, state: "finished", version: 6, runId: "run-\(id)",
                                         result: ["run_id": "run-\(id)", "text": "long answer", "truncated": false, "thread_id": NSNull(),
-                                                 "delivered_at": "2026-01-01T00:00:00Z"])
-            body["updated_at"] = "2026-01-01T00:00:00Z"
+                                                 "delivered_at": CallJSON.timestamp(-60 * CallJSON.day)])
+            body["updated_at"] = CallJSON.timestamp(-60 * CallJSON.day)
             return CallJSON.wire(body)
         }
         try store.apply(ChatSnapshot(cursors: [:], requests: [old("r-a"), old("r-b")]))
@@ -1108,7 +1108,7 @@ final class ChatTeamCallsTests: XCTestCase {
         try store.queue.write { db in
             try db.execute(sql: "INSERT INTO actions (request_id, kind, state, created_at, updated_at) VALUES ('r-b', 'notify_outcome', 'pending', 0, 0)")
         }
-        try store.calls.trim(now: try XCTUnwrap(ChatStore.date("2026-10-04T00:00:00Z")))
+        try store.calls.trim(now: CallJSON.now)
         XCTAssertEqual(try store.calls.request("r-a")?.result?.text, "")
         XCTAssertNil(try store.calls.request("r-a")?.localText)
         XCTAssertEqual(try store.calls.request("r-b")?.result?.text, "long answer", "its action may need it")
@@ -1121,8 +1121,8 @@ final class ChatTeamCallsTests: XCTestCase {
         let team = team()
         let seed = try ChatStore.open(files: files, key: anna).store
         var old = CallJSON.request(req, state: "finished", version: 6, runId: "run-1", owner: CallJSON.boris, initiator: CallJSON.anna)
-        old["created_at"] = "2026-08-01T00:00:00Z"
-        old["updated_at"] = "2026-08-01T00:00:00Z"
+        old["created_at"] = CallJSON.timestamp(-60 * CallJSON.day)
+        old["updated_at"] = CallJSON.timestamp(-60 * CallJSON.day)
         try seed.apply(ChatSnapshot(cursors: [:], requests: [CallJSON.wire(old)]))
         let (service, transports) = try await started(requests: [], next: nil)
         let store = try XCTUnwrap(service.orgSessions[anna]?.store)
@@ -1130,9 +1130,9 @@ final class ChatTeamCallsTests: XCTestCase {
         service.onCallsChanged = { (key: ChatOrgKey) in if team.calls.serverKey == key { team.calls.reload() } }
         let snapshot = Self.text(old)
         let result = Self.text(["request_id": req, "run_id": "run-1", "text": "late but here", "truncated": false, "thread_id": NSNull(),
-                                "delivered_at": "2026-10-04T18:25:00Z"])
-        transports.all[0].frame(#"{"frame":"event","stream":"\#(member)","seq":5,"id":"e-5","type":"request.snapshot","actor":null,"body":\#(snapshot),"command_id":null,"at":"2026-10-04T18:24:59Z","sig":null,"sig_alg":null,"enc":null}"#)
-        transports.all[0].frame(#"{"frame":"event","stream":"\#(member)","seq":6,"id":"e-6","type":"result.deliver","actor":null,"body":\#(result),"command_id":null,"at":"2026-10-04T18:25:00Z","sig":null,"sig_alg":null,"enc":null}"#)
+                                "delivered_at": CallJSON.timestamp()])
+        transports.all[0].frame(#"{"frame":"event","stream":"\#(member)","seq":5,"id":"e-5","type":"request.snapshot","actor":null,"body":\#(snapshot),"command_id":null,"at":"\#(CallJSON.timestamp(-1))","sig":null,"sig_alg":null,"enc":null}"#)
+        transports.all[0].frame(#"{"frame":"event","stream":"\#(member)","seq":6,"id":"e-6","type":"result.deliver","actor":null,"body":\#(result),"command_id":null,"at":"\#(CallJSON.timestamp())","sig":null,"sig_alg":null,"enc":null}"#)
         try await waitUntil { team.calls.outgoing.first { $0.id == self.req }?.report.state == .done }
         XCTAssertEqual(team.calls.outgoing.first { $0.id == self.req }?.report.text, "late but here")
     }
@@ -1191,15 +1191,15 @@ final class ChatTeamCallsTests: XCTestCase {
     func testTrimmingBetweenTheSnapshotAndTheResultKeepsTheRequest() throws {
         let store = try ChatStore.open(files: files, key: anna).store
         var old = CallJSON.request(req, state: "finished", version: 6, runId: "run-1", owner: CallJSON.boris, initiator: CallJSON.anna)
-        old["created_at"] = "2026-08-01T00:00:00Z"
-        old["updated_at"] = "2026-08-01T00:00:00Z"
+        old["created_at"] = CallJSON.timestamp(-60 * CallJSON.day)
+        old["updated_at"] = CallJSON.timestamp(-60 * CallJSON.day)
         try store.apply(ChatSnapshot(cursors: [:], requests: [CallJSON.wire(old)]))
-        let now = try XCTUnwrap(ChatStore.date("2026-10-04T18:25:00Z"))
+        let now = CallJSON.now
         try store.apply(CallJSON.event(member, 1, "request.snapshot", old))
         try store.calls.trim(now: now)
         try store.apply(CallJSON.event(member, 2, "result.deliver", [
             "request_id": req, "run_id": "run-1", "text": "late but here", "truncated": false, "thread_id": NSNull(),
-            "delivered_at": "2026-10-04T18:25:00Z",
+            "delivered_at": CallJSON.timestamp(),
         ]))
         try store.calls.trim(now: now)
         let request = try XCTUnwrap(store.calls.request(req))
@@ -1592,17 +1592,17 @@ final class ChatTeamCallsTests: XCTestCase {
     func testHistoryIsAViewNotALimitOnCalls() async throws {
         let store = try ChatStore.open(files: files, key: anna).store
         var old = CallJSON.request("r-old", state: "declined", version: 3, owner: CallJSON.boris, initiator: CallJSON.anna)
-        old["updated_at"] = "2026-01-01T00:00:00Z"
+        old["updated_at"] = CallJSON.timestamp(-60 * CallJSON.day)
         var awaiting = CallJSON.request("r-await", state: "finished", version: 6, runId: "run-1", owner: CallJSON.boris, initiator: CallJSON.anna)
-        awaiting["updated_at"] = "2026-10-01T00:00:00Z"
+        awaiting["updated_at"] = CallJSON.timestamp(-4 * CallJSON.day)
         var trimmed = CallJSON.request("r-trim", state: "finished", version: 6, runId: "run-t",
-                                       result: ["run_id": "run-t", "text": "long", "truncated": false, "thread_id": NSNull(), "delivered_at": "2026-01-01T00:00:00Z"],
+                                       result: ["run_id": "run-t", "text": "long", "truncated": false, "thread_id": NSNull(), "delivered_at": CallJSON.timestamp(-60 * CallJSON.day)],
                                        owner: CallJSON.boris, initiator: CallJSON.anna)
-        trimmed["updated_at"] = "2026-01-01T00:00:00Z"
+        trimmed["updated_at"] = CallJSON.timestamp(-60 * CallJSON.day)
         var newer = (0..<300).map { i -> [String: Any] in
             var body = CallJSON.request(String(format: "00000000-0000-4000-8000-%012d", i), state: "declined", version: 3, owner: CallJSON.boris,
                                         initiator: CallJSON.anna)
-            body["updated_at"] = String(format: "2026-10-03T%02d:%02d:00Z", i / 60, i % 60)
+            body["updated_at"] = CallJSON.timestamp(-2 * CallJSON.day + TimeInterval(i * 60))
             return body
         }
         newer += [old, awaiting, trimmed]
@@ -1975,13 +1975,17 @@ final class ChatTeamCallsTests: XCTestCase {
     /// the snapshot after it brings the whole (review D8h-p3-2).
     func testAnIncompleteFixedPartIsCompletedLater() throws {
         let store = try ChatStore.open(files: files, key: anna).store
-        var partial = CallJSON.request(req, state: "submitted", version: 1)
+        var complete = CallJSON.request(req, state: "submitted", version: 1)
+        // Keep literal fractional timestamps here: this test checks exact storage.
+        complete["deliver_by"] = "2026-10-11T18:20:00.123456Z"
+        complete["created_at"] = "2026-10-04T18:20:00.123456Z"
+        var partial = complete
         partial["conditions_version"] = nil
         partial["deliver_by"] = nil
         partial["created_at"] = nil
         try store.apply(CallJSON.event(member, 1, "request.later_kind", partial))
         XCTAssertEqual(try store.calls.request(req)?.hasFixed, false)
-        try store.apply(ChatSnapshot(cursors: [:], requests: [CallJSON.wire(CallJSON.request(req, state: "submitted", version: 1))]))
+        try store.apply(ChatSnapshot(cursors: [:], requests: [CallJSON.wire(complete)]))
         let request = try XCTUnwrap(store.calls.request(req))
         XCTAssertTrue(request.hasFixed)
         XCTAssertEqual(request.conditionsVersion, 1)
@@ -3029,6 +3033,8 @@ final class ChatTeamCallsTests: XCTestCase {
     /// installed, the queue held so commands stay to be looked at.
     private func ownerSetup(_ runner: OwnerRunner = OwnerRunner()) async throws -> (ChatService, TeamService, ChatStore, TeamPublishedAgent, OwnerRunner) {
         let (service, team, store, folder) = try await publishingSetup(executor: runner)
+        // Launches and continuations use the same captured clock as their requests.
+        try XCTUnwrap(service.launcher).now = { CallJSON.now }
         let billing = agent("billing", folder)
         try await team.calls.saveAndPublish([billing], teams: [general], key: anna)
         try answer(service, .sent)
@@ -3132,6 +3138,37 @@ final class ChatTeamCallsTests: XCTestCase {
         XCTAssertEqual(chain.map(\.type), ["run.start", "run.started", "run.finished", "result.deliver"])
         XCTAssertEqual(chain.last?.dependsOn, chain[2].commandId)
         XCTAssertEqual(try XCTUnwrap(service.journal).run(approval.runId)?.resultText, "Refunded twice by a retry.")
+    }
+
+    func testAnOwnerRequestStartsJustBeforeItsDeadline() async throws {
+        let (service, team, store, billing, runner) = try await ownerSetup()
+        runner.holds = false
+        let approval = try allowedUpTo("approved", service, team, store, billing)
+        let deadline = try XCTUnwrap(service.launchRequest(req)).expiresAt
+        try XCTUnwrap(service.launcher).now = { deadline.addingTimeInterval(-1) }
+        try server(store, service, "run.start", move("starting", 4, runId: approval.runId))
+        try await waitUntil { try XCTUnwrap(service.journal).run(approval.runId)?.outcome == .finished }
+        XCTAssertEqual(runner.calls, 1)
+        XCTAssertNotNil(try XCTUnwrap(service.journal).approval(approval.id)?.consumedAt)
+        XCTAssertTrue(try executorCommands(service).contains { $0.type == "result.deliver" })
+        XCTAssertFalse(try executorCommands(service).contains { $0.type == "run.failed_to_start" })
+    }
+
+    func testAnOwnerRequestExpiresAtItsDeadline() async throws {
+        let (service, team, store, billing, runner) = try await ownerSetup()
+        let approval = try allowedUpTo("approved", service, team, store, billing)
+        let deadline = try XCTUnwrap(service.launchRequest(req)).expiresAt
+        try XCTUnwrap(service.launcher).now = { deadline }
+        try server(store, service, "run.start", move("starting", 4, runId: approval.runId))
+        try await waitUntil { try self.executorCommands(service).contains { $0.type == "run.failed_to_start" } }
+        let journal = try XCTUnwrap(service.journal)
+        let expired = try XCTUnwrap(journal.approval(approval.id))
+        XCTAssertEqual(expired.voidReason, "expired")
+        XCTAssertNil(expired.consumedAt)
+        XCTAssertNil(try journal.run(approval.runId))
+        XCTAssertEqual(runner.calls, 0)
+        let fact = try XCTUnwrap(executorCommands(service).first { $0.type == "run.failed_to_start" })
+        XCTAssertEqual(try JSONDecoder().decode(ChatCommandEnvelope.self, from: fact.bodyBytes).args["reason"], .string("expired"))
     }
 
     // MARK: Review D4, round 1

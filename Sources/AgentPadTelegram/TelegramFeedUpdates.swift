@@ -74,9 +74,7 @@ extension TelegramFeedSession {
             if let message = update["message"]?.object, let chat = message["chat_id"]?.integer {
                 correlate(message, outcome: nil)
                 invalidateTopic(chat: chat, topic: TelegramMessageTopic.decode(message["topic_id"])?.forumID)
-                for feed in feeds(in: chat) where !feed.observers.isEmpty {
-                    if feed.snapshot.hasNewer { feed.dirty = true } else { merge(message, into: feed); trim(feed, keepOlder: false) }
-                }
+                for feed in feeds(in: chat) { applyLastMessage(message, to: feed) }
             }
         case "updateMessageSendSucceeded", "updateMessageSendFailed":
             if let message = update["message"]?.object {
@@ -84,10 +82,10 @@ extension TelegramFeedSession {
                 correlate(message, oldID: update["old_message_id"]?.integer, outcome: success ? .sent : .failed)
                 if let chat = message["chat_id"]?.integer {
                   invalidateTopic(chat: chat, topic: TelegramMessageTopic.decode(message["topic_id"])?.forumID)
-                  for feed in feeds(in: chat) {
+                  for feed in feeds(in: chat) where acceptsTopic(message["topic_id"], feed: feed) {
                     if let old = update["old_message_id"]?.integer { feed.snapshot.messages.removeAll { $0.messageID == old } }
                     let unresolved = journal.operations.contains { $0.chat == chat && $0.parts.contains { $0.messageID == message["id"]?.integer && $0.state == .unknown } }
-                    merge(message, into: feed, outcome: unresolved ? .unknown : success ? .sent : .failed("Message failed to send"))
+                    applyLastMessage(message, to: feed, outcome: unresolved ? .unknown : success ? .sent : .failed("Message failed to send"))
                   }
                 }
             }
@@ -111,6 +109,8 @@ extension TelegramFeedSession {
     }
     private func receiveChat(_ update: TDLibMessage, feed: Feed) {
         switch update.type {
+        case "updateChatLastMessage":
+            if feed.snapshot.destination.topic == nil { applyLastMessage(update["last_message"]?.object, to: feed) }
         case "updateChatPermissions": feed.chat?["permissions"] = update["permissions"]; capabilities(feed)
         case "updateChatNotificationSettings": feed.chat?["notification_settings"] = update["notification_settings"]; applyInheritedMute(feed)
         case "updateChatMessageSender": feed.chat?["message_sender_id"] = update["message_sender_id"]; capabilities(feed)

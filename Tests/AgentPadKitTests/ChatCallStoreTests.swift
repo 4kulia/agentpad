@@ -40,6 +40,15 @@ final class GatedActionHandler: ChatActionHandler {
 
 /// Builders of server JSON for the calls of stage D.
 enum CallJSON {
+    // One captured clock for live service fixtures. Relative timestamps keep
+    // requests runnable and history recent on any calendar date.
+    static let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+    static let day: TimeInterval = 24 * 60 * 60
+
+    static func timestamp(_ offset: TimeInterval = 0) -> String {
+        ChatCallStore.timestamp(now.addingTimeInterval(offset))
+    }
+
     static let anna = "8c2b3b55-6b1e-4f5e-9a39-0e3c1f7a2d40"
     static let boris = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
     static let agent = "2d7c6e0a-1f3b-4c5d-9e8f-0a1b2c3d4e5f"
@@ -60,8 +69,8 @@ enum CallJSON {
             body.merge([
                 "kind": "personal", "agent_id": agent, "owner_account_id": owner, "executor_device_name": "Anna's Mac",
                 "initiator_account_id": initiator, "text": "Why twice?", "origin": ["session": "Refund bug", "project": "billing-web"],
-                "thread_id": NSNull(), "conditions_version": 1, "deliver_by": "2026-10-11T18:20:00.123456Z",
-                "created_at": "2026-10-04T18:20:00.123456Z", "updated_at": "2026-10-04T18:20:00.123456Z",
+                "thread_id": NSNull(), "conditions_version": 1, "deliver_by": timestamp(7 * day),
+                "created_at": timestamp(), "updated_at": timestamp(),
             ]) { $1 }
         }
         if let onThisDevice { body["on_this_device"] = onThisDevice }
@@ -75,7 +84,7 @@ enum CallJSON {
 
     static func event(_ stream: String, _ seq: Int, _ type: String, _ body: [String: Any]) -> ChatEvent {
         ChatEvent(stream: stream, seq: seq, id: UUID().uuidString, type: type, actor: nil, body: json(body), commandId: nil,
-                  at: "2026-10-04T18:20:00Z")
+                  at: timestamp())
     }
 
     static func card(_ name: String = "billing", id: String = agent, owner: String = anna, teams: [String]? = nil) -> ChatAgentCard {
@@ -414,11 +423,11 @@ final class ChatCallStoreTests: XCTestCase {
     func testHistoryShowsRecentFinalRequestsAndKeepsEveryRow() throws {
         let store = try open()
         var old = CallJSON.request("r-old", state: "declined", version: 3)
-        old["updated_at"] = "2026-01-01T00:00:00Z"
+        old["updated_at"] = CallJSON.timestamp(-31 * CallJSON.day)
         let fresh = CallJSON.request("r-new", state: "declined", version: 3)
         let open = CallJSON.request("r-open", state: "running", version: 5)
         try store.apply(ChatSnapshot(cursors: [:], requests: [old, fresh, open].map(CallJSON.wire)))
-        let now = ChatStore.date("2026-10-04T18:20:00Z")!
+        let now = CallJSON.now
         XCTAssertEqual(Set(try store.calls.historyIds(now: now)), ["r-open", "r-new"])
         XCTAssertEqual(Set(try store.calls.requestIds()), ["r-old", "r-open", "r-new"])
     }
@@ -428,8 +437,10 @@ final class ChatCallStoreTests: XCTestCase {
     func testServiceReadsRequestStateAndLaunchInputsFromTheCache() throws {
         let service = ChatService(files: files, tokens: FakeTokenStore())
         let store = try XCTUnwrap(service.session(for: key).store)
+        var request = CallJSON.request(req, state: "starting", version: 4)
+        request["deliver_by"] = "2026-10-11T18:20:00.123456Z"
         try store.apply(ChatSnapshot(cursors: [:], members: [.init(accountId: CallJSON.boris, handle: "boris", name: "Boris", role: "member")],
-                                     requests: [CallJSON.wire(CallJSON.request(req, state: "starting", version: 4))]))
+                                     requests: [CallJSON.wire(request)]))
         XCTAssertEqual(service.requestState(key, req), "starting")
         XCTAssertNil(service.requestState(key, "unknown"))
         let launch = try XCTUnwrap(service.launchRequest(req))

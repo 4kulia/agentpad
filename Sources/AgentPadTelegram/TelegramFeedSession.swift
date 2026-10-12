@@ -41,6 +41,8 @@ final class TelegramFeedSession {
         var needsDetails = true
         var validating = false
         var historyCursor: Int64 = 0
+        var newestKnown: Int64 = 0
+        var newestDuringLatestLoad: Int64 = 0
         var requestedMessage: Int64?
         var pageLimit = 50
         var historyGeneration = UUID()
@@ -178,6 +180,7 @@ final class TelegramFeedSession {
         feed.observations[pane] = nil; feed.typing[pane] = nil
         if feed.observers.isEmpty {
             feed.snapshot.messages = []; feed.loaded = false; feed.historyCursor = 0
+            observeNewest(feed)
             feed.historyGeneration = UUID(); feed.aliases = [:]; feed.failed = [:]
         }
         reconcilePresentation(feed)
@@ -328,10 +331,12 @@ final class TelegramFeedSession {
         if feed.snapshot.destination.topic == nil {
             feed.snapshot.inbox = raw["last_read_inbox_message_id"]?.integer ?? 0
             feed.snapshot.outbox = raw["last_read_outbox_message_id"]?.integer ?? 0
+            applyLastMessage(raw["last_message"]?.object, to: feed)
         }
         feed.dirty = true
     }
     func capabilities(_ feed: Feed) {
+        defer { observeNewest(feed) }
         var value = TelegramConversationCapabilities()
         let type = feed.chat?["type"]?.object, peer = feed.peer
         let isPrivate = type?.type == "chatTypePrivate"
@@ -417,6 +422,7 @@ final class TelegramFeedSession {
         guard !feed.loading, feed.snapshot.capabilities.canRead else { return }
         let cursor = latest ? 0 : feed.historyCursor
         let generation = feed.historyGeneration
+        if latest { feed.newestDuringLatestLoad = 0 }
         feed.loading = true; feed.snapshot.loading = true; feed.dirty = true
         var fields: [String: TDLibValue] = ["chat_id": .integer(feed.snapshot.destination.chat), "from_message_id": .integer(cursor),
             "offset": .integer(0), "limit": .integer(Int64(feed.pageLimit))]
@@ -433,9 +439,15 @@ final class TelegramFeedSession {
             }
             guard result.type == "messages" else { self.problem(feed, "History unavailable · Retry loading messages"); feed.loaded = true; return }
             let values = Array((result["messages"]?.array ?? []).prefix(100))
-            if latest { feed.snapshot.messages = []; feed.snapshot.hasNewer = false }
+            if latest {
+                feed.snapshot.messages = []
+                // The newest-end page is authoritative, except for messages
+                // observed while this request was in flight.
+                feed.newestKnown = feed.newestDuringLatestLoad
+            }
             let before = Set(feed.snapshot.messages.map(\.messageID))
             for value in values { if let raw = value.object { self.merge(raw, into: feed) } }
+            self.observeNewest(feed)
             feed.loaded = true; feed.snapshot.error = nil
             // TDLib may return a short page. Only an empty page ends history.
             if values.isEmpty { feed.snapshot.hasOlder = false }
@@ -466,15 +478,34 @@ final class TelegramFeedSession {
             for value in (result["messages"]?.array ?? []).prefix(100) {
                 if let raw = value.object { self.merge(raw, into: feed) }
             }
-            feed.loaded = true; feed.snapshot.hasNewer = true; feed.snapshot.hasOlder = true
+            self.observeNewest(feed)
+            feed.loaded = true; feed.snapshot.hasOlder = true
             feed.historyCursor = feed.snapshot.messages.first?.messageID ?? message
             self.trim(feed, keepOlder: false); feed.dirty = true
         }
         if started { feed.requestedMessage = nil }
         else { feed.loading = false; feed.snapshot.loading = false }
     }
+    func observeNewest(_ feed: Feed, id: Int64 = 0) {
+        feed.newestKnown = max(feed.newestKnown, id)
+        feed.newestDuringLatestLoad = max(feed.newestDuringLatestLoad, id)
+        let hasNewer = (feed.snapshot.messages.last?.messageID ?? 0) < feed.newestKnown
+        if feed.snapshot.hasNewer != hasNewer { feed.snapshot.hasNewer = hasNewer; feed.dirty = true }
+    }
+    func applyLastMessage(_ message: TDLibMessage?, to feed: Feed, outcome: TelegramMessage.Delivery? = nil) {
+        guard let message, message["chat_id"]?.integer == feed.snapshot.destination.chat,
+              message["scheduling_state"] == nil || message["scheduling_state"] == .null,
+              acceptsTopic(message["topic_id"], feed: feed) else { return }
+        // TDLib may announce the new last message before updateNewMessage.
+        // Keep a live window live in either order, but never bridge an older gap.
+        if !feed.snapshot.hasNewer, !feed.observers.isEmpty {
+            merge(message, into: feed, outcome: outcome); trim(feed, keepOlder: false)
+        }
+        observeNewest(feed, id: message["id"]?.integer ?? 0)
+    }
     func merge(_ raw: TDLibMessage, into feed: Feed, outcome: TelegramMessage.Delivery? = nil) {
         guard feed.snapshot.capabilities.canRead, raw["chat_id"]?.integer == feed.snapshot.destination.chat,
+              raw["scheduling_state"] == nil || raw["scheduling_state"] == .null,
               let messageID = raw["id"]?.integer, !feed.expired.contains(messageID),
               acceptsTopic(raw["topic_id"], feed: feed), !feed.snapshot.isTopicList else { return }
         let sender = Sender(raw["sender_id"]?.object)
@@ -505,6 +536,7 @@ final class TelegramFeedSession {
         feed.snapshot.messages.removeAll { $0.id == row.id || $0.messageID == row.messageID }
         feed.snapshot.messages.append(row)
         feed.snapshot.messages.sort { $0.messageID < $1.messageID }
+        observeNewest(feed, id: messageID)
         resolveReplies(feed); feed.dirty = true
         refreshRetryStates(feed)
     }
@@ -522,6 +554,7 @@ final class TelegramFeedSession {
         feed.expired.insert(id)
         if feed.expired.count > 2000 { feed.expired = Set(feed.expired.sorted().suffix(2000)) }
         feed.snapshot.messages.removeAll { $0.messageID == id }
+        observeNewest(feed)
         if feed.snapshot.replyKeyboard?.messageID == id { feed.snapshot.replyKeyboard = nil; feed.replyMarkupID = 0; feed.replyMarkupGeneration = UUID() }
         if feed.snapshot.draft.replyTo == id {
             feed.snapshot.draft.replyTo = nil; feed.snapshot.draft.revision = UUID()
@@ -533,10 +566,11 @@ final class TelegramFeedSession {
     func trim(_ feed: Feed, keepOlder: Bool) {
         var lastEvicted: Int64?
         while feed.snapshot.messages.count > TelegramFeedLimits.paneMessages || feed.snapshot.messages.reduce(0, { $0 + $1.storageBytes }) > 4 * 1024 * 1024 {
-            if keepOlder { feed.snapshot.messages.removeLast(); feed.snapshot.hasNewer = true }
+            if keepOlder { feed.snapshot.messages.removeLast() }
             else { lastEvicted = feed.snapshot.messages.removeFirst().messageID }
         }
         if let lastEvicted { evictedOldest(feed, lastRemoved: lastEvicted) }
+        observeNewest(feed)
         pruneWindow(feed)
     }
     private func evictedOldest(_ feed: Feed, lastRemoved: Int64) {
@@ -544,7 +578,7 @@ final class TelegramFeedSession {
         // If the entire window was evicted, reload around its newest position.
         feed.historyCursor = feed.snapshot.messages.first?.messageID ?? lastRemoved
         feed.snapshot.hasOlder = true
-        if feed.snapshot.messages.isEmpty { feed.snapshot.hasNewer = true }
+        observeNewest(feed)
         // An in-flight page from the previous boundary would leave a hole too.
         feed.historyGeneration = UUID()
         feed.dirty = true
@@ -585,11 +619,12 @@ final class TelegramFeedSession {
         if users.count > 512 { for key in users.keys.sorted() where key != account && users.count > 512 { users[key] = nil } }
     }
     func userName(_ user: TDLibMessage) -> String {
-        [user["first_name"]?.string, user["last_name"]?.string].compactMap { $0 }.joined(separator: " ")
+        if user["id"]?.integer == account { return "You" }
+        return [user["first_name"]?.string, user["last_name"]?.string].compactMap { $0 }.joined(separator: " ")
     }
     func senderName(_ sender: Sender) -> String {
         switch sender {
-        case .user(let id): users[id].map(userName) ?? nameLookup(id) ?? (id == account ? "You" : "User \(id)")
+        case .user(let id): id == account ? "You" : users[id].map(userName) ?? nameLookup(id) ?? "User \(id)"
         case .chat(let id): feeds[destination(chat: id)]?.snapshot.title ?? chatNameLookup(id) ?? "Chat \(id)"
         }
     }

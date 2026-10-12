@@ -31,10 +31,12 @@ final class TelegramFeedHarness {
         TDLibMessage("user", ["id": .integer(202), "first_name": .string("Casey"), "have_access": .bool(true), "paid_message_star_count": .integer(0), "type": .typed(type)])
     }
     func message(_ id: Int64, text: String = "hello", outgoing: Bool = false, state: TDLibValue = .null, reply: Int64? = nil) -> TDLibMessage {
-        TDLibMessage("message", ["id": .integer(id), "chat_id": .integer(self.id.chat), "sender_id": .typed("messageSenderUser", ["user_id": .integer(outgoing ? 101 : 202)]),
-            "date": .integer(9000), "is_outgoing": .bool(outgoing), "can_be_saved": .bool(true), "sending_state": state,
-            "topic_id": .null, "reply_to": reply.map { .typed("messageReplyToMessage", ["chat_id": .integer(self.id.chat), "message_id": .integer($0)]) } ?? .null,
+        var message = TDLibMessage("message", ["id": .integer(id), "chat_id": .integer(self.id.chat), "sender_id": .typed("messageSenderUser", ["user_id": .integer(outgoing ? 101 : 202)]),
+            "date": .integer(9000), "is_outgoing": .bool(outgoing), "can_be_saved": .bool(true),
             "content": .typed("messageText", ["text": .typed("formattedText", ["text": .string(text), "entities": .array([])])])])
+        if state != .null { message["sending_state"] = state }
+        if let reply { message["reply_to"] = .typed("messageReplyToMessage", ["chat_id": .integer(self.id.chat), "message_id": .integer(reply)]) }
+        return message
     }
     @discardableResult func answer(_ method: String, _ response: TDLibMessage = TDLibMessage("ok"), beforeResponse: (() -> Void)? = nil, file: StaticString = #filePath, line: UInt = #line) throws -> TDLibMessage {
         let request = try XCTUnwrap(client.requests.last { $0.type == method && $0["@extra"]?.string.map { session.calls[$0] != nil } == true }, file: file, line: line)

@@ -285,7 +285,9 @@ final class TelegramChatIndex {
         try db.read { try Int64.fetchOne($0, sql: "SELECT userID FROM chats WHERE id=? AND kind IN ('person','bot','savedMessages')", arguments: [chat]) }
     }
     func userTitle(_ id: Int64) throws -> String? {
-        try db.read { try String.fetchOne($0, sql: "SELECT title FROM entities WHERE family='user' AND id=?", arguments: [id]) }
+        // The saved-chat alias in the directory is not a person's name.
+        if id == account { return "You" }
+        return try db.read { try String.fetchOne($0, sql: "SELECT title FROM entities WHERE family='user' AND id=?", arguments: [id]) }
     }
     func chatTitle(_ id: Int64) throws -> String? {
         try db.read { try String.fetchOne($0, sql: "SELECT title FROM chats WHERE id=?", arguments: [id]) }

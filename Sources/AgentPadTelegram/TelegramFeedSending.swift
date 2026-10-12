@@ -201,7 +201,7 @@ extension TelegramFeedSession {
         if result.type == "message", let id = result["id"]?.integer {
             do { try journal.update(operation) { $0.parts[index].messageID = id; $0.parts[index].state = .pending } }
             catch { if let feed = feeds[destination(chat: op.chat, topic: op.topic)] { problem(feed, TelegramConversationError.storage.rawValue) }; return }
-            if let feed = feeds[destination(chat: op.chat, topic: op.topic)] { feed.aliases[id] = part.key.uuidString; merge(result, into: feed, outcome: .pending) }
+            if let feed = feeds[destination(chat: op.chat, topic: op.topic)] { feed.aliases[id] = part.key.uuidString; applyLastMessage(result, to: feed, outcome: .pending) }
             if let early = earlyOutcomes.removeValue(forKey: "\(op.chat):\(id)") { correlate(early.0, oldID: id, outcome: early.1) }
         } else {
             let unknown = result["message"]?.string == "transport_unknown"
@@ -245,7 +245,7 @@ extension TelegramFeedSession {
             feed.aliases[id] = part.key.uuidString
             if let oldID { feed.aliases[oldID] = part.key.uuidString }
             feed.snapshot.messages.removeAll { $0.id == part.key.uuidString }
-            merge(message, into: feed, outcome: mismatch ? .unknown : outcome == .sent ? .sent : outcome == .failed ? .failed("Message failed to send") : .pending)
+            applyLastMessage(message, to: feed, outcome: mismatch ? .unknown : outcome == .sent ? .sent : outcome == .failed ? .failed("Message failed to send") : .pending)
             if mismatch { problem(feed, "Telegram changed the sender, reply or topic. Review the result in Telegram.") }
             feed.dirty = true
         }
@@ -346,7 +346,7 @@ extension TelegramFeedSession {
                         let result: TelegramSendJournal.Part.State? = state == "messageSendingStateFailed" ? .failed
                             : state == nil && messageID > 0 && messageID & ((1 << 20) - 1) == 0 ? .sent : nil
                         self.correlate(response, outcome: result)
-                        self.merge(response, into: feed)
+                        self.applyLastMessage(response, to: feed)
                     } else {
                         try? self.journal.update(operation.id) { $0.parts[index].state = .unknown }
                         self.problem(feed, "A previous send could not be resolved. Check Telegram; it will not be replayed.")
