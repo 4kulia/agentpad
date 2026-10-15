@@ -261,10 +261,10 @@ final class EverywhereSearchModel {
         let position = selected.flatMap { values.firstIndex(of: $0) } ?? (delta > 0 ? -1 : values.count)
         selected = values[min(values.count - 1, max(0, position + delta))]
     }
-    func activate(_ id: String? = nil, beside: Bool = false, pin: Bool = false) {
+    func activate(_ id: String? = nil, beside: Bool = false, addToFolder: Bool = false) {
         let id = id ?? selected
         if let hit = telegram.hits.first(where: { "t:" + $0.id == id }), source == .all || source == .telegram {
-            openTelegram(hit, beside, pin); return
+            openTelegram(hit, beside, addToFolder); return
         }
         if id?.hasPrefix("t:") == true || (source == .telegram && id == nil) { return }
         dismiss()
@@ -327,9 +327,9 @@ extension WorkspaceStore {
             Task { await SearchNavigation.open(hit, model: model, from: self) }
         }
         model.openResults = { [weak self] in guard let self else { return }; SupportTabs.shared.navigation.open(.search, from: self) }
-        model.openTelegram = { [weak self, weak model] hit, beside, pin in
+        model.openTelegram = { [weak self, weak model] hit, beside, addToFolder in
             guard let self, let model else { return }
-            Task { if await model.telegram.open(hit, from: self, beside: beside, pin: pin) { model.dismiss() } }
+            Task { if await model.telegram.open(hit, from: self, beside: beside, addToFolder: addToFolder) { model.dismiss() } }
         }
         return model
     }

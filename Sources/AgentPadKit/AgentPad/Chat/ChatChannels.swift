@@ -122,6 +122,18 @@ enum ChatChannels {
         }
     }
 
+    static func activity(_ db: Database) throws -> [String:Date] {
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT c.channel_id,coalesce(max(m.created_at),c.created_at) AS activity
+            FROM channels c LEFT JOIN messages m ON m.channel_id=c.channel_id
+              AND m.created_at IS NOT NULL AND m.deleted_at IS NULL AND m.local_state IS NULL
+            GROUP BY c.channel_id
+            """)
+        return Dictionary(uniqueKeysWithValues: rows.compactMap { row in
+            (row["activity"] as String?).flatMap(ChatFeedLayout.date).map { (row["channel_id"] as String,$0) }
+        })
+    }
+
     static func read(_ db: Database) throws -> [ChatChannelCard] {
         try Row.fetchAll(db, sql: "SELECT * FROM channels ORDER BY archived, name COLLATE NOCASE").map {
             ChatChannelCard(channelId: $0["channel_id"], teamId: $0["team_id"], name: $0["name"], createdBy: $0["created_by"],

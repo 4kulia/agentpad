@@ -159,12 +159,9 @@ final class TelegramConversationModel: ConversationActions {
         let epoch = snapshot.epoch
         Task { await provider?.composerActivity(id, epoch: epoch, pane: pane, typing: typing) }
     }
-    func pin() {
-        guard id.topic == nil || id.topic?.forumID != nil else { return }
-        Task {
-            guard let row = await TelegramService.chats.row(id.root) else { return }
-            await TelegramService.chats.mode(row, .pinned)
-        }
+    func addToFolder(chats: TelegramChatsModel = TelegramService.chats, windowID: UUID? = nil) {
+        guard let binding = chats.snapshot.binding, binding.account == id.account, binding.environment == id.environment else { return }
+        SidebarFolderActions.shared.present(.telegram(id.chat), binding: binding, windowID: windowID)
     }
     func cacheLimit(_ limit: Int) {
         let epoch = snapshot.epoch
@@ -202,12 +199,12 @@ final class TelegramConversationModel: ConversationActions {
 }
 
 enum TelegramComposerKey: Equatable {
-    case send, pin, native
+    case send, addToFolder, native
     static func action(code: UInt16, modifiers: NSEvent.ModifierFlags, markedText: Bool, repeatKey: Bool) -> Self {
         guard !markedText, !repeatKey, [36, 76].contains(code) else { return .native }
         let flags = modifiers.intersection([.command, .shift, .control, .option])
         if flags == .command { return .send }
-        if flags == [.command, .shift] { return .pin }
+        if flags == [.command, .shift] { return .addToFolder }
         return .native
     }
 }

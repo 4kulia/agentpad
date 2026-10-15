@@ -122,13 +122,14 @@ public actor LocalTDLibConnector: TelegramConnector, TelegramChatProvider, Teleg
             }
             machine.cleanup = profile.manifest.cleanup == .logout
             if machine.cleanup { machine.snapshot.state = .loggingOut }
+            let index = try TelegramChatIndex(directory: profile.directory, environment: environment,
+                                              account: Int64(profile.manifest.userID ?? "0") ?? 0)
+            profile.manifest.schemaVersion = 2
             let emptyDatabase = try FileManager.default.contentsOfDirectory(atPath: profile.database.path).isEmpty
             databaseKey = try keys.key(account: profile.manifest.keyAccount,
                                        mayCreate: !profile.manifest.keyCreated && emptyDatabase)
             profile.manifest.keyCreated = true
             try profile.save()
-            let index = try TelegramChatIndex(directory: profile.directory, environment: environment,
-                                              account: Int64(profile.manifest.userID ?? "0") ?? 0)
             if machine.cleanup { try index.clearNotifications() }
             let client = try factory()
             self.client = client
@@ -641,25 +642,6 @@ public actor LocalTDLibConnector: TelegramConnector, TelegramChatProvider, Teleg
         return pair.stream
     }
     private func removeChatObserver(_ id: UUID) { chatObservers[id] = nil; chats?.observers[id] = nil }
-    public func chatPage(offset: Int, revision: UInt64) -> TelegramChatPage {
-        let rows: [TelegramChatRow]
-        if let chats, chats.active, chats.snapshot.revision == revision, offset < chats.snapshot.visibleCount {
-            rows = (try? chats.index.page(offset: offset, limit: min(50, chats.snapshot.visibleCount - offset), now: Int64(now().timeIntervalSince1970))) ?? []
-        } else { rows = [] }
-        return TelegramChatPage(revision: revision, offset: offset, rows: rows)
-    }
-    public func expandChats(showLess: Bool) {
-        guard let chats, chats.active else { return }
-        chats.index.expandedCapacity = showLess ? nil : chats.snapshot.visibleCount + 10
-        chats.publish(now: now(), force: true)
-    }
-    public func holdChatOrder(_ held: Bool, owner: UUID) {
-        guard let chats else { return }
-        if held && chats.holds.isEmpty { chats.index.heldVisibleCount = chats.snapshot.visibleCount }
-        if held { chats.holds.insert(owner) } else { chats.holds.remove(owner) }
-        chats.index.orderHeld = !chats.holds.isEmpty
-        if !chats.index.orderHeld, chats.active { chats.index.heldVisibleCount = nil; chats.publish(now: now()) }
-    }
     public func setChatMode(_ id: TelegramChatID, mode: TelegramChatMode) {
         guard let chats, chats.active, id.account == chats.index.account, id.environment == environment else { return }
         do { try chats.index.mode(id.chat, mode, now: Int64(now().timeIntervalSince1970)) }
@@ -699,12 +681,6 @@ public actor LocalTDLibConnector: TelegramConnector, TelegramChatProvider, Teleg
     public func snoozeAttention(_ id: TelegramChatID, undo: Bool) {
         guard let chats, chats.active, id.account == chats.index.account, id.environment == environment else { return }
         do { try chats.index.snooze(id.chat, undo: undo, now: Int64(now().timeIntervalSince1970)) }
-        catch { chats.index.error = "The Telegram setting could not be saved on this Mac." }
-        chats.publish(now: now())
-    }
-    public func setChannelNotifications(_ id: TelegramChatID, enabled: Bool) {
-        guard let chats, chats.active, id.account == chats.index.account, id.environment == environment else { return }
-        do { try chats.index.channelNotifications(id.chat, enabled: enabled, now: Int64(now().timeIntervalSince1970)) }
         catch { chats.index.error = "The Telegram setting could not be saved on this Mac." }
         chats.publish(now: now())
     }
@@ -837,4 +813,69 @@ public actor LocalTDLibConnector: TelegramConnector, TelegramChatProvider, Teleg
         }
     }
 
+}
+
+
+extension LocalTDLibConnector {
+    private func folderSession(_ binding: TelegramProfileBinding) throws -> TelegramChatSession {
+        try Task.checkCancellation()
+        guard let chats, chats.active else { throw TelegramFolderError.unavailable }
+        try chats.index.validate(binding); return chats
+    }
+    public func chatPage(list: TelegramListKey, from: Int, revision: UInt64, binding: TelegramProfileBinding) async -> TelegramChatPage {
+        (try? folderSession(binding).index.listPage(list, from: from, revision: revision, now: Int64(now().timeIntervalSince1970))) ?? .init(revision: revision, offset: from, rows: [])
+    }
+    public func expandChats(list: TelegramListKey, showLess: Bool, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding)
+        guard let snapshot = session.snapshot.lists.first(where: { $0.key == list }) else { throw TelegramFolderError.invalidTarget }
+        session.index.listStates[list]!.capacity = showLess ? nil : snapshot.capacity + 10
+        session.publish(now: now())
+    }
+    public func holdChatOrder(list: TelegramListKey, held: Bool, owner: UUID, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding); session.index.hold(list, held: held, owner: owner); session.publish(now: now())
+    }
+    public func attentionPage(start: Int, revision: UInt64, binding: TelegramProfileBinding) async -> TelegramChatPage {
+        (try? folderSession(binding).index.attentionPage(start: start, revision: revision, now: Int64(now().timeIntervalSince1970))) ?? .init(revision: revision, offset: start, rows: [])
+    }
+    public func holdAttentionOrder(_ held: Bool, owner: UUID, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding)
+        if held { session.index.attentionHolds.insert(owner) } else { session.index.attentionHolds.remove(owner) }
+        session.publish(now: now())
+    }
+    public func setViewport(list: TelegramListKey, windows: Set<Int>, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding); try session.index.setViewport(list, windows: windows); session.publish(now: now())
+    }
+    public func setListVisible(_ list: TelegramListKey, visible: Bool, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding); try session.index.setListVisible(list, visible: visible)
+        session.tick(now: now()); session.publish(now: now())
+    }
+    public func setListCollapsed(window: UUID, list: TelegramListKey, collapsed: Bool, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding)
+        try session.index.setListCollapsed(window: window, list: list, collapsed: collapsed, binding: binding); session.publish(now: now())
+    }
+    public func retainFolderWindows(_ windows: Set<UUID>, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding); try session.index.retainWindows(windows, binding: binding); session.publish(now: now())
+    }
+    public func customMembers(binding: TelegramProfileBinding) async throws -> [UUID:Set<Int64>] { try folderSession(binding).index.customMembers(binding: binding) }
+    public func customSummaries(binding: TelegramProfileBinding) async throws -> [TelegramFolderSummary] {
+        try folderSession(binding).index.customSummaries(binding: binding, now: Int64(now().timeIntervalSince1970))
+    }
+    public func setCustomMember(folder: UUID, chat: Int64, member: Bool, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding); try session.index.setCustomMember(folder: folder, chat: chat, member: member, binding: binding); session.publish(now: now())
+    }
+    public func applyTombstones(_ tombstones: Set<UUID>, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding); try session.index.applyTombstones(tombstones, binding: binding); session.publish(now: now())
+    }
+    public func markAsRead(_ chat: Int64, retry: Set<TelegramMarkReadStep>? = nil, binding: TelegramProfileBinding) async -> TelegramMarkReadResult {
+        do {
+            let session = try folderSession(binding)
+            return await withCheckedContinuation { session.markAsRead(chat, retry: retry, now: now(), continuation: $0) }
+        } catch {
+            var result = TelegramMarkReadResult(); result.error = error as? TelegramFolderError ?? .storage; return result
+        }
+    }
+    public func setFollow(_ chat: Int64, enabled: Bool, binding: TelegramProfileBinding) async throws {
+        let session = try folderSession(binding)
+        try session.index.follow(chat, enabled: enabled, now: Int64(now().timeIntervalSince1970)); session.publish(now: now())
+    }
 }

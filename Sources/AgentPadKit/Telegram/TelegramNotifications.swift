@@ -108,7 +108,7 @@ final class TelegramNotifications {
     private func allowed(_ item: TelegramNotification) -> Bool {
         guard let item = deliveryItem(item) else { return false }
         let category: AttentionCategory = switch item.kind {
-        case .direct, .channelPost: .dm
+        case .direct, .channelPost, .groupMessage: .dm
         case .mention: .mentions
         case .reply, .botReply: .replies
         }

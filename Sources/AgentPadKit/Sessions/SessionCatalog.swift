@@ -136,6 +136,8 @@ final class SessionCatalog {
     @ObservationIgnored private let scan: Scan
     @ObservationIgnored private(set) var records: [AgentSessionRecord] = []
     @ObservationIgnored private var recordsByKey: [SessionNameKey: AgentSessionRecord] = [:]
+    /// Diagnostic for bounded metadata reads (does not invalidate observers).
+    @ObservationIgnored private(set) var recordReadCount = 0
     private(set) var revision = 0
     private(set) var isScanning = false
     private(set) var scanned = 0
@@ -174,8 +176,14 @@ final class SessionCatalog {
         return records.count + live.count - Set(live.filter(\.canRename).map { $0.record.nameKey }).filter { recordsByKey[$0] != nil }.count
     }
     func record(for key: SessionNameKey) -> AgentSessionRecord? {
+        recordReadCount += 1
         _ = revision
         return recordsByKey[key]
+    }
+    /// Copy-on-write input for off-actor keyed reductions; no record walk here.
+    var recordsSnapshot: [SessionNameKey: AgentSessionRecord] {
+        _ = revision
+        return recordsByKey
     }
     private func apply(_ update: SessionCatalogScanner.Progress, complete: Bool) {
         do { try profiles?.discover(update.discoveredRecords ?? update.records) } catch { /* Profiles expose discovery/save errors. */ }

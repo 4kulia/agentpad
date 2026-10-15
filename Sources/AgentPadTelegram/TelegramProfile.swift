@@ -3,7 +3,7 @@ import Foundation
 
 struct TelegramProfileManifest: Codable, Equatable, Sendable {
     enum Cleanup: String, Codable, Sendable { case none, logout, localOnly }
-    var schemaVersion = 1
+    var schemaVersion = 2
     let connectionID: UUID
     let environment: TelegramEnvironment
     var userID: String?
@@ -84,7 +84,7 @@ public struct TelegramProfileStore: Sendable {
             let manifestURL = directory.appendingPathComponent("profile.json")
             let bytes = try Self.read(manifestURL)
             guard let saved = try? JSONDecoder().decode(TelegramProfileManifest.self, from: bytes),
-                  saved.schemaVersion == 1, saved.connectionID == id, saved.environment == environment else {
+                  (1...2).contains(saved.schemaVersion), saved.connectionID == id, saved.environment == environment else {
                 throw TelegramStorageError.corruptProfile
             }
             manifest = saved

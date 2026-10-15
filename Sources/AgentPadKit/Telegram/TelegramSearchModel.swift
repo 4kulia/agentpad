@@ -23,9 +23,10 @@ final class TelegramSearchModel {
         lastAccount = chats.snapshot.account; lastQuery = query
         let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         // Available synchronously, before any actor hop / TDLib response.
-        let instant = chats.snapshot.automaticRows.filter {
+        var instant = chats.snapshot.suggestionRows.filter {
             normalized.isEmpty || $0.title.localizedCaseInsensitiveContains(normalized) || $0.username.localizedCaseInsensitiveContains(normalized.trimmingCharacters(in: CharacterSet(charactersIn: "@")))
         }.map { TelegramSearchHit(row: $0) }
+        if !normalized.isEmpty { instant.sort { TelegramSearchRank.precedes($0, $1, query: query) } }
         value = .init(query: query, hits: instant, searching: chats.connected, notice: chats.connected ? nil : "Connect Telegram…")
         changed()
         guard let provider = chats.provider else { return }
@@ -49,19 +50,19 @@ final class TelegramSearchModel {
         value = .init(query: value.query, notice: chats.connected ? nil : "Connect Telegram…")
         changed()
     }
-    func open(_ hit: TelegramSearchHit, from store: WorkspaceStore, beside: Bool, pin: Bool) async -> Bool {
+    func open(_ hit: TelegramSearchHit, from store: WorkspaceStore, beside: Bool, addToFolder: Bool, router: TabRouter = .shared) async -> Bool {
         guard !opening, let provider = chats.provider else { return false }
         let operation = UUID(); openingGeneration = operation; opening = true
         defer { if openingGeneration == operation { opening = false; openingGeneration = nil } }
-        let account = chats.snapshot.account
+        let account = chats.snapshot.account, binding = chats.snapshot.binding
         let resolved = await provider.resolveChat(hit)
-        guard openingGeneration == operation, !Task.isCancelled, chats.snapshot.account == account else { return false }
+        guard openingGeneration == operation, !Task.isCancelled, chats.snapshot.account == account, chats.snapshot.binding == binding else { return false }
         guard let row = resolved else {
             value.notice = "This Telegram chat could not be opened. Try again when connected."; return false
         }
-        guard TelegramTabs.open(row, from: store, beside: beside) != nil else { return false }
+        guard TelegramTabs.open(row, from: store, beside: beside, router: router) != nil else { return false }
+        if addToFolder { SidebarFolderActions.shared.present(.telegram(row.id.chat), binding: binding, windowID: store.windowID) }
         await provider.didOpenChat(row.id)
-        if pin, row.kind.eligible { await provider.setChatMode(row.id, mode: .pinned) }
         return true
     }
 }

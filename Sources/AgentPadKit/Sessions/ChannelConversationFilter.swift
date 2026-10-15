@@ -4,7 +4,7 @@ import GRDB
 /// One policy for ordinary session readers/actions. Executor conversations stay
 /// behind the approval gateway even after sign-out, journal reset or result erasure.
 /// Do not derive this from the disposable organization cache or current mode.
-struct ChannelConversationFilter: Sendable {
+struct ChannelConversationFilter: Equatable, Sendable {
     private let channelIds: Set<String>?
     private let seedIncompleteBefore: Date?
 

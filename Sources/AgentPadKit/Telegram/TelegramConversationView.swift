@@ -5,6 +5,8 @@ import SwiftUI
 struct TelegramConversationView: View {
     @Bindable var state: TabState
     let id: TelegramChatID
+    var chats: TelegramChatsModel
+    var applicationInteractive: () -> Bool
     @State var model: TelegramConversationModel
     @State var showHiddenGeneral = false
     @State var pane = UUID()
@@ -27,30 +29,32 @@ struct TelegramConversationView: View {
     @State private var selection = NSRange(location: 0, length: 0)
     @State private var editor = ChatEditorControl()
     @State private var editorHeight: CGFloat = 64
-    init(state: TabState, id: TelegramChatID) {
-        self.state = state; self.id = id
+    init(state: TabState, id: TelegramChatID, chats: TelegramChatsModel = TelegramService.chats, applicationInteractive: @escaping () -> Bool = { TelegramService.isInteractive }) {
+        self.state = state; self.id = id; self.chats = chats; self.applicationInteractive = applicationInteractive
         let model = state.telegramModel.flatMap { $0.id == id ? $0 : nil } ?? TelegramService.conversations.model(id)
         state.telegramModel = model
         _model = State(initialValue: model)
     }
     private var connectedAccount: Bool {
-        TelegramService.chats.snapshot.account?.account == id.account && TelegramService.chats.snapshot.account?.environment == id.environment
+        chats.snapshot.account?.account == id.account && chats.snapshot.account?.environment == id.environment
     }
     private var presentation: ConversationSnapshot { model.presentation }
-    private var canPin: Bool { state.telegramRow?.kind.eligible == true && (id.topic == nil || id.topic?.forumID != nil) }
+    private var canAddToFolder: Bool { state.telegramRow?.kind.eligible == true && (id.topic == nil || id.topic?.forumID != nil) }
     private var botDialog: TelegramBotDialog? {
         model.botDialog.flatMap { $0.pane == nil || $0.pane == pane ? $0 : nil }
     }
     private var sponsoredDialog: TelegramSponsoredDialog? { model.sponsoredDialog.flatMap { $0.pane == pane ? $0 : nil } }
     private var jumpToLatestVisible: Bool { !atBottom || model.snapshot.hasNewer }
     private var allowsKeyboardAction: Bool {
-        connectedAccount && TelegramService.isInteractive && box.view.map {
-            NavigationPresentationGate.allowsAcknowledgement($0, appActive: NSApp.isActive)
+        connectedAccount && box.view.map {
+            NavigationPresentationGate.allowsAcknowledgement($0, appActive: applicationInteractive())
         } == true
     }
     var body: some View {
         VStack(spacing: 0) {
-            header
+            header.addToFolderAnchor(.telegram(id.chat),
+                windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID,
+                enabled: !model.snapshot.capabilities.canSend && allowsKeyboardAction)
             if !connectedAccount {
                 unavailable("Connect this Telegram account to open this conversation.")
                 Button("Telegram settings") { SupportTabs.shared.settings(.telegram) }.padding()
@@ -72,10 +76,13 @@ struct TelegramConversationView: View {
                         .font(Theme.display(11)).foregroundStyle(ChatAppearance.failure).padding(10)
                 }
                 if let notice = model.notice { Text(notice).font(Theme.display(11)).foregroundStyle(.secondary).padding(8) }
+                TelegramReadNoticeView(model: chats)
                 if !model.snapshot.operations.isEmpty { operations }
                 if model.snapshot.capabilities.canSend {
                     botControls
-                    composer
+                    composer.addToFolderAnchor(.telegram(id.chat),
+                        windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID,
+                        enabled: allowsKeyboardAction)
                 }
                 else {
                     VStack(spacing: 6) {
@@ -91,12 +98,15 @@ struct TelegramConversationView: View {
         .background(ChatAppearance.surface)
         .attentionPlace([.telegram(id.root, message: 0)])
         .background(WindowReader(box: box, didAttach: observe, visibilityChanged: { _ in observe() }))
-        .task(id: TelegramService.chats.snapshot.account) {
-            guard connectedAccount, let provider = TelegramService.chats.provider as? any TelegramConversationProvider else { return }
+        .task(id: chats.snapshot.account) {
+            guard connectedAccount, let provider = chats.provider as? any TelegramConversationProvider else { return }
             await model.observe(pane: pane, provider: provider)
         }
-        .task(id: TelegramService.chats.snapshot.revision) {
-            state.telegramRow = await TelegramService.chats.row(id.root)
+        .task(id: chats.metadataRevision) {
+            let binding = chats.snapshot.binding
+            let row = await chats.row(id.root)
+            guard !Task.isCancelled, chats.snapshot.binding == binding else { return }
+            state.telegramRow = row
         }
         .onChange(of: model.snapshot.revision) { _, _ in
             if let topic = model.snapshot.topicInfo { state.telegramTopicTitle = topic.name }
@@ -135,9 +145,9 @@ struct TelegramConversationView: View {
         .onReceive(NotificationCenter.default.publisher(for: NavigationPresentationGate.didChange)) { _ in observe() }
         .onKeyPress(keys: [.return], phases: .down) { press in
             guard press.modifiers == [.command, .shift], allowsKeyboardAction,
-                  editor.view?.hasMarkedText() != true, NSApp.currentEvent?.isARepeat != true,
-                  canPin else { return .ignored }
-            model.pin(); return .handled
+                  editor.view?.hasMarkedText() != true, NSApp.currentEvent.map({ $0.type == .keyDown && $0.isARepeat }) != true,
+                  canAddToFolder else { return .ignored }
+            model.addToFolder(chats: chats, windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID); return .handled
         }
     }
     private var header: some View {
@@ -149,22 +159,16 @@ struct TelegramConversationView: View {
                     .font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
             }
             Spacer()
-            if connectedAccount, let row = state.telegramRow, canPin {
-                Button(row.pinned ? "Unpin" : "Pin here") { Task { await TelegramService.chats.mode(row, row.pinned ? .auto : .pinned) } }
-                    .help("Pin here (⌘⇧Return)")
+            if connectedAccount, let row = state.telegramRow, canAddToFolder {
                 Menu {
-                    if row.kind == .channel, row.pinned {
-                        Button(row.channelNotificationsActivating ? "Turning on post notifications…" : row.channelNotifications ? "Turn off post notifications" : "Notify about new posts") {
-                            Task { await TelegramService.chats.provider?.setChannelNotifications(row.id, enabled: !row.channelNotifications) }
-                        }.disabled(row.channelNotificationsActivating)
-                    }
+                    TelegramChatActions(row: row, model: chats, windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID)
                     if row.attention != nil {
-                        Button("Hide until next message") { Task { await TelegramService.chats.provider?.snoozeAttention(row.id, undo: false) } }
+                        Button("Hide until next message") { Task { await chats.provider?.snoozeAttention(row.id, undo: false) } }
                     }
                     if row.snoozed {
-                        Button("Undo hide until next message") { Task { await TelegramService.chats.provider?.snoozeAttention(row.id, undo: true) } }
+                        Button("Undo hide until next message") { Task { await chats.provider?.snoozeAttention(row.id, undo: true) } }
                     }
-                    Button(row.hidden ? "Restore" : "Don’t show") { Task { await TelegramService.chats.mode(row, row.hidden ? .auto : .hidden) } }
+                    Button(row.hidden ? "Restore" : "Don’t show") { Task { await chats.mode(row, row.hidden ? .auto : .hidden) } }
                     if let url = telegramURL { Link("Open in Telegram", destination: url) }
                     Menu("Download cache · \(model.snapshot.cacheLimitMiB) MiB") {
                         ForEach([128, 256, 512, 1024], id: \.self) { limit in Button("\(limit) MiB") { model.cacheLimit(limit) } }
@@ -391,10 +395,10 @@ struct TelegramConversationView: View {
                     selection: $selection, candidates: [], control: editor, heightChanged: { editorHeight = $0 }, placeholder: composerPlaceholder,
                     accessibilityName: "Telegram message", attachments: { model.paste($0) }, dropAttachments: { model.paste($0, fromDrop: true) }, suppressCommandReturnRepeat: true,
                     key: { code, modifiers in
-                        guard editor.focused, allowsKeyboardAction else { return false }
-                        switch TelegramComposerKey.action(code: code, modifiers: modifiers, markedText: editor.view?.hasMarkedText() == true, repeatKey: NSApp.currentEvent?.isARepeat == true) {
+                        guard let view = editor.view, view.window?.firstResponder === view, allowsKeyboardAction else { return false }
+                        switch TelegramComposerKey.action(code: code, modifiers: modifiers, markedText: editor.view?.hasMarkedText() == true, repeatKey: NSApp.currentEvent.map({ $0.type == .keyDown && $0.isARepeat }) == true) {
                         case .send: model.send(); return true
-                        case .pin: model.pin(); return true
+                        case .addToFolder: model.addToFolder(chats: chats, windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID); return true
                         case .native: return false
                         }
                     }).frame(height: max(52, min(160, editorHeight)))

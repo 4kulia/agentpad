@@ -20,7 +20,7 @@ struct OrgKey: Codable, Hashable, Sendable {
 enum TeamScope: Codable, Hashable, Sendable { case local, server(OrgKey) }
 
 enum SettingsTabSection: String, CaseIterable, Codable, Sendable {
-    case general, profile, telegram, appearance, agents, terminals, openIn, statusBar, notifications, search, advanced, about, updates
+    case general, profile, telegram, sidebar, appearance, agents, terminals, openIn, statusBar, notifications, search, advanced, about, updates
     var title: String {
         switch self {
         case .openIn: "Open in"

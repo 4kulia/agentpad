@@ -48,7 +48,7 @@ final class TelegramChatSearchTests: XCTestCase {
         reply(session, request: secondEnd, TDLibMessage("error", ["code": .integer(404)]), now: now)
         session.tick(now: now); session.publish(now: now)
         XCTAssertEqual(session.snapshot.state, .complete)
-        XCTAssertEqual(session.snapshot.foundCount, 6); XCTAssertEqual(session.snapshot.automaticCount, 1)
+        XCTAssertEqual(session.snapshot.lists.first { $0.key == .main }?.counts.rows, 6)
         XCTAssertFalse(fixture.client.requests.contains { ["getChatHistory", "searchChatMessages", "viewMessages", "sendMessage"].contains($0.type) })
     }
     func testFailedCompletionCheckpointRetriesWithBackoffWithoutReloadingFinishedLists() throws {
@@ -74,7 +74,7 @@ final class TelegramChatSearchTests: XCTestCase {
         XCTAssertEqual(session.snapshot.state, .complete, "The 404 completion remains true in memory")
         XCTAssertNotNil(session.snapshot.error)
         XCTAssertEqual(writes.count, 1, "The second completion respects the pending disk backoff")
-        let failureRevision = session.snapshot.revision
+        let failureRevision = session.snapshot.lists.first { $0.key == .main }?.revision
         // Exponential disk retries cap at 64 seconds; ticks between retries
         // neither hit the disk nor re-publish the same error.
         for (offset, due) in [2.0, 6, 14, 30, 62, 126, 190].enumerated() {
@@ -82,7 +82,7 @@ final class TelegramChatSearchTests: XCTestCase {
             XCTAssertEqual(writes.count, offset + 1)
             session.tick(now: now.addingTimeInterval(due))
             XCTAssertEqual(writes.count, offset + 2)
-            XCTAssertEqual(session.snapshot.revision, failureRevision)
+            XCTAssertEqual(session.snapshot.lists.first { $0.key == .main }?.revision, failureRevision)
             XCTAssertEqual(fixture.client.requests.filter { $0.type == "loadChats" }.count, 2)
         }
         XCTAssertEqual(try index.checkpoint("mainDone"), 0)

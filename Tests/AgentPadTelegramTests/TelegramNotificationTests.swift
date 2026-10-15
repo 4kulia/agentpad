@@ -102,8 +102,8 @@ final class TelegramNotificationTests: XCTestCase {
     func testSingleGroupHistoryAndLongChannelEpisodeStayBoundedAcrossRestart() throws {
         let fixture = try TelegramFixture(), now = AttentionFixture.now
         var index: TelegramChatIndex? = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
-        try AttentionFixture.chat(index!, kind: .channel); try index!.mode(1, .pinned, now: now)
-        try index!.channelNotifications(1, enabled: true, now: now)
+        try AttentionFixture.chat(index!, kind: .channel); try index!.mode(1, .auto, now: now)
+        try AttentionFixture.follow(index!, chat: 1)
         try index!.apply(NotificationFixture.snapshot([]), now: now)
         for id: Int64 in 1...30 {
             try index!.apply(NotificationFixture.group(added: [NotificationFixture.notification(id, message: 1000 + id)]), now: now)
@@ -128,8 +128,8 @@ final class TelegramNotificationTests: XCTestCase {
     func testLegacyHistoryMigratesWithBoundsAndPreservesChannelConsumption() throws {
         let fixture = try TelegramFixture(), now = AttentionFixture.now
         var index: TelegramChatIndex? = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
-        try AttentionFixture.chat(index!, kind: .channel); try index!.mode(1, .pinned, now: now)
-        try index!.channelNotifications(1, enabled: true, now: now)
+        try AttentionFixture.chat(index!, kind: .channel); try index!.mode(1, .auto, now: now)
+        try AttentionFixture.follow(index!, chat: 1)
         try index!.apply(NotificationFixture.snapshot([]), now: now)
         try index!.apply(NotificationFixture.group(added: [NotificationFixture.notification(1, message: 100)]), now: now)
         let item = try XCTUnwrap(index!.project(now: now).attention.notifications.items.first)
@@ -140,6 +140,7 @@ final class TelegramNotificationTests: XCTestCase {
                 ALTER TABLE tg_notification_consumed DROP COLUMN date;
                 ALTER TABLE tg_state DROP COLUMN notifiedEpisode;
                 """)
+            try LegacyFolderFixture.makeVersionOne(db)
         }
         index = nil
         let restored = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
@@ -178,8 +179,8 @@ final class TelegramNotificationTests: XCTestCase {
     func testSnoozeUndoDoesNotCreateAnotherChannelBannerAndLimitViolationIsAtomic() throws {
         let fixture = try TelegramFixture()
         let index = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
-        try AttentionFixture.chat(index, kind: .channel); try index.mode(1, .pinned)
-        try index.channelNotifications(1, enabled: true, now: AttentionFixture.now)
+        try AttentionFixture.chat(index, kind: .channel); try index.mode(1, .auto)
+        try AttentionFixture.follow(index, chat: 1)
         try index.apply(NotificationFixture.snapshot([]), now: AttentionFixture.now)
         try index.apply(NotificationFixture.group(added: [NotificationFixture.notification(1, message: 100)]), now: AttentionFixture.now)
         XCTAssertTrue(try index.project(now: AttentionFixture.now).attention.notifications.items[0].mayDeliver)
@@ -268,8 +269,8 @@ final class TelegramNotificationTests: XCTestCase {
     func testChannelTransportIDsShareDeliveryEpisodeAndRestartDoesNotReplay() throws {
         let fixture = try TelegramFixture()
         var index: TelegramChatIndex? = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
-        try AttentionFixture.chat(index!, kind: .channel); try index!.mode(1, .pinned)
-        try index!.channelNotifications(1, enabled: true, now: AttentionFixture.now)
+        try AttentionFixture.chat(index!, kind: .channel); try index!.mode(1, .auto)
+        try AttentionFixture.follow(index!, chat: 1)
         try index!.apply(NotificationFixture.snapshot([]), now: AttentionFixture.now)
         try index!.apply(NotificationFixture.group(added: [NotificationFixture.notification(1, message: 100)]), now: AttentionFixture.now)
         let first = try XCTUnwrap(index!.project(now: AttentionFixture.now).attention.notifications.items.first)

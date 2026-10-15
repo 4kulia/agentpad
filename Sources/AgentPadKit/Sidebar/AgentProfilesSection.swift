@@ -62,23 +62,26 @@ struct AgentProfilesSection: View {
     }
 }
 
-private struct AgentProfileRow: View {
+struct AgentProfileRow: View {
     let store: WorkspaceStore
     let profile: AgentProfile
     var attentionCount: Int
     var selection: ChatSidebarRowID?
     var select: (ChatSidebarRowID) -> Void
+    var showsSessions = true
+    var folderCaption: String?
+    var folderActions = AnyView(EmptyView())
     private var limit: Int { store.profileHistoryLimits[profile.id] ?? AgentProfileSessions.pageSize }
     @State private var folderExists = true
 
-    private var expanded: Bool { store.expandedAgentProfiles.contains(profile.id) }
+    private var expanded: Bool { showsSessions && store.expandedAgentProfiles.contains(profile.id) }
     private var template: AgentTemplate? { store.profileTemplates().first { $0.id == profile.templateID } }
 
     var body: some View {
         let items = expanded ? store.profileSessionItems(profile) : []
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 2) {
-                Button {
+                if showsSessions { Button {
                     if expanded { store.expandedAgentProfiles.remove(profile.id) }
                     else { store.expandedAgentProfiles.insert(profile.id) }
                 } label: {
@@ -87,6 +90,7 @@ private struct AgentProfileRow: View {
                 }
                 .buttonStyle(.plain).accessibilityLabel("Sessions for \(profile.name)")
                 .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+                }
                 Button {
                     select(.profile(profile.id))
                     folderExists = isDirectory(profile.folder)
@@ -95,20 +99,21 @@ private struct AgentProfileRow: View {
                     HStack(alignment: .top, spacing: 7) {
                         ContactAvatar(stableID: profile.id.uuidString, name: profile.name, kind: .agent, size: 24, image: store.agentProfiles.details.image(profile.id))
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(profile.name).font(Theme.display(12, weight: .medium)).lineLimit(1)
-                            Text(folderExists ? (template?.title ?? profile.templateID) + (expanded ? " · \(items.isEmpty ? "No sessions yet" : "\(items.count) sessions")" : "") : "Folder not found")
-                                .font(Theme.display(10)).foregroundStyle(folderExists ? Theme.chromeMuted : .orange)
+                            Text(profile.name).font(Theme.display(showsSessions ? 12 : 11, weight: .medium)).lineLimit(1)
+                            Text(folderCaption ?? (folderExists ? (template?.title ?? profile.templateID) + (expanded ? " · \(items.isEmpty ? "No sessions yet" : "\(items.count) sessions")" : "") : "Folder not found"))
+                                .font(Theme.display(showsSessions ? 10 : 9)).foregroundStyle(folderExists ? Theme.chromeMuted : .orange)
                         }
                         Spacer(minLength: 0)
-                        if attentionCount > 0 { ChatSidebarBadge(text: "\(attentionCount)", mention: true) }
+                        if attentionCount > 0 { SidebarAttentionDot() }
                     }.padding(.vertical, 6).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain).chatFocusRing().help("Start a new session in \(profile.folder.path)")
                 .accessibilityLabel("Start a new session with \(profile.name)")
-                .onKeyPress(.rightArrow) { store.expandedAgentProfiles.insert(profile.id); return .handled }
-                .onKeyPress(.leftArrow) { store.expandedAgentProfiles.remove(profile.id); return .handled }
+                .onKeyPress(.rightArrow) { guard showsSessions else { return .ignored }; store.expandedAgentProfiles.insert(profile.id); return .handled }
+                .onKeyPress(.leftArrow) { guard showsSessions else { return .ignored }; store.expandedAgentProfiles.remove(profile.id); return .handled }
                 Menu {
                     Button("Edit profile…") { SupportTabs.shared.navigation.open(.agentProfile(profile.id), from: store) }
+                    folderActions
                 } label: { Image(systemName: "ellipsis").frame(width: 24, height: 28) }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Edit profile")
                 .accessibilityLabel("Profile menu for \(profile.name)")
@@ -117,6 +122,10 @@ private struct AgentProfileRow: View {
             .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(selection == .profile(profile.id) ? ChatAppearance.accent : .clear, lineWidth: 2))
             .background(store.revealedAgentProfileID == profile.id ? Theme.chromeSelection : .clear,
                         in: RoundedRectangle(cornerRadius: 6))
+            .contextMenu {
+                Button("Edit profile…") { SupportTabs.shared.navigation.open(.agentProfile(profile.id), from: store) }
+                folderActions
+            }
             if let error = store.agentProfileErrors[profile.id] {
                 Text(error).font(Theme.display(11)).foregroundStyle(.orange).textSelection(.enabled)
                     .padding(.leading, 24)

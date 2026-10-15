@@ -4,54 +4,6 @@ import GRDB
 /// This is Telegram source state, not a UI mark ledger. Only compact IDs,
 /// settings, boundaries and checkpoints go to this private local database.
 extension TelegramChatIndex {
-    func installAttentionSchema() throws {
-        try db.write { db in
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS tg_state (
-                  chat INTEGER PRIMARY KEY, inbox INTEGER NOT NULL DEFAULT 0, lastMessage INTEGER NOT NULL DEFAULT 0,
-                  snooze INTEGER NOT NULL DEFAULT 0, previousSnooze INTEGER NOT NULL DEFAULT 0,
-                  channelEnabled INTEGER NOT NULL DEFAULT 0, activation INTEGER NOT NULL DEFAULT 0,
-                  generation TEXT NOT NULL DEFAULT '', episode TEXT, complete INTEGER NOT NULL DEFAULT 0,
-                  signature TEXT NOT NULL DEFAULT '', checked TEXT NOT NULL DEFAULT '', fresh TEXT NOT NULL DEFAULT '', activationRequested INTEGER NOT NULL DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS tg_messages (
-                  chat INTEGER, id INTEGER, topic TEXT NOT NULL, date INTEGER NOT NULL, sender INTEGER NOT NULL,
-                  mentioned INTEGER NOT NULL, unreadMention INTEGER NOT NULL, replyChat INTEGER NOT NULL,
-                  replyID INTEGER NOT NULL, replyToMe INTEGER, viewed INTEGER NOT NULL DEFAULT 0,
-                  PRIMARY KEY(chat,id));
-                CREATE INDEX IF NOT EXISTS tg_messages_topic ON tg_messages(chat,topic,id);
-                CREATE TABLE IF NOT EXISTS tg_receipts (chat INTEGER, id INTEGER, mentionRead INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(chat,id));
-                CREATE TABLE IF NOT EXISTS tg_scan_seen (chat INTEGER,id INTEGER,version TEXT,PRIMARY KEY(chat,id));
-                CREATE TABLE IF NOT EXISTS tg_settings (
-                  chat INTEGER, topic TEXT, muteUntil INTEGER, disableMention INTEGER, inbox INTEGER NOT NULL DEFAULT 0,
-                  PRIMARY KEY(chat,topic));
-                CREATE TABLE IF NOT EXISTS tg_scopes (scope TEXT PRIMARY KEY, muteUntil INTEGER NOT NULL, disableMention INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS tg_work (
-                  key TEXT PRIMARY KEY, method TEXT NOT NULL, chat INTEGER NOT NULL, topic TEXT NOT NULL DEFAULT '',
-                  message INTEGER NOT NULL DEFAULT 0, cursor INTEGER NOT NULL DEFAULT 0, pageSize INTEGER NOT NULL DEFAULT 50,
-                  lane INTEGER NOT NULL, age INTEGER NOT NULL, retry INTEGER NOT NULL DEFAULT 0, version TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS tg_reason_messages (chat INTEGER, id INTEGER, topic TEXT, date INTEGER, kind TEXT, viewed INTEGER, PRIMARY KEY(chat,id));
-                CREATE INDEX IF NOT EXISTS tg_reason_chat ON tg_reason_messages(chat,topic,id);
-                CREATE VIEW IF NOT EXISTS tg_channel_pending AS
-                  SELECT s.chat FROM tg_state s JOIN chats c ON c.id=s.chat
-                  LEFT JOIN tg_settings cs ON cs.chat=s.chat AND cs.topic=''
-                  LEFT JOIN tg_scopes sc ON sc.scope='notificationSettingsScopeChannelChats'
-                  WHERE s.episode IS NOT NULL AND s.complete=0 AND s.channelEnabled=1 AND c.hidden=0 AND c.pinOrder IS NOT NULL
-                    AND coalesce(cs.muteUntil,sc.muteUntil,9223372036854775807) <= coalesce((SELECT value FROM checkpoint WHERE key='attentionNow'),0);
-                """)
-            if try !db.columns(in: "tg_messages").contains(where: { $0.name == "senderIsChat" }) {
-                try db.execute(sql: "ALTER TABLE tg_messages ADD COLUMN senderIsChat INTEGER NOT NULL DEFAULT 0")
-                // The old decoder lost chat senders and could not recognize
-                // ordinary mentions. Recheck persisted unread messages.
-                try db.execute(sql: """
-                    UPDATE tg_messages SET mentioned=unreadMention;
-                    INSERT OR IGNORE INTO tg_work(key,method,chat,message,lane,age,version)
-                      SELECT 'mention:'||chat||':'||id,'getMessage',chat,id,0,0,'' FROM tg_messages WHERE sender=0;
-                    """)
-            }
-        }
-        try installNotificationSchema()
-    }
-
     func attentionSettings(_ settings: TDLibMessage?, chat: Int64, topic: String = "", inbox: Int64? = nil,
                            db: Database, now: Int64) throws {
         guard let settings else { return }
@@ -133,7 +85,10 @@ extension TelegramChatIndex {
             default: break
             }
         }
-        try refreshAttention(now: now)
+        let local: Set<String> = ["updateNewMessage", "updateChatLastMessage", "updateChatReadInbox", "updateChatUnreadMentionCount", "updateMessageMentionRead", "updateDeleteMessages"]
+        if local.contains(update.type), let chat = update["chat_id"]?.integer ?? update["message"]?.object?["chat_id"]?.integer {
+            if !attentionFullRebuild { try refreshAttention(chats: [chat], now: now) }
+        } else { attentionFullRebuild = true }
         return true
     }
 
@@ -144,15 +99,19 @@ extension TelegramChatIndex {
 
     func attentionMessage(_ raw: TDLibMessage, chat: Int64, db: Database, now: Int64) throws {
         guard let id = raw["id"]?.integer, id > 0 else { return }
+        // During activation this column is a provisional high-water mark. It is
+        // finalized only by the online history response, never by a clock.
+        try db.execute(sql: "UPDATE tg_state SET activation=max(activation,?) WHERE chat=? AND activating=1", arguments: [id,chat])
         let receipt = try Row.fetchOne(db, sql: "SELECT * FROM tg_receipts WHERE chat=? AND id=?", arguments: [chat,id])
         guard receipt?["deleted"] as Bool? != true else { return }
         // Reply verification never treats an unavailable/foreign target as ours.
         let ours = raw["is_outgoing"]?.bool == true && raw["sender_id"]?.object?["user_id"]?.integer == account
-        try db.execute(sql: "UPDATE tg_messages SET replyToMe=? WHERE replyChat=? AND replyID=?", arguments: [ours, chat, id])
+        try db.execute(sql: "UPDATE tg_messages SET replyToMe=? WHERE replyChat=? AND replyID=? AND replyToMe IS NOT ?", arguments: [ours, chat, id,ours])
+        if db.changesCount > 0 { attentionFullRebuild = true }
         guard raw["is_outgoing"]?.bool == false,
               raw["scheduling_state"] == nil || raw["scheduling_state"] == .null,
               TelegramRecentOutgoing.userContent.contains(raw["content"]?.object?.type ?? "") else { return }
-        guard let row = try Row.fetchOne(db, sql: "SELECT c.kind,s.inbox,s.channelEnabled,s.activation FROM chats c JOIN tg_state s ON s.chat=c.id WHERE c.id=?", arguments: [chat]) else { return }
+        guard let row = try Row.fetchOne(db, sql: "SELECT c.kind,s.inbox,s.followEnabled,s.activation,s.activating FROM chats c JOIN tg_state s ON s.chat=c.id WHERE c.id=?", arguments: [chat]) else { return }
         let topic = TelegramMessageTopic.decode(raw["topic_id"])
         if case .unsupported = topic { return }
         let inbox = try topic?.forumID != nil
@@ -166,9 +125,10 @@ extension TelegramChatIndex {
             }
         }
         guard !["savedMessages", "secret", "channelDirect"].contains(kind) else { return }
-        if ["group", "supergroup", "forum"].contains(kind) && !unread { return }
+        let following = row["followEnabled"] as Bool && !(row["activating"] as Bool)
+        if ["group", "supergroup", "forum"].contains(kind) && !unread && (!following || id <= max(row["activation"] as Int64,inbox)) { return }
         if ["person", "bot"].contains(kind) && id <= inbox && !unread { return }
-        if kind == "channel" && (!(row["channelEnabled"] as Bool) || id <= max(row["activation"] as Int64, row["inbox"] as Int64)) { return }
+        if kind == "channel" && (!following || id <= max(row["activation"] as Int64, row["inbox"] as Int64)) { return }
         let reply = raw["reply_to"]?.object
         let replyID = reply?.type == "messageReplyToMessage" ? reply?["message_id"]?.integer ?? 0 : 0
         let replyChat = reply?["chat_id"]?.integer ?? chat
@@ -205,15 +165,21 @@ extension TelegramChatIndex {
     /// Effective settings inherit topic -> chat -> scope. Mentions/replies use
     /// the sender's settings unless disable_mention_notifications routes them
     /// back through ordinary chat settings. Unknown settings fail closed.
-    func refreshAttention(now: Int64) throws {
+    func flushAttention(now: Int64) throws {
+        if attentionFullRebuild { try refreshAttention(now: now) }
+    }
+    func refreshAttention(chats: Set<Int64>? = nil, now: Int64) throws {
+        if let chats, chats.isEmpty { return }
+        let ids = chats?.sorted().map(String.init).joined(separator: ",")
+        func filter(_ column: String) -> String { ids.map { " AND \(column) IN (\($0))" } ?? "" }
         try db.write { db in
             try db.execute(sql: "INSERT OR REPLACE INTO checkpoint VALUES ('attentionNow',?)", arguments: [now])
-            try db.execute(sql: "DELETE FROM tg_reason_messages")
+            try db.execute(sql: "DELETE FROM tg_reason_messages WHERE 1\(filter("chat"))")
             try db.execute(sql: """
                 INSERT INTO tg_reason_messages
                 SELECT m.chat,m.id,m.topic,m.date,
                   CASE c.kind WHEN 'person' THEN 'direct' WHEN 'bot' THEN 'botReply' WHEN 'channel' THEN 'channelPost'
-                    ELSE CASE WHEN m.replyToMe=1 THEN 'reply' ELSE 'mention' END END,m.viewed
+                    ELSE CASE WHEN m.unreadMention=0 THEN 'groupMessage' WHEN m.replyToMe=1 THEN 'reply' ELSE 'mention' END END,m.viewed
                 FROM tg_messages m JOIN chats c ON c.id=m.chat JOIN tg_state s ON s.chat=m.chat
                 LEFT JOIN tg_settings cs ON cs.chat=m.chat AND cs.topic=''
                 LEFT JOIN tg_settings ts ON ts.chat=m.chat AND ts.topic=m.topic AND m.topic!=''
@@ -225,9 +191,9 @@ extension TelegramChatIndex {
                   WHEN m.senderIsChat=0 AND m.sender!=0 THEN 'notificationSettingsScopePrivateChats'
                   WHEN senderChat.kind='channel' THEN 'notificationSettingsScopeChannelChats'
                   WHEN senderChat.kind IN ('group','supergroup','forum') THEN 'notificationSettingsScopeGroupChats' END
-                WHERE c.hidden=0 AND m.id>s.snooze
+                WHERE c.hidden=0 AND m.id>s.snooze\(filter("m.chat"))
                   AND (m.topic NOT LIKE 'forum:%' OR ts.chat IS NOT NULL)
-                  AND CASE WHEN c.kind IN ('group','supergroup','forum') AND coalesce(ts.disableMention,cs.disableMention,sc.disableMention,1)=0
+                  AND CASE WHEN c.kind IN ('group','supergroup','forum') AND m.unreadMention=1 AND coalesce(ts.disableMention,cs.disableMention,sc.disableMention,1)=0
                     THEN coalesce(sender.muteUntil,ps.muteUntil,9223372036854775807)
                     ELSE coalesce(ts.muteUntil,cs.muteUntil,sc.muteUntil,9223372036854775807) END <= ?
                   AND (
@@ -235,30 +201,61 @@ extension TelegramChatIndex {
                       AND coalesce((SELECT value FROM checkpoint WHERE key='directAttention'),1)=1 AND (m.id>s.inbox OR m.unreadMention=1))
                     OR (c.kind='bot' AND m.replyToMe=1 AND (m.id>CASE WHEN m.topic LIKE 'forum:%' THEN ts.inbox ELSE s.inbox END OR m.unreadMention=1))
                     OR (c.kind IN ('group','supergroup','forum') AND m.unreadMention=1 AND (m.mentioned=1 OR m.replyToMe=1))
-                    OR (c.kind='channel' AND s.channelEnabled=1 AND c.pinOrder IS NOT NULL AND m.id>max(s.activation,s.inbox))
+                    OR (c.kind='channel' AND s.followEnabled=1 AND s.activating=0 AND m.id>max(s.activation,s.inbox))
+                    OR (c.kind IN ('group','supergroup','forum') AND s.followEnabled=1 AND s.activating=0 AND m.unreadMention=0
+                      AND m.id>max(s.activation,CASE WHEN m.topic LIKE 'forum:%' THEN ts.inbox ELSE s.inbox END))
                   )
                 """, arguments: [now])
-            // Allocate once per unread channel episode; anchors are projections,
+            try rebuildAttentionSummaries(db, chats: chats)
+            // Allocate once per unread follow episode; anchors are projections,
             // not identity. Cache eviction/errors never prove an episode empty.
             try db.execute(sql: """
-                UPDATE tg_state SET episode=lower(hex(randomblob(16))) WHERE episode IS NULL AND channelEnabled=1
-                  AND EXISTS(SELECT 1 FROM tg_reason_messages r WHERE r.chat=tg_state.chat AND r.kind='channelPost');
-                UPDATE tg_state SET episode=NULL WHERE channelEnabled=0 OR
-                  (complete=1 AND NOT EXISTS(SELECT 1 FROM tg_messages m WHERE m.chat=tg_state.chat AND m.id>max(activation,inbox,snooze)));
-                DELETE FROM tg_messages WHERE unreadMention=0 AND id <= CASE WHEN topic LIKE 'forum:%'
+                UPDATE tg_state SET episode=lower(hex(randomblob(16))) WHERE episode IS NULL AND followEnabled=1\(filter("chat"))
+                  AND EXISTS(SELECT 1 FROM tg_reason_messages r WHERE r.chat=tg_state.chat AND r.kind IN ('channelPost','groupMessage'));
+                UPDATE tg_state SET episode=NULL WHERE (followEnabled=0 OR
+                  (complete=1 AND NOT EXISTS(SELECT 1 FROM tg_messages m WHERE m.chat=tg_state.chat AND m.unreadMention=0 AND m.id>max(activation,snooze,
+                    CASE WHEN m.topic LIKE 'forum:%' THEN coalesce((SELECT inbox FROM tg_settings WHERE chat=m.chat AND topic=m.topic),0) ELSE inbox END))))\(filter("chat"));
+                DELETE FROM tg_messages WHERE unreadMention=0\(filter("chat")) AND id <= CASE WHEN topic LIKE 'forum:%'
                   THEN coalesce((SELECT inbox FROM tg_settings WHERE chat=tg_messages.chat AND topic=tg_messages.topic),0)
                   ELSE coalesce((SELECT inbox FROM tg_state WHERE chat=tg_messages.chat),0) END;
                 """)
         }
-        attentionExpiry = try db.read {
-            try Int64.fetchOne($0, sql: "SELECT min(muteUntil) FROM (SELECT muteUntil FROM tg_settings UNION ALL SELECT muteUntil FROM tg_scopes) WHERE muteUntil>?", arguments: [now]) ?? .max
+        dirty = true; attentionOrderDirty = true
+        if chats != nil {
+            let lists = try db.read { try String.fetchAll($0, sql: "SELECT DISTINCT list FROM tg_position WHERE 1\(filter("chat"))") }
+            countDirtyLists.formUnion(lists.compactMap(TelegramListKey.init(rawValue:)))
+        } else {
+            attentionFullRebuild = false
+            countDirtyLists.formUnion(listStates.keys)
+            attentionExpiry = try db.read {
+                try Int64.fetchOne($0, sql: "SELECT min(muteUntil) FROM (SELECT muteUntil FROM tg_settings UNION ALL SELECT muteUntil FROM tg_scopes) WHERE muteUntil>?", arguments: [now]) ?? .max
+            }
         }
+    }
+
+    /// One SQL summary per chat per reduction; every list and sidebar projection
+    /// reads this same row. Topic-specific tab marks aggregate only on demand.
+    func rebuildAttentionSummaries(_ db: Database, chats: Set<Int64>? = nil) throws {
+        let filter = chats.map { " WHERE chat IN (\($0.sorted().map(String.init).joined(separator: ",")))" } ?? ""
+        try db.execute(sql: "DELETE FROM tg_attention_summary\(filter)")
+        try db.execute(sql: """
+            INSERT INTO tg_attention_summary
+            WITH classes AS (
+              SELECT chat,kind,min(id) AS id,max(date) AS date,count(*) AS classCount
+              FROM tg_reason_messages\(filter) GROUP BY chat,kind
+            ), ranked AS (
+              SELECT *,sum(classCount) OVER (PARTITION BY chat) AS n,
+                row_number() OVER (PARTITION BY chat ORDER BY \(Self.reasonStrengthSQL)) AS strength FROM classes
+            )
+            SELECT s.chat,s.id,r.topic,s.date,s.kind,s.n,s.classCount FROM ranked s
+              JOIN tg_reason_messages r ON r.chat=s.chat AND r.id=s.id WHERE strength=1
+            """)
     }
 
     func setDirectAttention(_ enabled: Bool, now: Int64) throws {
         try checkpoint("directAttention", value: enabled ? 1 : 0)
         if !enabled { try db.write { try $0.execute(sql: "UPDATE tg_notifications SET fresh=0 WHERE chat IN (SELECT id FROM chats WHERE kind='person')") } }
-        try refreshAttention(now: now); changed()
+        attentionFullRebuild = true; changed()
     }
     func snooze(_ chat: Int64, undo: Bool, now: Int64) throws {
         try db.write { db in
@@ -270,20 +267,20 @@ extension TelegramChatIndex {
         }
         try refreshAttention(now: now); changed()
     }
-    func channelNotifications(_ chat: Int64, enabled: Bool, now: Int64) throws {
+    func follow(_ chat: Int64, enabled: Bool, now: Int64) throws {
         try db.write { db in
-            guard let row = try Row.fetchOne(db, sql: "SELECT * FROM chats WHERE id=? AND kind='channel' AND pinOrder IS NOT NULL AND hidden=0", arguments: [chat]) else { return }
-            _ = row
-            // updateNewChat has established the current head. If it has not,
-            // activation waits for a fresh getChat snapshot rather than using 0.
-            if enabled, try String.fetchOne(db, sql: "SELECT fresh FROM tg_state WHERE chat=?", arguments: [chat]) != attentionEpoch {
-                try db.execute(sql: "UPDATE tg_state SET activationRequested=1 WHERE chat=?", arguments: [chat])
-                try enqueueAttentionWork(key: "activate:\(chat)", method: "getChat", chat: chat, lane: 0, db: db, now: now); return
+            guard let row = try Row.fetchOne(db, sql: "SELECT s.* FROM chats c JOIN tg_state s ON s.chat=c.id WHERE c.id=? AND c.kind IN ('channel','group','supergroup','forum') AND c.hidden=0", arguments: [chat]) else { throw TelegramFolderError.invalidTarget }
+            guard row["followEnabled"] as Bool != enabled else { return }
+            let generation = UUID().uuidString
+            try db.execute(sql: "DELETE FROM tg_work WHERE key IN (?,?)", arguments: ["activate:\(chat)","history:\(chat)"])
+            try db.execute(sql: "UPDATE tg_state SET followEnabled=?,activation=lastMessage,generation=?,episode=NULL,activating=?,signature='',checked='' WHERE chat=?",
+                           arguments: [enabled,generation,enabled,chat])
+            if enabled {
+                try enqueueAttentionWork(key: "activate:\(chat)", method: "getChatHistory", chat: chat, lane: 0, version: generation, db: db, now: now)
+                try db.execute(sql: "UPDATE tg_work SET pageSize=1 WHERE key=?", arguments: ["activate:\(chat)"])
             }
-            try db.execute(sql: "UPDATE tg_state SET channelEnabled=?,activation=lastMessage,generation=?,episode=NULL,complete=1,activationRequested=0 WHERE chat=?",
-                           arguments: [enabled, UUID().uuidString, chat])
         }
-        try refreshAttention(now: now); changed()
+        attentionFullRebuild = true; changed()
     }
     func viewedMessages(chat: Int64, ids: Set<Int64>, now: Int64) throws {
         guard !ids.isEmpty else { return }

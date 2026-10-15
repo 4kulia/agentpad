@@ -4,8 +4,18 @@ import Foundation
 /// time is its backpressure: there is no update task queue to grow or overflow.
 final class TelegramChatSession {
     enum Purpose {
-        case load(String), attention(TelegramAttentionWork), search(UInt64, String), resolve(UUID), recent(Int64)
+        case markRead(UUID, TelegramMarkReadStep), load(TelegramListKey, UInt64), attention(TelegramAttentionWork), search(UInt64, String), resolve(UUID), recent(Int64)
     }
+    struct ReadAction {
+        let chat: Int64
+        let retry: Set<TelegramMarkReadStep>?
+        let continuation: CheckedContinuation<TelegramMarkReadResult,Never>
+        var steps: [(TelegramMarkReadStep,TDLibMessage)]?
+        var result = TelegramMarkReadResult()
+        var waiting = false
+    }
+    var readActions: [UUID:ReadAction] = [:]
+    var readQueue: [UUID] = []
     struct Call { let purpose: Purpose; let started: Date }
     struct Search {
         let generation: UInt64
@@ -28,10 +38,8 @@ final class TelegramChatSession {
     var resolvers: [UUID: CheckedContinuation<TelegramChatRow?, Never>] = [:]
     var observers: [UUID: AsyncStream<TelegramChatSnapshot>.Continuation] = [:]
     var snapshot = TelegramChatSnapshot()
-    var holds = Set<UUID>()
-    private var nextList = "main"
+    private var listTurn = 0
     private var backgroundTurn = 0
-    private var completedLists = Set<String>()
     private var unsavedCompletions = Set<String>()
     private var checkpointRetryAt = Date.distantPast
     private var checkpointFailures = 0
@@ -46,7 +54,6 @@ final class TelegramChatSession {
         catch { index.error = "Telegram retry state could not be saved on this Mac."; index.dirty = true }
     }
     private var failures = 0
-    private var nextExpiry: Int64 = 0
     private var reduced = 0
     private var lastPublish = Date.distantPast
 
@@ -64,6 +71,9 @@ final class TelegramChatSession {
     func stop() {
         active = false; calls.removeAll(); search?.continuation.finish(); search = nil
         for resolver in resolvers.values { resolver.resume(returning: nil) }; resolvers.removeAll()
+        var stopped = TelegramMarkReadResult(); stopped.error = .unavailable
+        for action in readActions.values { action.continuation.resume(returning: stopped) }
+        readActions.removeAll(); readQueue.removeAll()
         snapshot = TelegramChatSnapshot()
         for observer in observers.values { observer.yield(snapshot) }
     }
@@ -84,38 +94,45 @@ final class TelegramChatSession {
         do {
             let time = seconds(now)
             try index.expireNotificationHistory(now: time)
-            if time >= index.attentionExpiry { try index.refreshAttention(now: time); index.changed() }
-            if time >= nextExpiry { nextExpiry = try index.expire(now: time) ?? Int64.max }
+            if time >= index.attentionExpiry { index.attentionFullRebuild = true; index.changed() }
             try index.prepareAttentionScan(now: time)
-            let mainDone = completedLists.contains("main")
-            let archiveDone = completedLists.contains("archive")
+            let required = try index.requiredLists()
+            let listsDone = required.allSatisfy { index.listStates[$0]?.complete == true }
             let attentionPending = try index.hasAttentionWork()
             let newState: TelegramChatScanState
             if network != .ready { newState = .paused("Offline · saved chats") }
-            else if mainDone && archiveDone && !attentionPending { newState = .complete }
+            else if listsDone && !attentionPending { newState = .complete }
             else if retryAt > time { newState = .paused("Waiting to retry Telegram") }
             else if let pause { newState = .paused(pause) }
             else if calls.values.contains(where: { Self.isBackground($0.purpose) && now.timeIntervalSince($0.started) > 40 }) {
                 newState = .paused("Waiting for Telegram")
             } else { newState = .scanning }
-            if newState != index.state { index.state = newState; index.dirty = true }
+            if newState != index.state {
+                index.state = newState; index.dirty = true
+            }
+            if newState == .complete, index.error == nil { try index.finishMigrationScan() }
 
             // No calendar quota. Exactly one background slot, independent of
             // six interactive slots; a long TDLib wait keeps its slot/token.
             if newState == .scanning, !calls.values.contains(where: { Self.isBackground($0.purpose) }) {
                 let lane = [0, 1, 0, 2, 0, 1][backgroundTurn % 6]; backgroundTurn += 1
                 var work: TelegramAttentionWork?
-                if lane != 2 || (mainDone && archiveDone) { work = try index.nextAttentionWork(lane: lane, now: time) }
-                if work == nil && (lane != 2 || (mainDone && archiveDone)) {
+                if lane != 2 || (listsDone) { work = try index.nextAttentionWork(lane: lane, now: time) }
+                if work == nil && (lane != 2 || (listsDone)) {
                     for fallback in [0, 1, 2] where work == nil { work = try index.nextAttentionWork(lane: fallback, now: time) }
                 }
                 if let work { try request(work.method, work.fields, purpose: .attention(work), now: now) }
-                else if !mainDone || !archiveDone {
-                    let list = (nextList == "main" && !mainDone) || archiveDone ? "main" : "archive"
-                    nextList = list == "main" ? "archive" : "main"
-                    try request("loadChats", ["chat_list": .typed(list == "main" ? "chatListMain" : "chatListArchive"), "limit": .integer(50)], purpose: .load(list), now: now)
+                else if !listsDone {
+                    for offset in 0..<required.count {
+                        let position = (listTurn + offset) % required.count, list = required[position]
+                        guard let runtime = index.listStates[list], !runtime.complete else { continue }
+                        listTurn = (position + 1) % required.count
+                        try request("loadChats", ["chat_list": list.tdlib, "limit": .integer(50)], purpose: .load(list,runtime.generation), now: now)
+                        break
+                    }
                 }
             }
+            scheduleMarkReads(now: now)
             try scheduleSearch(now: now)
             try scheduleRecentlyOpened(now: now)
             if index.dirty, reduced >= 20 || now.timeIntervalSince(lastPublish) >= 0.05 { publish(now: now) }
@@ -144,11 +161,18 @@ final class TelegramChatSession {
             try writeCheckpoint("retryNotBefore", retryAt)
         }
         switch call.purpose {
-        case .load(let list):
+        case .markRead(let id, let step):
+            guard readActions[id] != nil else { return }
+            if error || message.type != "ok" { readActions[id]!.result.failed.insert(step) }
+            readActions[id]!.waiting = false
+            scheduleMarkReads(now: now)
+        case .load(let list, let generation):
+            guard index.listStates[list]?.generation == generation else { return }
             if error, message["code"]?.integer == 404 {
                 // TDLib has finished this list even if the checkpoint disk is
                 // unavailable. Retry persistence, never repeat loadChats.
-                completedLists.insert(list); unsavedCompletions.insert(list); failures = 0
+                try index.completeList(list, generation: generation)
+                unsavedCompletions.insert(list.rawValue); failures = 0
                 saveCompletions(now: now)
             } else if error || message.type != "ok" {
                 if !flood {
@@ -215,7 +239,6 @@ final class TelegramChatSession {
         guard active else { return }
         do {
             snapshot = try index.project(now: seconds(now), force: force)
-            nextExpiry = try index.expire(now: seconds(now)) ?? Int64.max
             lastPublish = now; reduced = 0
             for observer in observers.values { observer.yield(snapshot) }
         } catch {
@@ -224,6 +247,7 @@ final class TelegramChatSession {
         }
     }
     func beginSearch(_ query: String, now: Date) -> AsyncStream<TelegramSearchSnapshot> {
+        if index.dirty { publish(now: now) }
         search?.continuation.finish(); generation &+= 1; lastSearchSnapshot = nil
         let pair = AsyncStream<TelegramSearchSnapshot>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let query = String(decoding: query.trimmingCharacters(in: .whitespacesAndNewlines).utf8.prefix(1024), as: UTF8.self)
@@ -273,15 +297,8 @@ final class TelegramChatSession {
     private var lastSearchSnapshot: TelegramSearchSnapshot?
     func publishSearch(now: Date) {
         guard let search else { return }
-        let normalized = search.query.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "@ "))
-        let hits = search.hits.values.sorted { a, b in
-            func exact(_ hit: TelegramSearchHit) -> Bool { hit.row.title.lowercased() == normalized || hit.row.username.lowercased() == normalized }
-            if exact(a) != exact(b) { return exact(a) }
-            if a.row.isAutomatic != b.row.isAutomatic { return a.row.isAutomatic }
-            if a.row.lastMessageDate != b.row.lastMessageDate { return a.row.lastMessageDate > b.row.lastMessageDate }
-            if a.row.id.chat != b.row.id.chat { return a.row.id.chat < b.row.id.chat }
-            return (a.userID ?? 0) < (b.userID ?? 0)
-        }
+        let hits = search.query.isEmpty ? ((try? index.suggestions(now: seconds(now))) ?? []).map { TelegramSearchHit(row: $0) }
+            : search.hits.values.sorted { TelegramSearchRank.precedes($0, $1, query: search.query) }
         let running = !search.waiting.isEmpty || calls.values.contains { if case .search(let epoch, _) = $0.purpose { epoch == search.generation } else { false } }
         let notice = seconds(now) < retryAt ? "Telegram asks us to wait · Saved results available"
             : network != .ready && !search.query.isEmpty ? "Known on this Mac · More results need a connection" : search.notice
@@ -307,5 +324,37 @@ final class TelegramChatSession {
               !calls.values.contains(where: { if case .recent = $0.purpose { true } else { false } }),
               let chat = try index.nextOpened() else { return }
         try request("addRecentlyFoundChat", ["chat_id": .integer(chat)], purpose: .recent(chat), now: now)
+    }
+}
+
+
+extension TelegramChatSession {
+    func markAsRead(_ chat: Int64, retry: Set<TelegramMarkReadStep>?, now: Date,
+                    continuation: CheckedContinuation<TelegramMarkReadResult,Never>) {
+        let id = UUID(); readActions[id] = ReadAction(chat: chat, retry: retry, continuation: continuation); readQueue.append(id)
+        scheduleMarkReads(now: now)
+    }
+    private func scheduleMarkReads(now: Date) {
+        for id in readQueue {
+            guard var action = readActions[id], !action.waiting else { continue }
+            guard interactiveCount + otherInteractiveCount() < TelegramChatLimits.interactiveCalls, seconds(now) >= retryAt else { break }
+            do {
+                if action.steps == nil {
+                    let plan = try index.markReadPlan(chat: action.chat, only: action.retry)
+                    action.steps = plan.0; action.result.openChatRequired = plan.1
+                }
+                if action.steps!.isEmpty {
+                    readActions[id] = nil; action.continuation.resume(returning: action.result); continue
+                }
+                let (step,message) = action.steps!.removeFirst()
+                action.waiting = true; readActions[id] = action
+                do { try request(message.type, message.fields.filter { $0.key != "@type" }, purpose: .markRead(id,step), now: now) }
+                catch { readActions[id]!.result.failed.insert(step); readActions[id]!.waiting = false }
+            } catch {
+                action.result.error = error as? TelegramFolderError ?? .storage
+                readActions[id] = nil; action.continuation.resume(returning: action.result)
+            }
+        }
+        readQueue.removeAll { readActions[$0] == nil }
     }
 }

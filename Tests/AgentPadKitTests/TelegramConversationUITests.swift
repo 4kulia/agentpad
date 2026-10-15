@@ -68,7 +68,7 @@ actor ConversationUIFake: TelegramConversationProvider {
 
     func testComposerShortcutsRespectFocusIMEAndRepeat() {
         XCTAssertEqual(TelegramComposerKey.action(code: 36, modifiers: .command, markedText: false, repeatKey: false), .send)
-        XCTAssertEqual(TelegramComposerKey.action(code: 76, modifiers: [.command, .shift], markedText: false, repeatKey: false), .pin)
+        XCTAssertEqual(TelegramComposerKey.action(code: 76, modifiers: [.command, .shift], markedText: false, repeatKey: false), .addToFolder)
         for flags: NSEvent.ModifierFlags in [[], .shift, .option, [.command, .control]] {
             XCTAssertEqual(TelegramComposerKey.action(code: 36, modifiers: flags, markedText: false, repeatKey: false), .native)
         }

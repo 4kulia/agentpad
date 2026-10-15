@@ -188,6 +188,11 @@ final class WorkspaceStore {
         chatSidebarPreferences.setCollapsed(section, collapsed)
         scheduleSave()
     }
+    func setEntryCollapsed(_ entry: String, _ collapsed: Bool) {
+        guard SidebarEntryIdentity.persistable(entry, allowTelegramBlock: false) else { return }
+        chatSidebarPreferences.setEntryCollapsed(entry, collapsed)
+        scheduleSave()
+    }
     /// Right sidebar's full-mode content — live agents, history, or active
     /// session information.
     /// Persisted like `sidebarContent`; the panel's own footer toggle flips it.

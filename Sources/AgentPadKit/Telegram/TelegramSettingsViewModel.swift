@@ -22,8 +22,10 @@ enum TelegramService {
     private static var presenceObservers: [(NotificationCenter, NSObjectProtocol)] = []
 
     static func start() {
+        SidebarFoldersService.start()
         TelegramNotifications.shared.manager = AttentionCoordinator.shared.notificationManager
         chats.changed = {
+            SidebarFoldersService.receive(chats.snapshot, provider: chats.provider)
             TelegramNotifications.shared.receive(chats.snapshot, provider: chats.provider)
             AttentionCoordinator.shared.refreshBadge()
         }

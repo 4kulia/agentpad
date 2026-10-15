@@ -118,7 +118,8 @@ let package = Package(
         ),
         .testTarget(
             name: "AgentPadTelegramTests",
-            dependencies: ["AgentPadTelegram"]
+            dependencies: ["AgentPadTelegram"],
+            exclude: ["Fixtures"]
         ),
         .testTarget(
             name: "AgentPadHookKitTests",

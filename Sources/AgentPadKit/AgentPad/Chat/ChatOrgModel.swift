@@ -67,6 +67,7 @@ struct ChatOrgView: Equatable, Sendable {
     var refusals: [Refusal] = []
     /// F2: the channel cards kept (of the user's teams only).
     var channels: [ChatChannelCard] = []
+    var channelActivity: [String:Date] = [:]
     /// The last snapshot carried channels: the server has them.
     var channelsServed = false
     /// A read of the channels is under way or was cut off: a card missing
@@ -87,7 +88,7 @@ struct ChatOrgView: Equatable, Sendable {
     var agentsServed = false
 
     static func == (a: ChatOrgView, b: ChatOrgView) -> Bool {
-        guard a.unreadRepliesByChannel == b.unreadRepliesByChannel,
+        guard a.channelActivity == b.channelActivity, a.unreadRepliesByChannel == b.unreadRepliesByChannel,
               a.generation == b.generation, a.pendingGeneration == b.pendingGeneration, a.unreadBoundaries == b.unreadBoundaries else { return false }
         return a.orgName == b.orgName && a.members == b.members && a.teams == b.teams && a.invitations == b.invitations
             && a.followsAdmin == b.followsAdmin && a.rightsInDoubt == b.rightsInDoubt && a.rightsSession == b.rightsSession
@@ -150,6 +151,7 @@ struct ChatOrgView: Equatable, Sendable {
                 return Refusal(commandId: record.commandId, type: record.type, args: args, code: record.error ?? "refused")
             },
             channels: try ChatChannels.read(db),
+            channelActivity: try ChatChannels.activity(db),
             channelsServed: meta?["channels_served"] ?? false,
             channelsReadOpen: meta?["channels_read_open"] ?? false,
             creating: creating,

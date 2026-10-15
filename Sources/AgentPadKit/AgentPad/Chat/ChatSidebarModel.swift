@@ -8,6 +8,13 @@ struct ChatSidebarPreferences: Codable, Equatable {
         var server, account, org: String
         var team: String?
 
+        var entryID: String {
+            let scope = SidebarEntryIdentity.scope(server: server, account: account, org: org)
+            return team.map { "team:\(scope)|\($0)" } ?? "teamAgents:\(scope)"
+        }
+        init(server: String, account: String, org: String, team: String?) {
+            self.server = server; self.account = account; self.org = org; self.team = team
+        }
         init(_ key: ChatOrgKey, team: String?) {
             server = key.server.description; account = key.accountId; org = key.orgId; self.team = team
         }
@@ -15,15 +22,49 @@ struct ChatSidebarPreferences: Codable, Equatable {
 
     var attentionCollapsed: Bool?
     var width: Double = 268
-    var collapsed: [Section] = []
+    var collapsedEntries: [String] = []
+    var collapsed: [Section] {
+        collapsedEntries.compactMap { id in
+            let team = id.hasPrefix("team:"), agents = id.hasPrefix("teamAgents:")
+            guard team || agents else { return nil }
+            let parts = id.dropFirst(team ? 5 : 11).split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == (team ? 4 : 3) else { return nil }
+            return Section(server: parts[0], account: parts[1], org: parts[2], team: team ? parts[3] : nil)
+        }
+    }
+    private enum CodingKeys: String, CodingKey { case attentionCollapsed, width, collapsed, collapsedEntries }
+    init(attentionCollapsed: Bool? = nil, width: Double = 268, collapsed: [Section] = [], collapsedEntries: [String] = []) {
+        self.attentionCollapsed = attentionCollapsed; self.width = width
+        self.collapsedEntries = collapsedEntries.filter { SidebarEntryIdentity.persistable($0, allowTelegramBlock: false) }
+        for section in collapsed { setCollapsed(section, true) }
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(attentionCollapsed: try values.decodeIfPresent(Bool.self, forKey: .attentionCollapsed),
+                  width: try values.decodeIfPresent(Double.self, forKey: .width) ?? 268,
+                  collapsed: try values.decodeIfPresent([Section].self, forKey: .collapsed) ?? [],
+                  collapsedEntries: try values.decodeIfPresent([String].self, forKey: .collapsedEntries) ?? [])
+    }
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encodeIfPresent(attentionCollapsed, forKey: .attentionCollapsed)
+        try values.encode(width, forKey: .width)
+        // 1.2.1 requires this field; omitting it recovers the entire window,
+        // discarding its workspaces and tabs. Only AgentPad sections belong here.
+        try values.encode(collapsed, forKey: .collapsed)
+        try values.encode(collapsedEntries.filter { SidebarEntryIdentity.persistable($0, allowTelegramBlock: false) }, forKey: .collapsedEntries)
+    }
+    mutating func setEntryCollapsed(_ entry: String, _ value: Bool) {
+        guard SidebarEntryIdentity.persistable(entry, allowTelegramBlock: false) else { return }
+        collapsedEntries.removeAll { $0 == entry }; if value { collapsedEntries.append(entry) }
+    }
 
     static func clampWidth(_ width: Double) -> Double {
         width.isFinite ? min(320, max(220, width)).rounded() : 268
     }
 
     mutating func setCollapsed(_ section: Section, _ value: Bool) {
-        collapsed.removeAll { $0 == section }
-        if value { collapsed.append(section) }
+        setEntryCollapsed(section.entryID, value)
     }
 }
 
@@ -32,6 +73,10 @@ enum ChatSidebarFilter: String, CaseIterable {
 }
 
 enum ChatSidebarRowID: Equatable, Hashable {
+    static func folderInbox(_ entry: String, _ kind: ChatInboxKind) -> Self {
+        .entryItem(entry: entry, item: "inbox:\(kind.rawValue)")
+    }
+    case entry(String), entryItem(entry: String, item: String), entryMore(String)
     case team(String), channel(String), agents, agent(String)
     case profile(UUID), history(UUID, String), more(UUID), allSessions
 }
@@ -69,6 +114,7 @@ enum ChatSidebarKeyboard {
             return .none
         case .enter:
             if case .profile = row.id { return .activate(row.id) }
+            if case .entryItem(_, let item) = row.id, item.hasPrefix("myAgent:") { return .activate(row.id) }
             if let expanded = row.expanded { return .expand(row.id, !expanded) }
             return .activate(row.id)
         }
@@ -108,6 +154,7 @@ struct ChatSidebarSnapshot {
         var mentions: Int
         /// Included in the inbox's missing-history count, never the channel badge.
         var unreadReplies = 0
+        var activity: Date?
         var id: String { card.channelId }
         var isUnread: Bool { unread.count > 0 || unread.more || unread.something }
         var unreadLabel: String? { ChatSidebarSnapshot.unreadLabel(unread) }
@@ -155,9 +202,11 @@ struct ChatSidebarSnapshot {
                 guard model.visibleChannel(card.channelId) != nil else { return nil }
                 return Channel(card: card, unread: model.unread(card.channelId) ?? .init(),
                                mentions: model.unreadMentions(card.channelId),
-                               unreadReplies: model.view.unreadRepliesByChannel[card.channelId, default: 0])
+                               unreadReplies: model.view.unreadRepliesByChannel[card.channelId, default: 0],
+                               activity: model.view.channelActivity[card.channelId])
             }, creating: model.creatingChannels(in: team))
         }
+        if let key = model.key { SidebarFoldersService.defaults(scope: key, teams: teams.map(\.id)) }
         for channel in teams.flatMap(\.channels) {
             // The Unread navigation badge is the sum of channel badges; its list also contains replies.
             unread.count += channel.unread.count

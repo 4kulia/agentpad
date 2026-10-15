@@ -35,6 +35,16 @@ enum AttentionFixture {
     static func unread(_ index: TelegramChatIndex, chat: Int64 = 1) throws -> Int {
         try index.get(chat, now: now)?.attention?.count ?? 0
     }
+    static func follow(_ index: TelegramChatIndex, chat: Int64 = 1) throws {
+        try index.follow(chat, enabled: true, now: now)
+        let work = try index.db.read { db -> TelegramAttentionWork in
+            let row = try XCTUnwrap(Row.fetchOne(db, sql: "SELECT * FROM tg_work WHERE key=?", arguments: ["activate:\(chat)"]))
+            return .init(key: row["key"], method: row["method"], chat: row["chat"], topic: row["topic"], message: row["message"], cursor: row["cursor"], pageSize: row["pageSize"], version: row["version"])
+        }
+        let response = TDLibMessage("messages", ["messages": .array([])])
+        TelegramFixtureSchema.check(TDLibMessage(work.method, work.fields)); TelegramFixtureSchema.check(response)
+        try index.finishAttentionWork(work, response: response, now: now)
+    }
 }
 
 final class TelegramAttentionTests: XCTestCase {
@@ -53,6 +63,7 @@ final class TelegramAttentionTests: XCTestCase {
                 UPDATE tg_messages SET mentioned=0;
                 DELETE FROM tg_reason_messages; DELETE FROM tg_work;
                 """)
+            try LegacyFolderFixture.makeVersionOne(db)
         }
         index = nil
         let restored = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
@@ -125,7 +136,7 @@ final class TelegramAttentionTests: XCTestCase {
             try db.execute(sql: """
                 CREATE TRIGGER no_reason_rebuild BEFORE DELETE ON tg_reason_messages BEGIN SELECT RAISE(ABORT,'reason rebuild'); END;
                 CREATE TRIGGER no_other_chat_update BEFORE UPDATE ON tg_reason_messages WHEN OLD.chat!=1 BEGIN SELECT RAISE(ABORT,'unrelated chat'); END;
-                CREATE TRIGGER no_resort BEFORE DELETE ON chat_order BEGIN SELECT RAISE(ABORT,'chat order rebuild'); END;
+                CREATE TRIGGER no_resort BEFORE DELETE ON tg_list_order BEGIN SELECT RAISE(ABORT,'chat order rebuild'); END;
                 """)
         }
         index.dirty = false
@@ -158,48 +169,49 @@ final class TelegramAttentionTests: XCTestCase {
         XCTAssertEqual(try index.get(1, now: AttentionFixture.now)?.attention?.kind, .botReply)
     }
 
-    func testEquallyDatedReasonsUseChatIDBeforePinAndRecency() throws {
+    func testEquallyDatedAttentionReasonsUseChatIDWithoutReorderingFolders() throws {
         let fixture = try TelegramFixture()
         let index = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
         for chat: Int64 in [2, 1] {
             try AttentionFixture.chat(index, id: chat)
             try index.apply(AttentionFixture.message(100, chat: chat), now: AttentionFixture.now)
         }
-        try index.mode(2, .pinned, now: AttentionFixture.now)
-        XCTAssertEqual(try index.automatic(now: AttentionFixture.now).map(\.id.chat), [1, 2])
-        XCTAssertEqual(try index.project(now: AttentionFixture.now).firstRows.map(\.id.chat), [1, 2])
+        try index.mode(2, .auto, now: AttentionFixture.now)
+        let snapshot = try index.project(now: AttentionFixture.now)
+        XCTAssertEqual(snapshot.suggestionRows.map(\.id.chat), [1, 2])
+        XCTAssertEqual(snapshot.attentionRows.map(\.id.chat), [1, 2])
     }
 
-    func testUnpinDisablesChannelOptInAcrossRestart() throws {
+    func testHidingDisablesChannelOptInAcrossRestart() throws {
         let fixture = try TelegramFixture()
         var index: TelegramChatIndex? = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
         try AttentionFixture.chat(index!, kind: .channel)
-        try index!.mode(1, .pinned, now: AttentionFixture.now)
-        try index!.channelNotifications(1, enabled: true, now: AttentionFixture.now)
-        try index!.apply(AttentionFixture.message(100), now: AttentionFixture.now)
         try index!.mode(1, .auto, now: AttentionFixture.now)
+        try AttentionFixture.follow(index!, chat: 1)
+        try index!.apply(AttentionFixture.message(100), now: AttentionFixture.now)
+        try index!.mode(1, .hidden, now: AttentionFixture.now)
         index = nil
         let restored = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
-        try restored.mode(1, .pinned, now: AttentionFixture.now)
-        XCTAssertFalse(try XCTUnwrap(restored.get(1, now: AttentionFixture.now)).channelNotifications)
+        try restored.mode(1, .auto, now: AttentionFixture.now)
+        XCTAssertFalse(try XCTUnwrap(restored.get(1, now: AttentionFixture.now)).followEnabled)
         XCTAssertNil(try restored.get(1, now: AttentionFixture.now)?.attention)
     }
 
     func testChannelOptInAfterRestartWaitsForCurrentHeadAndExcludesOldUnread() throws {
         let fixture = try TelegramFixture()
         var index: TelegramChatIndex? = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
-        try AttentionFixture.chat(index!, kind: .channel); try index!.mode(1, .pinned)
+        try AttentionFixture.chat(index!, kind: .channel); try index!.mode(1, .auto)
         index = nil
         let restored = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
-        try restored.channelNotifications(1, enabled: true, now: AttentionFixture.now)
-        XCTAssertTrue(try restored.get(1, now: AttentionFixture.now)?.channelNotificationsActivating == true)
-        XCTAssertFalse(try restored.get(1, now: AttentionFixture.now)?.channelNotifications == true)
+        try restored.follow(1, enabled: true, now: AttentionFixture.now)
+        XCTAssertTrue(try restored.get(1, now: AttentionFixture.now)?.followActivating == true)
+        XCTAssertTrue(try restored.get(1, now: AttentionFixture.now)?.followEnabled == true)
         let work = try XCTUnwrap(restored.nextAttentionWork(lane: 0, now: AttentionFixture.now))
-        XCTAssertEqual(work.method, "getChat")
+        XCTAssertEqual(work.method, "getChatHistory")
         var chat = ChatFixture.chat(1, type: "chatTypeSupergroup", message: .object(AttentionFixture.message(200).fields), unread: 20)["chat"]!.object!
         chat["notification_settings"] = AttentionFixture.settings()
-        try restored.finishAttentionWork(work, response: chat, now: AttentionFixture.now)
-        XCTAssertTrue(try restored.get(1, now: AttentionFixture.now)?.channelNotifications == true)
+        try restored.finishAttentionWork(work, response: .init("messages", ["messages": .array([.object(AttentionFixture.message(200).fields)])]), now: AttentionFixture.now)
+        XCTAssertTrue(try restored.get(1, now: AttentionFixture.now)?.followEnabled == true)
         XCTAssertNil(try restored.get(1, now: AttentionFixture.now)?.attention)
         try restored.apply(AttentionFixture.message(201), now: AttentionFixture.now)
         XCTAssertEqual(try restored.get(1, now: AttentionFixture.now)?.attention?.firstMessage, 201)
@@ -270,27 +282,27 @@ final class TelegramAttentionTests: XCTestCase {
             try index!.apply(AttentionFixture.message(100 + chat, chat: chat), now: AttentionFixture.now)
         }
         let snapshot = try index!.project(now: AttentionFixture.now)
-        XCTAssertEqual(snapshot.visibleCount, 7); XCTAssertEqual(snapshot.attention.totalCount, 30)
-        XCTAssertEqual(snapshot.attention.overflowChatCount, 23)
-        XCTAssertEqual(snapshot.firstRows.first?.id.chat, 30)
+        XCTAssertEqual(snapshot.lists.first { $0.key == .main }?.capacity, 8); XCTAssertEqual(snapshot.attention.totalCount, 30)
+        XCTAssertEqual(snapshot.attentionTotal, 30)
+        XCTAssertEqual(try XCTUnwrap(index).listPage(.main, from: 0, revision: snapshot.lists.first { $0.key == .main }!.revision, now: AttentionFixture.now).rows.first?.id.chat, 1)
         index = nil
         let restored = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
         XCTAssertEqual(try restored.project(now: AttentionFixture.now).attention.totalCount, 30)
     }
 
-    func testChannelEpisodeAnchorsAndUnpinDoNotReplay() throws {
+    func testChannelEpisodeAnchorsAndHidingDoNotReplay() throws {
         let fixture = try TelegramFixture()
         let index = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
         try AttentionFixture.chat(index, kind: .channel)
-        try index.mode(1, .pinned); try index.channelNotifications(1, enabled: true, now: AttentionFixture.now)
+        try index.mode(1, .auto); try AttentionFixture.follow(index, chat: 1)
         for id: Int64 in [100, 101] { try index.apply(AttentionFixture.message(id), now: AttentionFixture.now) }
         let before = try XCTUnwrap(index.get(1, now: AttentionFixture.now)?.attention)
         XCTAssertEqual(before.count, 1)
         try index.apply(TDLibMessage("updateDeleteMessages", ["chat_id": .integer(1), "message_ids": .array([.integer(101)]), "is_permanent": .bool(true), "from_cache": .bool(false)]), now: AttentionFixture.now)
         let after = try XCTUnwrap(index.get(1, now: AttentionFixture.now)?.attention)
         XCTAssertEqual(after.identity, before.identity); XCTAssertEqual(after.firstMessage, 100)
-        try index.mode(1, .auto, now: AttentionFixture.now)
-        try index.mode(1, .pinned)
+        try index.mode(1, .hidden, now: AttentionFixture.now)
+        try index.mode(1, .auto)
         XCTAssertNil(try index.get(1, now: AttentionFixture.now)?.attention)
     }
 
@@ -298,8 +310,8 @@ final class TelegramAttentionTests: XCTestCase {
         let fixture = try TelegramFixture()
         var index: TelegramChatIndex? = try TelegramChatIndex(directory: fixture.directory, environment: .test, account: ChatFixture.me)
         try AttentionFixture.chat(index!, kind: .channel)
-        try index!.mode(1, .pinned, now: AttentionFixture.now)
-        try index!.channelNotifications(1, enabled: true, now: AttentionFixture.now)
+        try index!.mode(1, .auto, now: AttentionFixture.now)
+        try AttentionFixture.follow(index!, chat: 1)
         for id: Int64 in [100, 101] { try index!.apply(AttentionFixture.message(id), now: AttentionFixture.now) }
         let identity = try XCTUnwrap(index!.get(1, now: AttentionFixture.now)?.attention?.identity)
         try index!.apply(TDLibMessage("updateDeleteMessages", ["chat_id": .integer(1), "message_ids": .array([.integer(101)]), "is_permanent": .bool(true), "from_cache": .bool(false)]), now: AttentionFixture.now)

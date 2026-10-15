@@ -1,7 +1,9 @@
 import Foundation
 
 public enum TelegramAttentionKind: String, Codable, Sendable {
-    case direct, mention, reply, botReply, channelPost
+    case direct, mention, reply, botReply, groupMessage, channelPost
+    public var tier: Int { self == .groupMessage || self == .channelPost ? 4 : 3 }
+    var episode: Bool { self == .groupMessage || self == .channelPost }
 }
 
 /// Compact source metadata. The app's AttentionSidebarModel alone projects
@@ -13,17 +15,19 @@ public struct TelegramAttentionSummary: Equatable, Sendable {
     public var lastDate: Int64
     public var kind: TelegramAttentionKind
     public var identity: String
+    public var classCount: Int
+    public var incomplete: Bool
     public init(destination: TelegramChatID, count: Int, firstMessage: Int64, lastDate: Int64,
-                kind: TelegramAttentionKind, identity: String) {
+                kind: TelegramAttentionKind, identity: String, classCount: Int? = nil, incomplete: Bool = false) {
         self.destination = destination; self.count = count; self.firstMessage = firstMessage
         self.lastDate = lastDate; self.kind = kind; self.identity = identity
+        self.classCount = classCount ?? count; self.incomplete = incomplete
     }
 }
 
 public struct TelegramAttentionSnapshot: Equatable, Sendable {
     public var totalCount = 0
     public var chatCount = 0
-    public var overflowChatCount = 0
     public var directEnabled = true
     /// Only open destinations; sidebar rows carry their own summaries.
     public var destinations: [TelegramChatID: [TelegramAttentionSummary]] = [:]
@@ -59,7 +63,6 @@ public extension TelegramChatProvider {
     func setAttentionDestinations(_ destinations: Set<TelegramChatID>) async {}
     func setDirectAttention(_ enabled: Bool) async {}
     func snoozeAttention(_ id: TelegramChatID, undo: Bool) async {}
-    func setChannelNotifications(_ id: TelegramChatID, enabled: Bool) async {}
     func consumeNotification(_ id: String) async -> Bool { false }
 }
 

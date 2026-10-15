@@ -27,6 +27,7 @@ struct TelegramSettingsView: View {
             }.font(Theme.display(12))
 
             authContent
+            SidebarFolderSettings(compact: true)
             if TelegramService.chats.connected {
                 Toggle("Direct messages in Attention", isOn: Binding(
                     get: { TelegramService.chats.snapshot.attention.directEnabled },
@@ -153,6 +154,7 @@ struct TelegramSettingsView: View {
             Button("Sign in again") { Task { await model.retry() } }.buttonStyle(.borderedProminent)
             localRemoval
         case .blocked:
+            Text(TelegramFolderRollback.note).font(Theme.display(11)).foregroundStyle(.secondary)
             HStack {
                 Button("Retry connection") { Task { await model.retry() } }
                 localRemoval

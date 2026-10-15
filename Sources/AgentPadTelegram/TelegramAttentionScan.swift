@@ -19,7 +19,7 @@ struct TelegramAttentionWork {
             result["from_message_id"] = .integer(cursor); result["offset"] = .integer(0); result["limit"] = .integer(Int64(pageSize))
             if method == "getChatHistory" { result["only_local"] = .bool(false) }
             else {
-                result["topic_id"] = .null; result["query"] = .string(""); result["sender_id"] = .null
+                result["query"] = .string("")
                 result["filter"] = .typed("searchMessagesFilterUnreadMention")
             }
         }
@@ -38,23 +38,33 @@ extension TelegramChatIndex {
     func scheduleAttentionScan(_ chat: Int64, lane: Int, force: Bool = false, db: Database, now: Int64) throws {
         guard let row = try Row.fetchOne(db, sql: "SELECT c.*,s.* FROM chats c JOIN tg_state s ON s.chat=c.id WHERE c.id=?", arguments: [chat]) else { return }
         let kind: String = row["kind"]
-        let history = ["person", "bot", "channel"].contains(kind)
-        let eligible = history || ["group", "supergroup", "forum"].contains(kind)
+        let group = ["group", "supergroup", "forum"].contains(kind)
+        let following = row["followEnabled"] as Bool && !(row["activating"] as Bool)
+        let history = ["person", "bot"].contains(kind) || kind == "channel" && following
         let signature = "\(kind):\(row["lastMessage"] as Int64):\(row["inbox"] as Int64):\(row["unread"] as Int):\(row["mentions"] as Int):\(row["generation"] as String)"
         try db.execute(sql: "UPDATE tg_state SET signature=? WHERE chat=?", arguments: [signature,chat])
-        guard eligible, kind != "channel" || row["channelEnabled"] as Bool else { return }
-        guard force || (row["checked"] as String) != signature else { return }
-        guard (history ? row["unread"] as Int : row["mentions"] as Int) > 0 || force || (kind == "channel" && row["episode"] as String? != nil) else {
-            try db.execute(sql: "UPDATE tg_state SET checked=?,complete=1 WHERE chat=?", arguments: [signature,chat]); return
+        guard group || history, force || (row["checked"] as String) != signature else { return }
+        func schedule(_ key: String, history: Bool, lane: Int) throws {
+            let version = key + ":" + signature + (force ? ":" + UUID().uuidString : "")
+            let old = try String.fetchOne(db, sql: "SELECT version FROM tg_work WHERE key=?", arguments: [key])
+            if let old, old != version { try db.execute(sql: "DELETE FROM tg_scan_seen WHERE chat=? AND version=?", arguments: [chat,old]) }
+            try enqueueAttentionWork(key: key, method: history ? "getChatHistory" : "searchChatMessages", chat: chat, message: row["lastMessage"],
+                                     lane: lane, version: version, db: db, now: now)
+            // A changed head invalidates an in-flight reply, preserving queue age.
+            try db.execute(sql: "UPDATE tg_work SET cursor=0,pages=0,version=?,retry=0,lane=min(lane,?),message=? WHERE key=? AND version!=?",
+                           arguments: [version,lane,row["lastMessage"] as Int64,key,version])
         }
-        let version = force ? signature + ":" + UUID().uuidString : signature
-        try enqueueAttentionWork(key: "scan:\(chat)", method: history ? "getChatHistory" : "searchChatMessages", chat: chat, message: row["lastMessage"],
-                                 lane: lane, version: version, db: db, now: now)
-        // Preserve queue age across changes, but do not let an old in-flight
-        // page advance the checkpoint for a newer head.
-        try db.execute(sql: "UPDATE tg_work SET cursor=0,version=?,retry=0,lane=min(lane,?),message=? WHERE key=? AND version!=?",
-                       arguments: [version,lane,row["lastMessage"] as Int64,"scan:\(chat)",version])
-        try db.execute(sql: "UPDATE tg_state SET complete=0 WHERE chat=?", arguments: [chat])
+        if (history ? row["unread"] as Int : row["mentions"] as Int) > 0 || force || (history && row["episode"] as String? != nil) {
+            try schedule("scan:\(chat)", history: history, lane: lane)
+        }
+        if group && following && (row["unread"] as Int > 0 || force || row["episode"] as String? != nil) {
+            try schedule("history:\(chat)", history: true, lane: 1)
+        }
+        try updateScanCompletion(chat, db: db)
+    }
+    func updateScanCompletion(_ chat: Int64, db: Database) throws {
+        let pending = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM tg_work WHERE key IN (?,?))", arguments: ["scan:\(chat)","history:\(chat)"]) == true
+        try db.execute(sql: "UPDATE tg_state SET complete=?,checked=CASE WHEN ? THEN checked ELSE signature END WHERE chat=?", arguments: [!pending,pending,chat])
     }
     func prepareAttentionScan(now: Int64) throws {
         try db.write { db in
@@ -87,8 +97,6 @@ extension TelegramChatIndex {
     func finishAttentionWork(_ work: TelegramAttentionWork, response: TDLibMessage, now: Int64) throws {
         if work.method == "getChat", response.type == "chat", response["id"]?.integer == work.chat {
             try apply(TDLibMessage("updateNewChat", ["chat": .object(response.fields)]), now: now)
-            let requested = try db.read { try Bool.fetchOne($0, sql: "SELECT activationRequested FROM tg_state WHERE chat=?", arguments: [work.chat]) == true }
-            if requested { try channelNotifications(work.chat, enabled: true, now: now) }
         }
         try db.write { db in
             guard try String.fetchOne(db, sql: "SELECT version FROM tg_work WHERE key=?", arguments: [work.key]) == work.version else { return }
@@ -103,6 +111,20 @@ extension TelegramChatIndex {
                     // last channel anchor. Keep the checkpoint and episode.
                     try pause(response["code"]?.integer == 429 ? 60 : 30)
                 }
+                return
+            }
+            if work.key == "activate:\(work.chat)" {
+                guard response.type == "messages",
+                      try String.fetchOne(db, sql: "SELECT generation FROM tg_state WHERE chat=? AND activating=1 AND followEnabled=1", arguments: [work.chat]) == work.version else { try pause(30); return }
+                let values = response["messages"]?.array ?? []
+                guard values.allSatisfy({ $0.object?["chat_id"]?.integer == work.chat && ($0.object?["id"]?.integer ?? 0) > 0 }) else { try pause(30); return }
+                let head = values.compactMap { value -> Int64? in
+                    guard let raw = value.object, raw["chat_id"]?.integer == work.chat else { return nil }
+                    return raw["id"]?.integer
+                }.max() ?? 0
+                try db.execute(sql: "UPDATE tg_state SET activation=max(activation,lastMessage,?),activating=0,signature='',checked='' WHERE chat=?", arguments: [head,work.chat])
+                try finish(); try scheduleAttentionScan(work.chat, lane: 1, force: true, db: db, now: now)
+                attentionFullRebuild = true
                 return
             }
             switch work.method {
@@ -122,33 +144,53 @@ extension TelegramChatIndex {
                 guard response.type == "chat" else { try pause(30); return }
                 try finish()
             default:
-                guard ["messages", "foundChatMessages"].contains(response.type) else { try pause(30); return }
+                guard response.type == (work.method == "searchChatMessages" ? "foundChatMessages" : "messages") else { try pause(30); return }
                 let values = response["messages"]?.array ?? []
+                guard values.allSatisfy({ $0.object?["chat_id"]?.integer == work.chat && ($0.object?["id"]?.integer ?? 0) > 0 }) else { try pause(30); return }
                 for value in values.prefix(100) {
                     if let raw = value.object, raw["chat_id"]?.integer == work.chat {
                         try attentionMessage(raw, chat: work.chat, db: db, now: now)
                         if let id = raw["id"]?.integer { try db.execute(sql: "INSERT OR REPLACE INTO tg_scan_seen VALUES (?,?,?)", arguments: [work.chat,id,work.version]) }
                     }
                 }
-                let boundary = try Int64.fetchOne(db, sql: "SELECT max(inbox,activation,snooze) FROM tg_state WHERE chat=?", arguments: [work.chat]) ?? 0
+                let kind = try String.fetchOne(db, sql: "SELECT kind FROM chats WHERE id=?", arguments: [work.chat]) ?? "unknown"
+                let boundary = try Int64.fetchOne(db, sql: "SELECT max(\(kind == "forum" ? "0" : "inbox"),activation,snooze) FROM tg_state WHERE chat=?", arguments: [work.chat]) ?? 0
                 let minimum = values.compactMap { $0.object?["id"]?.integer }.min()
                 let cursor = work.method == "searchChatMessages" ? response["next_from_message_id"]?.integer ?? 0 : minimum ?? 0
                 let complete = work.method == "searchChatMessages" ? cursor == 0 : values.isEmpty || (minimum.map { $0 <= boundary } ?? false)
                 if complete {
-                    if try String.fetchOne(db, sql: "SELECT kind FROM chats WHERE id=?", arguments: [work.chat]) == "channel" {
-                        try db.execute(sql: "DELETE FROM tg_messages WHERE chat=? AND id>? AND id<=? AND id NOT IN (SELECT id FROM tg_scan_seen WHERE chat=? AND version=?)",
+                    if work.method == "getChatHistory", ["channel","group","supergroup","forum"].contains(kind) {
+                        try db.execute(sql: "DELETE FROM tg_messages WHERE chat=? AND unreadMention=0 AND id>? AND id<=? AND id NOT IN (SELECT id FROM tg_scan_seen WHERE chat=? AND version=?)",
                                        arguments: [work.chat,boundary,work.message,work.chat,work.version])
                     }
-                    try db.execute(sql: "DELETE FROM tg_scan_seen WHERE chat=?", arguments: [work.chat])
-                    try db.execute(sql: "UPDATE tg_state SET checked=signature,complete=1 WHERE chat=?", arguments: [work.chat]); try finish()
+                    if work.method == "searchChatMessages" {
+                        // Only this independent path owns unread mentions. Do not
+                        // reconcile live arrivals beyond the scan's captured head.
+                        try db.execute(sql: """
+                            INSERT INTO tg_receipts(chat,id,mentionRead)
+                            SELECT chat,id,1 FROM tg_messages WHERE chat=? AND unreadMention=1 AND id<=?
+                              AND id NOT IN (SELECT id FROM tg_scan_seen WHERE chat=? AND version=?)
+                            ON CONFLICT(chat,id) DO UPDATE SET mentionRead=1
+                            """, arguments: [work.chat,work.message,work.chat,work.version])
+                        try db.execute(sql: "UPDATE tg_messages SET unreadMention=0 WHERE chat=? AND unreadMention=1 AND id<=? AND id NOT IN (SELECT id FROM tg_scan_seen WHERE chat=? AND version=?)",
+                                       arguments: [work.chat,work.message,work.chat,work.version])
+                    }
+                    try db.execute(sql: "DELETE FROM tg_scan_seen WHERE chat=? AND version=?", arguments: [work.chat,work.version])
+                    try finish(); try updateScanCompletion(work.chat, db: db)
                 } else if cursor == work.cursor {
                     try pause(30); error = "Telegram history did not advance. Attention scan will retry."
                 } else {
                     let bytes = values.reduce(0) { $0 + $1.estimatedBytes }
-                    try db.execute(sql: "UPDATE tg_work SET cursor=?,pageSize=? WHERE key=?", arguments: [cursor, bytes > 2 * 1024 * 1024 ? max(1,work.pageSize/2) : work.pageSize,work.key])
+                    try db.execute(sql: "UPDATE tg_work SET cursor=?,pageSize=?,pages=pages+1 WHERE key=?", arguments: [cursor, bytes > 2 * 1024 * 1024 ? max(1,work.pageSize/2) : work.pageSize,work.key])
+                    if work.key.hasPrefix("history:") {
+                        try db.execute(sql: "UPDATE tg_work SET pages=0,age=(SELECT max(age)+1 FROM tg_work) WHERE key=? AND pages>=10", arguments: [work.key])
+                    }
                 }
             }
         }
-        try refreshAttention(now: now); changed()
+        if ["getChatHistory","searchChatMessages"].contains(work.method) {
+            if !attentionFullRebuild { try refreshAttention(chats: [work.chat], now: now) }
+        } else { attentionFullRebuild = true }
+        dirty = true; attentionOrderDirty = true
     }
 }

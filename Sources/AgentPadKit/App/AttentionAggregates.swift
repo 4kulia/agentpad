@@ -89,8 +89,9 @@ final class AttentionSidebarModel {
     var dismissalRevision = 0
     struct Projection: Equatable {
         var telegram = TelegramChatSnapshot()
-        var telegramPages: [Int: [TelegramChatRow]] = [:]
         var items: [AttentionItem] = []
+        var total = 0
+        var revealedCount = 0
         var terminals: [UUID: [AttentionItem]] = [:]
         var profileCounts: [UUID: Int] = [:]
         var terminalIDs: Set<UUID> = []
@@ -101,7 +102,11 @@ final class AttentionSidebarModel {
     }
     private struct Input: Equatable {
         var telegram: TelegramChatSnapshot
-        var telegramPages: [Int: [TelegramChatRow]]
+        var attentionRows: [Int64:TelegramChatRow]
+        var attentionKeys: [TelegramAttentionOrderKey]
+        var attentionState: TelegramAttentionState?
+        var attentionInactive: Set<Int64>
+        var attentionFrontier: TelegramAttentionOrderKey?
         var current: AttentionCurrent
         var tabs: [AttentionTabSnapshot]
         var events: [AttentionEvent]
@@ -146,6 +151,7 @@ final class AttentionSidebarModel {
     var terminalAttention: [UUID: [AttentionItem]] { projection.terminals }
     var profileAttentionCounts: [UUID: Int] { projection.profileCounts }
     var items: [AttentionItem] { projection.items }
+    var total: Int { projection.total }
     var tabIndicators: [UUID: AttentionIndicator] { projection.tabIndicators }
     var workspaceIndicators: [AttentionWorkspaceID: AttentionIndicator] { projection.workspaceIndicators }
     var windowIndicators: [UUID: AttentionIndicator] { projection.windowIndicators }
@@ -280,7 +286,11 @@ final class AttentionSidebarModel {
         }
         _ = dismissalRevision
         telegram.observeAttention(Set(tabs.flatMap(\.destinations).compactMap { if case .telegram(let id) = $0 { id } else { nil } }))
-        return (Input(telegram: telegram.snapshot, telegramPages: telegram.pages, current: current, tabs: tabs, events: ledger.events,
+        return (Input(telegram: telegram.snapshot,
+            attentionRows: telegram.attentionRows, attentionKeys: telegram.revealedAttentionKeys,
+            attentionState: telegram.attentionState,
+            attentionInactive: telegram.attentionInactive, attentionFrontier: telegram.attentionFrontier,
+            current: current, tabs: tabs, events: ledger.events,
             mentions: aggregates.mentions, dms: dms, channels: channels,
             settings: AgentPadSettingsModel.shared.attentionSettings,
             dismissed: Set(ledger.metadata.markers.filter { $0.value.hidden }.keys), viewed: ledger.viewedAttentionIDs), names)
@@ -290,15 +300,14 @@ final class AttentionSidebarModel {
         let items = AttentionList.items(ledger: input.events, current: input.current,
             mentions: input.mentions, dms: input.dms, settings: input.settings,
             dismissed: input.dismissed, viewed: input.viewed)
-        var result = Projection(telegram: input.telegram, telegramPages: input.telegramPages.mapValues { $0.filter { $0.attention == nil } }, items: items)
-        for offset in input.telegramPages.keys.sorted() {
-            for row in input.telegramPages[offset] ?? [] {
-                guard let summary = row.attention else { continue }
-                result.items.append(.init(id: "telegram-row:" + summary.identity, tier: 3,
-                    time: Date(timeIntervalSince1970: Double(summary.lastDate)), title: row.title,
-                    subtitle: summary.caption + (row.pinned ? " · Pinned here" : ""), action: .telegram(summary), secondary: .snooze, indicatorKind: .unread))
-            }
-        }
+        var result = Projection(telegram: input.telegram,
+            items: AttentionList.merged(items, telegram: Array(input.attentionRows.values), frontier: input.attentionFrontier,
+                keys: input.attentionKeys, inactive: input.attentionInactive, state: input.attentionState),
+            total: items.count + input.telegram.attentionTotal)
+        let revealedTelegram = input.attentionKeys.filter {
+            !input.attentionInactive.contains($0.chat) && input.attentionState?.inactive.contains($0.chat) != true
+        }.count
+        result.revealedCount = result.items.filter { $0.telegramChat == nil }.count + revealedTelegram
         var destinations: [AttentionTabDestination: [UUID]] = [:]
         for tab in input.tabs {
             result.tabs[tab.id] = tab

@@ -45,6 +45,9 @@ struct AttentionItem: Identifiable, Equatable, Sendable {
     var localProfileID: UUID?
     var avatarScope: AttentionScope?
     var indicatorKind: AttentionIndicator.Kind?
+    var telegramChat: Int64?
+    enum TelegramPlaceholder: Sendable { case loading, inactive }
+    var telegramPlaceholder: TelegramPlaceholder?
 }
 
 /// No message bodies. The future DM client supplies these through the same gate.
@@ -196,20 +199,57 @@ enum AttentionList {
         if settings.mentions { append(mentions, dm: false) }
         if settings.dm { append(dms, dm: true) }
         var seen = Set<String>()
-        return result.filter { seen.insert($0.id).inserted }.sorted {
-            if $0.tier != $1.tier { return $0.tier < $1.tier }
-            if $0.time != $1.time { return $0.tier == 3 ? $0.time > $1.time : $0.time < $1.time }
-            return $0.id < $1.id
+        return result.filter { seen.insert($0.id).inserted }
+    }
+
+    static func precedes(_ a: AttentionItem, _ b: AttentionItem) -> Bool {
+        if a.tier != b.tier { return a.tier < b.tier }
+        if a.time != b.time { return a.tier >= 3 ? a.time > b.time : a.time < b.time }
+        if let x = a.telegramChat, let y = b.telegramChat { return x < y }
+        return a.id < b.id
+    }
+
+    static func merged(_ items: [AttentionItem], telegram: [TelegramChatRow], frontier: TelegramAttentionOrderKey?,
+                       keys: [TelegramAttentionOrderKey]? = nil, inactive: Set<Int64> = [],
+                       state: TelegramAttentionState? = nil) -> [AttentionItem] {
+        let metadata = Dictionary(telegram.map { ($0.id.chat,$0) }, uniquingKeysWith: { _, row in row })
+        let order = keys ?? telegram.compactMap { row in
+            row.attentionOrderKey ?? row.attention.map { .init(chat: row.id.chat,tier: $0.kind.tier,rankingTime: $0.lastDate) }
         }
+        let rows: [AttentionItem] = order.map { key in
+            var item = AttentionItem(id: "telegram-row:\(key.chat)", tier: key.tier,
+                time: Date(timeIntervalSince1970: Double(key.rankingTime)), title: "", subtitle: "",
+                action: .event(""), telegramChat: key.chat)
+            if inactive.contains(key.chat) || state?.inactive.contains(key.chat) == true {
+                item.telegramPlaceholder = .inactive
+            } else if let row = metadata[key.chat], !row.hidden, row.kind.eligible, let summary = row.attention {
+                item.title = row.title; item.subtitle = summary.caption; item.action = .telegram(summary)
+                item.secondary = .snooze; item.indicatorKind = .unread
+            } else {
+                item.telegramPlaceholder = .loading
+            }
+            return item
+        }
+        var result = (items + rows).sorted(by: precedes)
+        if let frontier {
+            result = result.filter { item in
+                if item.tier != frontier.tier { return item.tier < frontier.tier }
+                let time = Date(timeIntervalSince1970: Double(frontier.rankingTime))
+                if item.time != time { return item.time > time }
+                if let chat = item.telegramChat { return chat <= frontier.chat }
+                return item.id <= "telegram-row:\(frontier.chat)"
+            }
+        }
+        return result
     }
 
     static func visible(_ items: [AttentionItem], expanded: Bool, collapsed: Bool = false) -> [AttentionItem] {
         if expanded && !collapsed { return items }
         var ordinaryIndex = 0
         return items.compactMap { item in
-            if case .telegram = item.action { return collapsed ? nil : item }
+            if item.tier <= 1 { return item }
             defer { ordinaryIndex += 1 }
-            return item.tier <= 1 || (!collapsed && ordinaryIndex < 5) ? item : nil
+            return !collapsed && ordinaryIndex < 5 ? item : nil
         }
     }
 }

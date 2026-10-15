@@ -11,29 +11,9 @@ enum TelegramNotificationLimits {
 }
 
 extension TelegramChatIndex {
-    func installNotificationSchema() throws {
+    func resetNotificationSession() throws {
         try db.write { db in
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS tg_notification_groups (id INTEGER PRIMARY KEY, type TEXT, chat INTEGER, settingsChat INTEGER, sound INTEGER);
-                CREATE TABLE IF NOT EXISTS tg_notifications (groupID INTEGER, id INTEGER, chat INTEGER, message INTEGER, date INTEGER, silent INTEGER, fresh INTEGER,
-                  PRIMARY KEY(groupID,id));
-                CREATE TABLE IF NOT EXISTS tg_notification_seen (groupID INTEGER, id INTEGER, PRIMARY KEY(groupID,id));
-                CREATE TABLE IF NOT EXISTS tg_notification_consumed (id TEXT PRIMARY KEY);
-                DELETE FROM tg_notification_groups; DELETE FROM tg_notifications;
-                DELETE FROM checkpoint WHERE key='notificationRetired';
-                """)
-            for table in ["tg_notification_seen", "tg_notification_consumed"] {
-                if try !db.columns(in: table).contains(where: { $0.name == "date" }) {
-                    try db.execute(sql: "ALTER TABLE \(table) ADD COLUMN date INTEGER NOT NULL DEFAULT 0")
-                }
-            }
-            if try !db.columns(in: "tg_state").contains(where: { $0.name == "notifiedEpisode" }) {
-                try db.execute(sql: "ALTER TABLE tg_state ADD COLUMN notifiedEpisode TEXT")
-                try db.execute(sql: """
-                    UPDATE tg_state SET notifiedEpisode=episode WHERE episode IS NOT NULL AND
-                      EXISTS(SELECT 1 FROM tg_notification_consumed WHERE id=?||chat||':'||generation||':'||episode)
-                    """, arguments: ["telegram:\(environment.rawValue):\(account):channel:"])
-            }
+            try db.execute(sql: "DELETE FROM tg_notification_groups; DELETE FROM tg_notifications; DELETE FROM checkpoint WHERE key='notificationRetired'")
             try pruneNotificationHistory(db, now: Int64(Date().timeIntervalSince1970))
         }
     }
@@ -151,7 +131,7 @@ extension TelegramChatIndex {
         if update.type == "updateActiveNotifications" {
             notificationSnapshotReceived = true; notificationLiveAfter = now
         }
-        try refreshAttention(now: now); changed(); return true
+        attentionFullRebuild = true; changed(); return true
     }
 
     func notificationProjection(_ db: Database) throws -> TelegramNotificationSnapshot {
@@ -169,8 +149,8 @@ extension TelegramChatIndex {
         var identities = Set<String>()
         for row in rows {
             let chat: Int64 = row["chat"], kind = TelegramAttentionKind(rawValue: row["kind"]) ?? .direct
-            let channel = kind == .channelPost
-            let identity = channel ? "channel:\(chat):\(row["generation"] as String):\(row["episode"] as String? ?? "")"
+            let channel = kind.episode
+            let identity = channel ? "\(kind == .channelPost ? "channel" : "group"):\(chat):\(row["generation"] as String):\(row["episode"] as String? ?? "")"
                 : "notification:\(row["groupID"] as Int64):\(row["id"] as Int64)"
             let id = "telegram:\(environment.rawValue):\(account):\(identity)"
             guard identities.insert(id).inserted else { continue }
@@ -194,7 +174,7 @@ extension TelegramChatIndex {
             try db.execute(sql: "INSERT OR IGNORE INTO tg_notification_consumed(id,date) VALUES (?,?)", arguments: [id,now])
             if parts.count == 3, parts[0] == "notification", let group = Int64(parts[1]), let notification = Int64(parts[2]) {
                 try db.execute(sql: "UPDATE tg_notifications SET fresh=0 WHERE groupID=? AND id=?", arguments: [group,notification])
-            } else if parts.count == 4, parts[0] == "channel", let chat = Int64(parts[1]) {
+            } else if parts.count == 4, ["channel","group"].contains(parts[0]), let chat = Int64(parts[1]) {
                 try db.execute(sql: "UPDATE tg_notifications SET fresh=0 WHERE chat=?", arguments: [chat])
                 try db.execute(sql: "UPDATE tg_state SET notifiedEpisode=episode WHERE chat=? AND generation=? AND episode=?", arguments: [chat,String(parts[2]),String(parts[3])])
             }

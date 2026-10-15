@@ -71,6 +71,8 @@ final class AgentProfileStore {
     private(set) var problem: String?
     var profiles: [AgentProfile] { archive.profiles }
     var bindings: [AgentProfileBinding] { Array(archive.bindings.values) }
+    /// Preserve dictionary storage when handing a snapshot to a worker actor.
+    var bindingsSnapshot: [String: AgentProfileBinding] { archive.bindings }
 
     init(fileURL: URL? = nil, details: AgentProfileDetailsStore? = nil, write: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)

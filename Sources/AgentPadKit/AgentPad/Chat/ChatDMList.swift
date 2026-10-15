@@ -2,7 +2,7 @@ import Foundation
 import GRDB
 import Observation
 
-struct ChatDMEntry: Equatable, Identifiable {
+struct ChatDMEntry: Equatable, Identifiable, Sendable {
     var card: ChatDMCard
     var lastUsed: Date
     var roots: ChatUnread.Count
@@ -41,7 +41,7 @@ struct ChatDMEntry: Equatable, Identifiable {
 }
 
 /// Sidebar identity is the person, whether or not a server conversation exists.
-struct ChatDMPerson: Equatable, Identifiable {
+struct ChatDMPerson: Equatable, Identifiable, Sendable {
     var peer: ChatDMCard.Peer
     var conversation: ChatDMEntry?
     var id: String { peer.accountId }
@@ -76,6 +76,14 @@ struct ChatDMPerson: Equatable, Identifiable {
     }
 }
 
+/// Gated value inputs can be reduced off MainActor for custom folders.
+struct ChatDMPeopleInput: Equatable, Sendable {
+    var entries: [ChatDMEntry] = []
+    var members: [ChatOrgView.Member] = []
+    var me = ""
+    var values: [ChatDMPerson] { ChatDMPerson.merge(entries, members: members, me: me) }
+}
+
 @MainActor @Observable
 final class ChatDMListModel {
     let key: ChatOrgKey
@@ -91,7 +99,10 @@ final class ChatDMListModel {
     }
     var entries: [ChatDMEntry] { readable ? kept : [] }
     var people: [ChatDMPerson] {
-        readable ? ChatDMPerson.merge(kept, members: members, me: key.accountId) : []
+        peopleInput.values
+    }
+    var peopleInput: ChatDMPeopleInput {
+        readable ? .init(entries: kept, members: members, me: key.accountId) : .init()
     }
     init(key: ChatOrgKey, store: ChatStore, service: ChatService) {
         self.key = key; self.service = service

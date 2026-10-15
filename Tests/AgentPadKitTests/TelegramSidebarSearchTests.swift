@@ -13,9 +13,9 @@ private actor FakeTelegramChatProvider: TelegramChatProvider {
     var deferResolution = false
     var resolution: CheckedContinuation<TelegramChatRow?, Never>?
     func chatSnapshots() -> AsyncStream<TelegramChatSnapshot> { AsyncStream { $0.yield(snapshot) } }
-    func chatPage(offset: Int, revision: UInt64) -> TelegramChatPage { .init(revision: revision, offset: offset, rows: pages[offset] ?? []) }
-    func expandChats(showLess: Bool) {}
-    func holdChatOrder(_ held: Bool, owner: UUID) {}
+    func chatPage(list: TelegramListKey,from: Int,revision: UInt64,binding: TelegramProfileBinding) async -> TelegramChatPage {
+        .init(revision: revision,offset: from,rows: pages[from] ?? [],next: from + 50 < 2000 ? from + 50 : nil)
+    }
     func setChatMode(_ id: TelegramChatID, mode: TelegramChatMode) {}
     func searchTelegram(_ query: String) -> AsyncStream<TelegramSearchSnapshot> {
         searchRequests.append(query)
@@ -31,7 +31,7 @@ private actor FakeTelegramChatProvider: TelegramChatProvider {
     func isResolving() -> Bool { resolution != nil }
     func finishOpening(_ row: TelegramChatRow) { resolution?.resume(returning: row); resolution = nil }
     func didOpenChat(_ id: TelegramChatID) {}
-    func chat(_ id: TelegramChatID) -> TelegramChatRow? { snapshot.firstRows.first { $0.id == id } }
+    func chat(_ id: TelegramChatID) -> TelegramChatRow? { snapshot.mainRows.first { $0.id == id } }
     func setChatScanPaused(_ reason: String?) {}
     func send(_ value: TelegramSearchSnapshot) { searches[value.query]?.yield(value) }
     func requested(_ query: String) -> Bool { searches[query] != nil }
@@ -44,12 +44,12 @@ private actor FakeTelegramChatProvider: TelegramChatProvider {
     private func row(_ id: Int64, _ title: String, automatic: Bool = true) -> TelegramChatRow {
         .init(id: .init(environment: .test, account: 42, chat: id), title: title, username: "", kind: .person,
               unreadCount: 80, unreadMentionCount: 0, inMain: false, inArchive: true, pinned: false, hidden: false,
-              lastMessageDate: 100, recentOutgoingDate: 100, isAutomatic: automatic)
+              lastMessageDate: 100, knownRelevant: automatic)
     }
     private func snapshot(_ rows: [TelegramChatRow]) -> TelegramChatSnapshot {
-        var value = TelegramChatSnapshot(); value.account = .init(environment: .test, account: 42, chat: 0)
-        value.state = .complete; value.revision = 1; value.firstRows = rows; value.automaticRows = rows
-        value.foundCount = rows.count; value.automaticCount = rows.count; value.visibleCount = rows.count
+        var value = TelegramChatSnapshot(); value.binding = .init(environment: .test, account: 42, connectionID: UUID()); value.account = .init(environment: .test, account: 42, chat: 0)
+        value.state = .complete; value.mainRows = rows; value.suggestionRows = rows
+        value.mainList.counts.rows = rows.count; value.mainList.capacity = rows.count
         return value
     }
     private func model(_ chats: TelegramChatsModel) -> EverywhereSearchModel {
@@ -175,17 +175,41 @@ private actor FakeTelegramChatProvider: TelegramChatProvider {
     }
     func testViewportCacheBoundAndExpansionDoesNotNeedAllRowsInMemory() async throws {
         let provider = FakeTelegramChatProvider(), model = TelegramChatsModel()
-        var snapshot = snapshot([row(1, "First")]); snapshot.visibleCount = 2000; snapshot.foundCount = 2000; snapshot.expanded = true
+        var snapshot = snapshot([row(1, "First")]); snapshot.mainList.capacity = 2000; snapshot.mainList.counts.rows = 2000; snapshot.mainList.expanded = true
         var pages: [Int: [TelegramChatRow]] = [:]
         for offset in stride(from: 0, to: 2000, by: 50) { pages[offset] = (offset..<offset + 50).map { row(Int64($0), "Chat \($0)") } }
         await provider.configure(snapshot, pages: pages); model.attach(provider)
         try await eventually { model.connected }
-        for offset in stride(from: 50, to: 2000, by: 50) { await model.loadPage(offset) }
-        XCTAssertLessThanOrEqual(model.pages.values.reduce(0) { $0 + $1.count }, 1000)
-        XCTAssertEqual(model.snapshot.visibleCount, 2000)
-        XCTAssertNotNil(model.pages[1950]); XCTAssertNil(model.pages[0])
+        for offset in stride(from: 50, to: 2000, by: 50) { await model.loadPage(list: .main, start: offset) }
+        XCTAssertLessThanOrEqual((model.listPages[.main] ?? [:]).values.reduce(0) { $0 + $1.rows.count }, 1000)
+        XCTAssertEqual(model.snapshot.mainList.capacity, 2000)
+        XCTAssertNotNil(model.listPages[.main]?[1950]); XCTAssertNil(model.listPages[.main]?[0])
         model.receive(TelegramChatSnapshot())
-        XCTAssertFalse(model.connected); XCTAssertEqual(model.pages.values.flatMap { $0 }.count, 0)
+        XCTAssertFalse(model.connected); XCTAssertEqual(model.listPages.values.flatMap { $0.values.flatMap(\.rows) }.count, 0)
+    }
+    func testListPagesShareOneBudgetAndBindingOrRevisionChangesInvalidateThem() async throws {
+        let provider = FakeTelegramChatProvider(), model = TelegramChatsModel()
+        let overhead = (0..<50).map { row(Int64($0),"Snapshot \($0)") }
+        var value = snapshot(overhead)
+        value.suggestionRows = overhead; value.attentionRows = overhead
+        value.binding = .init(environment: .test,account: 42,connectionID: UUID())
+        value.lists = (1...30).map { id in
+            TelegramListSnapshot(key: .folder(Int64(id)),name: "Folder",icon: "Work",visible: true,complete: false,
+                generation: 0,revision: 1,counts: .init(),capacity: 2000,expanded: true,windows: [:],collapsedWindows: [])
+        }
+        let pages = Dictionary(uniqueKeysWithValues: stride(from: 0,to: 2000,by: 50).map { start in
+            (start,(start..<start+50).map { row(Int64($0),"Chat \($0)") })
+        })
+        await provider.configure(value,pages: pages); model.attach(provider)
+        try await eventually { model.snapshot.binding == value.binding }
+        for id in 1...30 { await model.loadPage(list: .folder(Int64(id)),start: 0) }
+        let snapshotRows = model.snapshot.suggestionRows.count + model.snapshot.attentionRows.count
+        XCTAssertLessThanOrEqual(model.listPages.values.reduce(0) { $0 + $1.values.reduce(0) { $0 + $1.rows.count } } + snapshotRows,1000)
+        XCTAssertNotNil(model.listPages[.folder(30)]?[0]); XCTAssertNil(model.listPages[.folder(1)]?[0])
+        value.lists[29].revision = 2; model.receive(value)
+        XCTAssertNil(model.listPages[.folder(30)]?[0])
+        value.binding = .init(environment: .test,account: 42,connectionID: UUID()); model.receive(value)
+        XCTAssertEqual(model.listPages.values.flatMap { $0.values }.count,0)
     }
     func testPlaceholderUsesAccountIdentityAcrossWindowsAndBesideDoesNotDuplicate() throws {
         let origin = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: { XCTFail("Telegram cannot launch a terminal"); return TestEngine() })
@@ -212,7 +236,7 @@ private actor FakeTelegramChatProvider: TelegramChatProvider {
         let model = model(chats), search = model.telegram
         let store = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: { XCTFail("No terminal"); return TestEngine() })
         defer { store.terminate() }
-        let opening = Task { await search.open(.init(row: row, userID: 7), from: store, beside: false, pin: false) }
+        let opening = Task { await search.open(.init(row: row, userID: 7), from: store, beside: false, addToFolder: false) }
         try await eventually { await provider.isResolving() }
         model.dismiss() // Escape or moving to another pane cancels the UI intent.
         await provider.finishOpening(row)

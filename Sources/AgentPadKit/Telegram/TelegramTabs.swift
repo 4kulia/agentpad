@@ -22,10 +22,10 @@ import SwiftUI
         return session
     }
     @discardableResult static func open(_ row: TelegramChatRow, from store: WorkspaceStore,
-                                       beside: Bool = false, router: TabRouter = .shared) -> Session? {
+                                       beside: Bool = false, newTab: Bool = false, router: TabRouter = .shared) -> Session? {
         let route = ToolRoute.telegram(row.id)
         let existing = router.find(route, windowID: store.windowID)
-        guard let session = router.open(route, from: store) else { return nil }
+        guard let session = newTab ? store.openToolTab(route) : router.open(route, from: store) else { return nil }
         session.tabState?.telegramRow = row
         if beside, existing == nil, let location = store.location(ofSessionId: session.id),
            let pane = store.splitPane(location.pane, orientation: .horizontal, in: location.workspace) {

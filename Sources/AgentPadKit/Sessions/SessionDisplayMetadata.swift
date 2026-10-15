@@ -56,12 +56,15 @@ struct SessionDisplayMetadata: Equatable, Sendable {
                   !(value.contains("/") && !value.contains(where: \.isWhitespace)) else { return nil }
             return value
         }
-        let activity = [catalog?.lastActivity,
-                        binding.flatMap { $0.hasScanProvenance ? $0.lastActivity : nil },
-                        live?.hookStateAt].compactMap { $0 }.filter { $0 > .distantPast }.max()
         return Self(title: explicitTitle(live?.explicitName)
                         ?? custom ?? ai ?? summary ?? prompt ?? explicitTitle(live?.cachedTitle) ?? terminal ?? template,
-                    lastActivity: activity ?? live?.startedAt ?? .distantPast)
+                    lastActivity: activity(catalog: catalog, binding: binding, hookStateAt: live?.hookStateAt, startedAt: live?.startedAt))
+    }
+
+    static func activity(catalog: AgentSessionRecord?, binding: AgentSessionRecord?,
+                         hookStateAt: Date? = nil, startedAt: Date? = nil) -> Date {
+        [catalog?.lastActivity, binding.flatMap { $0.hasScanProvenance ? $0.lastActivity : nil }, hookStateAt]
+            .compactMap { $0 }.filter { $0 > .distantPast }.max() ?? startedAt ?? .distantPast
     }
 }
 

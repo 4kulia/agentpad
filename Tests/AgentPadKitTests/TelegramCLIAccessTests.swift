@@ -55,7 +55,7 @@ final class TelegramCLIAccessTests: XCTestCase {
         let chat = store.openToolTab(.telegram(id))
         chat.tabState?.telegramRow = .init(id: id, title: secret + " chat", username: secret + " username", kind: .forum,
             unreadCount: 5, unreadMentionCount: 2, inMain: true, inArchive: false, pinned: true, hidden: false,
-            lastMessageDate: 100, recentOutgoingDate: 100, isAutomatic: true)
+            lastMessageDate: 100, knownRelevant: true)
         let topic = store.openToolTab(.telegram(id.withTopic(.forum(7))))
         topic.tabState?.telegramRow = chat.tabState?.telegramRow
         topic.tabState?.telegramTopicTitle = secret + " topic"

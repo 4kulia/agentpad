@@ -1,4 +1,5 @@
 import AppKit
+import AgentPadTelegram
 import SwiftUI
 
 typealias ChatSidebarStyle = ChatAppearance
@@ -84,17 +85,25 @@ struct ChatSidebarView: View {
     let model: ChatOrgModel?
     var attention = AttentionSidebarModel.shared
     var profileHistory = AgentSessionHistory.shared
-    @State private var organizationMenu = false
-    @State private var channelNameEdit = InlineNameEdit()
-    @State private var renamingChannel: ChatChannelCard?
-    @State private var renamingKey: ChatOrgKey?
-    @FocusState private var focus: Focus?
-    private enum Focus { case search, tree }
-    @Environment(\.colorSchemeContrast) private var contrast
+    @State var organizationMenu = false
+    @State var channelNameEdit = InlineNameEdit()
+    @State var renamingChannel: ChatChannelCard?
+    @State var renamingKey: ChatOrgKey?
+    @FocusState var focus: SidebarFocusRegion?
+    @State var folders = SidebarFoldersModel()
+    @State var folderViewport = SidebarFolderViewport()
+    var telegram = TelegramService.chats
+    var peopleSource: (ChatOrgKey) -> ChatDMPeopleInput = { key in
+        ChatService.shared.dmAllowed(key) ? ChatService.shared.dmList(key)?.peopleInput ?? .init() : .init()
+    }
+    @State var hoveredEntry: String?
+    @State var heldLists = Set<TelegramListKey>()
+    @State var sidebarWindow = WindowBox()
+    @Environment(\.colorSchemeContrast) var contrast
 
-    private var active: ChannelRef? { store.active?.activeSession?.channel }
-    private var snapshot: ChatSidebarSnapshot { ChatSidebarSnapshot(model: model, active: active) }
-    private var filtering: Bool { !navigation.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || navigation.filter != .all }
+    var active: ChannelRef? { store.active?.activeSession?.channel }
+    var snapshot: ChatSidebarSnapshot { ChatSidebarSnapshot(model: model, active: active) }
+    var filtering: Bool { !navigation.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || navigation.filter != .all }
 
     var body: some View {
         let snapshot = snapshot
@@ -113,10 +122,10 @@ struct ChatSidebarView: View {
         .onChange(of: navigation.query) { _, _ in resetFilteredFocus() }
         .onChange(of: navigation.filter) { _, _ in resetFilteredFocus() }
         .onChange(of: focus) { _, value in
-            if value == .tree, navigation.selection == nil { navigation.selection = keyboardRows(snapshot).first?.id }
+            if value == .folders, navigation.selection == nil { navigation.selection = keyboardRows(snapshot).first?.id }
         }
         .onChange(of: navigation.focusRequested, initial: true) { _, requested in
-            if requested { focus = .tree; navigation.focusRequested = false }
+            if requested { focus = .folders; navigation.focusRequested = false }
         }
         // Scoped to this focus subtree: terminal Cmd-F remains untouched.
         .onKeyPress(characters: CharacterSet(charactersIn: "f")) { press in
@@ -125,19 +134,30 @@ struct ChatSidebarView: View {
         }
     }
 
-    private func sidebar(_ snapshot: ChatSidebarSnapshot) -> some View {
-        VStack(spacing: 0) {
-            organization(snapshot)
-            if case .ready = snapshot.state { searchField }
-            tree(snapshot)
-            Spacer(minLength: 0)
-            if case .ready = snapshot.state, let me = model?.members.first(where: { $0.accountId == model?.me }) {
-                account(me)
+    func sidebar(_ snapshot: ChatSidebarSnapshot) -> some View {
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                organization(snapshot)
+                AttentionSidebarSection(store: store, model: attention, telegram: telegram, alwaysShowsHeader: true, maximumHeight: geometry.size.height * 0.4)
+                    .focusable().focused($focus, equals: .attention).focusEffectDisabled()
+                searchField
+                folderTree(snapshot)
+                folderFooter
+                if case .ready = snapshot.state, let me = model?.members.first(where: { $0.accountId == model?.me }) { account(me) }
             }
+        }
+        .background(WindowReader(box: sidebarWindow))
+        .onKeyPress(keys: [.tab]) { press in
+            guard press.modifiers.isEmpty || press.modifiers == .shift else { return .ignored }
+            focus = SidebarFocusRegion.next(focus, backwards: press.modifiers == .shift)
+            return .handled
+        }
+        .sheet(isPresented: $folders.sheetPresented) {
+            FoldersSheet(model: folders, entries: folderEntries(snapshot, includeHidden: true), telegram: telegram) { folders.sheetPresented = false }
         }
     }
 
-    private func organization(_ snapshot: ChatSidebarSnapshot) -> some View {
+    func organization(_ snapshot: ChatSidebarSnapshot) -> some View {
         let orgName = snapshot.state == .notConnected || snapshot.state == .checking ? "This Mac" : model?.orgName ?? "This Mac"
         let connection = ChatConnectionStatus(snapshot: snapshot.state, service: ChatService.shared.state, socket: ChatService.shared.socket?.state)
         return Button { organizationMenu = true } label: {
@@ -158,7 +178,7 @@ struct ChatSidebarView: View {
         .buttonStyle(.plain)
         .chatFocusRing()
         .foregroundStyle(Theme.chromeForeground)
-        .padding(.horizontal, 16).padding(.top, 17).padding(.bottom, 15)
+        .padding(.horizontal, 14).padding(.top, 10).padding(.bottom, 8)
         .accessibilityLabel("Organization and connection")
         .accessibilityValue("\(orgName), \(connection.text)")
         .attentionPopover(isPresented: $organizationMenu, arrowEdge: .bottom) {
@@ -175,25 +195,27 @@ struct ChatSidebarView: View {
         }
     }
 
-    private var searchField: some View {
+    var searchField: some View {
         HStack(spacing: 7) {
             Image(systemName: "magnifyingglass").font(.system(size: 12)).accessibilityHidden(true)
             TextField("Find a channel or agent", text: $navigation.query)
                 .textFieldStyle(.plain).font(Theme.display(10)).focused($focus, equals: .search)
                 .accessibilityLabel("Filter channels and agents by name")
-                .onKeyPress(.downArrow) { focus = .tree; navigation.selection = keyboardRows(snapshot).first?.id; return .handled }
-                .onKeyPress(.escape) { navigation.query = ""; focus = .tree; return .handled }
+                .onKeyPress(.downArrow) { focus = .folders; navigation.selection = keyboardRows(snapshot).first?.id; return .handled }
+                .onKeyPress(.escape) { navigation.query = ""; focus = .folders; return .handled }
         }
         .foregroundStyle(ChatSidebarStyle.secondary)
-        .padding(.horizontal, 8).frame(height: 32)
+        .padding(.horizontal, 8).frame(height: 28)
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(focus == .search ? ChatSidebarStyle.accent : borderColor))
-        .padding(.horizontal, 15).padding(.bottom, 13)
+        .padding(.horizontal, 10).padding(.top, 6).padding(.bottom, 2)
     }
 
-    private func savedViews(_ snapshot: ChatSidebarSnapshot) -> some View {
+    func savedViews(_ snapshot: ChatSidebarSnapshot, entry: String) -> some View {
         VStack(spacing: 0) {
             inboxRow(.unread, badge: ChatSidebarSnapshot.unreadLabel(snapshot.unread))
+                .id(ChatSidebarRowID.folderInbox(entry, .unread)).overlay(focusBorder(.folderInbox(entry, .unread)))
             inboxRow(.mentions, badge: snapshot.mentions > 0 ? "@\(snapshot.mentions)" : nil)
+                .id(ChatSidebarRowID.folderInbox(entry, .mentions)).overlay(focusBorder(.folderInbox(entry, .mentions)))
             if snapshot.incomplete {
                 Text("From loaded history").font(Theme.display(10)).foregroundStyle(ChatSidebarStyle.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 9).padding(.top, 4)
@@ -201,7 +223,7 @@ struct ChatSidebarView: View {
         }.padding(.horizontal, 12)
     }
 
-    private func inboxRow(_ value: ChatInboxKind, badge: String?) -> some View {
+    func inboxRow(_ value: ChatInboxKind, badge: String?) -> some View {
         let ref = model?.key.map { ChatInboxRef($0, kind: value) }
         let selected = ref != nil && store.active?.activeSession?.inbox == ref
         return Button {
@@ -223,93 +245,12 @@ struct ChatSidebarView: View {
             .accessibilityIdentifier("chat-inbox-\(value.rawValue)")
     }
 
-    private func tree(_ snapshot: ChatSidebarSnapshot) -> some View {
-        let teams = snapshot.filteredTeams(query: navigation.query, filter: navigation.filter)
-        let agents = remoteAgents(snapshot)
-        return ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    AttentionSidebarSection(store: store, model: attention, alwaysShowsHeader: true)
-                    if case .ready = snapshot.state {
-                        heading("Channels")
-                        savedViews(snapshot)
-                        ForEach(teams) { team in teamSection(team) }
-                        if let key = model?.key { ChatDMSidebarSection(store: store, key: key) }
-                    } else if snapshot.state == .checking {
-                        caption(model?.notice ?? "Team content is hidden while access is checked.")
-                    } else if snapshot.state == .noChannels {
-                        caption("This server has no channels.")
-                    }
-                    TelegramSidebarSection(store: store, model: TelegramService.chats)
-                    AgentProfilesSection(store: store, history: profileHistory, sharedProfiles: localPublications(snapshot).profiles,
-                        disconnected: snapshot.state == .notConnected || snapshot.state == .checking,
-                        selection: focus == .tree ? navigation.selection : nil, select: { navigation.selection = $0 })
-                        .padding(.top, 18)
-                    if snapshot.agentsServed, navigation.filter == .all, !agents.isEmpty || !filtering {
-                        sectionHeading(.agents, title: "Team agents")
-                            .padding(.top, 24).id(ChatSidebarRowID.agents)
-                        if expanded(.agents) {
-                            ForEach(agents) { agent in agentRow(agent) }
-                            if agents.isEmpty { caption("No agents available") }
-                        }
-                    }
-                    if filtering && teams.isEmpty && agents.isEmpty { caption("No matches") }
-                    AllSessionsSidebarLink(store: store).padding(.top, 16).id(ChatSidebarRowID.allSessions).overlay(focusBorder(.allSessions))
-                    if snapshot.state == .notConnected || snapshot.state == .checking {
-                        ChatDisconnectedRow()
-                        if ChatService.shared.state == .signedIn {
-                            Button("Connect a team") { ConnectionTabs.shared.show() }.buttonStyle(.plain).padding(10)
-                        }
-                    }
-                    if case .ready = snapshot.state, let model = model {
-                        ForEach(model.channelRefusals, id: \.id) { item in
-                            caption("\(item.title): \(item.reason).")
-                        }
-                        if !model.channelRefusals.isEmpty {
-                            Button("Dismiss") { model.dismissRefusals(Set(model.channelRefusals.map(\.id))) }
-                                .buttonStyle(.borderless).padding(8)
-                        }
-                        if let notice = model.notice { caption(notice) }
-                    }
-                }.padding(.horizontal, 12).padding(.bottom, 20)
-            }
-            .focusable().focused($focus, equals: .tree).focusEffectDisabled()
-            .accessibilityLabel("Unified sidebar")
-            .onChange(of: store.agentProfileRevealRevision) { _, _ in
-                if let id = store.revealedAgentProfileID { proxy.scrollTo(id, anchor: .center) }
-            }
-            .onAppear {
-                mapLocalProfiles()
-                if let id = store.revealedAgentProfileID { proxy.scrollTo(id, anchor: .center) }
-            }
-            .onChange(of: TeamService.shared.calls.agents) { _, _ in mapLocalProfiles() }
-            .onChange(of: ChatService.shared.publishRevision) { _, _ in mapLocalProfiles() }
-            .onKeyPress(keys: [.upArrow, .downArrow, .leftArrow, .rightArrow, .return]) { press in
-                guard press.modifiers.isEmpty, focus == .tree else { return .ignored }
-                let key: ChatSidebarKeyboard.Key
-                switch press.key {
-                case .upArrow: key = .up
-                case .downArrow: key = .down
-                case .leftArrow: key = .left
-                case .rightArrow: key = .right
-                default: key = .enter
-                }
-                handle(key, snapshot)
-                if let selected = navigation.selection { proxy.scrollTo(selected, anchor: nil) }
-                return .handled
-            }
-            .onChange(of: keyboardRows(snapshot).map(\.id)) { _, ids in
-                if let selected = navigation.selection, !ids.contains(selected) { navigation.selection = ids.first }
-            }
-        }
-    }
-
-    private func heading(_ title: String) -> some View {
+    func heading(_ title: String) -> some View {
         Text(title).font(Theme.display(11, weight: .semibold)).foregroundStyle(ChatSidebarStyle.secondary)
             .padding(.horizontal, 7).padding(.top, 18).padding(.bottom, 6)
     }
 
-    private func mapLocalProfiles() {
+    func mapLocalProfiles() {
         do {
             try store.agentProfiles.mapPublications(TeamService.shared.calls.agents)
             try ChatService.shared.rememberProfilePublications(store.agentProfiles)
@@ -317,7 +258,7 @@ struct ChatSidebarView: View {
         catch { store.agentProfiles.report(error) }
     }
 
-    private func localPublications(_ snapshot: ChatSidebarSnapshot) -> LocalProfilePublications {
+    func localPublications(_ snapshot: ChatSidebarSnapshot) -> LocalProfilePublications {
         let remembered = store.agentProfiles.details.archive.confirmedPublications ?? []
         guard case .ready = snapshot.state, let key = model?.key else {
             return .init(profiles: Set(remembered.map(\.profileID)))
@@ -327,48 +268,14 @@ struct ChatSidebarView: View {
         return current
     }
 
-    private func remoteAgents(_ snapshot: ChatSidebarSnapshot) -> [ChatSidebarSnapshot.Agent] {
+    func remoteAgents(_ snapshot: ChatSidebarSnapshot) -> [ChatSidebarSnapshot.Agent] {
         let local = localPublications(snapshot).agents
         return snapshot.filteredAgents(query: navigation.query, filter: navigation.filter).filter { !local.contains($0.id) }
     }
 
-    private func teamSection(_ team: ChatSidebarSnapshot.Team) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 0) {
-                sectionHeading(.team(team.id), title: team.card.name + (team.card.archived ? " · archived" : ""))
-                if let model = model, model.canCreateChannel(in: team.card) {
-                    Button {
-                        setExpanded(.team(team.id), true)
-                        ChatSidebarActions.newChannel(in: team.card, model, from: store)
-                    } label: { Image(systemName: "plus").frame(width: 28, height: 28) }
-                    .buttonStyle(.plain).foregroundStyle(ChatSidebarStyle.secondary).chatFocusRing()
-                    .help("Create a channel in \(team.card.name)").accessibilityLabel("Create a channel in \(team.card.name)")
-                }
-            }.id(ChatSidebarRowID.team(team.id))
-            if expanded(.team(team.id)) {
-                ForEach(team.channels) { channel in channelRow(channel) }
-                ForEach(Array(team.creating.enumerated()), id: \.offset) { _, name in caption("#\(name) — creating…") }
-                if team.channels.isEmpty && team.creating.isEmpty { caption("No channels") }
-            }
-        }.padding(.top, 24)
-    }
-
-    private func sectionHeading(_ id: ChatSidebarRowID, title: String) -> some View {
-        Button { navigation.selection = id; setExpanded(id, !expanded(id)) } label: {
-            HStack(spacing: 6) {
-                Image(systemName: expanded(id) ? "chevron.down" : "chevron.right").font(.system(size: 9)).accessibilityHidden(true)
-                Text(title).font(Theme.display(11, weight: .medium)).lineLimit(2)
-                Spacer(minLength: 0)
-            }.padding(.horizontal, 6).frame(minHeight: 32).contentShape(Rectangle())
-        }.buttonStyle(.plain).foregroundStyle(ChatSidebarStyle.secondary)
-            .overlay(focusBorder(id)).chatFocusRing()
-            .accessibilityValue(expanded(id) ? "Expanded" : "Collapsed")
-            .accessibilityHint("Left and right arrows collapse or expand this section")
-    }
-
-    private func channelRow(_ channel: ChatSidebarSnapshot.Channel) -> some View {
+    func channelRow(_ channel: ChatSidebarSnapshot.Channel, entry: String, folder: SidebarCustomFolder? = nil) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            channelButton(channel)
+            channelButton(channel, entry: entry, folder: folder)
             if renamingChannel?.channelId == channel.id, channelNameEdit.isEditing {
                 InlineNameField(edit: channelNameEdit, label: "Channel name") { value in
                     guard let model, model.key == renamingKey, let original = renamingChannel,
@@ -381,20 +288,27 @@ struct ChatSidebarView: View {
     }
 
 
-    private func channelButton(_ channel: ChatSidebarSnapshot.Channel) -> some View {
-        let id = ChatSidebarRowID.channel(channel.id)
+    func channelButton(_ channel: ChatSidebarSnapshot.Channel, entry: String, folder: SidebarCustomFolder?) -> some View {
+        let item = SidebarItemSummary.channel(channel, scope: model!.key!).reference
+        let id = ChatSidebarRowID.entryItem(entry: entry, item: item.stableID)
         let selected = model?.key.map { active == ChannelRef($0, channel: channel.id) } == true
         let unreadStatus = channel.isUnread ? "Unread. " : ""
-        let archivedStatus = channel.card.archived ? "Archived. " : ""
+        let archivedStatus = channel.card.archived ? "Archived · read only. " : ""
         let selectedStatus = selected ? "Selected. " : ""
         let unreadMessages = channel.unreadLabel.map { "\($0) unread messages. " } ?? ""
         let accessibilityValue = "\(unreadStatus)\(archivedStatus)\(selectedStatus)\(unreadMessages)\(channel.mentions) unread mentions"
         return Button { navigation.selection = id; open(channel.id) } label: {
             HStack(alignment: .top, spacing: 9) {
                 Text("#").font(Theme.display(19)).foregroundStyle(ChatSidebarStyle.secondary).frame(width: 17).accessibilityHidden(true)
-                Text(channel.card.name).font(Theme.display(12, weight: channel.isUnread ? .semibold : .regular))
-                    .lineLimit(2).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(channel.card.name).font(Theme.display(11, weight: channel.isUnread ? .semibold : .regular)).lineLimit(1)
+                    if folder != nil {
+                        Text(channel.card.archived ? "Archived · read only" : "Channel · " + (channel.activity.map { relativeActivityLabel($0) } ?? "no activity"))
+                            .font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
                 if channel.card.archived { Image(systemName: "archivebox").font(.system(size: 10)).help("Archived: read only") }
+                if channel.mentions > 0 { SidebarAttentionDot() }
                 if let count = channel.unreadLabel { ChatSidebarBadge(text: count).accessibilityLabel("Unread messages: \(count)") }
                 if let mentions = channel.mentionLabel {
                     ChatSidebarBadge(text: mentions, mention: true).accessibilityLabel("\(channel.mentions) unread mentions from loaded history")
@@ -407,10 +321,15 @@ struct ChatSidebarView: View {
             .help("#\(channel.card.name)" + (channel.card.archived ? " · Archived: read only" : ""))
             .accessibilityLabel("#\(channel.card.name)")
             .accessibilityValue(accessibilityValue)
-            .contextMenu { channelMenu(channel.id) }
+            .sidebarContextMenu(selected: focus == .folders && navigation.selection == id) {
+                channelMenu(channel.id)
+                folderItemActions(item, entry: entry, folder: folder)
+            }
+            .addToFolderAnchor(item, windowID: store.windowID, anchor: entry)
+            .onDrag { SidebarDragRegistry.provider(.init(item: item, binding: folders.snapshot.binding)) }
     }
 
-    @ViewBuilder private func channelMenu(_ id: String) -> some View {
+    @ViewBuilder func channelMenu(_ id: String) -> some View {
         if let model = model, let card = model.visibleChannel(id) {
             Button("Open in New Tab") { open(id, newTab: true) }
             if let unread = model.unread(id) {
@@ -437,15 +356,17 @@ struct ChatSidebarView: View {
         }
     }
 
-    private func agentRow(_ agent: ChatSidebarSnapshot.Agent) -> some View {
-        let id = ChatSidebarRowID.agent(agent.id)
+    func agentRow(_ agent: ChatSidebarSnapshot.Agent, entry: String, folder: SidebarCustomFolder? = nil) -> some View {
+        let item = SidebarItemSummary.teamAgent(agent, scope: model!.key!).reference
+        let id = ChatSidebarRowID.entryItem(entry: entry, item: item.stableID)
         return Button { navigation.selection = id; openAgent(agent.id) } label: {
             HStack(alignment: .top, spacing: 8) {
                 ContactAvatar(stableID: agent.id, name: agent.name, kind: .agent, size: 23, remote: .agent(agent.id, model?.key))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(agent.name).font(Theme.display(11)).lineLimit(2)
-                    Text(agentCaption(agent)).font(Theme.display(9)).foregroundStyle(ChatSidebarStyle.secondary).lineLimit(2)
+                    Text(folder == nil ? agentCaption(agent) : "Team agent · no activity").font(Theme.display(9)).foregroundStyle(ChatSidebarStyle.secondary).lineLimit(2)
                 }.frame(maxWidth: .infinity, alignment: .leading)
+                if agentAttention(agent.id) { SidebarAttentionDot() }
                 Text("BOT").font(Theme.mono(9)).foregroundStyle(ChatSidebarStyle.secondary)
                     .padding(.horizontal, 4).padding(.vertical, 2)
                     .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(borderColor))
@@ -453,20 +374,26 @@ struct ChatSidebarView: View {
         }.buttonStyle(ChatSidebarRowStyle()).foregroundStyle(Theme.chromeForeground).overlay(focusBorder(id)).chatFocusRing().id(id)
             .help("\(agent.name) · Owner: \(agent.owner) · \(agentCaption(agent))")
             .accessibilityLabel("\(agent.name), BOT, owner \(agent.owner), \(agentCaption(agent))")
+            .sidebarContextMenu(selected: focus == .folders && navigation.selection == id) {
+                Button("Open") { openAgent(agent.id) }
+                folderItemActions(item, entry: entry, folder: folder)
+            }
+            .addToFolderAnchor(item, windowID: store.windowID, anchor: entry)
+            .onDrag { SidebarDragRegistry.provider(.init(item: item, binding: folders.snapshot.binding)) }
 
     }
 
-    private func openAgent(_ id: String) {
+    func openAgent(_ id: String) {
         guard let key = model?.key else { return }
         CompositionTabs.shared.agent(id, key: key, channel: active?.channel, from: store)
     }
 
-    private func agentCaption(_ agent: ChatSidebarSnapshot.Agent) -> String {
+    func agentCaption(_ agent: ChatSidebarSnapshot.Agent) -> String {
         [agent.mine ? "You" : agent.owner, agent.device ?? (agent.mine ? "Another Mac" : nil),
          agent.enabled ? (agent.available ? nil : "Unavailable") : "Disabled"].compactMap { $0 }.joined(separator: " · ")
     }
 
-    private func account(_ me: ChatOrgView.Member) -> some View {
+    func account(_ me: ChatOrgView.Member) -> some View {
         HStack(spacing: 9) {
             Button { SupportTabs.shared.settings(.profile) } label: {
                 HStack(spacing: 9) {
@@ -485,93 +412,21 @@ struct ChatSidebarView: View {
             .padding(.horizontal, 16)
     }
 
-    private var borderColor: Color { contrast == .increased ? Theme.chromeForeground.opacity(0.5) : Theme.chromeHairline }
-    private func focusBorder(_ id: ChatSidebarRowID) -> some View {
-        RoundedRectangle(cornerRadius: 6).strokeBorder(focus == .tree && navigation.selection == id ? ChatSidebarStyle.accent : .clear, lineWidth: 2)
+    var borderColor: Color { contrast == .increased ? Theme.chromeForeground.opacity(0.5) : Theme.chromeHairline }
+    func focusBorder(_ id: ChatSidebarRowID) -> some View {
+        RoundedRectangle(cornerRadius: 6).strokeBorder(focus == .folders && navigation.selection == id ? ChatSidebarStyle.accent : .clear, lineWidth: 2)
             .allowsHitTesting(false)
     }
-    private func caption(_ text: String) -> some View {
+    func caption(_ text: String) -> some View {
         Text(text).font(Theme.display(10)).foregroundStyle(ChatSidebarStyle.secondary)
             .fixedSize(horizontal: false, vertical: true).padding(9)
     }
-    private func expanded(_ id: ChatSidebarRowID) -> Bool {
-        if case .profile(let id) = id { return store.expandedAgentProfiles.contains(id) }
-        if filtering { return !navigation.filterCollapsed.contains(id) }
-        guard let key = model?.key else { return false }
-        switch id {
-        case .team(let team): return !store.chatSidebarPreferences.collapsed.contains(.init(key, team: team))
-        case .agents: return !store.chatSidebarPreferences.collapsed.contains(.init(key, team: nil))
-        default: return false
-        }
-    }
-    private func setExpanded(_ id: ChatSidebarRowID, _ value: Bool) {
-        if case .profile(let id) = id {
-            if value { store.expandedAgentProfiles.insert(id) } else { store.expandedAgentProfiles.remove(id) }
-            return
-        }
-        if filtering {
-            if value { navigation.filterCollapsed.remove(id) } else { navigation.filterCollapsed.insert(id) }
-            return
-        }
-        guard let key = model?.key else { return }
-        switch id {
-        case .team(let team): store.setChatSectionCollapsed(.init(key, team: team), !value)
-        case .agents: store.setChatSectionCollapsed(.init(key, team: nil), !value)
-        default: break
-        }
-    }
-    private func keyboardRows(_ snapshot: ChatSidebarSnapshot) -> [ChatSidebarKeyboard.Row] {
-        var rows: [ChatSidebarKeyboard.Row] = []
-        for team in snapshot.filteredTeams(query: navigation.query, filter: navigation.filter) {
-            let id = ChatSidebarRowID.team(team.id)
-            rows.append(.init(id: id, expanded: expanded(id)))
-            if expanded(id) { rows += team.channels.map { .init(id: .channel($0.id), parent: id) } }
-        }
-        let shared = localPublications(snapshot).profiles
-        let profiles = store.agentProfiles.profiles.sorted {
-            if shared.contains($0.id) != shared.contains($1.id) { return shared.contains($0.id) }
-            let order = $0.name.localizedStandardCompare($1.name)
-            return order == .orderedSame ? $0.id.uuidString < $1.id.uuidString : order == .orderedAscending
-        }
-        for profile in profiles {
-            let id = ChatSidebarRowID.profile(profile.id)
-            rows.append(.init(id: id, expanded: expanded(id)))
-            if expanded(id) {
-                let items = store.profileSessionItems(profile), limit = store.profileHistoryLimits[profile.id] ?? 5
-                rows += AgentProfileSessions.page(items, limit: limit).map { .init(id: .history(profile.id, $0.id), parent: id) }
-                if items.count > limit { rows.append(.init(id: .more(profile.id), parent: id)) }
-            }
-        }
-        let agents = remoteAgents(snapshot)
-        if snapshot.agentsServed, navigation.filter == .all, !agents.isEmpty || !filtering {
-            rows.append(.init(id: .agents, expanded: expanded(.agents)))
-            if expanded(.agents) { rows += agents.map { .init(id: .agent($0.id), parent: .agents) } }
-        }
-        rows.append(.init(id: .allSessions))
-        return rows
-    }
-    private func handle(_ key: ChatSidebarKeyboard.Key, _ snapshot: ChatSidebarSnapshot) {
-        switch ChatSidebarKeyboard.route(key, selection: navigation.selection, rows: keyboardRows(snapshot)) {
-        case .select(let id): navigation.selection = id
-        case .expand(let id, let expanded): setExpanded(id, expanded)
-        case .activate(.channel(let id)): open(id)
-        case .activate(.agent(let id)): openAgent(id)
-        case .activate(.profile(let id)): store.activateAgentProfile(id)
-        case .activate(.history(let id, let item)):
-            if let profile = store.agentProfiles.profile(id), let row = store.profileSessionItems(profile).first(where: { $0.id == item }) {
-                store.openProfileSession(row, profileID: id)
-            }
-        case .activate(.more(let id)): store.profileHistoryLimits[id, default: 5] += 5
-        case .activate(.allSessions): SupportTabs.shared.navigation.open(.allSessions, from: store)
-        default: break
-        }
-    }
-    private func resetFilteredFocus() { navigation.selection = nil; navigation.agentID = nil; navigation.filterCollapsed = [] }
-    private func open(_ id: String, newTab: Bool = false) {
+    func resetFilteredFocus() { navigation.selection = nil; navigation.agentID = nil; navigation.filterCollapsed = [] }
+    func open(_ id: String, newTab: Bool = false) {
         guard let model = model, let key = model.key, model.visibleChannel(id) != nil else { return }
         store.showChannel(ChannelRef(key, channel: id), newTab: newTab)
     }
-    private func openCreated() {
+    func openCreated() {
         guard let model = model, let key = model.key else { return }
         for ref in navigation.toOpen where ref.belongs(to: key) && model.visibleChannel(ref.channel) != nil {
             navigation.toOpen.remove(ref)

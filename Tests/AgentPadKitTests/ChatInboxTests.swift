@@ -823,6 +823,10 @@ extension ChatInboxTests {
 
     func testNativeInboxListsAndEmptyStates() async throws {
         _ = NSApplication.shared
+        let enhancedUI = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previousEnhancedUI = NSApp.accessibilityAttributeValue(enhancedUI)
+        NSApp.accessibilitySetValue(true, forAttribute: enhancedUI)
+        defer { NSApp.accessibilitySetValue(previousEnhancedUI, forAttribute: enhancedUI) }
         let (store, org) = try fixture()
         try post(store, "old", seq: 1, text: "@andrew The first draft is ready for review.", at: "2026-10-05T15:30:00Z")
         try write(store) { try ChatUnread.markRead($0, channel: "alpha", upTo: 1) }
@@ -839,8 +843,8 @@ extension ChatInboxTests {
         let service = ChatService(files: ChatFiles(directory: directory), tokens: FakeTokenStore())
         let unread = inbox(store, org)
         let mention = inbox(store, org, kind: .mentions)
-        // Fixed native click coordinates require an isolated attention source:
-        // earlier tests can leave local reasons in the app-wide ledger.
+        // Keep the native fixture's attention deterministic; earlier tests can
+        // leave local reasons in the app-wide ledger.
         let attention = AttentionSidebarModel(ledger: AttentionLedger())
         func content(_ kind: ChatInboxKind) -> AnyView {
             AnyView(HStack(spacing: 0) {
@@ -863,15 +867,22 @@ extension ChatInboxTests {
         window.isReleasedWhenClosed = false; window.title = "AgentPad — Chat"; window.contentView = host
         defer { window.contentView = nil; window.close() }
         window.makeKeyAndOrderFront(nil)
-        // Real AppKit mouse events in the fixed native fixture exercise the
-        // SwiftUI buttons; XCTest does not expose SwiftUI's AX tree here.
+        // Keep real AppKit clicks, but locate the sidebar controls in its live
+        // accessibility tree so folder/header spacing cannot change the target.
+        func accessibilityNodes(_ object: NSObject, depth: Int = 0) -> [FoldersAXNode] {
+            guard depth < 40 else { return [] }
+            let node = FoldersAXNode(object: object)
+            return [node] + node.children.flatMap { accessibilityNodes($0, depth: depth + 1) }
+        }
         func press(_ id: String) throws {
             let point: NSPoint
             switch id {
-            // The rail design keeps the empty Needs attention header visible
-            // above Channels (401fb30), adding 43 points to these native targets.
-            case "chat-inbox-unread": point = NSPoint(x: 100, y: 700 - 207)
-            case "chat-inbox-mentions": point = NSPoint(x: 100, y: 700 - 241)
+            case "chat-inbox-unread", "chat-inbox-mentions":
+                let node = try XCTUnwrap(accessibilityNodes(host).first { $0.attribute("accessibilityIdentifier") as? String == id })
+                let frame = node.accessibilityFrame()
+                XCTAssertGreaterThan(frame.width, 0)
+                XCTAssertGreaterThan(frame.height, 0)
+                point = window.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY))
             case "chat-inbox-mark-all-read": point = NSPoint(x: 1020, y: 700 - Theme.contentHeaderHeight - 31)
             case "chat-inbox-message-reply": point = NSPoint(x: 500, y: 700 - Theme.contentHeaderHeight - 225)
             default: return XCTFail("Unknown native target: \(id)")

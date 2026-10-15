@@ -272,9 +272,9 @@ final class SearchTextField: NSTextField, NSTextFieldDelegate {
             model.move(1)
         case #selector(NSResponder.moveUp(_:)): model.move(-1)
         case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
-            guard !textView.hasMarkedText(), NSApp.currentEvent?.isARepeat != true else { return true }
+            guard !textView.hasMarkedText(), NSApp.currentEvent.map({ $0.type == .keyDown && $0.isARepeat }) != true else { return true }
             let modifiers = NSApp.currentEvent?.modifierFlags.intersection([.command, .control, .option, .shift]) ?? []
-            if modifiers == [.command, .shift], model.selected?.hasPrefix("t:") == true { model.activate(pin: true) }
+            if modifiers == [.command, .shift], model.selected?.hasPrefix("t:") == true { model.activate(addToFolder: true) }
             else if modifiers == .option { model.activate(beside: true) }
             else if modifiers == .command { model.showResults() }
             else if modifiers.isEmpty { model.activate() }
@@ -285,7 +285,7 @@ final class SearchTextField: NSTextField, NSTextFieldDelegate {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if ownsEditor, event.keyCode == 36, event.modifierFlags.intersection([.command, .control, .option, .shift]) == [.command, .shift],
            model.selected?.hasPrefix("t:") == true {
-            if event.isARepeat == false, (currentEditor() as? NSTextView)?.hasMarkedText() != true { model.activate(pin: true) }
+            if event.isARepeat == false, (currentEditor() as? NSTextView)?.hasMarkedText() != true { model.activate(addToFolder: true) }
             return true
         }
         if ownsEditor, event.keyCode == 36, event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command {

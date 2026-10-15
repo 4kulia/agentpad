@@ -13,7 +13,7 @@ final class TelegramChatConnectorTests: XCTestCase, @unchecked Sendable {
         let time = Int64(Date().timeIntervalSince1970)
         fixture.client.enqueue(ChatFixture.chat(100, title: "From last message", message: ChatFixture.message(date: time)))
         let id = TelegramChatID(environment: .test, account: ChatFixture.me, chat: 100)
-        await eventually { await connector.chat(id)?.isAutomatic == true }
+        await eventually { await connector.chat(id)?.knownRelevant == true }
         let loaded = await connector.chat(id)
         let row = try XCTUnwrap(loaded)
         await connector.setChatMode(id, mode: .hidden)

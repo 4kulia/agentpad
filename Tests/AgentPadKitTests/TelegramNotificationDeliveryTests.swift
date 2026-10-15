@@ -7,9 +7,6 @@ private actor TelegramDeliveryProvider: TelegramChatProvider {
     var consumed = Set<String>()
     func consumeNotification(_ id: String) -> Bool { consumed.insert(id); return true }
     func chatSnapshots() -> AsyncStream<TelegramChatSnapshot> { AsyncStream { $0.finish() } }
-    func chatPage(offset: Int, revision: UInt64) -> TelegramChatPage { .init(revision: revision, offset: offset, rows: []) }
-    func expandChats(showLess: Bool) {}
-    func holdChatOrder(_ held: Bool, owner: UUID) {}
     func setChatMode(_ id: TelegramChatID, mode: TelegramChatMode) {}
     func searchTelegram(_ query: String) -> AsyncStream<TelegramSearchSnapshot> { AsyncStream { $0.finish() } }
     func resolveChat(_ hit: TelegramSearchHit) -> TelegramChatRow? { nil }

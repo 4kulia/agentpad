@@ -17,7 +17,7 @@ public enum TelegramChatKind: String, Codable, Sendable {
     case person, group, supergroup, channel, forum, bot, savedMessages, secret, channelDirect, unknown
     public var eligible: Bool { self != .secret && self != .channelDirect && self != .unknown }
 }
-public enum TelegramChatMode: String, Sendable { case auto, pinned, hidden }
+public enum TelegramChatMode: String, Sendable { case auto, hidden }
 public struct TelegramChatRow: Identifiable, Equatable, Sendable {
     public var id: TelegramChatID
     public var title: String
@@ -30,35 +30,87 @@ public struct TelegramChatRow: Identifiable, Equatable, Sendable {
     public var pinned: Bool
     public var hidden: Bool
     public var lastMessageDate: Int64
-    public var recentOutgoingDate: Int64
-    public var isAutomatic: Bool
+    public var knownRelevant: Bool
+    public var markedUnread = false
+    public var muted = true
+    public var lastOutgoing = false
+    public var attentionOrderKey: TelegramAttentionOrderKey? = nil
     public var attention: TelegramAttentionSummary? = nil
-    public var channelNotifications = false
-    public var channelNotificationsActivating = false
+    public var followEnabled = false
+    public var followActivating = false
     public var snoozed = false
+    public var lists: Set<TelegramListKey> = []
+    public var listPosition: Int? = nil
 }
 public enum TelegramChatScanState: Equatable, Sendable {
     case disconnected, scanning, complete, paused(String)
 }
+
+/// Built on the provider actor once per frozen revision. Consumers share the
+/// immutable buffers and compare versions, never traverse the order to adopt it.
+public struct TelegramAttentionOrder: Equatable, Sendable {
+    public let binding: TelegramProfileBinding
+    public let revision: UInt64
+    public let keys: [TelegramAttentionOrderKey]
+    public let positions: [Int64:Int]
+    public init(binding: TelegramProfileBinding, revision: UInt64, keys: [TelegramAttentionOrderKey]) {
+        self.binding = binding; self.revision = revision; self.keys = keys
+        positions = Dictionary(uniqueKeysWithValues: keys.enumerated().map { ($0.element.chat,$0.offset) })
+    }
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.binding == rhs.binding && lhs.revision == rhs.revision
+    }
+}
+
+/// Live marks have their own version because read state changes during a hold.
+/// Keep them immutable: a view's page corrections must not copy this full set.
+public struct TelegramAttentionState: Equatable, Sendable {
+    public let order: TelegramAttentionOrder
+    public let liveChats: Set<Int64>
+    public let inactive: Set<Int64>
+    public let version = UUID()
+    public init(order: TelegramAttentionOrder, liveChats: Set<Int64>) {
+        self.order = order; self.liveChats = liveChats
+        inactive = Set(order.positions.keys).subtracting(liveChats)
+    }
+    public static func == (lhs: Self, rhs: Self) -> Bool { lhs.version == rhs.version }
+}
+
 public struct TelegramChatSnapshot: Equatable, Sendable {
+    public var binding: TelegramProfileBinding?
+    public var lists: [TelegramListSnapshot] = []
+    public var attentionRows: [TelegramChatRow] = []
+    public var attentionTotal = 0
+    public var attentionRevision: UInt64 = 0
+    public var attentionNext: Int?
+    public var attentionFrontier: TelegramAttentionOrderKey?
+    /// Ready-made frozen geometry, position index and live eligibility markers.
+    public var attentionState: TelegramAttentionState?
+    public var attentionKeys: [TelegramAttentionOrderKey]? { attentionState?.order.keys }
+    public var attentionLiveChats: Set<Int64>? { attentionState?.liveChats }
+    public var attentionNewCount = 0
+    /// Live membership counts for frozen windows, without retaining their rows.
+    public var attentionWindowCounts: [Int:Int] = [:]
+    public var suggestionRows: [TelegramChatRow] = []
     public var account: TelegramChatID?
-    public var revision: UInt64 = 0
     public var state: TelegramChatScanState = .disconnected
-    public var foundCount = 0
-    public var automaticCount = 0
-    public var visibleCount = 0
-    public var expanded = false
-    public var firstRows: [TelegramChatRow] = []
-    public var automaticRows: [TelegramChatRow] = []
     public var error: String?
     public var attention = TelegramAttentionSnapshot()
-    public var overflow: Int { max(0, foundCount - visibleCount) }
     public init() {}
 }
-public struct TelegramChatPage: Sendable {
+public struct TelegramChatPage: Equatable, Sendable {
     public let revision: UInt64
     public let offset: Int
     public let rows: [TelegramChatRow]
+    public let next: Int?
+    public let attentionFrontier: TelegramAttentionOrderKey?
+    public let attentionKeys: [TelegramAttentionOrderKey]?
+    public init(revision: UInt64, offset: Int, rows: [TelegramChatRow], next: Int? = nil, attentionFrontier: TelegramAttentionOrderKey? = nil,
+                attentionKeys: [TelegramAttentionOrderKey]? = nil) {
+        self.revision = revision; self.offset = offset; self.rows = rows; self.next = next
+        self.attentionFrontier = attentionFrontier
+        self.attentionKeys = attentionKeys
+    }
 }
 public struct TelegramSearchHit: Identifiable, Equatable, Sendable {
     public var row: TelegramChatRow
@@ -78,9 +130,21 @@ public struct TelegramSearchSnapshot: Sendable {
 }
 public protocol TelegramChatProvider: Sendable {
     func chatSnapshots() async -> AsyncStream<TelegramChatSnapshot>
-    func chatPage(offset: Int, revision: UInt64) async -> TelegramChatPage
-    func expandChats(showLess: Bool) async
-    func holdChatOrder(_ held: Bool, owner: UUID) async
+    func chatPage(list: TelegramListKey, from: Int, revision: UInt64, binding: TelegramProfileBinding) async -> TelegramChatPage
+    func expandChats(list: TelegramListKey, showLess: Bool, binding: TelegramProfileBinding) async throws
+    func holdChatOrder(list: TelegramListKey, held: Bool, owner: UUID, binding: TelegramProfileBinding) async throws
+    func attentionPage(start: Int, revision: UInt64, binding: TelegramProfileBinding) async -> TelegramChatPage
+    func holdAttentionOrder(_ held: Bool, owner: UUID, binding: TelegramProfileBinding) async throws
+    func setViewport(list: TelegramListKey, windows: Set<Int>, binding: TelegramProfileBinding) async throws
+    func setListVisible(_ list: TelegramListKey, visible: Bool, binding: TelegramProfileBinding) async throws
+    func setListCollapsed(window: UUID, list: TelegramListKey, collapsed: Bool, binding: TelegramProfileBinding) async throws
+    func retainFolderWindows(_ windows: Set<UUID>, binding: TelegramProfileBinding) async throws
+    func customMembers(binding: TelegramProfileBinding) async throws -> [UUID:Set<Int64>]
+    func customSummaries(binding: TelegramProfileBinding) async throws -> [TelegramFolderSummary]
+    func setCustomMember(folder: UUID, chat: Int64, member: Bool, binding: TelegramProfileBinding) async throws
+    func applyTombstones(_ tombstones: Set<UUID>, binding: TelegramProfileBinding) async throws
+    func markAsRead(_ chat: Int64, retry: Set<TelegramMarkReadStep>?, binding: TelegramProfileBinding) async -> TelegramMarkReadResult
+    func setFollow(_ chat: Int64, enabled: Bool, binding: TelegramProfileBinding) async throws
     func setChatMode(_ id: TelegramChatID, mode: TelegramChatMode) async
     func searchTelegram(_ query: String) async -> AsyncStream<TelegramSearchSnapshot>
     func resolveChat(_ hit: TelegramSearchHit) async -> TelegramChatRow?
@@ -90,14 +154,12 @@ public protocol TelegramChatProvider: Sendable {
     func setAttentionDestinations(_ destinations: Set<TelegramChatID>) async
     func setDirectAttention(_ enabled: Bool) async
     func snoozeAttention(_ id: TelegramChatID, undo: Bool) async
-    func setChannelNotifications(_ id: TelegramChatID, enabled: Bool) async
     func consumeNotification(_ id: String) async -> Bool
 }
 
-enum TelegramChatLimits {
+public enum TelegramChatLimits {
     static let page = 50
-    static let recentSeconds: Int64 = 7 * 24 * 60 * 60
-    static let metadataRows = 1000
+    public static let metadataRows = 1000
     static let interactiveCalls = 6
 }
 
@@ -111,14 +173,4 @@ enum TelegramRecentOutgoing {
         "messageAnimatedEmoji", "messageDice", "messageGame", "messagePoll", "messageStakeDice",
         "messageStory", "messageChecklist", "messageInvoice", "messageGiveaway"
     ]
-    static func candidate(_ message: TDLibMessage) -> (date: Int64, sender: Int64)? {
-        guard message["is_outgoing"]?.bool == true,
-              message["sending_state"] == nil || message["sending_state"] == .null,
-              message["scheduling_state"] == nil || message["scheduling_state"] == .null,
-              let id = message["id"]?.integer, id > 0, id & ((1 << 20) - 1) == 0,
-              userContent.contains(message["content"]?.object?.type ?? ""),
-              let date = message["date"]?.integer, date > 0 else { return nil }
-        let sender = message["sender_id"]?.object
-        return (date, sender?.type == "messageSenderUser" ? sender?["user_id"]?.integer ?? 0 : 0)
-    }
 }

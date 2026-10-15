@@ -338,6 +338,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             for id in ids { addWindow(windowId: id) }
         }
         TabRouter.shared.reconcileRestoredTabs()
+        SidebarFoldersService.windows(Set(windowControllers.map { $0.store.windowID }))
         // `addWindow` keys each as it's created; duplicate Connection routes
         // then focus their surviving tab. The previous key window isn't saved.
         //

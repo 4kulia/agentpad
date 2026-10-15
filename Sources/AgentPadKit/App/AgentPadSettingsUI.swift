@@ -1311,6 +1311,7 @@ struct AgentPadSettingsView: View {
             case .general: generalDetail
             case .profile: AccountProfileSettings()
             case .telegram: TelegramSettingsView(model: TelegramService.settings)
+            case .sidebar: SidebarFolderSettings()
             case .appearance: appearanceDetail
             case .agents: codingAgentsDetail
             case .terminals: terminalPresetsDetail
