@@ -32,6 +32,8 @@ struct TeamRunRequest: Sendable {
     /// and session agents cannot use executor transcripts as a source.
     var isExecutorConversation = false
     var dmHistoryFiles: ChatFiles = .standard
+    /// The executor and its version preflight share one process registry.
+    var processes: TeamProcesses = .shared
 }
 
 struct TeamRunResult: Codable, Equatable, Sendable {
@@ -50,6 +52,8 @@ struct TeamProcessStart: Equatable, Sendable {
 }
 
 protocol TeamAgentRunner: Sendable {
+    /// The account of processes used by the launcher and recovery as well.
+    var processes: TeamProcesses { get }
     /// Runs the call to the end. Cancelling the task stops the process.
     /// `onActivity` receives the tool the agent is using now.
     func run(_ request: TeamRunRequest, onActivity: @escaping @Sendable (String) -> Void) async throws -> TeamRunResult
@@ -60,6 +64,7 @@ protocol TeamAgentRunner: Sendable {
 }
 
 extension TeamAgentRunner {
+    var processes: TeamProcesses { .shared }
     func run(_ request: TeamRunRequest, onActivity: @escaping @Sendable (String) -> Void,
              onProcessStarted: @escaping @Sendable (TeamProcessStart) throws -> Void) async throws -> TeamRunResult {
         try await run(request, onActivity: onActivity)
@@ -133,6 +138,7 @@ struct ClaudeCodeRunner: TeamAgentRunner {
     /// inherits CLAUDE_CONFIG_DIR from the app or a caller's environment.
     var isolatedConfigDirectory: URL? = nil
     var isolatedHomeDirectory: URL? = nil
+    var processes: TeamProcesses = .shared
 
     func executionEnvironment(claudePath: String, isolateGit: Bool, ownersPath: Bool,
                               base: [String: String] = ProcessInfo.processInfo.environment) throws -> [String: String] {
@@ -379,9 +385,11 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         // app's registry, or a server run in the journal not confirmed gone —
         // starts no new one, in any mode, until the owner dealt with them
         // (review C8-2, C10-6).
+        var request = request
+        request.processes = processes
         let agentId = request.agent.id.uuidString.lowercased()
         let journalBlocks = await MainActor.run { TeamRunAdmission.journalBlocks(agentId) }
-        guard !TeamProcesses.shared.blocks(agentId: agentId), !journalBlocks else {
+        guard !processes.blocks(agentId: agentId), !journalBlocks else {
             throw TeamRunnerError.didNotStart("an earlier run of this agent may still be running; see the Team window")
         }
         try ClaudeVersionPreflight.checkCancellation()
@@ -467,12 +475,12 @@ struct ClaudeCodeRunner: TeamAgentRunner {
             spawned.kill()
             _ = await exited.wait(timeout: .seconds(5))
             spawned.release()
-            TeamProcesses.shared.remove(identity)
+            processes.remove(identity)
             throw error
         }
         // After quit began nothing new is registered: the run is not let go
         // of and ends here (review C4-2).
-        guard TeamProcesses.shared.add(identity, seen: seen, callId: request.runToolsCallId, spawned: spawned,
+        guard processes.add(identity, seen: seen, callId: request.runToolsCallId, spawned: spawned,
                                        agentId: request.agent.id.uuidString.lowercased()) else {
             try await abandon(TeamRunnerError.didNotStart("AgentPad is quitting"))
         }
@@ -532,10 +540,10 @@ struct ClaudeCodeRunner: TeamAgentRunner {
         // C7-11), with whether its output was seen closed. The registry holds
         // the leader until then; removing it lets the leader be reaped.
         if stopped == .stopped {
-            TeamProcesses.shared.remove(identity)
+            processes.remove(identity)
             spawned.release()
         } else {
-            TeamProcesses.shared.markLeftOver(identity, outputOpen: !stop.sawOutputClosed)
+            processes.markLeftOver(identity, outputOpen: !stop.sawOutputClosed)
         }
 
         if Task.isCancelled { throw TeamRunnerError.stopped(stopped) }
@@ -674,6 +682,8 @@ final class TeamProcesses: @unchecked Sendable {
     /// By the leader's identity: a later run whose leader got the same
     /// number is another entry (review C8-2).
     private var entries: [ProcessIdentity: Entry] = [:]
+    /// Crash evidence is checked by recovery, never signalled by killAll at quit.
+    private var recovered: [ProcessIdentity: TeamPidSet] = [:]
     /// Quit began: nothing new is registered (review C4-2).
     private var closed = false
 
@@ -711,6 +721,11 @@ final class TeamProcesses: @unchecked Sendable {
     /// Tests: every read of the table takes this many seconds (a read that hangs).
     nonisolated(unsafe) static var tableHang: TimeInterval?
 
+    /// The kernel read, replaceable by tests to exercise a size/read race.
+    nonisolated(unsafe) static var readProcessTable: @Sendable (inout [Int32], UnsafeMutableRawPointer?, inout Int) -> Int32 = { mib, buffer, size in
+        sysctl(&mib, UInt32(mib.count), buffer, &size, nil, 0)
+    }
+
     /// The live process of `identity`: alive as itself, gone (none, or another
     /// process has the number), or unknown (the table could not be read).
     static func liveness(_ identity: ProcessIdentity) -> Liveness {
@@ -727,14 +742,24 @@ final class TeamProcesses: @unchecked Sendable {
         if let hang = tableHang { Thread.sleep(forTimeInterval: hang) }
         if tableUnreadable || (wholeTableUnreadable && mib[2] == KERN_PROC_ALL) { return nil }
         var mib = mib
-        var size = 0
-        guard sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0 else { return nil }
-        guard size > 0 else { return [] }
-        let count = size / MemoryLayout<kinfo_proc>.stride + 16
-        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
-        size = count * MemoryLayout<kinfo_proc>.stride
-        guard sysctl(&mib, UInt32(mib.count), &procs, &size, nil, 0) == 0 else { return nil }
-        return Array(procs.prefix(size / MemoryLayout<kinfo_proc>.stride)).filter { $0.kp_proc.p_stat != SZOMB }
+        // The process table can grow between sizing and copying it. ENOMEM
+        // means the buffer was too small, not that the processes are unknown.
+        // Retry the entire snapshot; never use a partial copy or forget an
+        // actual failed look. Bound retries if the table keeps changing.
+        for _ in 0..<3 {
+            var size = 0
+            guard readProcessTable(&mib, nil, &size) == 0 else { return nil }
+            guard size > 0 else { return [] }
+            let count = size / MemoryLayout<kinfo_proc>.stride + 16
+            var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+            size = count * MemoryLayout<kinfo_proc>.stride
+            if readProcessTable(&mib, &procs, &size) == 0 {
+                return Array(procs.prefix(size / MemoryLayout<kinfo_proc>.stride)).filter { $0.kp_proc.p_stat != SZOMB }
+            }
+            let error = errno
+            guard error == ENOMEM else { return nil }
+        }
+        return nil
     }
 
     /// The live processes of group `pgid`, each with its start time from the
@@ -812,7 +837,10 @@ final class TeamProcesses: @unchecked Sendable {
         }
     }
     func remove(_ leader: TeamProcessStart) {
-        let entry = lock.withLock { entries.removeValue(forKey: leader.identity) }
+        let entry = lock.withLock {
+            recovered.removeValue(forKey: leader.identity)
+            return entries.removeValue(forKey: leader.identity)
+        }
         // No longer held by the registry: the leader is reaped once it ended.
         // Detached: a stop whose look hangs holds the leader's lock, and the
         // registry is called from the main actor.
@@ -932,7 +960,21 @@ final class TeamProcesses: @unchecked Sendable {
     /// registered with that very identity: one account of them for the run,
     /// its stop and every later check (review C6-3).
     func seen(of leader: TeamProcessStart) -> TeamPidSet? {
-        lock.withLock { entries[leader.identity]?.seen }
+        lock.withLock { entries[leader.identity]?.seen ?? recovered[leader.identity] }
+    }
+
+    /// Restore crash evidence without replacing a still-held leader or its account.
+    func restore(_ leader: TeamProcessStart, seen snapshot: TeamPidSet.Snapshot) -> TeamPidSet? {
+        let seen = lock.withLock { () -> TeamPidSet? in
+            if let seen = entries[leader.identity]?.seen ?? recovered[leader.identity] { return seen }
+            guard !closed else { return nil }
+            let seen = TeamPidSet()
+            recovered[leader.identity] = seen
+            return seen
+        }
+        seen?.insert(snapshot.identities)
+        if snapshot.incomplete { seen?.markIncomplete() }
+        return seen
     }
 
     /// Every run now: its leader while confirmed (nil once its number is gone
@@ -1013,6 +1055,7 @@ final class TeamProcesses: @unchecked Sendable {
             var alive = states.contains(.alive)
             if held, leader.pgid == leader.pid {
                 if let members = groupIdentities(leader.pid) {
+                    seen?.insert(members)
                     if members.contains(where: { $0.pid != leader.pid }) { alive = true }
                 } else {
                     unknown = true
@@ -1080,6 +1123,7 @@ final class TeamProcesses: @unchecked Sendable {
             }
             if held, leader.pgid == leader.pid {
                 if let members = groupIdentities(leader.pid) {
+                    seen.insert(members)
                     alive += members.filter { $0.pid != leader.pid }
                 } else {
                     unknown.append("the run's process group could not be looked at")
@@ -1183,21 +1227,56 @@ final class TeamRunLog: @unchecked Sendable {
 /// from the same read — so a number the system has since given to another
 /// process is never taken for it.
 final class TeamPidSet: @unchecked Sendable {
+    struct Snapshot: Codable, Equatable, Sendable {
+        var identities: [ProcessIdentity]
+        var incomplete: Bool
+    }
+
     private let lock = NSLock()
     /// Every identity seen: a number seen again under another start time is
     /// another process, kept too (review C7-5).
     private var seen: Set<ProcessIdentity> = []
     private var missed = false
+    private var save: (@Sendable (Snapshot) throws -> Void)?
+    private var saved: Snapshot?
 
     init(_ identities: [ProcessIdentity] = []) { insert(identities) }
 
     func insert(_ identities: [ProcessIdentity]) {
-        lock.withLock { seen.formUnion(identities) }
+        lock.withLock {
+            seen.formUnion(identities)
+            saveChanges()
+        }
+    }
+
+    /// Installed before the suspended process runs. Writes stay under this lock
+    /// so an older concurrent snapshot cannot overwrite a newly discovered child.
+    /// The writer must not call back into this account or its registry.
+    func persist(_ save: @escaping @Sendable (Snapshot) throws -> Void) throws {
+        try lock.withLock {
+            self.save = save
+            let current = snapshot()
+            try save(current)
+            saved = current
+        }
+    }
+
+    private func snapshot() -> Snapshot {
+        Snapshot(identities: seen.sorted { ($0.pid, $0.startTime) < ($1.pid, $1.startTime) }, incomplete: missed)
+    }
+
+    /// A failed write leaves cleanup unconfirmed and is retried on the next look.
+    private func saveChanges() {
+        guard let save else { return }
+        let current = snapshot()
+        guard saved != current else { return }
+        do { try save(current); saved = current }
+        catch { missed = true }
     }
 
     /// A look for its processes failed: some may never have been seen, so
     /// they can never be confirmed gone (review C7-2).
-    func markIncomplete() { lock.withLock { missed = true } }
+    func markIncomplete() { lock.withLock { missed = true; saveChanges() } }
     var isIncomplete: Bool { lock.withLock { missed } }
 
     var identities: [ProcessIdentity] { lock.withLock { Array(seen) } }

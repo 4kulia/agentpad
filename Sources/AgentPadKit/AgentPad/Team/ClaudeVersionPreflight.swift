@@ -298,7 +298,7 @@ enum ClaudeVersionCommand {
         try? input.fileHandleForWriting.close()
         spawned.onExit { exited.finish($0); woke.finish(1) }
         let seen = TeamPidSet()
-        let registered = TeamProcesses.shared.add(spawned.identity, seen: seen, callId: nil, spawned: spawned,
+        let registered = request.processes.add(spawned.identity, seen: seen, callId: nil, spawned: spawned,
                                                    agentId: request.agent.id.uuidString.lowercased())
         var recordingError: Error?
         do { try request.onPreflightProcess?(spawned.identity) } catch { recordingError = error }
@@ -320,10 +320,10 @@ enum ClaudeVersionCommand {
         let cleanup = await stop.outcome()
         watcher.cancel()
         guard cleanup == .stopped else {
-            TeamProcesses.shared.markLeftOver(spawned.identity, outputOpen: !stop.sawOutputClosed)
+            request.processes.markLeftOver(spawned.identity, outputOpen: !stop.sawOutputClosed)
             throw TeamRunnerError.preflightCleanupUnconfirmed(spawned.identity, cleanup)
         }
-        TeamProcesses.shared.remove(spawned.identity)
+        request.processes.remove(spawned.identity)
         spawned.release()
         do { try request.onPreflightProcess?(nil) } catch {
             throw TeamRunnerError.didNotStart("Не удалось записать завершение проверки версии Claude Code: \(error.localizedDescription)")

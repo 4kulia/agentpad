@@ -169,6 +169,9 @@ struct ChatRunRecord: Codable, Equatable, Sendable, FetchableRecord, Persistable
     var launchFailure: ClaudeLaunchDiagnostic.Failure? = nil
     /// Being stopped for this reason when the app had to quit.
     var stopReason: String?
+    /// Processes discovered under this run, retained even after its leader dies.
+    /// Nil for journals written before this account was persisted.
+    var seen: TeamPidSet.Snapshot? = nil
     /// When its processes were confirmed gone — by this app's own stop, or by
     /// the owner after a crash: from then on only its outcome and fact are
     /// owed, and its numbers are not looked at again (review C6-6, C7).
@@ -191,7 +194,7 @@ struct ChatRunRecord: Codable, Equatable, Sendable, FetchableRecord, Persistable
     var channelRevoked = false
 
     enum CodingKeys: String, CodingKey {
-        case pid, pgid, outcome, kind, org
+        case pid, pgid, outcome, kind, org, seen
         case launchFailure = "launch_failure"
         case channelId = "channel_id", threadRootId = "thread_root_id", resultErased = "result_erased"
         case channelRevoked = "channel_revoked"
@@ -361,6 +364,21 @@ extension ChatJournal {
         try queue.write { db in
             try db.execute(sql: "UPDATE runs SET preflight_pid = ?, preflight_pgid = ?, preflight_started_at = ? WHERE run_id = ?",
                            arguments: [start?.pid, start?.pgid, start.map { Int64(bitPattern: $0.startTime) }, runId])
+        }
+    }
+
+    func recordSeen(_ runId: String, _ seen: TeamPidSet.Snapshot) throws {
+        try queue.write { db in
+            // A recovery stop accounts only for its selected targets. Merge
+            // that evidence with the run's earlier account in this transaction.
+            let previous = try ChatRunRecord.fetchOne(db, key: runId)?.seen
+            let combined = TeamPidSet.Snapshot(
+                identities: Set(seen.identities + (previous?.identities ?? [])).sorted {
+                    ($0.pid, $0.startTime) < ($1.pid, $1.startTime)
+                }, incomplete: seen.incomplete || previous?.incomplete == true)
+            let json = String(decoding: try JSONEncoder().encode(combined), as: UTF8.self)
+            try db.execute(sql: "UPDATE runs SET seen = ? WHERE run_id = ? AND outcome IS NULL AND processes_gone_at IS NULL",
+                           arguments: [json, runId])
         }
     }
 

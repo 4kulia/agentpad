@@ -295,7 +295,7 @@ final class ChatInboxTests: XCTestCase {
         model.stop()
     }
 
-    func testNewHeadsShareTheTotalAutomaticPageBudget() async throws {
+    func testCompletedRangesDoNotSpendLaterPassBudget() async throws {
         let (store, org) = try fixture()
         org.isFollowed = { _ in false }
         try write(store) { db in
@@ -316,13 +316,143 @@ final class ChatInboxTests: XCTestCase {
         try write(store) { try $0.execute(sql: "UPDATE cursors SET seq = 2 WHERE stream = 'channel:c00'") }
         try post(store, "live", seq: 2, channel: "c00")
         try await wait { model.entries(org).count > 20 && !model.loading }
-        XCTAssertEqual(calls, 20, "a new head cannot renew the shared automatic budget")
-        XCTAssertTrue(model.limited)
-        model.retry()
-        try await wait { !model.loading }
-        XCTAssertEqual(calls, 21)
+        XCTAssertEqual(calls, 21, "a completed pass must not consume the next unread range's budget")
         XCTAssertFalse(model.limited)
         model.stop()
+    }
+
+    func testReactionsOnCompletedHistoryNeverDeferButNewHistoryStillHasBoundedPaging() async throws {
+        for kind in ChatInboxKind.allCases {
+            for followed in [false, true] {
+                let (store, org) = try fixture(subdirectory: "\(kind.rawValue)-\(followed)")
+                org.isFollowed = { _ in followed }
+                try post(store, "loaded", seq: 1)
+                try write(store) { try $0.execute(sql: "INSERT INTO cursors VALUES ('channel:alpha', 1)") }
+                let model = ChatInboxModel(ref: ChatInboxRef(key, kind: kind))
+                var heads: [Int] = [], cursors: [Int?] = []
+                var gap = false, finish = false
+                model.follow(store, org: org) { target, before in
+                    heads.append(target.head)
+                    if gap {
+                        cursors.append(before)
+                        let seq = (before ?? target.head + 1) - 1
+                        return try ChatMessagesPage(messages: [self.wire("new\(seq)", seq: seq)],
+                                                    next: finish ? nil : seq, head: target.head)
+                    }
+                    return try ChatMessagesPage(messages: [self.wire("loaded", seq: 1)], next: nil, head: target.head)
+                }
+                try await wait { !model.loading && heads.count == 1 }
+                let lastHead = ChatInboxLoading.pagesPerPass + 6
+                for head in 2...lastHead {
+                    XCTAssertEqual(try store.apply(ChatEvent(stream: "channel:alpha", seq: head, id: "reaction\(head)",
+                        type: "reaction.changed", actor: nil,
+                        body: .object(["channel_id": .string("alpha"), "message_id": .string("loaded"), "revision": .number(1)]),
+                        commandId: nil, at: "now")), .applied)
+                    try await wait { !model.loading && (heads.last == head || model.limited) }
+                    XCTAssertFalse(model.limited, "\(kind), followed=\(followed), reaction head=\(head): no unread history remains")
+                    if model.limited { break }
+                }
+                if model.limited { model.stop(); continue }
+                XCTAssertEqual(heads.count, lastHead)
+                XCTAssertEqual(model.entries(org).map(\.id), ["loaded"])
+                XCTAssertNil(model.problem)
+
+                // A genuine new range still stops at five pages and explicit
+                // continuation resumes its cursor, even after many refreshes.
+                gap = true
+                try write(store) { try $0.execute(sql: "UPDATE cursors SET seq = 100 WHERE stream = 'channel:alpha'") }
+                try await wait { !model.loading && model.limited }
+                XCTAssertEqual(cursors, [nil, 100, 99, 98, 97])
+                finish = true; model.retry()
+                try await wait { !model.loading && !model.limited && cursors.count == 6 }
+                XCTAssertEqual(cursors.last!, 96)
+                model.stop()
+            }
+        }
+    }
+
+    func testSimultaneousReactionRefreshesDoNotSpendSharedPagingBudget() async throws {
+        for kind in ChatInboxKind.allCases {
+            for followed in [false, true] {
+                let (store, org) = try fixture(subdirectory: "\(kind.rawValue)-\(followed)")
+                org.isFollowed = { _ in followed }
+                let channels = (0..<21).map { String(format: "c%02d", $0) }
+                // Exercise real gaps both before and after the completed histories.
+                let gapPrefix = followed ? "a-gap" : "z-gap"
+                let gaps = (0..<5).map { "\(gapPrefix)\($0)" }
+                try write(store) { db in
+                    for channel in channels {
+                        try db.execute(sql: "INSERT INTO channels (channel_id, team_id, name, archived, version, stamp, created_by, created_at) VALUES (?, 'team', ?, 0, 1, 1, 'other', 'now')", arguments: [channel, channel])
+                        try db.execute(sql: "INSERT INTO cursors VALUES (?, 1)", arguments: ["channel:\(channel)"])
+                        try ChatMessages.write(db, self.wire("\(channel)-loaded", seq: 1, channel: channel))
+                    }
+                }
+                try refresh(store, org)
+                let model = ChatInboxModel(ref: ChatInboxRef(key, kind: kind))
+                var requests: [(channel: String, before: Int?)] = []
+                var finish = false
+                model.follow(store, org: org) { target, before in
+                    requests.append((target.channel, before))
+                    if target.channel.hasPrefix(gapPrefix) {
+                        let seq = (before ?? 101) - 1
+                        return try ChatMessagesPage(messages: [self.wire("\(target.channel)-\(seq)", seq: seq, channel: target.channel)],
+                                                    next: finish ? nil : seq, head: target.head)
+                    }
+                    XCTAssertNil(before, "a reaction refresh stops at the covered range")
+                    return try ChatMessagesPage(messages: [self.wire("\(target.channel)-loaded", seq: 1, channel: target.channel)],
+                                                next: target.head > 1 ? 1 : nil, head: target.head)
+                }
+                try await wait { !model.loading && !requests.isEmpty }
+                XCTAssertEqual(requests.count, 20)
+                XCTAssertTrue(model.limited)
+                model.retry()
+                try await wait { !model.loading && requests.count == channels.count }
+                XCTAssertFalse(model.limited)
+
+                requests.removeAll()
+                // Publish every reaction head in one transaction, so all 21
+                // completed histories need a refresh in the same loading pass.
+                try write(store) { db in
+                    for channel in channels {
+                        try ChatB1.invalidate(db, event: ChatEvent(stream: "channel:\(channel)", seq: 2, id: "reaction-\(channel)",
+                            type: "reaction.changed", actor: nil,
+                            body: .object(["channel_id": .string(channel), "message_id": .string("\(channel)-loaded"), "revision": .number(1)]),
+                            commandId: nil, at: "now"))
+                        try db.execute(sql: "UPDATE cursors SET seq = 2 WHERE stream = ?", arguments: ["channel:\(channel)"])
+                    }
+                }
+                try await wait { !model.loading && !requests.isEmpty }
+                XCTAssertEqual(requests.map(\.channel), channels, "every completed history must refresh in this pass")
+                XCTAssertFalse(model.limited, "reaction-only refreshes must not offer More unread messages / Load more")
+                XCTAssertEqual(Set(model.entries(org).map(\.id)), Set(channels.map { "\($0)-loaded" }))
+                XCTAssertNil(model.problem)
+
+                requests.removeAll()
+                try write(store) { db in
+                    for channel in gaps {
+                        try db.execute(sql: "INSERT INTO channels (channel_id, team_id, name, archived, version, stamp, created_by, created_at) VALUES (?, 'team', ?, 0, 1, 1, 'other', 'now')", arguments: [channel, channel])
+                        try db.execute(sql: "INSERT INTO cursors VALUES (?, 100)", arguments: ["channel:\(channel)"])
+                        try db.execute(sql: "INSERT INTO channel_windows (channel_id, epoch, bottom_seq) VALUES (?, 1, 100)", arguments: [channel])
+                    }
+                    for channel in channels {
+                        try db.execute(sql: "UPDATE cursors SET seq = 3 WHERE stream = ?", arguments: ["channel:\(channel)"])
+                    }
+                }
+                try refresh(store, org)
+                try await wait { !model.loading && !requests.isEmpty }
+                XCTAssertEqual(requests.filter { channels.contains($0.channel) }.map(\.channel), channels,
+                               "refreshes must run even after real history exhausts the shared budget")
+                XCTAssertEqual(requests.filter { gaps.contains($0.channel) }.count, 20,
+                               "refreshes leave the full, unchanged paging allowance for unloaded ranges")
+                XCTAssertTrue(model.limited, "genuine unread history beyond the loaded range must still offer Load more")
+                XCTAssertNil(model.problem)
+                finish = true; model.retry()
+                try await wait { !model.loading }
+                XCTAssertFalse(model.limited)
+                XCTAssertNil(model.problem)
+                model.stop()
+            }
+        }
     }
 
     func testNewHeadDuringLoadingIsFetchedAndReadClearsDeferredWork() async throws {
@@ -335,14 +465,14 @@ final class ChatInboxTests: XCTestCase {
         model.follow(store, org: org) { target, before in
             heads.append(target.head)
             if heads.count == 1 { return await withCheckedContinuation { held = $0 } }
-            let seq = (before ?? 10) - 1
-            return try ChatMessagesPage(messages: [self.wire("m\(seq)", seq: seq)], next: seq, head: 9)
+            let seq = (before ?? 21) - 1
+            return try ChatMessagesPage(messages: [self.wire("m\(seq)", seq: seq)], next: seq, head: 20)
         }
         try await wait { held != nil }
-        try write(store) { try $0.execute(sql: "UPDATE cursors SET seq = 9 WHERE stream = 'channel:alpha'") }
+        try write(store) { try $0.execute(sql: "UPDATE cursors SET seq = 20 WHERE stream = 'channel:alpha'") }
         held?.resume(returning: try ChatMessagesPage(messages: [wire("m5", seq: 5)], next: nil, head: 5))
-        try await wait { !model.loading && model.limited && model.entries(org).count == 5 }
-        XCTAssertEqual(heads, [5, 9, 9, 9, 9], "new heads share the original channel budget")
+        try await wait { !model.loading && model.limited && model.entries(org).count == 6 }
+        XCTAssertEqual(heads, [5, 20, 20, 20, 20, 20], "the new range gets five pages after the first range completes")
         try write(store) { _ = try ChatInbox.markAllRead($0, account: me, session: "s") }
         try await wait { model.entries(org).isEmpty && !model.limited }
         model.stop()

@@ -184,6 +184,15 @@ enum TerminalOpenTargetResolver {
             return TerminalFileReference(url: locationURL, line: location?.0, column: location?.1)
         }
 
+        var spellings: [(path: String, line: Int?, column: Int?)] = []
+        if fragmentLocation == nil || fragmentIsPathSuffix { spellings.append((rawPath, nil, nil)) }
+        if let location { spellings.append((pathWithoutLocation, location.0, location.1)) }
+        if let found = TerminalRelativeFileLookup.find(spellings.map(\.path), currentDirectory: currentDirectory,
+                                                       fileExists: fileExists) {
+            let spelling = spellings[found.index]
+            return TerminalFileReference(url: found.url, line: spelling.line, column: spelling.column)
+        }
+
         // Preserve the useful semantic interpretation when the file disappears
         // between terminal output and click, so the preview can explain which
         // file is missing instead of handing a bogus scheme to LaunchServices.
@@ -259,6 +268,70 @@ enum TerminalOpenTargetResolver {
               let number = Int(value), number > 0
         else { return nil }
         return number
+    }
+}
+
+/// Called on TerminalLinkResolution's worker, after the cwd spelling failed.
+/// Never accept a partial scan as proof of uniqueness. A stalled filesystem
+/// call is still covered by the worker's existing independent reply deadline.
+enum TerminalRelativeFileLookup {
+    static func find(_ paths: [String], currentDirectory: URL?,
+                     fileExists: TerminalOpenTargetResolver.FileExists,
+                     entryLimit: Int = 50_000, timeLimit: Duration = .seconds(1),
+                     now: () -> ContinuousClock.Instant = { .now }) -> (index: Int, url: URL)? {
+        let deadline = now() + timeLimit
+        let relative = paths.enumerated().compactMap { index, path -> (Int, String)? in
+            guard !(path as NSString).isAbsolutePath, !path.hasPrefix("~") else { return nil }
+            let components = path.split(separator: "/").filter { $0 != "." }
+            guard !components.isEmpty, !components.contains("..") else { return nil }
+            return (index, components.joined(separator: "/"))
+        }
+        guard !relative.isEmpty, let currentDirectory, currentDirectory.isFileURL,
+              FileManager.default.fileExists(atPath: currentDirectory.path), now() < deadline else { return nil }
+        let cwd = currentDirectory.resolvingSymlinksInPath().standardizedFileURL
+        let git = GitStatusFetcher.runGit(["-C", cwd.path, "--no-optional-locks", "rev-parse", "--show-toplevel"], timeout: 0.25)
+        var root = cwd
+        if let git, git.hasPrefix("/") {
+            let candidate = URL(fileURLWithPath: git).resolvingSymlinksInPath().standardizedFileURL
+            if contains(cwd, in: candidate) { root = candidate }
+        }
+        guard now() < deadline else { return nil }
+        if root != cwd {
+            for (index, path) in relative {
+                let candidate = root.appendingPathComponent(path).resolvingSymlinksInPath().standardizedFileURL
+                guard now() < deadline else { return nil }
+                if contains(candidate, in: root), fileExists(candidate.path) { return (index, candidate) }
+            }
+        }
+
+        var complete = true
+        let keys: Set<URLResourceKey> = [.isSymbolicLinkKey, .isRegularFileKey]
+        guard let entries = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil,
+            errorHandler: { _, _ in complete = false; return false }) else { return nil }
+        var matches: [Int: [URL]] = [:], count = 0
+        while let entry = entries.nextObject() as? URL {
+            count += 1
+            guard count <= entryLimit, now() < deadline, complete else { return nil }
+            let candidates = relative.filter { entry.path.hasSuffix("/" + $0.1) }
+            guard !candidates.isEmpty else { continue }
+            guard let values = try? entry.resourceValues(forKeys: keys) else { return nil }
+            // Enumeration does not descend symlinks. Do not follow file links
+            // either: their target could be outside the search root.
+            guard values.isSymbolicLink != true, values.isRegularFile == true else { continue }
+            for (index, _) in candidates where matches[index, default: []].count < 2 {
+                matches[index, default: []].append(entry)
+            }
+        }
+        guard complete, now() < deadline else { return nil }
+        for (index, _) in relative {
+            guard let found = matches[index], !found.isEmpty else { continue }
+            return found.count == 1 ? (index, found[0].standardizedFileURL) : nil
+        }
+        return nil
+    }
+
+    private static func contains(_ url: URL, in root: URL) -> Bool {
+        url.path == root.path || url.path.hasPrefix(root.path == "/" ? "/" : root.path + "/")
     }
 }
 

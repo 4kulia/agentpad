@@ -528,6 +528,8 @@ final class ChatLiveFeedTests: XCTestCase {
     private final class LiveRunner: TeamAgentRunner, @unchecked Sendable {
         let real: Bool
         var isolation: IsolatedClaudeFixture?
+        private let fallbackProcesses = TeamProcesses()
+        var processes: TeamProcesses { isolation?.processes ?? fallbackProcesses }
         var answer = "E2E answer from the stand-in executor"
         var broken = false
         /// Runs until stopped (D4b).
@@ -539,6 +541,10 @@ final class ChatLiveFeedTests: XCTestCase {
         private(set) var requests: [TeamRunRequest] = []
         func release() { released = true }
         init(real: Bool) { self.real = real }
+        deinit {
+            fallbackProcesses.killAll()
+            for left in fallbackProcesses.leftOvers() { fallbackProcesses.remove(left.leader) }
+        }
         func run(_ request: TeamRunRequest, onActivity: @escaping @Sendable (String) -> Void) async throws -> TeamRunResult {
             try await run(request, onActivity: onActivity, onProcessStarted: { _ in })
         }
@@ -554,7 +560,7 @@ final class ChatLiveFeedTests: XCTestCase {
                 child.executableURL = URL(fileURLWithPath: "/bin/sleep")
                 child.arguments = ["120"]
                 try child.run()
-                defer { child.terminate() }
+                defer { child.terminate(); child.waitUntilExit() }
                 let pid = child.processIdentifier
                 try onProcessStarted(TeamProcessStart(pid: pid, pgid: pid, startTime: TeamProcesses.startTime(pid) ?? 1))
                 while !released {
@@ -568,11 +574,11 @@ final class ChatLiveFeedTests: XCTestCase {
                 let script = URL(fileURLWithPath: request.agent.folder).appendingPathComponent("e2e-hold")
                 try "#!/bin/sh\nexec /bin/sleep 300\n".write(to: script, atomically: true, encoding: .utf8)
                 try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
-                return try await ClaudeCodeRunner(fixturePath: script.path)
+                return try await ClaudeCodeRunner(fixturePath: script.path, processes: processes)
                     .run(request, onActivity: onActivity, onProcessStarted: onProcessStarted)
             }
             if broken {
-                return try await ClaudeCodeRunner(claudePath: "/nonexistent/agentpad-e2e/claude")
+                return try await ClaudeCodeRunner(claudePath: "/nonexistent/agentpad-e2e/claude", processes: processes)
                     .run(request, onActivity: onActivity, onProcessStarted: onProcessStarted)
             }
             if real {

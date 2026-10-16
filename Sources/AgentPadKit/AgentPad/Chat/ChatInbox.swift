@@ -98,7 +98,6 @@ final class ChatInboxModel {
     @ObservationIgnored private var targets: [ChatInboxLoading.Key] = []
     @ObservationIgnored private var attempted: Set<ChatInboxLoading.Key> = []
     @ObservationIgnored private var progress: [ChatInboxLoading.HistoryKey: ChatInboxLoading.Progress] = [:]
-    @ObservationIgnored private var remainingPages = ChatInboxLoading.pagesPerPass
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var generation = UUID()
 
@@ -130,14 +129,12 @@ final class ChatInboxModel {
         generation = UUID(); loadTask?.cancel(); loadTask = nil
         observation = nil; store = nil; followedOrg = nil; readPage = nil
         cached = []; targets = []; attempted = []; progress = [:]
-        remainingPages = ChatInboxLoading.pagesPerPass
         loading = false; deferred = []; failed = []; localProblem = nil
     }
 
     func retry() {
         guard !loading, let store, let org = followedOrg else { return }
         localProblem = nil; deferred = []; failed = []; attempted = []
-        remainingPages = ChatInboxLoading.pagesPerPass
         for key in progress.keys { progress[key]?.pages = 0 }
         follow(store, org: org, readPage: readPage)
     }
@@ -171,29 +168,43 @@ final class ChatInboxModel {
         loading = true
         loadTask = Task { [weak self] in
             guard let self else { return }
+            // Bound this pass over pending ranges. Completed refreshes must
+            // not spend the allowance of a later, unrelated range.
+            var remainingPages = ChatInboxLoading.pagesPerPass
             for target in pending {
                 guard self.isCurrent(generation, store: store, org: org) else { break }
                 self.attempted.insert(target)
                 let history = target.history
                 var saved = self.progress[history] ?? ChatInboxLoading.Progress(after: target.after, through: target.head)
-                if saved.complete {
+                let refreshing = saved.complete
+                if refreshing {
                     // Catch up above the covered range only after its history
                     // is complete. A newer head never replaces an older cursor.
-                    saved = ChatInboxLoading.Progress(after: max(target.after, saved.through), through: target.head, pages: saved.pages)
+                    saved = ChatInboxLoading.Progress(after: max(target.after, saved.through), through: target.head)
                 }
-                guard self.remainingPages > 0, saved.pages < ChatInboxLoading.pagesPerChannel else {
+                // Even with no paging allowance left, a completed history needs
+                // a refresh to distinguish reaction-only heads from new messages.
+                guard refreshing || remainingPages > 0, saved.pages < ChatInboxLoading.pagesPerChannel else {
                     self.deferred.insert(history); continue
                 }
                 do {
-                    while self.remainingPages > 0 && saved.pages < ChatInboxLoading.pagesPerChannel {
+                    while (refreshing || remainingPages > 0) && saved.pages < ChatInboxLoading.pagesPerChannel {
                         guard self.isCurrent(generation, store: store, org: org),
                               org.visibleChannel(target.channel) != nil,
                               try self.canRead(store, target) else { break }
-                        self.remainingPages -= 1; saved.pages += 1
-                        self.progress[history] = saved
                         let page = try await readPage(target, saved.before)
                         guard self.isCurrent(generation, store: store, org: org),
                               org.visibleChannel(target.channel) != nil else { break }
+                        let alreadyCovered = refreshing
+                            && !page.messages.contains { $0.channelId == target.channel && $0.seq > saved.after }
+                            && (page.next.map { $0 <= saved.after } ?? true)
+                        if !alreadyCovered {
+                            // A probe that discovers a new range must still obey
+                            // the shared budget; retry can fetch it from this cursor.
+                            guard remainingPages > 0 else { self.deferred.insert(history); break }
+                            remainingPages -= 1; saved.pages += 1
+                        }
+                        self.progress[history] = saved
                         guard try self.apply(page, target: target, store: store) else { break }
                         guard let next = page.next, next > saved.after else {
                             saved.before = nil; saved.complete = true
@@ -204,7 +215,7 @@ final class ChatInboxModel {
                         // A repeated/nondecreasing cursor cannot make progress.
                         guard saved.before.map({ next < $0 }) ?? true else { throw ChatInboxLoadError.pagination }
                         saved.before = next; self.progress[history] = saved
-                        if self.remainingPages == 0 || saved.pages == ChatInboxLoading.pagesPerChannel {
+                        if remainingPages == 0 || saved.pages == ChatInboxLoading.pagesPerChannel {
                             self.deferred.insert(history); break
                         }
                     }

@@ -338,6 +338,48 @@ final class RequestTabsTests: XCTestCase {
         }
     }
 
+    func testDeleteFromVisibleInactiveSplitAndWindowBecomingKeyAfterAppearance() async throws {
+        for scenario in ["inactive split", "initially not key", "both", "hidden view", "hidden tab", "zoomed sibling", "detached", "disappeared", "not key"] {
+            let f = try await fixture()
+            let wire = try JSONDecoder().decode(ChatMessageWire.self, from: JSONSerialization.data(withJSONObject: [
+                "message_id": messageID, "channel_id": channel, "author_account_id": f.key.accountId,
+                "author_agent_id": CallJSON.agent, "author_session_name": "Personal session", "text": "delete me",
+                "revision": 1, "seq": 1, "created_at": "2026-10-07T12:00:00Z", "mentions": []]))
+            try write(f.store.queue) { _ = try ChatMessages.write($0, wire) }
+            let host = makeTestStore(); hosts.append(host)
+            let workspace = try XCTUnwrap(host.active), pane = try XCTUnwrap(workspace.activePane)
+            let session = host.openChannelTab(ChannelRef(f.key, channel: channel), in: workspace, pane: pane)
+            let sibling = try XCTUnwrap(host.splitPane(pane, orientation: .horizontal, in: workspace))
+            if !["inactive split", "both"].contains(scenario) { host.activateTab(session, in: workspace) }
+            let engine = try XCTUnwrap(session.engine as? ChannelTabEngine), c = engine.conversation.confirmation
+            let model = ChatChannelModel(key: f.key, channel: channel)
+            model.service = f.service; model.follow(f.store); model.confirmation = c; model.tabID = session.id
+            let window = ConfirmationTestWindow(contentRect: .init(x: 0, y: 0, width: 600, height: 400),
+                                                styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = engine.view
+            defer { window.contentView = nil; window.close() }
+            window.key = !["initially not key", "both"].contains(scenario)
+            XCTAssertTrue(model.requestDelete(try XCTUnwrap(model.message(messageID))), scenario)
+            c.shown(true) // The inline block's appearance callback, before window activation.
+            window.key = true
+            switch scenario {
+            case "hidden view": engine.view.isHidden = true
+            case "hidden tab": pane.activeTabId = pane.tabs.first { $0 !== session }?.id
+            case "zoomed sibling": workspace.zoomedPaneId = sibling.id
+            case "detached": window.contentView = nil
+            case "disappeared": c.shown(false)
+            case "not key": window.key = false
+            default: break
+            }
+            let shouldDelete = ["inactive split", "initially not key", "both"].contains(scenario)
+            c.confirm(); c.confirm(); try await wait { !c.isExecuting }
+            XCTAssertEqual(try f.commands().filter { $0.type == "message.delete" }.count, shouldDelete ? 1 : 0, scenario)
+            if shouldDelete { XCTAssertEqual(c.phase, .completed, scenario) }
+            c.invalidate()
+        }
+    }
+
     func testFolderRefusalIsOneDecisionAndCreatesNoContinuation() async throws {
         let f = try await fixture(); _ = try await f.allow(); try f.move("running", 5, run: "run")
         let path = root.appendingPathComponent("requested")
@@ -383,6 +425,12 @@ final class RequestTabsTests: XCTestCase {
             catch { XCTAssertEqual(error as? TeamLauncher.Failure, .alreadyUsed) }
         }
     }
+}
+
+@MainActor private final class ConfirmationTestWindow: NSWindow {
+    var key = true
+    override var isKeyWindow: Bool { key }
+    override var isVisible: Bool { true }
 }
 
 @MainActor

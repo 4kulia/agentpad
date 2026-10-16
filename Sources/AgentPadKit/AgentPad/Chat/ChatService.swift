@@ -1252,7 +1252,7 @@ final class ChatService {
             guard let rows = try? journal.unfinishedRuns() else { return true }
             return rows.contains { $0.agentId == agentId && $0.processesGoneAt == nil && !(launcher?.isLive($0.runId) ?? false) }
         }
-        let recovery = TeamRunRecovery(journal: journal) { [weak launcher] in launcher?.isLive($0) ?? false }
+        let recovery = TeamRunRecovery(journal: journal, processes: launcher.processes) { [weak launcher] in launcher?.isLive($0) ?? false }
         recovery.facts = self
         launcher.recovery = recovery
         let stopper = TeamRunStopper(launcher: launcher)

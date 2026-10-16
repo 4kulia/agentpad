@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import AgentPadKit
 
@@ -72,5 +73,165 @@ final class TeamReviewC10Tests: XCTestCase {
         let answer = await recovery.confirmGone(params.runId)
         XCTAssertNil(answer)
         XCTAssertFalse(TeamRunAdmission.journalBlocks(f.agent.id.uuidString.lowercased()))
+    }
+
+    func testReopenedJournalKeepsLiveSetsidChildBlockedInNewRegistry() async throws {
+        try await checkReopenedChild(exitsBeforeRecovery: false)
+    }
+
+    func testReopenedJournalAllowsExitedSetsidChildInNewRegistry() async throws {
+        try await checkReopenedChild(exitsBeforeRecovery: true)
+    }
+
+    func testReopenedJournalRestoresPreflightSetsidChild() async throws {
+        try await checkReopenedChild(exitsBeforeRecovery: false, preflight: true)
+    }
+
+    private func checkReopenedChild(exitsBeforeRecovery: Bool, preflight: Bool = false) async throws {
+        let binary = try NativeTeamChildFixture.make(in: root)
+        let spawned = try TeamSpawn.suspended(path: binary.path, arguments: [], environment: [:],
+                                              directory: root.path, stdin: Pipe(), stdout: Pipe(), stderr: Pipe())
+        let processes = TeamProcesses()
+        defer {
+            spawned.kill()
+            if let child = NativeTeamChildFixture.child(in: root) { NativeTeamChildFixture.stop(child) }
+            _ = TeamSpawn.waitForExit(spawned.pid)
+            processes.remove(spawned.identity)
+            spawned.release()
+        }
+        let runner = JournalChildRunner(processes: processes, spawned: spawned, root: root, preflight: preflight)
+        let f = try ExecutorFixture(root: root, runner: runner)
+        let approval = try f.approve()
+        do {
+            _ = try await f.launcher.launch(approvalId: approval.id)
+            XCTFail("the child's cleanup must stay unconfirmed")
+        } catch let error as TeamRunnerError {
+            if preflight {
+                guard case .preflightCleanupUnconfirmed = error else { return XCTFail("\(error)") }
+            } else {
+                guard case .stopped(.stillAlive) = error else { return XCTFail("\(error)") }
+            }
+        }
+        try f.journal.markStopping(approval.runId, reason: "stopped_by_owner")
+        let child = try XCTUnwrap(NativeTeamChildFixture.child(in: root))
+        XCTAssertEqual(getsid(child.pid), child.pid)
+        XCTAssertEqual(TeamProcesses.liveness(spawned.identity.identity), .gone)
+        XCTAssertEqual(TeamProcesses.groupIdentities(spawned.pid), [])
+        let saved = try XCTUnwrap(f.journal.run(approval.runId))
+        XCTAssertTrue(saved.seen?.identities.contains(child) == true)
+        XCTAssertEqual(saved.seen?.incomplete, true)
+        XCTAssertNil(saved.processesGoneAt)
+        // Discard the first app's account, close its database, and reap its dead
+        // leader. Recovery has only the disk evidence and PID/start-time checks.
+        processes.remove(spawned.identity)
+        spawned.release()
+        try f.journal.queue.close()
+        if exitsBeforeRecovery { NativeTeamChildFixture.stop(child) }
+        let reopened = try ChatJournal.open(files: f.files)
+        defer { try? reopened.queue.close() }
+        let fresh = TeamProcesses()
+        let recovery = TeamRunRecovery(journal: reopened, processes: fresh) { _ in false }
+        try await recovery.check().get()
+        XCTAssertEqual(recovery.blocked.map(\.id), [approval.runId])
+        XCTAssertTrue(fresh.seen(of: spawned.identity)?.identities.contains(child) == true)
+        XCTAssertEqual(fresh.seen(of: spawned.identity)?.isIncomplete, true)
+        XCTAssertEqual(recovery.blocked.first?.found, exitsBeforeRecovery ? [] : [child])
+        if !exitsBeforeRecovery {
+            // Recovery is passive even when this new app quits: only the
+            // owner's explicit Stop These Processes may signal the survivor.
+            let send = TeamProcesses.sendSignal
+            let signalled = TeamValueBox<pid_t>()
+            TeamProcesses.sendSignal = { pid, _, _ in signalled.set(pid) }
+            fresh.killAll()
+            TeamProcesses.sendSignal = send
+            XCTAssertNil(signalled.get())
+            let refused = await recovery.confirmGone(approval.runId)
+            XCTAssertNotNil(refused, "a live child outside the dead leader's group still blocks")
+            XCTAssertNil(try reopened.run(approval.runId)?.processesGoneAt)
+            XCTAssertNil(try reopened.run(approval.runId)?.outcome)
+            recovery.stopGrace = .zero
+            let stopped = await recovery.stopProcesses(approval.runId)
+            XCTAssertNil(stopped)
+            XCTAssertTrue(NativeTeamChildFixture.waitUntil { TeamProcesses.liveness(child) == .gone })
+            XCTAssertEqual(try reopened.run(approval.runId)?.seen, saved.seen,
+                           "a stop of selected processes must retain the earlier cleanup evidence")
+        }
+        let confirmed = await recovery.confirmGone(approval.runId)
+        XCTAssertNil(confirmed)
+        XCTAssertTrue(recovery.blocked.isEmpty)
+        XCTAssertNil(fresh.seen(of: spawned.identity))
+        XCTAssertNotNil(try reopened.run(approval.runId)?.processesGoneAt)
+        XCTAssertEqual(try reopened.run(approval.runId)?.outcome, .stoppedLocally)
+    }
+
+    func testJournalWithoutSeenMigratesAndKeepsLegacyRecovery() async throws {
+        let f = try ExecutorFixture(root: root, runner: RecordingRunner())
+        let approval = try f.approve()
+        let params = try TeamLaunchParams.decode(approval.params)
+        let row = ChatRunRecord(runId: params.runId, requestId: approval.requestId, approvalId: approval.id,
+                                agentId: approval.agentId, conversationId: params.conversationId,
+                                pid: 999_965, pgid: 999_965, processStartedAt: 1, startedAt: f.now)
+        XCTAssertTrue(try f.journal.consume(approval, run: row))
+        try f.journal.markStopping(row.runId, reason: "stopped_by_owner")
+        let before = try XCTUnwrap(f.journal.run(row.runId))
+        // The shipped schema, before the additive seen-process migration.
+        try await f.journal.queue.write { db in
+            try db.execute(sql: "ALTER TABLE runs DROP COLUMN seen")
+            try db.execute(sql: "DELETE FROM grdb_migrations WHERE identifier = 'release-12-seen-processes'")
+        }
+        try f.journal.queue.close()
+        let reopened = try ChatJournal.open(files: f.files)
+        defer { try? reopened.queue.close() }
+        let saved = try XCTUnwrap(reopened.run(row.runId))
+        XCTAssertEqual(saved, before)
+        XCTAssertNil(saved.seen)
+        let fresh = TeamProcesses()
+        let recovery = TeamRunRecovery(journal: reopened, processes: fresh) { _ in false }
+        try await recovery.check().get()
+        XCTAssertEqual(recovery.blocked.map(\.id), [row.runId])
+        XCTAssertEqual(recovery.blocked.first?.found, [])
+        let confirmed = await recovery.confirmGone(row.runId)
+        XCTAssertNil(confirmed, "old rows keep the owner's confirmation path")
+        XCTAssertTrue(recovery.blocked.isEmpty)
+        XCTAssertEqual(try reopened.run(row.runId)?.outcome, .stoppedLocally)
+    }
+}
+
+/// Exercise the launcher's real journal wiring while controlling when a native
+/// child is discovered, leaves the group, and survives its dead leader.
+private struct JournalChildRunner: TeamAgentRunner {
+    let processes: TeamProcesses
+    let spawned: TeamSpawned
+    let root: URL
+    let preflight: Bool
+
+    func run(_ request: TeamRunRequest, onActivity: @escaping @Sendable (String) -> Void) async throws -> TeamRunResult {
+        try await run(request, onActivity: onActivity, onProcessStarted: { _ in })
+    }
+
+    func run(_ request: TeamRunRequest, onActivity: @escaping @Sendable (String) -> Void,
+             onProcessStarted: @escaping @Sendable (TeamProcessStart) throws -> Void) async throws -> TeamRunResult {
+        let seen = TeamPidSet()
+        processes.add(spawned.identity, seen: seen, spawned: spawned, agentId: request.agent.id.uuidString.lowercased())
+        if preflight { try request.onPreflightProcess?(spawned.identity) }
+        else { try onProcessStarted(spawned.identity) }
+        try Data().write(to: root.appendingPathComponent("fork"))
+        Darwin.kill(spawned.pid, SIGCONT)
+        XCTAssertTrue(NativeTeamChildFixture.waitUntil {
+            NativeTeamChildFixture.child(in: root) != nil && TeamProcesses.liveness(spawned.identity.identity) == .gone
+        })
+        let child = try XCTUnwrap(NativeTeamChildFixture.child(in: root))
+        seen.insert([ProcessIdentity(pid: child.pid, startTime: child.startTime - 1)])
+        if preflight {
+            XCTAssertEqual(TeamProcesses.liveness(spawned.identity, also: seen, holder: spawned), .alive)
+        } else {
+            XCTAssertEqual(TeamProcesses.outcome(spawned.identity, also: seen, holder: spawned), .stillAlive([child]))
+        }
+        seen.markIncomplete()
+        try Data().write(to: root.appendingPathComponent("detach"))
+        XCTAssertTrue(NativeTeamChildFixture.waitUntil { FileManager.default.fileExists(atPath: root.appendingPathComponent("detached").path) })
+        processes.markLeftOver(spawned.identity)
+        if preflight { throw TeamRunnerError.preflightCleanupUnconfirmed(spawned.identity, .stillAlive([child])) }
+        throw TeamRunnerError.stopped(.stillAlive([child]))
     }
 }

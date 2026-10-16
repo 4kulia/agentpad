@@ -71,6 +71,7 @@ final class TeamLauncher {
 
     let journal: ChatJournal
     private let runner: TeamAgentRunner
+    let processes: TeamProcesses
     /// The agent as `agents.json` has it now; nil when it is gone.
     var agent: @MainActor (String) -> TeamPublishedAgent? = { _ in nil }
     /// The request as the cache has it now (D8).
@@ -88,7 +89,7 @@ final class TeamLauncher {
     weak var facts: TeamRunFacts?
     /// The processes of a run whose stop was not confirmed (the runner left it
     /// registered); nil when they are confirmed gone. Replaced in tests.
-    var processesLeft: (TeamProcessStart) -> TeamPidSet? = { TeamProcesses.shared.seen(of: $0) }
+    var processesLeft: (TeamProcessStart) -> TeamPidSet?
 
     private(set) var live: [String: LiveRun] = [:]
     /// Runs the stopper asked to end: their outcome is `stopped_locally`.
@@ -117,6 +118,8 @@ final class TeamLauncher {
     init(journal: ChatJournal, runner: TeamAgentRunner) {
         self.journal = journal
         self.runner = runner
+        self.processes = runner.processes
+        self.processesLeft = { [processes = runner.processes] in processes.seen(of: $0) }
     }
 
     var prepareAttachmentFiles: @MainActor (TeamLaunchParams, ChatRunRecord) async throws -> ChatAttachmentCallFiles? = { params, _ in
@@ -178,7 +181,7 @@ final class TeamLauncher {
         if let stuck = blocking.first(where: { $0.agentId == approval.agentId && !isLive($0.runId) }) {
             throw Failure.blocked(agentId: approval.agentId, pid: stuck.pid)
         }
-        if TeamProcesses.shared.blocks(agentId: approval.agentId) { throw Failure.blocked(agentId: approval.agentId, pid: nil) }
+        if processes.blocks(agentId: approval.agentId) { throw Failure.blocked(agentId: approval.agentId, pid: nil) }
 
         launching.insert(approvalId)
         defer { launching.remove(approvalId) }
@@ -302,7 +305,12 @@ final class TeamLauncher {
             if let selectedFiles { try await self.verifyAttachmentFiles(selectedFiles) }
             try self.validateWaitingSegment(params, row: row)
         }
-        request.onPreflightProcess = { start in try journal.recordPreflightProcess(runId, start) }
+        request.onPreflightProcess = { start in
+            try journal.recordPreflightProcess(runId, start)
+            if let start {
+                try runner.processes.seen(of: start)?.persist { try journal.recordSeen(runId, $0) }
+            }
+        }
         var outcome: Result<TeamRunResult, Error> = .failure(CancellationError())
         let started = TeamStartBox()
         let task = Task { [weak self] in
@@ -312,6 +320,7 @@ final class TeamLauncher {
                 }, onProcessStarted: { start in
                     // On disk before it runs; when it cannot be, it does not run (D11).
                     try journal.recordProcess(runId, start)
+                    try runner.processes.seen(of: start)?.persist { try journal.recordSeen(runId, $0) }
                     started.set(start)
                     Task { @MainActor in
                         self?.live[runId]?.process = start
@@ -575,6 +584,7 @@ final class TeamRunRecovery {
     }
 
     let journal: ChatJournal
+    private let registry: TeamProcesses
     private let isLive: (String) -> Bool
     weak var facts: TeamRunFacts?
     /// What blocks agents now.
@@ -588,16 +598,18 @@ final class TeamRunRecovery {
     private(set) var problem: String?
     /// Looks for a blocked run's live processes; nil when that cannot be told
     /// (a read that failed, or no leader recorded). Replaced in tests.
-    var find: @MainActor (TeamProcessStart?) async -> [ProcessIdentity]? = { leader in
-        try? await BackgroundInspection.run { TeamRunRecovery.processes(leader: leader) }
-    }
+    var find: @MainActor (TeamProcessStart?) async -> [ProcessIdentity]?
     /// How long "Stop These Processes" waits after SIGTERM before SIGKILL.
     var stopGrace: Duration = .seconds(5)
     private var checking: Task<Result<Void, Error>, Never>?
 
-    init(journal: ChatJournal, isLive: @escaping (String) -> Bool) {
+    init(journal: ChatJournal, processes: TeamProcesses = .shared, isLive: @escaping (String) -> Bool) {
         self.journal = journal
+        self.registry = processes
         self.isLive = isLive
+        self.find = { leader in
+            try? await BackgroundInspection.run { Self.processes(leader: leader, registry: processes) }
+        }
     }
 
     /// At start, before each launch, when the server becomes known, and on
@@ -626,6 +638,17 @@ final class TeamRunRecovery {
         for run in rows where !isLive(run.runId) {
             guard run.processesGoneAt != nil else {
                 let leader = Self.leader(of: run)
+                if let leader, let saved = run.seen {
+                    do {
+                        guard let seen = registry.restore(leader, seen: saved) else {
+                            throw CancellationError()
+                        }
+                        try seen.persist { [journal] in try journal.recordSeen(run.runId, $0) }
+                    } catch {
+                        problem = error.localizedDescription
+                        return .failure(error)
+                    }
+                }
                 nowBlocked.append(Blocked(run: run, leader: leader, found: await inspect(leader)))
                 continue
             }
@@ -662,6 +685,8 @@ final class TeamRunRecovery {
         let targets = found.filter(shown.contains)
         let leader = item.leader.flatMap { targets.contains($0.identity) ? $0 : nil } ?? TeamProcessStart(pid: 0, pgid: 0, startTime: 0)
         let others = TeamPidSet(targets.filter { $0 != leader.identity })
+        do { try others.persist { [journal] in try journal.recordSeen(item.run.runId, $0) } }
+        catch { return error.localizedDescription }
         let grace = stopGrace
         let completed = await TeamProcesses.withDeadline(grace + .seconds(3)) {
             TeamProcesses.signal(leader, SIGTERM, also: others)
@@ -689,7 +714,7 @@ final class TeamRunRecovery {
             }
         }
         do { try journal.markProcessesGone(item.run.runId) } catch { return error.localizedDescription }
-        if let leader = item.leader { TeamProcesses.shared.remove(leader) }
+        if let leader = item.leader { registry.remove(leader) }
         await check()
         return nil
     }
@@ -697,7 +722,7 @@ final class TeamRunRecovery {
     /// The live processes of a run's recorded leader: the leader alive as
     /// itself and what this app saw under it. Nil when there is no leader to
     /// look for or a read failed.
-    nonisolated static func processes(leader: TeamProcessStart?) -> [ProcessIdentity]? {
+    nonisolated static func processes(leader: TeamProcessStart?, registry: TeamProcesses = .shared) -> [ProcessIdentity]? {
         guard let leader else { return nil }
         var found: Set<ProcessIdentity> = []
         switch TeamProcesses.liveness(leader.identity) {
@@ -705,7 +730,7 @@ final class TeamRunRecovery {
         case .alive: found.insert(leader.identity)
         case .gone: break
         }
-        for identity in TeamProcesses.shared.seen(of: leader)?.identities ?? [] {
+        for identity in registry.seen(of: leader)?.identities ?? [] {
             switch TeamProcesses.liveness(identity) {
             case .unknown: return nil
             case .alive: found.insert(identity)
@@ -768,7 +793,8 @@ final class TeamRunStopper {
         for (runId, run) in launcher.live {
             try? launcher.journal.markStopping(runId, reason: "stopped_by_owner")
             guard let process = run.process else { continue }
-            _ = try? await BackgroundInspection.run { TeamProcesses.signal(process, SIGKILL, also: TeamProcesses.shared.seen(of: process)) }
+            let processes = launcher.processes
+            _ = try? await BackgroundInspection.run { TeamProcesses.signal(process, SIGKILL, also: processes.seen(of: process)) }
         }
     }
 }

@@ -39,12 +39,16 @@ final class TeamService {
     /// Published agents and calls.
     let calls: TeamCalls
     private let storage: TeamStorage
+    private let processes: TeamProcesses
 
     /// `offCalls`: the calls while team work is off (none in the app; the
     /// file store of tests when not given).
-    init(storage: TeamStorage, runner: TeamAgentRunner = ClaudeCodeRunner(), offCalls: TeamCallStore? = nil) {
+    init(storage: TeamStorage, runner: TeamAgentRunner? = nil, offCalls: TeamCallStore? = nil,
+         processes: TeamProcesses? = nil) {
+        let processes = processes ?? runner?.processes ?? .shared
         self.storage = storage
-        self.calls = TeamCalls(storage: storage, runner: runner, offStore: offCalls)
+        self.processes = processes
+        self.calls = TeamCalls(storage: storage, runner: runner ?? ClaudeCodeRunner(processes: processes), offStore: offCalls)
     }
 
     // MARK: Lifecycle
@@ -60,7 +64,7 @@ final class TeamService {
 
     /// The move to a server is not possible while a run of this app is not
     /// confirmed gone, or a call still runs.
-    var canMoveToServer: Bool { !calls.hasRunningCalls && !TeamProcesses.shared.hasRegisteredRuns }
+    var canMoveToServer: Bool { !calls.hasRunningCalls && !processes.hasRegisteredRuns }
 
     func enterServerMode() {
         mode = .server

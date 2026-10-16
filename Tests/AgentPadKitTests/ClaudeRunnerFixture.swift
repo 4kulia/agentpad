@@ -4,8 +4,8 @@ import Foundation
 /// Older process/stop tests deliberately run shell fixtures. Y2 is mocked in
 /// those tests; production rejects scripts (TeamRunnerVersionTests).
 extension ClaudeCodeRunner {
-    init(fixturePath: String, stopTiming: TeamRunStop.Timing = .standard) {
-        self.init(claudePath: fixturePath, stopTiming: stopTiming, preflight: FixtureVersionCheck())
+    init(fixturePath: String, stopTiming: TeamRunStop.Timing = .standard, processes: TeamProcesses = .shared) {
+        self.init(claudePath: fixturePath, stopTiming: stopTiming, preflight: FixtureVersionCheck(), processes: processes)
     }
 }
 

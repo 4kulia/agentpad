@@ -22,7 +22,10 @@ final class ConfirmationCoordinator {
     private(set) var verb = ""
     private(set) var destructive = false
     private(set) var cancelTitle = "Cancel"
-    private(set) var isVisible = false
+    private var isMounted = false
+    // Appearance and eligibility have different lifetimes: a mounted block
+    // can become actionable when its window becomes key, without reappearing.
+    var isVisible: Bool { isMounted && canShow() }
     @ObservationIgnored private var valid: () -> Bool = { false }
     @ObservationIgnored private var operation: (() async throws -> Void)?
     @ObservationIgnored private var completion: ((Bool) -> Void)?
@@ -44,7 +47,7 @@ final class ConfirmationCoordinator {
                  destructive: Bool = false, cancelTitle: String = "Cancel", stillValid: @escaping () -> Bool,
                  completion: @escaping (Bool) -> Void = { _ in }, operation: @escaping () async throws -> Void) -> Bool {
         guard !showsBlock, stillValid(), context.deadline.map({ $0 > now() }) ?? true else { completion(false); return false }
-        isVisible = false
+        isMounted = false
         initiatingResponder = NSApp?.keyWindow?.firstResponder as? NSView
         self.context = context; self.title = title; self.consequences = consequences
         self.verb = verb; self.destructive = destructive; self.cancelTitle = cancelTitle; self.valid = stillValid
@@ -68,14 +71,14 @@ final class ConfirmationCoordinator {
         }
     }
     func shown(_ visible: Bool) {
-        isVisible = visible && canShow()
+        isMounted = visible
         if isVisible, isAwaiting, let context {
             PendingConfirmations.shared.register(context.actionID, tabID: context.tabID, coordinator: self)
         } else if !visible { invalidate() }
     }
     func validate() {
         guard isAwaiting else { return }
-        if !valid() || (isVisible && !canShow()) || context?.deadline.map({ $0 <= now() }) == true { invalidate() }
+        if !valid() || (isMounted && !canShow()) || context?.deadline.map({ $0 <= now() }) == true { invalidate() }
     }
     func confirm() {
         validate()
@@ -110,7 +113,7 @@ final class ConfirmationCoordinator {
         phase = .invalidated; finish(false)
     }
     private func finish(_ accepted: Bool) {
-        isVisible = false
+        isMounted = false
         deadlineTask?.cancel(); deadlineTask = nil
         if let id = context?.actionID { PendingConfirmations.shared.end(id) }
         let callback = completion; completion = nil; operation = nil; valid = { false }

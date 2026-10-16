@@ -742,6 +742,10 @@ enum ChatStoreMigrations {
         // Retain the identifier so journals opened by the earlier naming attempt
         // are not rejected as newer. Its optional columns are no longer used.
         migrator.registerMigration("release-12-publication-text-provenance") { _ in }
+        migrator.registerMigration("release-12-seen-processes") { db in
+            // Older runs have no saved process account and keep their recovery rules.
+            try db.alter(table: "runs") { t in t.add(column: "seen", .text) }
+        }
         return migrator
     }
 

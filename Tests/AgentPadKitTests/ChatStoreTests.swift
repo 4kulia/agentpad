@@ -75,13 +75,13 @@ final class ChatStoreTests: XCTestCase {
         }
         try journal.read { db in
             XCTAssertEqual(try String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"),
-                           (1...9).map { "release-\($0)" } + ["release-10-ux1", "release-11-notification-diagnostics", "release-12-publication-text-provenance"])
+                           (1...9).map { "release-\($0)" } + ["release-10-ux1", "release-11-notification-diagnostics", "release-12-publication-text-provenance", "release-12-seen-processes"])
             for table in ["channel_authorities", "publication_surfaces", "automatic_request_blocks"] {
                 XCTAssertTrue(try db.tableExists(table), table)
             }
             let columns = Set(try db.columns(in: "runs").map(\.name))
             for column in ["stop_confirmed_at", "preflight_pid", "preflight_pgid", "preflight_started_at",
-                           "kind", "org", "channel_id", "thread_root_id", "result_erased", "channel_revoked"] {
+                           "kind", "org", "channel_id", "thread_root_id", "result_erased", "channel_revoked", "seen"] {
                 XCTAssertTrue(columns.contains(column), column)
             }
         }

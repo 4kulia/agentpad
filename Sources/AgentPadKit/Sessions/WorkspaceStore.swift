@@ -2659,8 +2659,14 @@ final class WorkspaceStore {
             engine.conversation.tabID = session.id
             engine.onClose = close
             engine.conversation.confirmation.canShow = { [weak self, weak session, weak engine] in
-                guard let self, let session, let engine else { return false }
-                return self.isOnScreen && self.active?.activeSession === session && engine.view.window?.isKeyWindow == true
+                guard let self, let session, let engine, self.isOnScreen,
+                      let workspace = self.active,
+                      let pane = workspace.root.allPanes.first(where: { $0.activeTab === session }),
+                      workspace.zoomedPaneId == nil || workspace.zoomedPaneId == pane.id,
+                      let window = engine.view.window else { return false }
+                // Every unzoomed split pane is visible, including the one
+                // that does not currently own the workspace's keyboard focus.
+                return window.isVisible && window.isKeyWindow && !engine.view.isHiddenOrHasHiddenAncestor
             }
             engine.conversation.confirmation.restoreFocus = { [weak engine] in
                 guard let engine, engine.conversation.confirmation.canShow() else { return }

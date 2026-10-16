@@ -28,6 +28,7 @@ struct IsolatedClaudeFixture: Sendable {
     let project: URL
     let profile: URL
     let config: URL
+    let processes = TeamProcesses()
     var projects: URL { config.appendingPathComponent("projects") }
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment, requireAuthentication: Bool = true,
@@ -65,7 +66,7 @@ struct IsolatedClaudeFixture: Sendable {
         let isolatedPreflight = preflight ?? self.preflight()
         return ClaudeCodeRunner(claudePath: claudePath ?? executablePath ?? "/nonexistent/isolated-claude",
                                 preflight: isolatedPreflight, sessionFilesRoot: projects, isolatedConfigDirectory: config,
-                                isolatedHomeDirectory: home)
+                                isolatedHomeDirectory: home, processes: processes)
     }
 
     func preflight(configuration: String = ClaudeVersionMatrix.configuration,
@@ -83,5 +84,9 @@ struct IsolatedClaudeFixture: Sendable {
         calls?.sessionFilesRoot = projects
     }
 
-    func remove() { try? FileManager.default.removeItem(at: root) }
+    func remove() {
+        processes.killAll()
+        for left in processes.leftOvers() { processes.remove(left.leader) }
+        try? FileManager.default.removeItem(at: root)
+    }
 }
