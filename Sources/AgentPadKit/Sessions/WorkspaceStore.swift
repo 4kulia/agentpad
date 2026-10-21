@@ -443,7 +443,9 @@ final class WorkspaceStore {
     /// default a test construction silently inherits; `AppDelegate.addWindow`
     /// wires the real `RecentFolders` sink.
     private let noteRecentFolder: @MainActor (URL) -> Void
-    @ObservationIgnored var searchModel: EverywhereSearchModel?
+    @ObservationIgnored var searchModel: EverywhereSearchModel? {
+        didSet { searchModel?.popupCoordinator = popups }
+    }
     let windowID: UUID
     let drafts: DraftRepository
     let tabCloseCoordinator: TabCloseCoordinator
@@ -633,7 +635,9 @@ final class WorkspaceStore {
     }
 
     var allSessions: [Session] { workspaces.flatMap { $0.root.allPanes.flatMap(\.tabs) } }
+    @ObservationIgnored lazy var popups = PopupCoordinator(store: self)
     func invalidateTabConfirmations() {
+        popups.invalidateConfirmations()
         for session in allSessions {
             session.terminalConfirmation.invalidate()
             session.tabState?.confirmation.invalidate()
@@ -644,6 +648,8 @@ final class WorkspaceStore {
 
     @discardableResult
     func openToolTab(_ route: ToolRoute, navigation: TabNavigation = TabNavigation()) -> Session {
+        if route.presentation == .popup { return popups.present(route, navigation: navigation) }
+        popups.dismiss(reason: .dismiss)
         // Reopen/duplicate enter here without the router. Connection still
         // has one login flow across every window, including hidden windows.
         let owners = route == .connection ? [self] + peerStores().filter { $0 !== self } : [self]
@@ -675,7 +681,7 @@ final class WorkspaceStore {
         scheduleSave()
     }
 
-    private func makeToolSession(_ route: ToolRoute, id: UUID = UUID(), navigation: TabNavigation = TabNavigation(), cwd: URL) -> Session {
+    func makeToolSession(_ route: ToolRoute, id: UUID = UUID(), navigation: TabNavigation = TabNavigation(), cwd: URL) -> Session {
         var navigation = navigation
         let recovered = navigation.draftID.flatMap(drafts.draft) ?? drafts.drafts
             .filter { $0.route.key(windowID: windowID) == route.key(windowID: windowID) }
@@ -683,6 +689,12 @@ final class WorkspaceStore {
         if let recovered { navigation.draftID = recovered.id }
         let state = TabState(route: route, navigation: navigation)
         state.draft = recovered
+        if case .fileOperations = route {
+            state.changed = { [weak self] in self?.scheduleSave() }
+            if let snapshot = navigation.fileTransfer {
+                state.fileOperation = FileTransferBatch(snapshot, state: state, tabID: id, restored: true)
+            }
+        }
         if case .unavailable = route { state.message = "This saved tab is damaged or belongs to a newer version. Other tabs are still available." }
         if navigation.draftID != nil, recovered == nil { state.saveError = "The saved draft could not be loaded." }
         let engine = NativeTabEngine(state: state, tabID: id)
@@ -1709,6 +1721,7 @@ final class WorkspaceStore {
     /// Completing the form must not close its host window when it is the last
     /// tab: the newly added agent needs to remain visible, without a seed PTY.
     func closeCompletedAgentForm(_ session: Session, in workspace: Workspace) {
+        if popups.contains(session.id) { popups.dismiss(session, reason: .applied); return }
         guard case .newAgent = session.toolRoute,
               let pane = pane(containing: session, in: workspace),
               let index = pane.tabs.firstIndex(where: { $0.id == session.id }) else { return }
@@ -1717,6 +1730,7 @@ final class WorkspaceStore {
     }
 
     func closeTab(_ session: Session, in workspace: Workspace) {
+        if popups.contains(session.id) { popups.dismiss(session, reason: .dismiss); return }
         tabCloseCoordinator.request(session) { [weak self, weak session, weak workspace] in
             guard let self, let session, let workspace else { return }
             self.closeTab(session, in: workspace, recordHistory: true)
@@ -2415,6 +2429,7 @@ final class WorkspaceStore {
         pendingSave?.cancel(); pendingSave = nil
         do {
             try agentProfiles.flush()
+            try popups.saveDrafts()
             for session in allSessions { if let state = session.tabState { try tabCloseCoordinator.save(state) } }
             try persistence.saveChecked(terminationSnapshot ?? snapshot())
             persistenceError = nil
@@ -2434,13 +2449,16 @@ final class WorkspaceStore {
     func terminate() {
         guard !isTerminated else { return }
         isTerminated = true
-        navigationDragExit?.cancel()
         terminationSnapshot = snapshot()
+        popups.terminate()
+        navigationDragExit?.cancel()
         pendingSave?.cancel()
         pendingSave = nil
         for workspace in workspaces {
             for pane in workspace.root.allPanes {
                 for tab in pane.tabs {
+                    tab.remoteClaudeAccountCheck?.cancel()
+                    tab.claudeAccountLaunch?.cleanup()
                     tab.engine.terminate()
                 }
             }
@@ -2464,9 +2482,10 @@ final class WorkspaceStore {
 
     private func restore(from state: PersistedState) {
         let fm = FileManager.default
+        var recoveredOperations: [PersistedTab] = []
         for ws in state.workspaces {
             let sshHost = Self.normalizedSSHHost(ws.sshRemoteHost)
-            guard let root = restorePane(ws.root, fm: fm, sshRemoteHost: sshHost) else { continue }
+            guard let root = restorePane(ws.root, fm: fm, sshRemoteHost: sshHost, recoveredOperations: &recoveredOperations) else { continue }
             let workspace = Workspace(
                 id: ws.id,
                 workingDirectory: URL(fileURLWithPath: ws.workingDirectoryPath),
@@ -2521,16 +2540,29 @@ final class WorkspaceStore {
             .map { AgentOverviewSidebar.clampWidth(CGFloat($0)) }
             ?? AgentOverviewSidebar.fullWidth
         collapsedInfoSections = Set(state.collapsedInfoSections ?? [])
+        for tab in recoveredOperations {
+            guard case .tool(let route) = tab.content, let navigation = tab.navigation else { continue }
+            // The existing pane record carries recovery data, but the Inventory
+            // presents File operations as a popup. Each restored operation is a
+            // direct entry; unrelated operations must not become Back history.
+            popups.dismiss(reason: .dismiss)
+            popups.present(route, navigation: navigation)
+        }
         scheduleAgentProfileAdoption()
         if state.leftNavigation == nil { scheduleSave() }
     }
 
-    private func restorePane(_ persisted: PersistedPaneNode, fm: FileManager, sshRemoteHost: String? = nil) -> PaneNode? {
+    private func restorePane(_ persisted: PersistedPaneNode, fm: FileManager, sshRemoteHost: String? = nil,
+                             recoveredOperations: inout [PersistedTab]) -> PaneNode? {
         switch persisted.kind {
         case .pane(let p):
             let pane = Pane(id: p.id)
             for tab in p.tabs {
                 if case .tool(let route) = tab.content {
+                    guard route.presentation == .tab else {
+                        if case .fileOperations = route, tab.navigation?.fileTransfer != nil { recoveredOperations.append(tab) }
+                        continue
+                    }
                     pane.tabs.append(makeToolSession(route, id: tab.id, navigation: tab.navigation ?? TabNavigation(), cwd: resolvedSpawnCwd(tab.currentDirectoryPath)))
                     continue
                 }
@@ -2593,10 +2625,11 @@ final class WorkspaceStore {
                     initialCwd: pinnedCwd ?? resolvedSpawnCwd(tab.currentDirectoryPath),
                     sessionId: tab.id,
                     conversationId: tab.conversationId,
-                    sshRemoteHost: profile == nil ? (tab.sshWorkspaceHost.map(Self.normalizedSSHHost) ?? sshRemoteHost) : nil,
+                    sshRemoteHost: tab.sshWorkspaceHost.map(Self.normalizedSSHHost) ?? sshRemoteHost,
                     profile: profile, launchOrigin: origin, captureOrigin: false,
                     adoptionCwd: origin?.folder ?? tab.profileOriginalCwd ?? URL(fileURLWithPath: tab.currentDirectoryPath)
                 )
+                if session.unavailableTab != nil { session.unavailableTab = tab }
                 session.retainedNameKey = tab.explicitNameKey
                 session.lastDisplayTitle = tab.lastDisplayTitle
                 pane.tabs.append(session)
@@ -2606,8 +2639,8 @@ final class WorkspaceStore {
                 : pane.tabs.first?.id
             return PaneNode(pane: pane)
         case .split(let orientation, let first, let second, let fraction):
-            guard let firstChild = restorePane(first, fm: fm, sshRemoteHost: sshRemoteHost),
-                  let secondChild = restorePane(second, fm: fm, sshRemoteHost: sshRemoteHost) else { return nil }
+            guard let firstChild = restorePane(first, fm: fm, sshRemoteHost: sshRemoteHost, recoveredOperations: &recoveredOperations),
+                  let secondChild = restorePane(second, fm: fm, sshRemoteHost: sshRemoteHost, recoveredOperations: &recoveredOperations) else { return nil }
             return PaneNode(
                 id: persisted.id,
                 content: .split(
@@ -2812,6 +2845,12 @@ final class WorkspaceStore {
         // local-only resume id, forcing a wrapped shell) — see
         // `makeSessionConfig(sshHost:)`.
         let sshHost = Self.normalizedSSHHost(sshRemoteHost)
+        // A legacy history binding has no launch origin, but still belongs to
+        // its profile. Resolve only the account here; keep option provenance.
+        let accountProfile = profile.flatMap { agentProfiles.profile($0.id) } ?? profile
+            ?? (sshHost == nil && template.id == AgentTemplate.claudeCodeID
+                ? conversationId.flatMap { agentProfiles.binding(agentID: template.rosterId, conversationID: $0) }
+                    .flatMap { agentProfiles.profile($0.profileID) } : nil)
         var config = template.makeSessionConfig(
             extraOptions: extraOptions,
             resumeId: resumeId,
@@ -2835,7 +2874,6 @@ final class WorkspaceStore {
         ) { _, new in new }
         let launchID = sshHost == nil && config.environment["AGENTPAD_AGENT"] != nil ? UUID() : nil
         config.environment["AGENTPAD_LAUNCH_ID"] = launchID?.uuidString
-        engine.start(config: config)
         // Mirror the command-line gates: SSH/raw commands carry no local
         // resume ID, and a non-empty prompt starts a fresh conversation.
         let promptSuppressesResume = !(initialPrompt?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
@@ -2858,9 +2896,50 @@ final class WorkspaceStore {
         // launch configuration. Only a fresh conversation captures new evidence.
         session.launchOrigin = launchOrigin ?? ((captureOrigin && conversationId == nil && !template.isShell && sshHost == nil && rawLaunchCommand == nil)
             ? AgentLaunchOrigin(template: template, folder: initialCwd, options: extraOptions ?? "") : nil)
-        session.profileID = profile?.id
-        session.profileOriginalCwd = profile == nil ? nil : initialCwd
+        session.profileID = accountProfile?.id
+        session.profileOriginalCwd = accountProfile == nil ? nil : initialCwd
         session.pendingAgentLaunch = launchID.map { ($0, !template.isShell) }
+        if let sshHost, template.id == AgentTemplate.claudeCodeID, let profileID = accountProfile?.id {
+            configureRemoteClaudeAccount(&config, session: session, profileID: profileID,
+                template: template, host: sshHost, extraOptions: extraOptions, initialPrompt: initialPrompt)
+        } else if template.id == AgentTemplate.claudeCodeID, let profileID = accountProfile?.id {
+            config.prepareClaudeAccount = { [weak self, weak session] config in
+                guard let self, let session else { return false }
+                let launch: ClaudeAccountLaunch?
+                if let accountID = self.agentProfiles.profile(profileID)?.claudeAccountID {
+                    if let failure = ClaudeAccountSettings.optionsFailure(extraOptions) {
+                        self.failClaudeAccountLaunch(session, message: failure)
+                        return false
+                    }
+                    let accounts = self.agentProfiles.claudeAccounts
+                    launch = ClaudeAccountLaunch(accountName: accounts.account(accountID)?.name ?? "Unknown account") {
+                            try accounts.token(id: accountID)
+                        }
+                } else {
+                    launch = nil
+                }
+                let refreshed = template.makeSessionConfig(
+                    extraOptions: extraOptions,
+                    resumeId: resumeId,
+                    newSessionId: newSessionId,
+                    initialPrompt: initialPrompt,
+                    sshHost: sshHost,
+                    rawLaunchCommand: rawLaunchCommand,
+                    claudeProjectsRoot: self.claudeProjectsRoot,
+                    visibility: visibility,
+                    claudeResolution: resolution,
+                    claudeAccountLaunch: launch
+                )
+                config.environment["AGENTPAD_AGENT"] = refreshed.environment["AGENTPAD_AGENT"]
+                config.claudeAccountLaunch = refreshed.claudeAccountLaunch
+                session.claudeAccountLaunch = refreshed.claudeAccountLaunch
+                session.claudeAccountLaunch?.onFailure = { [weak self, weak session] message in
+                    guard let self, let session else { return }
+                    self.failClaudeAccountLaunch(session, message: message)
+                }
+                return true
+            }
+        }
         session.resumedConversationId = resumedConversationId
         session.spawnsInBackground = spawnInBackground
         if let sshHost {
@@ -2870,7 +2949,146 @@ final class WorkspaceStore {
             // reads as "agent starting", matching the local launch feel.
             if !template.isShell { session.activityState = .running }
         }
+        engine.start(config: config)
         return session
+    }
+
+    private func failClaudeAccountLaunch(_ session: Session, message: String) {
+        session.remoteClaudeAccountCheck?.cancel()
+        session.remoteClaudeAccountCheck = nil
+        session.remoteClaudeAccountLaunch = nil
+        session.claudeAccountLaunch?.cleanup()
+        let saved = PersistedTab(session)
+        let unavailable = makeToolSession(.unavailable(session.id), id: session.id, cwd: session.currentDirectory)
+        session.engine.terminate()
+        session.engine = unavailable.engine
+        session.content = unavailable.content
+        session.agent = .terminal
+        session.unavailableTab = saved
+        session.pendingAgentLaunch = nil
+        session.tabState?.message = message
+        if let id = session.profileID { agentProfileErrors[id] = message }
+    }
+
+    private func blockRemoteClaudeAccountLaunch(_ session: Session, block: RemoteClaudeAccountBlock) {
+        failClaudeAccountLaunch(session, message: block.status == .stale
+            ? "\(block.accountName) is out of date on \(block.host)"
+            : "\(block.accountName) isn't installed on \(block.host)")
+        session.remoteClaudeAccountBlock = block
+        scheduleSave()
+    }
+
+    /// Runs when the terminal is actually revealed. Only the revision crosses
+    /// SSH here; the credential remains on the server for the remote exec.
+    private func configureRemoteClaudeAccount(_ config: inout TerminalSessionConfig, session: Session,
+        profileID: UUID, template: AgentTemplate, host: String, extraOptions: String?, initialPrompt: String?,
+        checkedAccount: ClaudeAccount? = nil) {
+        config.prepareClaudeAccount = { [weak self, weak session] config in
+            guard let self, let session, !self.isTerminated else { return false }
+            guard let profile = self.agentProfiles.profile(profileID) else {
+                self.failClaudeAccountLaunch(session, message: "This agent profile is no longer available.")
+                return false
+            }
+            guard let accountID = profile.claudeAccountID else {
+                session.remoteClaudeAccountLaunch = nil
+                config.environment["AGENTPAD_AGENT"] = template.makeSessionConfig(extraOptions: extraOptions,
+                    initialPrompt: initialPrompt, sshHost: host).environment["AGENTPAD_AGENT"]
+                return true
+            }
+            guard let account = self.agentProfiles.claudeAccounts.account(accountID) else {
+                self.failClaudeAccountLaunch(session,
+                    message: "This Claude account is no longer available. Choose an account in the agent profile.")
+                return false
+            }
+            if checkedAccount?.id == account.id,
+               checkedAccount?.credentialRevision == account.credentialRevision {
+                let launchID = UUID()
+                session.remoteClaudeAccountLaunch = (launchID, RemoteClaudeAccountBlock(accountID: account.id,
+                    accountName: account.name, host: host, status: .current, profileName: profile.name,
+                    folder: session.currentDirectory.path))
+                config.environment["AGENTPAD_AGENT"] = template.makeSessionConfig(extraOptions: extraOptions,
+                    initialPrompt: initialPrompt, sshHost: host, remoteClaudeAccount: account,
+                    remoteClaudeAccountLaunchID: launchID)
+                    .environment["AGENTPAD_AGENT"]
+                return true
+            }
+            // Holding a deferred config is safe: it contains identifiers only.
+            var pending = config
+            let engine = session.engine
+            session.remoteClaudeAccountCheck?.cancel()
+            session.remoteClaudeAccountCheck = Task { @MainActor [weak self, weak session] in
+                guard let self, let session else { return }
+                let status = await self.agentProfiles.remoteClaudeAccounts.check(accountID: account.id, host: host)
+                guard !Task.isCancelled, session.engine === engine,
+                      let owner = self.profileStores.first(where: { $0.allSessions.contains { $0 === session } }) else { return }
+                session.remoteClaudeAccountCheck = nil
+                // Selection or token may change while SSH connects. Re-enter
+                // preparation with the current profile instead of using old consent.
+                let current = owner.agentProfiles.profile(profileID)?.claudeAccountID
+                    .flatMap(owner.agentProfiles.claudeAccounts.account)
+                if current?.id != account.id || current?.credentialRevision != account.credentialRevision {
+                    owner.configureRemoteClaudeAccount(&pending, session: session, profileID: profileID,
+                        template: template, host: host, extraOptions: extraOptions, initialPrompt: initialPrompt)
+                    engine.start(config: pending)
+                    return
+                }
+                guard status == .current else {
+                    let block = RemoteClaudeAccountBlock(accountID: account.id, accountName: account.name,
+                        host: host, status: status, profileName: profile.name, folder: session.currentDirectory.path)
+                    owner.blockRemoteClaudeAccountLaunch(session, block: block)
+                    return
+                }
+                owner.configureRemoteClaudeAccount(&pending, session: session, profileID: profileID,
+                    template: template, host: host, extraOptions: extraOptions,
+                    initialPrompt: initialPrompt, checkedAccount: account)
+                engine.start(config: pending)
+            }
+            return false
+        }
+    }
+
+    /// Capture exactly the blocked tab, profile, account and destination shown
+    /// by the install confirmation. Installation can finish after any of these
+    /// changes; that completion must leave the current tab alone.
+    func remoteClaudeAccountStartAfterInstall(sessionID: UUID, accountID: UUID, host: String) -> (() -> Void)? {
+        guard let session = findSession(id: sessionID),
+              session.remoteClaudeAccountBlock?.accountID == accountID,
+              session.remoteClaudeAccountBlock?.host == host,
+              let profileID = session.profileID,
+              session.unavailableTab?.profileID == profileID,
+              session.sshWorkspaceHost == host, session.unavailableTab?.sshWorkspaceHost == host,
+              agentProfiles.profile(profileID)?.claudeAccountID == accountID else { return nil }
+        return { [weak self, weak session] in
+            guard let self, let session, self.findSession(id: sessionID) === session,
+                  session.profileID == profileID, session.unavailableTab?.profileID == profileID,
+                  session.remoteClaudeAccountBlock?.accountID == accountID,
+                  session.remoteClaudeAccountBlock?.host == host,
+                  session.sshWorkspaceHost == host, session.unavailableTab?.sshWorkspaceHost == host,
+                  self.agentProfiles.profile(profileID)?.claudeAccountID == accountID else { return }
+            self.retryRemoteClaudeAccount(sessionID: sessionID)
+        }
+    }
+
+    /// Replace the blocked tab in place only while it still names the same
+    /// profile account and host. The popup additionally checks object identity.
+    func retryRemoteClaudeAccount(sessionID: UUID) {
+        guard !isTerminated, let old = findSession(id: sessionID), let block = old.remoteClaudeAccountBlock,
+              let saved = old.unavailableTab, let profileID = saved.profileID,
+              old.profileID == profileID, old.sshWorkspaceHost == block.host, saved.sshWorkspaceHost == block.host,
+              let profile = agentProfiles.profile(profileID),
+              profile.claudeAccountID == block.accountID,
+              let template = profileTemplates().first(where: { $0.id == profile.templateID }),
+              let location = location(ofSessionId: sessionID),
+              let index = location.pane.tabs.firstIndex(where: { $0 === old }) else { return }
+        teardownSessionMonitors(old)
+        let session = spawnSession(template: template, initialCwd: old.currentDirectory,
+            sessionId: old.id, sshRemoteHost: block.host,
+            profile: profile, launchOrigin: saved.launchOrigin, captureOrigin: false)
+        session.retainedNameKey = old.retainedNameKey
+        location.pane.tabs[index] = session
+        configureSession(session, in: location.workspace, codexRolloutId: nil)
+        agentProfileErrors[profileID] = nil
+        scheduleSave()
     }
 
     /// Trimmed, non-empty SSH destination or nil. Single gate for every
@@ -2993,9 +3211,20 @@ final class WorkspaceStore {
             if session.consumeShellControlTitle(title) { return }
             if title.hasPrefix(AgentLaunchExitMarker.prefix) {
                 if let result = AgentLaunchExitMarker.parse(title),
+                   let launch = session.remoteClaudeAccountLaunch, launch.id == result.id,
+                   let status = self.agentProfiles.remoteClaudeAccounts.recordLaunchRefusal(
+                       accountID: launch.block.accountID, host: launch.block.host, exitCode: result.exit) {
+                    let block = RemoteClaudeAccountBlock(accountID: launch.block.accountID,
+                        accountName: launch.block.accountName, host: launch.block.host, status: status,
+                        profileName: launch.block.profileName, folder: launch.block.folder)
+                    self.blockRemoteClaudeAccountLaunch(session, block: block)
+                    return
+                }
+                if let result = AgentLaunchExitMarker.parse(title),
                    let launch = session.pendingAgentLaunch, launch.id == result.id {
                     let ranAgent = launch.isAgent || session.awaitingAgentExitOutcome || session.transientAgent != nil || !session.agent.isShell
                     session.pendingAgentLaunch = nil
+                    session.claudeAccountLaunch?.cleanup()
                     session.reportedAgentLaunchExit = true
                     self.finishShellCommand(session, exit: result.exit, duration: 0, ranAgent: ranAgent)
                 }
@@ -3415,7 +3644,13 @@ final class WorkspaceStore {
         removeGitWatch(sessionId: session.id)
         codexUsageMonitor.stop(sessionId: session.id)
         kiroConversationMonitor.stop(sessionId: session.id, removeRecord: !keepForTransfer)
-        if !keepForTransfer { session.engine.terminate() }
+        if !keepForTransfer {
+            session.remoteClaudeAccountCheck?.cancel()
+            session.remoteClaudeAccountCheck = nil
+            session.remoteClaudeAccountLaunch = nil
+            session.claudeAccountLaunch?.cleanup()
+            session.engine.terminate()
+        }
     }
 
     /// Collects prompt/spawn/watcher triggers for one gitdir. Keeping the
@@ -3516,9 +3751,41 @@ final class WorkspaceStore {
     }
 
     private func snapshot() -> PersistedState {
-        PersistedState(
-            workspaces: workspaces.map(PersistedWorkspace.init),
-            activeWorkspaceId: activeWorkspaceId,
+        var savedWorkspaces = workspaces.map(PersistedWorkspace.init)
+        var savedActiveWorkspaceId = activeWorkspaceId
+        let operations = popups.sessions.filter {
+            if case .fileOperations = $0.toolRoute { return $0.tabState?.navigation.fileTransfer != nil }
+            return false
+        }.map(PersistedTab.init)
+        // Reuse the existing workspace/pane recovery carrier even after the
+        // final terminal removes its workspace and closes the window. This is
+        // only a persisted container: it must not resurrect a terminal or keep
+        // the runtime window open. Restore moves its operations into popups.
+        if let operation = operations.first, savedWorkspaces.isEmpty {
+            let pane = PersistedPane(id: UUID(), tabs: [])
+            let workspace = PersistedWorkspace(id: windowID, workingDirectoryPath: operation.currentDirectoryPath,
+                root: PersistedPaneNode(id: pane.id, kind: .pane(pane)), activePaneId: pane.id)
+            savedWorkspaces.append(workspace)
+            savedActiveWorkspaceId = workspace.id
+        }
+        if !operations.isEmpty {
+            func appendOperations(to node: PersistedPaneNode) -> PersistedPaneNode {
+                var node = node
+                switch node.kind {
+                case .pane(var pane):
+                    pane.tabs.append(contentsOf: operations)
+                    node.kind = .pane(pane)
+                case .split(let orientation, let first, let second, let fraction):
+                    node.kind = .split(orientation: orientation, first: appendOperations(to: first), second: second, fraction: fraction)
+                }
+                return node
+            }
+            let index = savedWorkspaces.firstIndex { $0.id == activeWorkspaceId } ?? 0
+            savedWorkspaces[index].root = appendOperations(to: savedWorkspaces[index].root)
+        }
+        return PersistedState(
+            workspaces: savedWorkspaces,
+            activeWorkspaceId: savedActiveWorkspaceId,
             sidebarMode: sidebarMode,
             rightSidebarMode: rightSidebarMode,
             // Legacy readers do not know Chat (or, before F2, Team).

@@ -99,6 +99,35 @@ func printSuccess(_ response: AgentPadCLIResponse, for command: AgentPadCLIComma
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 
+// Local account preflight runs after the tab's rc files, with its final cwd
+// and environment. It needs neither a running app nor the control socket.
+if arguments.first == "claude-account-check" {
+    guard arguments.count == 4 else { fail("invalid Claude account check arguments") }
+    let accountName = arguments[1], source = URL(fileURLWithPath: arguments[2])
+    func accountFail(_ message: String) -> Never {
+        unlink(source.path)
+        rmdir(source.deletingLastPathComponent().path)
+        fail(message)
+    }
+    let settings = AgentPadClaudeAccountSettings()
+    if let message = settings.failure(accountName: accountName,
+                                      folder: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)) {
+        accountFail(message)
+    }
+    // Discover every provider variable now, including ones exported by rc files
+    // and flags added by future Claude versions. env removes names only; the
+    // selected OAuth value is read later by the shell-native exec assignment.
+    let argv = ["/usr/bin/env"] + settings.environmentRemovals.flatMap { ["-u", $0] }
+        + ["/bin/sh", "+x", "-c", arguments[3]]
+    let storage = argv.map { strdup($0) }
+    defer { storage.forEach { free($0) } }
+    var pointers = storage + [nil]
+    pointers.withUnsafeMutableBufferPointer { buffer in
+        _ = execv("/usr/bin/env", buffer.baseAddress!)
+    }
+    accountFail("Claude account launch could not execute /usr/bin/env.")
+}
+
 // AgentPad: `agentpad-cli mcp` — the team tools as an MCP server on stdio,
 // started by Claude Code sessions in AgentPad (TeamMCPServer.swift).
 // AgentPad: `agentpad-cli run-tools <call-id>` — the same server for a

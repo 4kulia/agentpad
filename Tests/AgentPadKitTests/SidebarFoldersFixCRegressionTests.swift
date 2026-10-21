@@ -90,8 +90,9 @@ extension SidebarFoldersUITests {
     }
 
     func testCDeletingSelectedFolderKeepsNeighbourAndKeyboardFocus() async throws {
-        let host = FoldersUIHost(FoldersSheet(model: fixture.folders,
-            entries: fixture.sidebar.folderEntries(fixture.sidebar.snapshot, includeHidden: true), telegram: fixture.telegram, dismiss: {}), width: 520, height: 650)
+        let host = FoldersUIHost(Color.clear.popupHost(fixture.store.popups), width: 800, height: 850)
+        fixture.folders.presentPopup(in: fixture.store.popups,
+            entries: { self.fixture.sidebar.folderEntries(self.fixture.sidebar.snapshot, includeHidden: true) }, telegram: fixture.telegram)
         defer { host.close() }
         try await host.settle()
         XCTAssertTrue(host.press("New folder"))
@@ -100,7 +101,7 @@ extension SidebarFoldersUITests {
         try await host.settle(); host.key(36, "\r")
         try await eventually { fixture.folders.editing == nil }
         try await host.settle(); host.key(51, "\u{8}", modifiers: .command)
-        try await eventually { fixture.folders.deleting?.id == id }
+        try await eventually { fixture.store.popups.page?.title == "Delete custom folder" }
         try await host.settle(); host.press("Delete")
         try await eventually { fixture.folders.snapshot.catalog.tombstones.contains(id) }
         try await host.settle()

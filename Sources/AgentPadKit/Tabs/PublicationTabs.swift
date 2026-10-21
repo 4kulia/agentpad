@@ -316,6 +316,10 @@ extension TeamTabs {
             state.draft = nil; state.navigation.draftID = nil; state.savedRevision = nil
         } catch { form.fields = savedFields; state.saveError = error.localizedDescription; return }
         if let location = owner(state) {
+            if state.isPopup {
+                location.store.popups.dismiss(location.session, reason: .applied)
+                return
+            }
             _ = router.rekey(location.session.id, to: .publication(scope, publicationID: target.id.uuidString.lowercased()))
             // The editor now describes one publication, even when Both was used.
             let current = service.calls.agents.first { $0.id == target.id } ?? target

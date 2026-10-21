@@ -161,6 +161,9 @@ final class PaneTreeHostView: FlippedLayoutView {
     /// paths (mount grab on new tabs/splits, click gestures) do the work;
     /// this then mostly agrees with them (same target) or no-ops.
     private func syncFocus(force: Bool) {
+        // The popup owns this window's responder chain, even if a background
+        // change selects another tab or an explicit content-focus action runs.
+        guard !store.popups.isPresented else { return }
         let workspace = store.active
         let pane = workspace?.activePane
         let key = FocusKey(

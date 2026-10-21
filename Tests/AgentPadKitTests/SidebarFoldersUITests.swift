@@ -9,6 +9,7 @@ import XCTest
     var fixture: FoldersUIFixture!
     var previousTheme: AgentPadSettingsModel?
     var previousEnhancedUI: Any?
+    var previousStores: (() -> [WorkspaceStore])!
     let enhancedUI = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
     override func setUp() async throws {
         _ = NSApplication.shared
@@ -17,9 +18,14 @@ import XCTest
         team = TeamServiceTestScope(); previousTheme = AgentPadSettingsModel.testModel
         AgentPadSettingsModel.testModel = AgentPadSettingsModel(read: { ["appearance":["mode":"light"]] },write: { _ in },appliesRuntimeEffects: false)
         fixture = try FoldersUIFixture(); try await fixture.start()
+        previousStores = TabRouter.shared.stores
+        TabRouter.shared.stores = { [weak self] in
+            guard let fixture = self?.fixture else { return [] }; return [fixture.store]
+        }
     }
     override func tearDown() async throws {
         SidebarFolderActions.shared.request = nil
+        TabRouter.shared.stores = previousStores
         fixture.close(); fixture = nil; team.close(); team = nil
         AgentPadSettingsModel.testModel = previousTheme
         NSApp.accessibilitySetValue(previousEnhancedUI,forAttribute: enhancedUI)
@@ -147,12 +153,15 @@ import XCTest
     func testRowMenuChooserToggleAndCreateThenRemoveMembership() async throws {
         let row = FoldersUIFixture.rows()[2]
         let rowView = TelegramFolderRow(row: row,store: fixture.store,model: fixture.telegram,folders: fixture.folders,entryID: "work",selected: true)
-        let menu = FoldersUIHost(VStack(alignment: .leading) { rowView; Spacer() },width: 320,height: 400)
+        let menu = FoldersUIHost(VStack(alignment: .leading) { rowView; Spacer() }.popupHost(fixture.store.popups),width: 620,height: 600)
         try await menu.settle()
         menu.key(109,"\u{F70D}",modifiers: .shift,throughApp: true); try await menu.settle()
         XCTAssertTrue(menu.press("Add to folder…",popup: true))
         let request = try XCTUnwrap(SidebarFolderActions.shared.request)
-        try await eventually { menu.popupElements.contains { $0.accessibilityLabel() == "Add to folder" } }
+        try await eventually { menu.elements.contains { $0.accessibilityLabel() == "Add to folder" } }
+        XCTAssertTrue(fixture.store.popups.isPresented)
+        XCTAssertNil(menu.window.attachedSheet)
+        fixture.store.popups.dismiss(reason: .cancel)
         menu.close()
         XCTAssertEqual(request.item,.telegram(row.id.chat)); XCTAssertEqual(request.anchor,"work")
         let chooser = FoldersUIHost(AddToFolderChooser(request: request,model: fixture.folders,dismiss: {}),width: 308,height: 440)
@@ -169,12 +178,12 @@ import XCTest
         fixture.folders.remove(.telegram(3),from: created.id)
         try await eventually { fixture.folders.snapshot.members[created.id]?.isEmpty == true }
         chooser.close(); SidebarFolderActions.shared.request = nil
-        let pinned = FoldersUIHost(fixture.sidebar)
+        let pinned = FoldersUIHost(fixture.sidebar.popupHost(fixture.store.popups), width: 620, height: 800)
         defer { pinned.close() }; try await pinned.settle()
         let attention = try XCTUnwrap(fixture.attention.items.first { $0.telegramChat != nil })
         SidebarFolderActions.shared.present(.telegram(try XCTUnwrap(attention.telegramChat)),binding: fixture.binding,
             windowID: fixture.store.windowID,anchor: "attention:" + attention.id)
-        try await eventually { pinned.popupElements.contains { $0.accessibilityLabel() == "Add to folder" } }
+        try await eventually { pinned.elements.contains { $0.accessibilityLabel() == "Add to folder" } }
     }
     func testSheetOneTelegramHandleAndKeyboardMovesWholeBlock() async throws {
         let host = FoldersUIHost(FoldersSheet(model: fixture.folders,entries: fixture.sidebar.folderEntries(fixture.sidebar.snapshot,includeHidden: true),telegram: fixture.telegram,dismiss: {}),width: 520,height: 650)
@@ -185,15 +194,117 @@ import XCTest
         for _ in 0..<4 { host.key(125,"\u{F701}"); try await host.settle() }
         host.key(126,"\u{F700}",modifiers: [.command,.option])
         try await eventually { fixture.folders.snapshot.catalog.order != before }
+        try await host.settle()
         XCTAssertEqual(fixture.folders.snapshot.catalog.order.firstIndex(of: "telegram"),(before.firstIndex(of: "telegram") ?? 0) - 1)
         XCTAssertEqual(fixture.telegram.snapshot.lists.map(\.name),["Work","Family","Unread","All chats","Archive"])
-        XCTAssertTrue(host.labels().contains("Show Work"))
+        XCTAssertTrue(host.labels().contains("Show Work"), host.labels().joined(separator: " | "))
         host.key(49," "); try await eventually { fixture.telegram.snapshot.lists.first { $0.key == .folder(1) }?.visible == false }
         try await host.settle(); host.key(49," "); try await eventually { fixture.telegram.snapshot.lists.first { $0.key == .folder(1) }?.visible == true }
     }
+    func testFoldersPopupKeepsRenameOnDismissAndCancelDiscardsOnlyTheText() async throws {
+        let owner = fixture.store, folders = fixture.folders
+        let original = try XCTUnwrap(folders.snapshot.catalog.custom.first { $0.id == fixture.launch })
+        let host = FoldersUIHost(Color.clear.popupHost(owner.popups), width: 800, height: 850)
+        defer { host.close() }
+        folders.editing = original.id; folders.editingName = "Unfinished rename"
+        let entries = { self.fixture.sidebar.folderEntries(self.fixture.sidebar.snapshot, includeHidden: true) }
+        folders.presentPopup(in: owner.popups, entries: entries, telegram: fixture.telegram)
+        try await host.settle()
+        let page = try XCTUnwrap(folders.popup)
+        owner.popups.dismiss(reason: .dismiss)
+        XCTAssertEqual(folders.snapshot.catalog.custom.first { $0.id == original.id }, original)
+        folders.presentPopup(in: owner.popups, entries: entries, telegram: fixture.telegram)
+        try await host.settle()
+        XCTAssertTrue(folders.popup === page)
+        XCTAssertEqual(folders.editingName, "Unfinished rename")
+        XCTAssertTrue(owner.popups.showsDraftNotice)
+        owner.popups.dismiss(reason: .cancel)
+        XCTAssertNil(folders.editing)
+        XCTAssertEqual(folders.editingName, "")
+        XCTAssertEqual(folders.snapshot.catalog.custom.first { $0.id == original.id }, original)
+        XCTAssertTrue(owner.allSessions.isEmpty)
+    }
+
+    func testSidebarFoldersPopupTracksTeamUpdatesWhileOpenAndAfterDraftReopen() async throws {
+        let owner = fixture.store, folders = fixture.folders
+        let host = FoldersUIHost(fixture.sidebar.popupHost(owner.popups), width: 800, height: 900)
+        defer { host.close() }
+        try await host.settle()
+        XCTAssertTrue(host.press("Folders…"))
+        try await host.settle()
+        let page = try XCTUnwrap(folders.popup)
+        func popupLabels() throws -> [String] {
+            let dialog = try XCTUnwrap(host.descendants().first { $0.accessibilityIdentifier() == "popup-dialog" })
+            func read(_ object: NSObject, depth: Int = 0) -> [String] {
+                guard depth < 40 else { return [] }
+                let node = FoldersAXNode(object: object)
+                let label = node.accessibilityLabel() ?? node.accessibilityTitle() ?? node.accessibilityValue() as? String
+                return (label.map { [$0] } ?? []) + node.children.flatMap { read($0, depth: depth + 1) }
+            }
+            return read(dialog)
+        }
+        XCTAssertTrue(try popupLabels().contains { $0.contains("Channels · Aster") })
+        var updated = fixture.org.view
+        updated.teams[0].name = "Aster live update"
+        fixture.org.set(updated)
+        try await host.settle()
+        XCTAssertTrue(try popupLabels().contains { $0.contains("Channels · Aster live update") },
+            "The popup must read the current organization snapshot while it remains open")
+
+        folders.editing = fixture.launch
+        try await host.settle()
+        folders.editingName = "Unsubmitted rename"
+        try await host.settle()
+        owner.popups.dismiss(reason: .dismiss)
+        XCTAssertEqual(folders.editingName, "Unsubmitted rename")
+        updated.teams[0].name = "Aster after dismissal"
+        fixture.org.set(updated)
+        try await host.settle()
+        XCTAssertTrue(host.press("Folders…"))
+        try await host.settle()
+        XCTAssertTrue(folders.popup === page)
+        XCTAssertEqual(folders.editingName, "Unsubmitted rename")
+        XCTAssertTrue(owner.popups.showsDraftNotice)
+        XCTAssertTrue(try popupLabels().contains { $0.contains("Channels · Aster after dismissal") },
+            "Reopening a retained rename draft must refresh the other live rows")
+        owner.popups.dismiss(reason: .cancel)
+    }
+
+    func testChooserUsesWindowPopupAndRetainsSearchUntilExplicitCancel() async throws {
+        let actions = SidebarFolderActions(folders: fixture.folders), owner = fixture.store
+        let host = FoldersUIHost(Color.clear.popupHost(owner.popups), width: 800, height: 700)
+        defer { host.close() }
+        let before = fixture.folders.snapshot.catalog
+        actions.present(.telegram(3), binding: fixture.binding, windowID: owner.windowID)
+        try await host.settle()
+        try await assertPopupInventoryPresentation(in: host.window, root: host.view, coordinator: owner.popups,
+            title: "Add to folder…")
+        guard case .native(let page) = owner.popups.page else { return XCTFail("Chooser did not use PopupHost") }
+        let editor = try XCTUnwrap(host.window.firstResponder as? NSTextView)
+        editor.insertText("Launch", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+        try await host.settle()
+        owner.popups.dismiss(reason: .dismiss)
+        XCTAssertNil(actions.request)
+        actions.present(.telegram(3), binding: fixture.binding, windowID: owner.windowID)
+        try await host.settle()
+        XCTAssertEqual(owner.popups.page?.id, ObjectIdentifier(page))
+        XCTAssertTrue(owner.popups.showsDraftNotice)
+        XCTAssertTrue(host.elements.contains { $0.accessibilityValue() as? String == "Launch" })
+        owner.popups.dismiss(reason: .cancel)
+        actions.present(.telegram(3), binding: fixture.binding, windowID: owner.windowID)
+        XCTAssertNotEqual(owner.popups.page?.id, ObjectIdentifier(page))
+        XCTAssertFalse(owner.popups.showsDraftNotice)
+        XCTAssertEqual(fixture.folders.snapshot.catalog, before)
+        XCTAssertTrue(owner.allSessions.isEmpty)
+        XCTAssertNil(host.window.attachedSheet)
+    }
     func testSheetCreateRenameDeleteAndNotConnectedGroup() async throws {
-        let host = FoldersUIHost(FoldersSheet(model: fixture.folders,entries: fixture.sidebar.folderEntries(fixture.sidebar.snapshot,includeHidden: true),telegram: fixture.telegram,dismiss: {}),width: 520,height: 650)
+        let host = FoldersUIHost(Color.clear.popupHost(fixture.store.popups), width: 800, height: 850)
+        fixture.folders.presentPopup(in: fixture.store.popups,
+            entries: { self.fixture.sidebar.folderEntries(self.fixture.sidebar.snapshot, includeHidden: true) }, telegram: fixture.telegram)
         defer { host.close() }; try await host.settle()
+        try await assertPopupInventoryPresentation(in: host.window, root: host.view, coordinator: fixture.store.popups,
+            title: "Folders…")
         XCTAssertTrue(host.press("New folder"))
         try await eventually { fixture.folders.editing != nil }
         let id = try XCTUnwrap(fixture.folders.editing)
@@ -205,9 +316,12 @@ import XCTest
         try await eventually { fixture.folders.snapshot.catalog.custom.first { $0.id == id }?.name == "Release notes" }
         try await host.settle()
         host.key(51,"\u{8}",modifiers: .command)
-        try await eventually { fixture.folders.deleting?.id == id }
+        try await eventually { fixture.store.popups.page?.title == "Delete custom folder" }
         try await host.settle()
-        XCTAssertTrue(host.labels().contains("Items stay where they are."))
+        try await assertPopupInventoryPresentation(in: host.window, root: host.view, coordinator: fixture.store.popups,
+            title: "Delete custom folder")
+        XCTAssertTrue(host.labels().contains { $0.contains("Items stay where they are.") })
+        XCTAssertNil(host.window.attachedSheet)
         host.press("Delete")
         try await eventually { fixture.folders.snapshot.catalog.tombstones.contains(id) }
         fixture.telegram.receive(.init()); try await host.settle()

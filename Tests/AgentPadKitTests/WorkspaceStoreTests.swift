@@ -69,6 +69,47 @@ final class WorkspaceStoreTests: XCTestCase {
         return pane
     }
 
+    private func closeReview(_ store: WorkspaceStore, file: StaticString = #filePath, line: UInt = #line) throws -> CloseWorkspaceBatch {
+        guard case .tool(let session) = store.popups.page else {
+            XCTFail("close review must be the visible popup", file: file, line: line)
+            return try XCTUnwrap(nil, file: file, line: line)
+        }
+        XCTAssertTrue(store.popups.sessions.contains { $0 === session }, file: file, line: line)
+        XCTAssertFalse(store.allSessions.contains { $0 === session }, file: file, line: line)
+        return try XCTUnwrap(session.tabState?.closeWorkspaces, file: file, line: line)
+    }
+
+    private func assertCloseReviewPreservesWorkspaces(
+        _ store: WorkspaceStore, batch: CloseWorkspaceBatch, workspaces: [Workspace], sessions: [Session],
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let pageID = store.popups.page?.id
+        let assertPreserved = {
+            XCTAssertEqual(store.workspaces.map(ObjectIdentifier.init), workspaces.map(ObjectIdentifier.init), file: file, line: line)
+            XCTAssertEqual(store.allSessions.map(ObjectIdentifier.init), sessions.map(ObjectIdentifier.init), file: file, line: line)
+            for session in sessions {
+                XCTAssertEqual(self.engine(session).terminateCount, 0, file: file, line: line)
+            }
+            XCTAssertFalse(batch.working, file: file, line: line)
+            XCTAssertFalse(batch.rows.contains { $0.done || $0.directoryDeleted }, file: file, line: line)
+        }
+        assertPreserved()
+        XCTAssertTrue(store.popups.locksDismissal, file: file, line: line)
+        XCTAssertFalse(store.popups.canGoBack, file: file, line: line)
+        store.popups.dismiss(reason: .dismiss)
+        store.popups.back()
+        XCTAssertEqual(store.popups.page?.id, pageID, file: file, line: line)
+        assertPreserved()
+
+        let previousStores = TabRouter.shared.stores
+        TabRouter.shared.stores = { [store] }
+        defer { TabRouter.shared.stores = previousStores }
+        batch.cancel()
+        XCTAssertFalse(store.popups.isPresented, file: file, line: line)
+        XCTAssertFalse(store.popups.sessions.contains { $0.tabState?.closeWorkspaces != nil }, file: file, line: line)
+        assertPreserved()
+    }
+
     func testRequestRenameActiveTabBeginsInlineEdit() {
         let store = makeStore()
         XCTAssertEqual(store.active?.activeSession?.nameEdit.isEditing, false)
@@ -165,23 +206,25 @@ final class WorkspaceStoreTests: XCTestCase {
         store.requestCloseWorkspace(plain)
         XCTAssertFalse(store.workspaces.contains { $0.id == plain.id })
         XCTAssertFalse(store.allSessions.contains { $0.tabState?.closeWorkspaces != nil })
+        XCTAssertFalse(store.popups.sessions.contains { $0.tabState?.closeWorkspaces != nil })
     }
 
-    func testRequestCloseWorkspaceParksWorktreeForConfirmation() {
-        // worktree workspaces must surface in `pendingRemovalRequest` so
-        // the sidebar's confirm sheet can intercept — the close itself
-        // does NOT happen until the sheet's `confirm` action runs.
-        let store = makeStore()
+    func testRequestCloseWorkspaceParksWorktreeForConfirmation() throws {
+        // A worktree stays intact until the popup's named close action runs.
+        let store = makeStore(); defer { store.terminate() }
         let source = store.workspaces[0]
         let wt = store.addWorkspace(
             workingDirectory: URL(fileURLWithPath: "/tmp/projectA-feat-x"),
             worktreeParent: source,
             worktreeBranch: "feat-x"
         )
+        let workspaces = store.workspaces, sessions = store.allSessions
         store.requestCloseWorkspace(wt)
         XCTAssertTrue(store.workspaces.contains { $0.id == wt.id },
-                      "worktree workspace must remain until the sheet confirms")
-        XCTAssertEqual(store.allSessions.compactMap { $0.tabState?.closeWorkspaces }.first?.rows.first?.id, wt.id)
+                      "worktree workspace must remain until the popup confirms")
+        let review = try closeReview(store)
+        XCTAssertEqual(review.rows.map(\.id), [wt.id])
+        assertCloseReviewPreservesWorkspaces(store, batch: review, workspaces: workspaces, sessions: sessions)
     }
 
     func testCloseOtherWorkspacesKeepsWorktreeFamilyIntact() {
@@ -319,12 +362,11 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(after.first?.id, wt.id, "matched pair must keep its original id")
     }
 
-    func testRequestCloseSourceWithWorktreesParksForConfirm() {
+    func testRequestCloseSourceWithWorktreesParksForConfirm() throws {
         // Closing a top-level workspace that owns worktrees would either
         // strand them as orphan rows or vanish them silently. Either way
-        // is wrong — the request parks in `pendingCloseSourceRequest` so
-        // the sheet can ask about deleting all of them in one shot.
-        let store = makeStore()
+        // is wrong — the popup reviews the whole family together.
+        let store = makeStore(); defer { store.terminate() }
         let source = store.addWorkspace(workingDirectory: projectA)
         let wtA = store.addWorkspace(
             workingDirectory: URL(fileURLWithPath: "/tmp/projectA-a"),
@@ -334,12 +376,15 @@ final class WorkspaceStoreTests: XCTestCase {
             workingDirectory: URL(fileURLWithPath: "/tmp/projectA-b"),
             worktreeParent: source, worktreeBranch: "b"
         )
+        let workspaces = store.workspaces, sessions = store.allSessions
         store.requestCloseWorkspace(source)
         XCTAssertTrue(store.workspaces.contains { $0.id == source.id },
-                      "source must stay until the sheet confirms")
-        let req = store.allSessions.compactMap { $0.tabState?.closeWorkspaces }.first
-        XCTAssertTrue(req?.rows.contains { $0.id == source.id } == true)
-        XCTAssertEqual(Set(req?.rows.filter { $0.parentID != nil }.map(\.id) ?? []), Set([wtA.id, wtB.id]))
+                      "source must stay until the popup confirms")
+        let req = try closeReview(store)
+        XCTAssertTrue(req.rows.contains { $0.id == source.id })
+        XCTAssertEqual(Set(req.rows.filter { $0.parentID != nil }.map(\.id)), Set([wtA.id, wtB.id]))
+        XCTAssertEqual(Set(req.rows.map(\.id)), Set([source.id, wtA.id, wtB.id]))
+        assertCloseReviewPreservesWorkspaces(store, batch: req, workspaces: workspaces, sessions: sessions)
     }
 
     func testRequestCloseSourceWithoutWorktreesClosesInline() {
@@ -350,6 +395,7 @@ final class WorkspaceStoreTests: XCTestCase {
         store.requestCloseWorkspace(solo)
         XCTAssertFalse(store.workspaces.contains { $0.id == solo.id })
         XCTAssertFalse(store.allSessions.contains { $0.tabState?.closeWorkspaces != nil })
+        XCTAssertFalse(store.popups.sessions.contains { $0.tabState?.closeWorkspaces != nil })
     }
 
     func testPerformCloseSourceAlsoDeleteFalseSkipsGitRemoveEntirely() async {
@@ -377,6 +423,7 @@ final class WorkspaceStoreTests: XCTestCase {
             "disk dir must survive alsoDelete=false close"
         )
         XCTAssertFalse(store.allSessions.contains { $0.tabState?.closeWorkspaces != nil })
+        XCTAssertFalse(store.popups.sessions.contains { $0.tabState?.closeWorkspaces != nil })
     }
 
     func testPerformCloseSourceAbortsWhenGitRemoveFails() async {
@@ -400,23 +447,25 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertTrue(store.workspaces.contains { $0.id == wt.id })
     }
 
-    func testCloseLastTabOfWorktreeRoutesThroughConfirmInsteadOfCascading() {
+    func testCloseLastTabOfWorktreeRoutesThroughConfirmInsteadOfCascading() throws {
         // The default cascade is closeTab → detachSession → closePane →
-        // closeWorkspace, which skips the worktree confirm sheet. The
-        // intercept should park the workspace in `pendingRemovalRequest`
-        // and leave the tab in place so the sheet's cancel can roll back.
-        let store = makeStore()
+        // closeWorkspace, which skips the worktree confirmation. The
+        // intercept must leave the original workspace and tab intact.
+        let store = makeStore(); defer { store.terminate() }
         let source = store.workspaces[0]
         let wt = store.addWorkspace(
             workingDirectory: URL(fileURLWithPath: "/tmp/projectA-feat-x"),
             worktreeParent: source, worktreeBranch: "feat-x"
         )
         let onlyTab = firstPane(wt).tabs[0]
+        let workspaces = store.workspaces, sessions = store.allSessions
         store.closeTab(onlyTab, in: wt)
         XCTAssertTrue(store.workspaces.contains { $0.id == wt.id },
-                      "worktree workspace must survive until the sheet confirms")
+                      "worktree workspace must survive until the popup confirms")
         XCTAssertTrue(firstPane(wt).tabs.contains { $0 === onlyTab }, "the original tab stays while the review opens")
-        XCTAssertEqual(store.allSessions.compactMap { $0.tabState?.closeWorkspaces }.first?.rows.first?.id, wt.id)
+        let review = try closeReview(store)
+        XCTAssertEqual(review.rows.map(\.id), [wt.id])
+        assertCloseReviewPreservesWorkspaces(store, batch: review, workspaces: workspaces, sessions: sessions)
     }
 
     func testCloseOtherWithoutWorktreesRunsInline() {
@@ -429,25 +478,28 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(store.workspaces.count, 1)
         XCTAssertEqual(store.workspaces.first?.id, kept.id)
         XCTAssertFalse(store.allSessions.contains { $0.tabState?.closeWorkspaces != nil })
+        XCTAssertFalse(store.popups.sessions.contains { $0.tabState?.closeWorkspaces != nil })
     }
 
-    func testCloseOtherWithWorktreesParksForConfirmSheet() {
-        // Any worktree in `others` → park the request and let the sheet
-        // ask about the directories. No workspace closes until the sheet
-        // calls performCloseOthers.
-        let store = makeStore()
+    func testCloseOtherWithWorktreesParksForConfirmSheet() throws {
+        // Any worktree in `others` → park the request and let the popup
+        // ask about the directories. No workspace closes before approval.
+        let store = makeStore(); defer { store.terminate() }
         let kept = store.workspaces[0]
         let other = store.addWorkspace(workingDirectory: projectA)
         let wt = store.addWorkspace(
             workingDirectory: URL(fileURLWithPath: "/tmp/projectA-wt"),
             worktreeParent: other, worktreeBranch: "feat"
         )
+        let workspaces = store.workspaces, sessions = store.allSessions
         store.closeOtherWorkspaces(keeping: kept)
-        XCTAssertEqual(store.workspaces.count, 3, "nothing closed yet, awaiting sheet")
-        let req = store.allSessions.compactMap { $0.tabState?.closeWorkspaces }.first
-        XCTAssertFalse(req?.rows.contains { $0.id == kept.id } == true)
-        XCTAssertEqual(req?.rows.filter { $0.parentID != nil }.count, 1)
-        XCTAssertEqual(req?.rows.first { $0.parentID != nil }?.id, wt.id)
+        XCTAssertEqual(store.workspaces.count, 3, "nothing closed yet, awaiting popup")
+        let req = try closeReview(store)
+        XCTAssertFalse(req.rows.contains { $0.id == kept.id })
+        XCTAssertEqual(req.rows.filter { $0.parentID != nil }.count, 1)
+        XCTAssertEqual(req.rows.first { $0.parentID != nil }?.id, wt.id)
+        XCTAssertEqual(Set(req.rows.map(\.id)), Set([other.id, wt.id]))
+        assertCloseReviewPreservesWorkspaces(store, batch: req, workspaces: workspaces, sessions: sessions)
     }
 
     func testPerformCloseOthersClosesPlainWorkspacesWhenNoWorktrees() async {
@@ -464,6 +516,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(store.workspaces.count, 1)
         XCTAssertEqual(store.workspaces.first?.id, kept.id)
         XCTAssertFalse(store.allSessions.contains { $0.tabState?.closeWorkspaces != nil })
+        XCTAssertFalse(store.popups.sessions.contains { $0.tabState?.closeWorkspaces != nil })
     }
 
     func testPerformCloseOthersAbortsWhenGitRemoveFails() async {
@@ -2006,20 +2059,51 @@ final class WorkspaceStoreTests: XCTestCase {
     func testClosingTerminalSplitKeepsWorkspaceDirectoryWhenSettingsBecomesActive() throws {
         let store = makeStore(); defer { store.terminate() }
         let workspace = store.addWorkspace(workingDirectory: projectA)
+        let content = store.openToolTab(.search)
         let settings = store.openToolTab(.settings)
         let terminalPane = try XCTUnwrap(store.splitPane(firstPane(workspace), orientation: .horizontal, in: workspace))
         let terminal = store.addTab(in: workspace, pane: terminalPane, template: .terminal)
         engine(terminal).emitPwd(projectB.path)
+        XCTAssertFalse(content.hasProcess)
+        XCTAssertEqual(content.currentDirectory, projectA)
         XCTAssertEqual(settings.currentDirectory, projectA)
         XCTAssertEqual(workspace.workingDirectory, projectB)
 
         store.closeTab(terminal, in: workspace)
         XCTAssertEqual(workspace.root.allPanes.count, 1)
-        XCTAssertTrue(workspace.activeSession === settings)
+        XCTAssertTrue(workspace.activeSession === content)
+        guard case .tool(let visible) = store.popups.page else { return XCTFail("Settings popup must remain visible") }
+        XCTAssertTrue(visible === settings)
+        XCTAssertFalse(store.allSessions.contains { $0 === settings })
         XCTAssertEqual(workspace.workingDirectory, projectB)
         XCTAssertEqual(store.fileTreeRoot, projectB)
         let next = store.addTab(in: workspace, pane: try XCTUnwrap(workspace.activePane), template: .terminal)
         XCTAssertEqual(next.currentDirectory, projectB)
+    }
+
+    func testClosingTerminalSplitRestoresSurvivingTerminalDirectoryWithSettingsPopup() throws {
+        let store = makeStore(); defer { store.terminate() }
+        let workspace = store.addWorkspace(workingDirectory: projectA)
+        let survivingTerminal = try XCTUnwrap(workspace.activeSession)
+        let settings = store.openToolTab(.settings)
+        let terminalPane = try XCTUnwrap(store.splitPane(firstPane(workspace), orientation: .horizontal, in: workspace))
+        let terminal = store.addTab(in: workspace, pane: terminalPane, template: .terminal)
+        engine(terminal).emitPwd(projectB.path)
+        XCTAssertTrue(survivingTerminal.hasProcess)
+        XCTAssertEqual(survivingTerminal.currentDirectory, projectA)
+        XCTAssertEqual(settings.currentDirectory, projectA)
+        XCTAssertEqual(workspace.workingDirectory, projectB)
+
+        store.closeTab(terminal, in: workspace)
+        XCTAssertEqual(workspace.root.allPanes.count, 1)
+        XCTAssertTrue(workspace.activeSession === survivingTerminal)
+        guard case .tool(let visible) = store.popups.page else { return XCTFail("Settings popup must remain visible") }
+        XCTAssertTrue(visible === settings)
+        XCTAssertFalse(store.allSessions.contains { $0 === settings })
+        XCTAssertEqual(workspace.workingDirectory, projectA)
+        XCTAssertEqual(store.fileTreeRoot, projectA)
+        let next = store.addTab(in: workspace, pane: try XCTUnwrap(workspace.activePane), template: .terminal)
+        XCTAssertEqual(next.currentDirectory, projectA)
     }
 
     func testClosingZoomedPaneClearsZoom() {
@@ -2870,7 +2954,12 @@ extension WorkspaceStoreTests {
     func testSameRepoTabSpawnMergesGitStatusFetches() async throws {
         let repo = try makeGitRepo()
         defer { try? FileManager.default.removeItem(at: repo) }
-        let store = makeStore()
+        let store = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true,
+            sessionNames: .testing, engineFactory: { TestEngine() }, optionsProvider: { _ in nil }, resumeProvider: { true })
+        defer { store.terminate() }
+        XCTAssertEqual(store.workspaces.count, 1)
+        XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertEqual(store.gitWatchHubStats.watchers, 0)
         let baseline = store.gitStatusDispatchCount
 
         let ws = store.addWorkspace(workingDirectory: repo)

@@ -293,10 +293,69 @@ enum AgentPadShellIntegration {
         "-o", "ControlPersist=30",
     ]
 
+    /// A mux client passes stdin to the existing master, whose core limit we
+    /// cannot control. Credential transfers must use only their guarded child,
+    /// overriding even a ControlPath configured in the user's SSH config.
+    static let sshCredentialOptions = [
+        "-o", "ControlMaster=no",
+        "-o", "ControlPath=none",
+    ]
+
     private static let remotePasteSSHOptions = [
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
     ] + sshMultiplexOptions
+
+    /// Credential bytes travel only through stdin, never SSH argv or the
+    /// terminal. Call from a worker thread; stderr is deliberately discarded.
+    static func runSSHProcess(_ executable: String, _ arguments: [String], stdin: Data?,
+                              timeout: TimeInterval, captureOutput: Bool = true,
+                              environment: [String: String] = ProcessInfo.processInfo.environment,
+                              inspectLaunch: ((String, [String], [String: String]) -> Void)? = nil) -> RemoteSSHProcessResult {
+        let process = Process(), input = Pipe(), output = Pipe()
+        // The shell drops its own (and exec's inherited) core limit before
+        // reading stdin. Positional arguments carry only the executable/argv.
+        // Never lower the app's process-wide limit around a concurrent spawn.
+        process.executableURL = URL(fileURLWithPath: stdin == nil ? executable : "/bin/sh")
+        process.arguments = stdin == nil ? arguments :
+            ["+x", "-c", "ulimit -c 0 || exit 46\nexec \"$@\"", "agentpad-ssh", executable] + arguments
+        let childEnvironment = environment.filter {
+            !ClaudeAccountSettings.isCompeting($0.key) && $0.key != "BASH_ENV" && $0.key != "ENV"
+        }
+        process.environment = childEnvironment
+        process.standardInput = input
+        if captureOutput { process.standardOutput = output }
+        else { process.standardOutput = FileHandle.nullDevice }
+        process.standardError = FileHandle.nullDevice
+        inspectLaunch?(process.executableURL!.path, process.arguments ?? [], process.environment ?? [:])
+        do { try process.run() }
+        catch { return RemoteSSHProcessResult(exitCode: -1) }
+        let writer = DispatchGroup()
+        writer.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { try? input.fileHandleForWriting.close(); writer.leave() }
+            if let stdin { try? input.fileHandleForWriting.write(contentsOf: stdin) }
+        }
+        let watchdog = DispatchWorkItem { [weak process] in
+            guard let process, process.isRunning else { return }
+            process.terminate()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1) { [weak process] in
+                guard let process, process.isRunning else { return }
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+        var captured = Data()
+        if captureOutput {
+            while let chunk = try? output.fileHandleForReading.read(upToCount: 4096), !chunk.isEmpty {
+                captured.append(chunk.prefix(max(0, 128 - captured.count)))
+            }
+        }
+        process.waitUntilExit()
+        watchdog.cancel()
+        writer.wait()
+        return RemoteSSHProcessResult(exitCode: process.terminationStatus, output: captured)
+    }
 
     /// mkdir for this paste plus a piggybacked expiry sweep: agentpad-pastes
     /// dirs older than an hour are removed on the way (ample time for any

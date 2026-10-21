@@ -63,18 +63,22 @@ final class RequestTabsTests: XCTestCase {
     }
     private func decisions(_ f: Fixture) throws -> [ChatCommandRecord] { try f.commands().filter { $0.type == "request.decide" } }
 
-    func testOneAddressAcrossEntriesTransferScopeAndRestoreNeverRestoresConsent() async throws {
+    func testWindowOwnedRequestAddressAndRestoreNeverRestoresConsent() async throws {
         let f = try await fixture(), (tabs, session, model) = try await tab(f)
         tabs.router.stores = { [weak self] in self?.hosts ?? [] }
         let state = try XCTUnwrap(session.tabState)
         model.reason = "A saved reason, including invalid unfinished input"
         XCTAssertTrue(model.confirm(.decline)); state.confirmation.shown(true)
         let other = host(), workspace = try XCTUnwrap(other.active)
-        XCTAssertTrue(tabs.open(requestID, scope: .server(OrgKey(f.key)), from: other) === session)
-        XCTAssertTrue(tabs.open(requestID, callScope: TeamCallScope(f.key), from: other) === session)
-        XCTAssertTrue(other.handleTabDrop(droppedId: session.id, in: workspace))
+        let otherSession = try XCTUnwrap(tabs.open(requestID, scope: .server(OrgKey(f.key)), from: other))
+        XCTAssertFalse(otherSession === session)
+        XCTAssertTrue(tabs.open(requestID, callScope: TeamCallScope(f.key), from: other) === otherSession)
+        XCTAssertFalse(other.handleTabDrop(droppedId: session.id, in: workspace))
         XCTAssertTrue(tabs.model(state) === model)
-        XCTAssertEqual(state.confirmation.phase, .invalidated)
+        XCTAssertNotEqual(tabs.router.owner(of: session.id)?.store.windowID, other.windowID)
+        XCTAssertEqual(otherSession.tabState?.confirmation.phase, .idle)
+        XCTAssertTrue(state.confirmation.isAwaiting)
+        state.confirmation.cancel()
         XCTAssertEqual(model.reason, "A saved reason, including invalid unfinished input")
         XCTAssertFalse(tabs.open(requestID, scope: .local, from: other) === session)
         let otherAccount = try OrgKey(server: f.key.server.description, accountID: "other", orgID: f.key.orgId)
@@ -87,6 +91,28 @@ final class RequestTabsTests: XCTestCase {
         XCTAssertEqual(restored.confirmation.phase, .idle)
         XCTAssertTrue(try decisions(f).isEmpty)
         XCTAssertFalse(session.hasProcess)
+    }
+
+    func testRequestStatusContinuesUpdatingAcrossPopupDismissalWithoutSending() async throws {
+        let f = try await fixture(), (tabs, session, model) = try await tab(f)
+        let owner = try XCTUnwrap(tabs.router.owner(of: session.id)?.store)
+        model.reason = "Keep this reason"
+        let initial = model.revision
+        try f.move("running", 3, run: "run")
+        try await wait { model.revision > initial }
+        XCTAssertEqual(model.request?.state, .running)
+        owner.popups.dismiss(reason: .dismiss)
+        let hidden = model.revision
+        try f.move("finished", 4, run: "run")
+        try f.store.calls.setLocal(requestID, text: "Answer arrived while closed", log: nil, runId: "run")
+        try await wait { model.revision > hidden }
+        XCTAssertFalse(owner.popups.isPresented)
+        XCTAssertFalse(session.tabState?.isClosed == true)
+        XCTAssertTrue(tabs.open(requestID, scope: .server(OrgKey(f.key)), from: owner) === session)
+        XCTAssertTrue(tabs.model(try XCTUnwrap(session.tabState)) === model)
+        XCTAssertEqual(model.request?.state, .finished)
+        XCTAssertEqual(model.reason, "Keep this reason")
+        XCTAssertTrue(try f.commands().isEmpty, "Dismissal may not decide, stop, cancel or publish")
     }
 
     func testPersonalRequestDecisionsUseD9AndInlineReasonWithoutChannelContent() async throws {
@@ -396,7 +422,7 @@ final class RequestTabsTests: XCTestCase {
     func testD9AndY2InBothOrdersRemainIndependentAndStartOnce() async throws {
         for versionFirst in [false, true] {
             let versions = ClaudeVersionApprovals(), runner = RequestVersionRunner(versions: versions)
-            let f = try await fixture(executor: runner), (_, session, model) = try await tab(f, versions: versions)
+            let f = try await fixture(executor: runner), (tabs, session, model) = try await tab(f, versions: versions)
             if versionFirst {
                 var probe = TeamRunRequest(agent: f.agent, prompt: "probe", sessionId: UUID().uuidString, resume: false, callerName: "test", callerProject: nil)
                 probe.runToolsCallId = requestID
@@ -408,6 +434,7 @@ final class RequestTabsTests: XCTestCase {
                 XCTAssertEqual(runner.starts, 0)
             }
             try await accept(.allow, model, session)
+            XCTAssertTrue(session.tabState?.isClosed == true, "The named request decision completes its popup")
             let approval = try XCTUnwrap(f.journal.approval(f.key, requestId: requestID))
             XCTAssertEqual(runner.starts, 0, "D9 does not bypass the server's start")
             try f.move("starting", 4, run: approval.runId)
@@ -415,7 +442,10 @@ final class RequestTabsTests: XCTestCase {
             if !versionFirst {
                 try await wait { versions.pending.count == 1 }
                 XCTAssertEqual(runner.starts, 0, "D9 must never grant Y2")
-                try await accept(.version(XCTUnwrap(versions.pending.first?.id), true), model, session)
+                let reopened = try XCTUnwrap(tabs.open(requestID, scope: .server(OrgKey(f.key)), from: tabs.router.stores().first))
+                let state = try XCTUnwrap(reopened.tabState)
+                state.confirmation.canShow = { true }
+                try await accept(.version(XCTUnwrap(versions.pending.first?.id), true), tabs.model(state), reopened)
             }
             _ = try await launching.value
             XCTAssertEqual(runner.starts, 1)

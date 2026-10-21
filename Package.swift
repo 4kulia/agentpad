@@ -8,6 +8,11 @@ let package = Package(
         // The pinned TDLib macOS binary requires macOS 15.
         .macOS("15.0")
     ],
+    products: [
+        // Inserted only by quiet test launchers; never a shipped app dependency.
+        .library(name: "AgentPadQuietInterposer", type: .dynamic, targets: ["AgentPadQuietInterposer"]),
+        .library(name: "AgentPadQuietTestSupport", type: .dynamic, targets: ["AgentPadQuietTestSupport"]),
+    ],
     dependencies: [
         // AgentPad: in-app updates ("Install and Relaunch"), verified with an
         // EdDSA key and a Developer ID signature. Pinned: updates are deliberate.
@@ -23,9 +28,11 @@ let package = Package(
     targets: [
         // Thin executable: main.swift only. Everything else lives in AgentPadKit so
         // tests can `@testable import` it (SPM doesn't allow importing executables).
+        // Account launches require the current helper even when SwiftPM
+        // builds only this product (`swift run AgentPad`).
         .executableTarget(
             name: "AgentPad",
-            dependencies: ["AgentPadKit"],
+            dependencies: ["AgentPadKit", "agentpad-cli"],
             path: "Sources/AgentPad",
             // AgentPad: Sparkle.framework lives in Contents/Frameworks of the
             // app bundle (scripts/build-app.sh).
@@ -101,6 +108,22 @@ let package = Package(
                 .linkedFramework("Carbon"),
             ]
         ),
+        .target(
+            name: "AgentPadQuietTestSupport",
+            path: "Sources/AgentPadQuietTestSupport",
+            exclude: ["Interposer"],
+            publicHeadersPath: "include",
+            cSettings: [.define("DEBUG", .when(configuration: .debug)), .unsafeFlags(["-fobjc-arc"])],
+            linkerSettings: [.linkedFramework("AppKit"), .linkedFramework("AVFoundation"),
+                             .linkedFramework("AudioToolbox"), .linkedFramework("UserNotifications")]
+        ),
+        .target(
+            name: "AgentPadQuietInterposer",
+            path: "Sources/AgentPadQuietTestSupport/Interposer",
+            publicHeadersPath: "include",
+            cSettings: [.unsafeFlags(["-fobjc-arc"])],
+            linkerSettings: [.linkedFramework("AppKit"), .linkedFramework("AudioToolbox")]
+        ),
         .binaryTarget(
             name: "GhosttyKit",
             // Run scripts/setup-libghostty.sh to populate this; not committed.
@@ -110,11 +133,14 @@ let package = Package(
             name: "AgentPadKitTests",
             // AgentPadHookKit is listed so socket integration tests can drive
             // HookServer with the real CLI transport client.
-            dependencies: ["AgentPadKit", "AgentPadHookKit"],
+            dependencies: ["AgentPadKit", "AgentPadHookKit", "AgentPadQuietTestSupport"],
             path: "Tests/AgentPadKitTests",
             // AgentPad: the server's API samples, read from disk by the
             // chat tests (scripts/sync-chat-fixtures.sh).
-            exclude: ["Fixtures"]
+            exclude: ["Fixtures"],
+            // XCTest always uses containment, including release-configured
+            // screenshot runs. The ordinary release app never enables it.
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-u", "-Xlinker", "_APQuietInstall"])]
         ),
         .testTarget(
             name: "AgentPadTelegramTests",

@@ -151,6 +151,104 @@ enum AgentPadWindowLayout {
     }
 }
 
+/// The first main window, before the user chooses its terminal configuration.
+/// Its NSWindow is handed to AgentPadWindowController, never replaced. This
+/// stage owns only the existing PopupHost: no store, pane, glass or runtime.
+@MainActor
+final class AgentPadStartupWindowController: NSWindowController, NSWindowDelegate {
+    let popups = PopupCoordinator()
+    private let ghosttyConfig: URL
+    private var onChoice: (() -> Void)?
+
+    init(ghosttyConfig: URL, onChoice: @escaping () -> Void) {
+        self.ghosttyConfig = ghosttyConfig
+        self.onChoice = onChoice
+        super.init(window: AgentPadWindowController.makeWindow())
+        window?.delegate = self
+        window?.contentView = NSHostingView(rootView: AgentPadStartupContent(popups: popups) { [weak self] in
+            self?.presentChoice()
+        })
+        window?.center()
+        presentChoice()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not a storyboard window") }
+
+    func presentChoice() {
+        guard onChoice != nil, !popups.isPresented else { return }
+        let page = PopupCoordinator.NativePage(title: "Import Ghostty settings?", content: { [weak self] in
+            AnyView(GhosttyImportPopup { [weak self] useGhostty in self?.choose(importSettings: useGhostty) })
+        })
+        popups.presentNative(page)
+    }
+
+    private func choose(importSettings: Bool) {
+        guard let completion = onChoice else { return }
+        onChoice = nil
+        AgentPadOnboarding.complete(importSettings: importSettings, from: ghosttyConfig)
+        popups.dismiss(reason: .applied)
+        completion()
+    }
+
+    func takeWindow() -> NSWindow? {
+        popups.terminate()
+        let result = window
+        result?.delegate = nil
+        window = nil
+        return result
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
+}
+
+private struct AgentPadStartupContent: View {
+    let popups: PopupCoordinator
+    let presentChoice: () -> Void
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Welcome to \(AgentPadApp.name)").font(Theme.display(22, weight: .semibold))
+            Text("Choose your settings to open the first terminal.")
+                .font(Theme.display(13)).foregroundStyle(Theme.chromeMuted)
+            Button("Choose startup settings", action: presentChoice)
+                .accessibilityIdentifier("startup-choose-settings")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground)
+        .popupHost(popups)
+    }
+}
+
+private struct GhosttyImportPopup: View {
+    let choose: (Bool) -> Void
+    var body: some View {
+        VStack(spacing: 0) {
+            PopupScrollBody {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Welcome to \(AgentPadApp.name)").font(Theme.display(18, weight: .semibold))
+                            .foregroundStyle(Theme.chromeForeground)
+                        Text("Import Ghostty settings?").font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
+                    }
+                    Text("We found your existing ghostty configuration. Would you like to import it into \(AgentPadApp.name)?")
+                    Text("You can change settings any time via Help → Open Settings.")
+                }.font(Theme.display(11)).foregroundStyle(Theme.chromeMuted).padding(24)
+            }
+            Divider()
+            HStack {
+                Button("Start fresh") { choose(false) }
+                    .accessibilityIdentifier("ghostty-fresh")
+                Spacer()
+                Button("Use ghostty settings") { choose(true) }
+                    .buttonStyle(PopupPrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("ghostty-import")
+            }.padding(.horizontal, 20).padding(.vertical, 13)
+        }
+    }
+}
+
 /// One AgentPad window: an `NSWindow` paired with its own `WorkspaceStore`.
 /// `AppDelegate` keeps an array of these — every window is fully
 /// independent (own sidebar, own workspaces, own persisted slice keyed by
@@ -194,11 +292,14 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
     }
     private var preFullScreenFrame: NSRect?
 
-    init(windowId: UUID, store: WorkspaceStore, restoring savedFrame: PersistedFrame? = nil) {
+    init(windowId: UUID, store: WorkspaceStore, restoring savedFrame: PersistedFrame? = nil,
+         adopting startupWindow: NSWindow? = nil) {
         self.windowId = windowId
         self.store = store
         self.paneHost = PaneTreeHostView(store: store)
-        super.init(window: Self.makeWindow())
+        super.init(window: startupWindow ?? Self.makeWindow())
+        window?.appearance = Theme.windowAppearance
+        window?.applyGlassBacking()
         // Choose docked/overlay layout from the saved geometry, before the
         // hosting view or initial minimum can enlarge the temporary 1100pt window.
         if let savedFrame, let window,
@@ -208,9 +309,12 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
         }
         store.navigationWindow = window
         navigationKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, event.window === self.window, event.keyCode == 53,
-                  self.store.handleNavigationEscape() else { return event }
-            return nil
+            guard let self, event.window === self.window, event.keyCode == 53 else { return event }
+            if self.store.popups.isPresented {
+                self.store.popups.dismiss(reason: .dismiss)
+                return nil
+            }
+            return self.store.handleNavigationEscape() ? nil : event
         }
         window?.delegate = self
         window?.contentView = NSHostingView(
@@ -232,7 +336,7 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
 
     /// Builds a AgentPad main window with the standard chrome. Mirrors the
     /// config that used to live inline in `applicationDidFinishLaunching`.
-    private static func makeWindow() -> NSWindow {
+    static func makeWindow() -> NSWindow {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1100, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -255,10 +359,8 @@ final class AgentPadWindowController: NSWindowController, NSWindowDelegate {
         // "AgentPad × N" above our own workspace/tab list. Drop them — the Dock
         // menu's workspace list and ⌘P are the real navigation.
         window.isExcludedFromWindowsMenu = true
-        // Liquid Glass needs a non-opaque window so the glass layer can sample
-        // the desktop behind it and the terminal's `background-opacity` reads
-        // through. `refreshThemeAppearances` keeps this in sync on live edits.
-        window.applyGlassBacking()
+        // The first-launch shell uses this same window before settings are
+        // chosen. Glass backing is applied only when the workspace mounts.
         return window
     }
 

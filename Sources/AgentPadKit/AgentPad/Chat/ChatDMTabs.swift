@@ -70,9 +70,10 @@ struct ChatDMNewView: View {
     @Bindable var state: TabState
     let scope: OrgKey
     private var key: ChatOrgKey { .init(server: scope.server, accountId: scope.accountID, orgId: scope.orgID) }
-    private var service = ChatService.shared
+    var service: ChatService = .shared
     var body: some View {
-        Group {
+        VStack(spacing: 0) {
+         Group {
             if let model = state.newDMModel, model.readable {
                 ChatDMPeoplePicker(model: model) { route in
                     guard !state.isClosed, service.dmAllowed(key), let owner = SupportTabs.shared.owner(state) else { return }
@@ -80,9 +81,19 @@ struct ChatDMNewView: View {
                     _ = SupportTabs.shared.navigation.router.rekey(owner.session.id, to: route)
                 }
             } else { Text(service.connection?.orgKey == key ? "Checking access…" : "Not connected").foregroundStyle(ChatAppearance.secondary) }
-        }.frame(maxWidth: .infinity, maxHeight: .infinity).background(ChatAppearance.surface)
+         }.frame(maxWidth: .infinity)
+         Divider()
+         HStack {
+             Spacer()
+             Button("Cancel") {
+                 guard let owner = SupportTabs.shared.owner(state) else { return }
+                 owner.store.popups.dismiss(owner.session, reason: .cancel)
+             }.accessibilityIdentifier("newMessageCancel")
+         }.padding(.horizontal, 20).padding(.vertical, 13)
+        }.frame(maxWidth: .infinity).background(ChatAppearance.surface)
+            .accessibilityIdentifier("newMessageForm")
             .onChange(of: service.dmAllowed(key), initial: true) { _, allowed in
-                if allowed, state.newDMModel == nil { state.newDMModel = ChatDMNewModel(key: key, state: state) }
+                if allowed, state.newDMModel == nil { state.newDMModel = ChatDMNewModel(key: key, state: state, service: service) }
                 else if !allowed { state.newDMModel?.stop(); state.newDMModel = nil }
             }
     }
@@ -94,13 +105,17 @@ struct ChatDMPeoplePicker: View {
     @FocusState private var search: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("New message").font(Theme.display(22, weight: .semibold))
+            Text("New message").font(Theme.display(18, weight: .semibold))
             Text("Choose a person in your organization. Only the two of you can read the conversation.")
                 .font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary)
-            TextField("Find a person by name or handle", text: $model.query).textFieldStyle(.roundedBorder).focused($search)
-                .accessibilityLabel("Find a person")
-            ScrollView {
-                LazyVStack(spacing: 2) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Find a person").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
+                TextField("Find a person by name or handle", text: $model.query).textFieldStyle(.roundedBorder).focused($search)
+                    .accessibilityLabel("Find a person")
+                    .accessibilityIdentifier("newMessageSearch")
+            }
+            PopupScrollBody(maxHeight: 330) {
+                VStack(spacing: 8) {
                     ForEach(model.people) { person in
                         Button { model.choose(person.accountId) } label: {
                             HStack(spacing: 12) {
@@ -110,13 +125,16 @@ struct ChatDMPeoplePicker: View {
                                     Text("@\(person.handle)").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
                                 }
                                 Spacer(); Image(systemName: "chevron.right").font(.caption).foregroundStyle(ChatAppearance.secondary)
-                            }.padding(10).contentShape(Rectangle())
-                        }.buttonStyle(.plain).chatFocusRing()
+                            }.padding(10).frame(maxWidth: .infinity, minHeight: 55)
+                                .background(Theme.chromeMuted.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.chromeMuted.opacity(0.2)))
+                                .contentShape(RoundedRectangle(cornerRadius: 8))
+                        }.buttonStyle(.plain).chatFocusRing().accessibilityIdentifier("newMessagePerson-\(person.accountId)")
                     }
                     if model.people.isEmpty { Text("No people found").foregroundStyle(ChatAppearance.secondary).padding(24) }
                 }
             }
-        }.padding(28).frame(maxWidth: 600).foregroundStyle(Theme.chromeForeground)
+        }.padding(24).frame(maxWidth: .infinity).foregroundStyle(Theme.chromeForeground)
             .onAppear { search = true }
             .onChange(of: model.result) { _, result in if let result { open(result) } }
     }

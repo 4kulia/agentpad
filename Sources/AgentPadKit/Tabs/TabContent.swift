@@ -20,15 +20,18 @@ struct OrgKey: Codable, Hashable, Sendable {
 enum TeamScope: Codable, Hashable, Sendable { case local, server(OrgKey) }
 
 enum SettingsTabSection: String, CaseIterable, Codable, Sendable {
-    case general, profile, telegram, sidebar, appearance, agents, terminals, openIn, statusBar, notifications, search, advanced, about, updates
+    case general, profile, telegram, sidebar, appearance, agents, claudeAccounts, terminals, openIn, statusBar, notifications, search, advanced, about, updates
     var title: String {
         switch self {
+        case .claudeAccounts: "Claude accounts"
         case .openIn: "Open in"
         case .statusBar: "Status Bar"
         default: rawValue.prefix(1).uppercased() + rawValue.dropFirst()
         }
     }
 }
+
+enum ToolPresentation: Equatable, Sendable { case popup, tab }
 
 /// Sections, revisions and scrolling deliberately do not participate in identity.
 /// Later migration groups add their views, not a second routing system.
@@ -66,6 +69,22 @@ enum ToolRoute: Codable, Hashable, Sendable {
     case viewer(OrgKey, channelID: String, messageID: String, attachmentID: String)
     case unavailable(UUID)
 
+    var presentation: ToolPresentation {
+        switch self {
+        // Inventory groups C–F share the phase-1 host, as do the other
+        // classified service surfaces. Conversation/list content stays below.
+        case .settings, .newDM, .linkFailure, .organization, .agent, .ask, .request,
+             .publication, .publish, .forward, .connection, .newChannel, .agentProfile,
+             .newAgent, .newSSH, .newWorktree, .workspaceDetails, .closeWorkspaces,
+             .fileOperations, .importSession:
+            .popup
+        case .notifications, .allSessions, .search, .telegram, .directMessage,
+             .directMessageDraft, .publishedAgents, .teamActivity, .files, .dmViewer,
+             .viewer, .unavailable:
+            .tab
+        }
+    }
+
     var isWindowScoped: Bool {
         switch self { case .settings, .notifications, .allSessions, .search, .linkFailure: true; default: false }
     }
@@ -100,7 +119,7 @@ enum ToolRoute: Codable, Hashable, Sendable {
         case .publication: "Publication"
         case .publish: "Publish"
         case .forward: "Forward"
-        case .connection: "Connection"
+        case .connection: "Connect to a Server"
         case .newChannel: "New channel"
         case .agentProfile: "Edit profile"
         case .newAgent: "New agent"
@@ -154,6 +173,15 @@ struct TabNavigation: Codable, Equatable {
 
 @MainActor @Observable
 final class TabState {
+    /// Presentation is runtime-only; persisted navigation and form drafts keep
+    /// their existing format.
+    var isPopup = false
+    /// Runtime-only and local to this tab, including when a conversation
+    /// model is shared with another pane or window.
+    var primaryInputFocusRequest: UUID?
+    var popupContentHeight: CGFloat?
+    var popupViewportHeight: CGFloat?
+    var popupMaximumBodyHeight: CGFloat = 520
     var route: ToolRoute
     var navigation: TabNavigation
     var draft: TabDraft?

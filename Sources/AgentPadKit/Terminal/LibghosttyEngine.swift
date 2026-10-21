@@ -1175,10 +1175,14 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         guard surface == nil,
               let window,
               !isHiddenOrHasHiddenAncestor || spawnsWhileHidden,
-              let config = pendingConfig,
+              var config = pendingConfig,
               let app = LibghosttyApp.shared.app
         else { return }
 
+        guard config.prepareForProcessStart() else {
+            pendingConfig = nil
+            return
+        }
         let scale = Double(window.backingScaleFactor)
         // Pin contentsScale so Core Animation doesn't double-scale ghostty's
         // already-pixel-correct render.
@@ -1231,6 +1235,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         }
 
         guard let new else {
+            config.claudeAccountLaunch?.cleanup()
             NSLog("agentpad: ghostty_surface_new failed")
             return
         }

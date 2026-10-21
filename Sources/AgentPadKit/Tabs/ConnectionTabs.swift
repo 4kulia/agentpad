@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// One login flow and one Disconnect across all windows. Only the route is
-/// persisted; the model and the confirmation live in the owning TabState.
+/// Window-owned login forms share one Disconnect coordinator. Only the route
+/// is persisted; the model and confirmation live in the owning TabState.
 @MainActor
 final class ConnectionTabs {
     static let shared = ConnectionTabs()
@@ -20,12 +20,16 @@ final class ConnectionTabs {
     func show() -> Session? { navigation.open(.connection) }
 
     func close(_ state: TabState) {
-        for store in navigation.router.stores() where !store.isTerminated {
-            guard let session = store.allSessions.first(where: { $0.tabState === state }),
-                  let location = store.location(ofSessionId: session.id) else { continue }
-            store.closeTab(session, in: location.workspace)
-            return
-        }
+        guard let location = navigation.router.owner(of: state) else { return }
+        if state.isPopup {
+            location.store.popups.dismiss(location.session, reason: .applied)
+        } else { location.store.closeTab(location.session, in: location.workspace) }
+    }
+
+    func cancel(_ state: TabState) {
+        guard let location = navigation.router.owner(of: state) else { return }
+        if state.isPopup { location.store.popups.dismiss(location.session, reason: .cancel) }
+        else { location.store.closeTab(location.session, in: location.workspace) }
     }
 
     func model(_ state: TabState) -> ChatConnectModel {
@@ -133,14 +137,12 @@ struct ConnectionTabView: View {
     let state: TabState
     let tabs: ConnectionTabs
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                ChatConnectView(model: tabs.model(state), onClose: {
-                    tabs.close(state)
-                }, onDisconnect: { tabs.disconnect() })
-                if let message = state.message { Text(message).foregroundStyle(.orange).padding(.horizontal, 18) }
-            }.frame(maxWidth: .infinity, alignment: .leading)
-        }
+        VStack(spacing: 0) {
+            ChatConnectView(model: tabs.model(state), onClose: {
+                tabs.close(state)
+            }, onDisconnect: { tabs.disconnect() }, onCancel: { tabs.cancel(state) })
+            if let message = state.message { Text(message).foregroundStyle(.orange).padding(.horizontal, 18) }
+        }.frame(maxWidth: .infinity)
         .disabled(state.confirmation.isAwaiting || state.confirmation.isExecuting)
     }
 }

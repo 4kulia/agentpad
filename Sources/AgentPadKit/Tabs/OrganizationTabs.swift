@@ -48,6 +48,24 @@ final class OrganizationFormState {
 
 @MainActor
 enum OrganizationTabs {
+    static func sections(actions: Set<ChatOrgAction>?, hasDevices: Bool) -> [AttentionOrganizationSection] {
+        var result: [AttentionOrganizationSection] = actions == nil ? [] : [.members, .teams]
+        if actions?.contains(.invite) == true { result.append(.invitations) }
+        if hasDevices { result.append(.devices) }
+        if actions?.contains(.seeAudit) == true { result.append(.audit) }
+        return result
+    }
+
+    static func readableDate(_ text: String?, includesTime: Bool = true,
+                             locale: Locale = .current, timeZone: TimeZone = .current) -> String {
+        guard let text, !text.isEmpty else { return "Not available" }
+        guard let date = ChatStore.date(text) else { return text }
+        let formatter = DateFormatter()
+        formatter.locale = locale; formatter.timeZone = timeZone
+        formatter.dateStyle = .medium; formatter.timeStyle = includesTime ? .short : .none
+        return formatter.string(from: date)
+    }
+
     @discardableResult
     static func show(key: OrgKey? = nil) -> Session? {
         guard let key = key ?? ChatService.shared.connection?.orgKey.map(OrgKey.init) else {
@@ -96,7 +114,7 @@ struct OrganizationTabView: View {
                 ChatOrgTabContent(state: state, form: OrganizationFormState.form(state, model: model), model: model, devices: devices)
             } else if state.navigation.selection == AttentionOrganizationSection.devices.rawValue, let devices {
                 // Device sessions belong to the whole server, even after losing org membership.
-                ChatOrgDevicesTab(model: devices, state: state)
+                ChatOrgTabContent(state: state, form: OrganizationFormState.form(state, model: nil), model: nil, devices: devices)
             } else {
                 VStack(spacing: 12) {
                     Text("Connect to this organization and wait for access to be checked.").foregroundStyle(.secondary)

@@ -1,10 +1,26 @@
 import AppKit
 
-struct TerminalSessionConfig {
+struct TerminalSessionConfig: CustomStringConvertible, CustomDebugStringConvertible {
     var command: String
     var arguments: [String]
     var workingDirectory: String?
     var environment: [String: String]
+    var claudeAccountLaunch: ClaudeAccountLaunch? = nil
+    var prepareClaudeAccount: (@MainActor (inout TerminalSessionConfig) -> Bool)? = nil
+
+    @MainActor
+    mutating func prepareForProcessStart() -> Bool {
+        let preparation = prepareClaudeAccount
+        prepareClaudeAccount = nil
+        guard preparation?(&self) ?? true else { return false }
+        return claudeAccountLaunch?.prepare() ?? true
+    }
+
+    /// Configuration diagnostics must never stringify process credentials.
+    var description: String {
+        "TerminalSessionConfig(command: \(command), arguments: \(arguments), workingDirectory: \(workingDirectory ?? "nil"), environmentKeys: \(environment.keys.sorted()))"
+    }
+    var debugDescription: String { description }
 
     static func defaultShell() -> TerminalSessionConfig {
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? AgentPadShellIntegration.zshPath
@@ -46,6 +62,9 @@ struct TerminalSessionConfig {
 @MainActor
 protocol TerminalEngine: AnyObject {
     var view: NSView { get }
+    /// Restores typing when a popup's opener has unmounted. Each tab owns
+    /// its primary input; tabs without one keep focus on their hosting view.
+    func focusPrimaryInput()
     func renderNowIfNeeded()
     /// The owning window was ordered out (closed-but-alive) or brought back.
     /// Off screen, an engine must stop presenting frames: the PTY keeps
@@ -180,6 +199,7 @@ protocol TerminalEngine: AnyObject {
 }
 
 extension TerminalEngine {
+    func focusPrimaryInput() { view.window?.makeFirstResponder(view) }
     func setOnScreen(_ onScreen: Bool) {}
     // Non-terminal tabs have no filesystem links.
     var onOpenFile: ((TerminalFileReference) -> Void)? {

@@ -25,7 +25,18 @@ enum AgentProfileSessions {
         let byConversation = Dictionary(records.map { ($0.conversationId, $0) }, uniquingKeysWith: { first, _ in first })
         var liveConversations: Set<String> = []
         var result: [AgentProfileSessionItem] = []
-        for session in sessions where session.hasProcess && session.sshWorkspaceHost == nil {
+        for session in sessions {
+            if let host = session.sshWorkspaceHost {
+                guard session.profileID == profile.id,
+                      session.hasProcess || session.remoteClaudeAccountBlock != nil else { continue }
+                // Remote conversations have no local transcript identity. Keep
+                // the live/blocked tab reachable without binding local history.
+                result.append(AgentProfileSessionItem(id: session.id.uuidString, session: session, record: nil,
+                    title: session.remoteClaudeAccountBlock == nil ? session.title : "Waiting to start · \(host)",
+                    cwd: session.profileOriginalCwd ?? session.currentDirectory, lastActivity: session.lastActivated))
+                continue
+            }
+            guard session.hasProcess else { continue }
             let conversation = session.conversationId ?? session.resumedConversationId
             let bound = conversation.flatMap { byConversation[$0] }
             let scanned = conversation.flatMap { catalog.record(for: SessionNameKey(profile.rosterID, $0)) }

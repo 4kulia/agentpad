@@ -13,11 +13,10 @@ final class SupportTabNavigation {
         self.router = router
         router.admit = { [weak self] in self?.admit($0) ?? false }
     }
-    /// The existing startup step commits the choice before any workspace or
-    /// runtime can be made (including the runtime used by glass backing).
-    func loadConfiguration(onboarding: () -> Void, load: () -> Void) {
+    /// Called after the startup choice, before any workspace or runtime can be
+    /// made (including the runtime used by glass backing).
+    func loadConfiguration(load: () -> Void) {
         guard !configurationLoaded else { return }
-        onboarding()
         load()
         configurationLoaded = true
     }
@@ -51,6 +50,7 @@ final class SupportTabs {
     static let shared = SupportTabs()
     let navigation: SupportTabNavigation
     var settingsModel: () -> AgentPadSettingsModel = { .shared }
+    var telegramSettings: () -> TelegramSettingsViewModel = { TelegramService.settings }
     var ledger: AttentionLedger
     var updates = UpdatesTabModel()
     var activateNotice: (NotificationInbox.Event) -> Void = { _ in }
@@ -106,7 +106,7 @@ final class SupportTabs {
             if let batch = state.fileOperation { return AnyView(FileOperationTab(batch: batch)) }
             return AnyView(Text("Interrupted. Start a new file operation after reviewing the files."))
         case .closeWorkspaces:
-            if let batch = state.closeWorkspaces { return AnyView(ScrollView { CloseWorkspacesView(batch: batch) }) }
+            if let batch = state.closeWorkspaces { return AnyView(CloseWorkspacesView(batch: batch)) }
             return AnyView(Text("This close review ended. Select the workspaces again to start a new review."))
         case .importSession:
             return AnyView(ImportSessionView(state: state))
@@ -149,15 +149,37 @@ final class SupportTabs {
             return AnyView(AgentPadSettingsView(model: model, state: state, screen: state.settingsScreen,
                 updates: updates, onOpenInTab: { [weak self, weak state] in
                     guard let self, let state else { return }; self.openSettingsFile(state)
-                }))
+                }, telegram: telegramSettings())
+                .environment(\.popupCoordinator, owner(state)?.store.popups))
         case .notifications:
             return AnyView(NotificationTabView(state: state, support: self))
         case .linkFailure:
             return AnyView(LinkFailureView(reason: state.message ?? LinkFailureMessage.unavailable.text,
+                close: { [weak self, weak state] in
+                    guard let self, let state, let owner = self.owner(state) else { return }
+                    owner.store.popups.dismiss(owner.session, reason: .applied)
+                },
                 openInbox: { [weak self, weak state] in
                     guard let self, let state else { return }
                     self.navigation.open(.notifications, from: self.owner(state)?.store)
                 }))
+        case .unavailable:
+            if let owner = owner(state), let block = owner.session.remoteClaudeAccountBlock {
+                let current = RemoteClaudeAccountBlock(accountID: block.accountID, accountName: block.accountName,
+                    host: block.host, status: owner.store.agentProfiles.remoteClaudeAccounts.state(accountID: block.accountID, host: block.host),
+                    profileName: block.profileName, folder: block.folder)
+                return AnyView(RemoteClaudeAccountBlockedView(block: current, onInstall: {
+                    owner.store.openRemoteClaudeAccountInstall(accountID: block.accountID, host: block.host, profileName: block.profileName,
+                        onInstalled: owner.store.remoteClaudeAccountStartAfterInstall(sessionID: owner.session.id,
+                            accountID: block.accountID, host: block.host))
+                }, onManage: { owner.store.openRemoteClaudeAccountManagement(accountID: block.accountID) },
+                    onStart: { owner.store.retryRemoteClaudeAccount(sessionID: owner.session.id) },
+                    onRetry: { owner.store.retryRemoteClaudeAccount(sessionID: owner.session.id) }))
+            }
+            return AnyView(VStack(spacing: 12) {
+                Label(state.route.title, systemImage: state.route.symbol).font(.title2)
+                Text(state.message ?? "This screen is not available in this version.").foregroundStyle(.secondary)
+            }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity))
         default:
             return AnyView(VStack(spacing: 12) {
                 Label(state.route.title, systemImage: state.route.symbol).font(.title2)
@@ -166,10 +188,7 @@ final class SupportTabs {
         }
     }
     func owner(_ state: TabState) -> TabRouter.Location? {
-        for store in navigation.router.stores() {
-            if let session = store.allSessions.first(where: { $0.tabState === state }) { return navigation.router.owner(of: session.id) }
-        }
-        return nil
+        navigation.router.owner(of: state)
     }
     func linkFailed(_ reason: String) {
         let safe = LinkFailureMessage(reason: reason).text
@@ -193,6 +212,7 @@ final class SupportTabs {
             tintHex: nil, initialCommand: "${EDITOR:-vi} \(AgentPadShellIntegration.quote(AgentPadSettings.url.path))")
         let session = location.store.addTab(in: location.workspace, pane: location.pane, template: template)
         session.applyTerminalTitle("settings.json")
+        location.store.popups.dismiss(reason: .dismiss)
     }
 }
 
@@ -201,10 +221,26 @@ struct NotificationTabView: View {
     let support: SupportTabs
     private var repository: DraftRepository? { support.owner(state)?.store.drafts }
     private var openDraftIDs: Set<UUID> {
-        Set(support.navigation.router.stores().flatMap(\.allSessions).compactMap { $0.tabState?.navigation.draftID })
+        let sessions = support.navigation.router.stores().filter { !$0.isTerminated }.flatMap { store -> [Session] in
+            let pages = store.popups.backStack + (store.popups.page.map { [$0] } ?? [])
+            let presented = pages.compactMap { page -> Session? in
+                if case .tool(let session) = page { return session }
+                return nil
+            }
+            return store.allSessions + presented
+        }
+        return Set(sessions.compactMap { $0.tabState?.navigation.draftID })
     }
     private var drafts: [TabDraft] {
         (repository?.drafts ?? []).filter { !openDraftIDs.contains($0.id) && Self.mayRead($0) }.sorted { $0.id.uuidString < $1.id.uuidString }
+    }
+    private var runtimeDrafts: [(owner: WorkspaceStore, page: PopupCoordinator.Page)] {
+        support.navigation.router.stores().filter { !$0.isTerminated }.flatMap { store in
+            store.popups.retainedRuntimeDrafts.filter { page in
+                if case .tool(let session) = page { return Self.mayRead(scope: session.toolRoute?.organizationScope) }
+                return true
+            }.map { (owner: store, page: $0) }
+        }
     }
     private var selection: Binding<String> {
         Binding(get: { state.navigation.selection ?? "events" }, set: {
@@ -221,19 +257,32 @@ struct NotificationTabView: View {
             }
             Picker("Notifications and drafts", selection: selection) {
                 Text("Events").tag("events")
-                Text("Drafts (\(drafts.count))").tag("drafts")
+                Text("Drafts (\(drafts.count + runtimeDrafts.count))").tag("drafts")
             }.pickerStyle(.segmented).padding(16).accessibilityIdentifier("notifications-sections")
             if selection.wrappedValue == "drafts" {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
-                        if drafts.isEmpty { Text("No saved drafts").foregroundStyle(.secondary) }
+                        if drafts.isEmpty && runtimeDrafts.isEmpty { Text("No saved drafts").foregroundStyle(.secondary) }
+                        ForEach(runtimeDrafts, id: \.page.id) { draft in
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(draft.page.title).font(.headline)
+                                Text("Kept until AgentPad quits").font(.caption).foregroundStyle(.secondary)
+                                HStack {
+                                    Button("Open draft") {
+                                        draft.owner.popups.reopenRuntimeDraft(draft.page)
+                                        support.navigation.router.revealWindow(draft.owner)
+                                    }
+                                    Button("Discard…", role: .destructive) { discardRuntime(draft.page, owner: draft.owner) }
+                                        .disabled(runtimeBusy(draft.page))
+                                }
+                            }
+                        }
                         ForEach(drafts) { draft in
                             VStack(alignment: .leading, spacing: 8) {
                                 Text(draft.route.title).font(.headline)
                                 HStack {
                                     Button("Open draft") {
-                                        guard Self.mayRead(draft) else { return }
-                                        support.navigation.open(draft.route, from: support.owner(state)?.store)
+                                        open(draft)
                                     }
                                     Button("Discard…", role: .destructive) { discard(draft) }
                                 }
@@ -244,6 +293,38 @@ struct NotificationTabView: View {
             } else { InboxView(inbox: NotificationInbox(ledger: support.ledger), onActivate: support.activateNotice, onClear: {}) }
         }
     }
+    private func runtimeBusy(_ page: PopupCoordinator.Page) -> Bool {
+        if case .tool(let session) = page { return session.tabState?.connectionForm?.busy == true }
+        return false
+    }
+    private func discardRuntime(_ page: PopupCoordinator.Page, owner: WorkspaceStore) {
+        guard let location = support.owner(state) else { return }
+        state.confirmation.request(.init(tabID: location.session.id, targetID: String(describing: page.id)),
+            title: "Discard \(page.title) draft?", consequences: "The unfinished form will be cleared from this window.",
+            verb: "Discard draft", destructive: true, stillValid: {
+                !owner.isTerminated && !runtimeBusy(page) && runtimeDrafts.contains { $0.page.id == page.id }
+            }) { try owner.popups.discardRuntimeDraft(page) }
+    }
+    private func open(_ draft: TabDraft) {
+        guard Self.mayRead(draft), let repository, repository.draft(draft.id) == draft else { return }
+        // A shared draft archive can be shown from another window. Reuse the
+        // retained form in its owner instead of creating a competing copy.
+        let retainedOwner = support.navigation.router.stores().first { store in
+            !store.isTerminated && store.drafts === repository
+                && store.popups.sessions.contains { $0.tabState?.draft == draft }
+        }
+        guard let target = retainedOwner ?? support.owner(state)?.store else { return }
+        if let cached = target.popups.find(draft.route)?.session, let cachedState = cached.tabState,
+           let older = cachedState.draft, older.id == draft.id, older.revision < draft.revision,
+           cachedState.savedRevision == older.revision {
+            // Another window saved a newer revision. Retire only this saved
+            // cache, preserving both the newer archive and any unsaved forms.
+            cachedState.draft = nil
+            cachedState.navigation.draftID = nil
+            target.popups.dismiss(cached, reason: .applied)
+        }
+        support.navigation.open(draft.route, from: target)
+    }
     private func discard(_ draft: TabDraft) {
         guard let owner = support.owner(state), let repository else { return }
         state.confirmation.request(.init(tabID: owner.session.id, targetID: draft.id.uuidString,
@@ -251,6 +332,16 @@ struct NotificationTabView: View {
             title: "Discard \(draft.route.title) draft?", consequences: "The saved local text will be deleted.", verb: "Discard draft",
             destructive: true, stillValid: { repository.draft(draft.id) == draft && !openDraftIDs.contains(draft.id) && Self.mayRead(draft) }) {
                 try repository.discard(draft.id)
+                for store in support.navigation.router.stores() where !store.isTerminated && store.drafts === repository {
+                    for session in store.popups.sessions where session.tabState?.navigation.draftID == draft.id {
+                        // The archive write succeeded. Remove the retained form
+                        // without another draft write, so a later save cannot
+                        // resurrect the text the user explicitly discarded.
+                        session.tabState?.draft = nil
+                        session.tabState?.navigation.draftID = nil
+                        store.popups.dismiss(session, reason: .cancel)
+                    }
+                }
             }
     }
     static func mayRead(_ draft: TabDraft) -> Bool {
@@ -258,6 +349,9 @@ struct NotificationTabView: View {
         if case .forwardForm(let fields) = draft.payload { scope = fields.destination }
         else if case .forward(_, _, let destination, _, _, _) = draft.payload { scope = destination }
         else { scope = draft.route.organizationScope }
+        return mayRead(scope: scope)
+    }
+    private static func mayRead(scope: OrgKey?) -> Bool {
         guard let scope else { return true }
         guard let model = ChatOrgCurrent.shared.model, model.isCurrent(), model.visible, !model.inDoubt, !model.snapshotOwed(),
               let key = model.key else { return false }
@@ -298,15 +392,25 @@ enum LinkFailureMessage: CaseIterable {
 
 struct LinkFailureView: View {
     let reason: String
+    let close: () -> Void
     let openInbox: () -> Void
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Label("Link could not be opened", systemImage: "exclamationmark.triangle").font(.title2)
-                Text(reason).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        VStack(spacing: 0) {
+            PopupScrollBody {
+                VStack(alignment: .leading, spacing: 18) {
+                    Image(systemName: "info.circle").foregroundStyle(.orange).accessibilityHidden(true)
+                    Text(reason).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Divider()
+            HStack {
+                Button("OK", action: close).accessibilityIdentifier("link-failure-ok")
+                Spacer()
                 Button("Open Notifications", action: openInbox)
-            }.padding(28).frame(maxWidth: .infinity, alignment: .leading)
-        }.accessibilityIdentifier("link-failure-content")
+                    .buttonStyle(PopupPrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("link-failure-notifications")
+            }.padding(.horizontal, 20).padding(.vertical, 14)
+        }.accessibilityElement(children: .contain).accessibilityIdentifier("link-failure-content")
     }
 }
 

@@ -3,6 +3,24 @@ import XCTest
 
 @MainActor
 final class AgentPadSettingsModelTests: XCTestCase {
+    func testPendingFirstLaunchAppearanceDoesNotWriteAndChoiceReplacesIt() {
+        var values: [String: Any]?
+        var writes = 0
+        let model = AgentPadSettingsModel(read: { values }, write: { values = $0; writes += 1 }, appliesRuntimeEffects: false)
+        model.prepareFirstLaunchAppearance()
+        XCTAssertTrue(model.pairedThemeSchemaEnabled)
+        XCTAssertEqual(model.appearanceMode, .system)
+        XCTAssertNil(values)
+        XCTAssertEqual(writes, 0)
+
+        values = ["terminal": ["font-size": 17, "background-blur": false]]
+        model.load()
+        XCTAssertFalse(model.pairedThemeSchemaEnabled, "Imported legacy settings keep their original appearance semantics")
+        XCTAssertEqual(model.fontSize, 17)
+        XCTAssertEqual(model.backgroundBlur, "false")
+        XCTAssertEqual(writes, 0)
+    }
+
     func testNativeAppLanguagePreferenceCodec() {
         XCTAssertEqual(AgentPadAppLanguage.resolved(nil), .system)
         XCTAssertEqual(AgentPadAppLanguage.resolved([]), .system)

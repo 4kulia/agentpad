@@ -399,6 +399,14 @@ final class AgentPadSettingsModel {
         load()
     }
 
+    /// The pending first-launch shell follows the system appearance without
+    /// saving a choice. load() replaces this with the chosen settings before
+    /// any workspace, glass backing or terminal is constructed.
+    func prepareFirstLaunchAppearance() {
+        pairedThemeSchemaEnabled = true
+        appearanceMode = .system
+    }
+
     func load() {
         let settings = settingsReader()
         savedSettings = settings.map { NSDictionary(dictionary: $0) }
@@ -1151,13 +1159,37 @@ final class AgentPadSettingsModel {
     }
 }
 
-/// Settings content is hosted by the same native tab in every pane/window.
+/// Settings keeps its existing autosaving model inside the window popup.
+extension SettingsTabSection {
+    /// Native equivalents of the section icons in the popup mockup.
+    var systemImage: String {
+        switch self {
+        case .general: "gearshape"
+        case .profile: "person"
+        case .telegram: "paperplane"
+        case .sidebar: "sidebar.left"
+        case .appearance: "circle.lefthalf.filled"
+        case .agents: "cpu"
+        case .claudeAccounts: "key"
+        case .terminals: "terminal"
+        case .openIn: "arrow.up.right.square"
+        case .statusBar: "rectangle.bottomthird.inset.filled"
+        case .notifications: "bell"
+        case .search: "magnifyingglass"
+        case .advanced: "slider.horizontal.3"
+        case .about: "info.circle"
+        case .updates: "square.and.arrow.down"
+        }
+    }
+}
+
 struct AgentPadSettingsView: View {
     @Bindable var model: AgentPadSettingsModel
     @Bindable var state: TabState
     @Bindable var screen: SettingsScreenState
     let updates: UpdatesTabModel
     let onOpenInTab: () -> Void
+    var telegram: TelegramSettingsViewModel = TelegramService.settings
     @FocusState private var focusedSection: SettingsTabSection?
     private var selected: SettingsTabSection { state.navigation.settingsSection }
     private var sectionBinding: Binding<SettingsTabSection> {
@@ -1171,13 +1203,14 @@ struct AgentPadSettingsView: View {
         // reasonable time"). Each half stays comfortably under the limit.
         let core = GeometryReader { geometry in
             VStack(spacing: 0) {
-                HStack(spacing: 12) {
+                if !state.isPopup { HStack(spacing: 12) {
                     Label("Settings", systemImage: "gearshape").font(Theme.display(20, weight: .semibold))
                     Spacer(minLength: 8)
                     Text(model.saveError != nil ? "Changes could not be saved" : model.isSaving ? "Saving…" : "Changes applied")
                         .font(Theme.display(11)).foregroundStyle(.secondary)
                 }.padding(20)
                 Divider()
+                }
                 if geometry.size.width >= 620 {
                     HStack(spacing: 0) {
                         sidebar
@@ -1253,7 +1286,7 @@ struct AgentPadSettingsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(SettingsTabSection.allCases, id: \.self) { category in
                     Button { state.select(category) } label: {
-                        Label(category.title, systemImage: category == .about ? "info.circle" : category == .updates ? "arrow.down.circle" : "gearshape")
+                        Label(category.title, systemImage: category.systemImage)
                             .font(Theme.display(12)).frame(maxWidth: .infinity, alignment: .leading).padding(10)
                             .background(selected == category ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 6))
                             .contentShape(Rectangle())
@@ -1277,7 +1310,8 @@ struct AgentPadSettingsView: View {
     @ViewBuilder
     private var detail: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if selected == .general
+            if selected == .claudeAccounts
+                || selected == .general
                 || selected == .appearance
                 || selected == .agents
                 || selected == .terminals
@@ -1310,10 +1344,29 @@ struct AgentPadSettingsView: View {
             switch selected {
             case .general: generalDetail
             case .profile: AccountProfileSettings()
-            case .telegram: TelegramSettingsView(model: TelegramService.settings)
+            case .telegram: TelegramSettingsView(model: telegram)
             case .sidebar: SidebarFolderSettings()
             case .appearance: appearanceDetail
             case .agents: codingAgentsDetail
+            case .claudeAccounts:
+                if let store = SupportTabs.shared.owner(state)?.store {
+                    ClaudeAccountsSettingsView(profiles: store.agentProfiles,
+                        selection: store.popups.claudeAccountSSHSelection, hosts: store.remoteClaudeAccountHosts,
+                        onAdd: { store.popups.presentAccount(profiles: store.agentProfiles, onAdded: {
+                            store.popups.claudeAccountSSHSelection.accountID = $0.id
+                        }) },
+                        onReplace: { id in store.popups.presentAccount(profiles: store.agentProfiles, replacing: id, onAdded: {
+                            store.popups.claudeAccountSSHSelection.accountID = $0.id
+                            store.popups.claudeAccountSSHSelection.replacedAccountID = $0.id
+                        }) },
+                        onConfirmRemove: { account, action in
+                            store.popups.presentConfirmation(title: "Remove Claude account?",
+                                message: "Remove “\(account.name)” and its token from this Mac? Copies installed on SSH hosts remain. Remove those separately before deleting the local account if you no longer need them.", verb: "Remove", action: action)
+                        }, onSSHAction: { account, host, kind in
+                            store.popups.presentRemoteClaudeAccountOperation(account: account, host: host, kind: kind,
+                                profiles: store.agentProfiles)
+                        }).padding(.horizontal, 28)
+                }
             case .terminals: terminalPresetsDetail
             case .openIn: openInDetail
             case .statusBar: statusBarDetail

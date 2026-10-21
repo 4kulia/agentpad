@@ -119,6 +119,7 @@ final class EverywhereSearchModel {
     var quickReadouts: ([PaletteItem]) -> [PaletteItem] = { $0 }
     @ObservationIgnored var matchQuick: (String, [PaletteItem]) -> [PaletteItem] = { PaletteIndex.match(query: $0, in: $1, limit: 6) }
     @ObservationIgnored var activateQuick: (PaletteItem) -> Void = { _ in }
+    @ObservationIgnored weak var popupCoordinator: PopupCoordinator?
     @ObservationIgnored var openResults: () -> Void = {}
     @ObservationIgnored var openMessage: (ChatSearchHit) -> Void = { _ in }
     @ObservationIgnored var openTelegram: (TelegramSearchHit, Bool, Bool) -> Void = { _, _, _ in }
@@ -267,9 +268,15 @@ final class EverywhereSearchModel {
             openTelegram(hit, beside, addToFolder); return
         }
         if id?.hasPrefix("t:") == true || (source == .telegram && id == nil) { return }
+        if let item = quick.first(where: { "q:" + $0.id == id }) {
+            // A quick command can open any popup. Let its window retain the
+            // opener before dismissal, without classifying individual routes.
+            if let popupCoordinator { popupCoordinator.performSearchAction { activateQuick(item) } }
+            else { activateQuick(item); dismiss() }
+            return
+        }
         dismiss()
-        if let item = quick.first(where: { "q:" + $0.id == id }) { activateQuick(item) }
-        else if let item = messages.hits.first(where: { "m:" + $0.id == id }) { openMessage(item) }
+        if let item = messages.hits.first(where: { "m:" + $0.id == id }) { openMessage(item) }
         else if let item = local.first(where: { "l:" + $0.id == id }) { show(item); openResults() }
         else if let item = metadata.first(where: { "d:" + $0.id == id }) { selectedHit = nil; selectedRecord = item; context = []; openResults() }
         else { showResults() }

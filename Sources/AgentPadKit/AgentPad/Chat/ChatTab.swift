@@ -69,20 +69,27 @@ enum ChannelTabs {
 @MainActor
 final class ChannelTabEngine: TerminalEngine {
     let ref: ChannelRef
+    private let service: ChatService
     private(set) var starts = 0
     private(set) var terminations = 0
     /// Closes the tab; set by the store that holds it.
     var onClose: () -> Void = {}
     let conversation = ChatChannelSession()
-    private lazy var host: NSView = NSHostingView(rootView: ChannelTabView(ref: ref, conversation: conversation, close: { [weak self] in self?.onClose() }))
+    private lazy var host: NSView = NSHostingView(rootView: ChannelTabView(ref: ref, conversation: conversation, close: { [weak self] in self?.onClose() }, service: service))
 
-    init(ref: ChannelRef) {
+    init(ref: ChannelRef, service: ChatService = .shared) {
         self.ref = ref
+        self.service = service
         // Its channel is followed while the tab is open (F3).
-        ChatService.shared.channelTab(ref, open: true)
+        service.channelTab(ref, open: true)
     }
 
     var view: NSView { host }
+    func focusPrimaryInput() {
+        guard let window = host.window, !host.isHiddenOrHasHiddenAncestor else { return }
+        window.makeFirstResponder(host)
+        conversation.model?.focusRequest = ChatFocusRequest(area: .composer)
+    }
     func renderNowIfNeeded() {}
     func setOnScreen(_ onScreen: Bool) { if !onScreen { conversation.confirmation.invalidate() } }
     var backgroundColor: NSColor { .windowBackgroundColor }
@@ -106,7 +113,7 @@ final class ChannelTabEngine: TerminalEngine {
     func terminate() {
         terminations += 1
         conversation.confirmation.invalidate()
-        if terminations == 1 { ChatService.shared.channelTab(ref, open: false) }
+        if terminations == 1 { service.channelTab(ref, open: false) }
     }
     var suspendsSizePropagation: Bool { false }
     func beginSizePropagationSuspension() {}
@@ -126,12 +133,14 @@ struct ChannelTabView: View {
     let ref: ChannelRef
     let conversation: ChatChannelSession
     let close: () -> Void
-    private var current = ChatOrgCurrent.shared
+    private let service: ChatService
+    private var current: ChatOrgCurrent { service.orgCurrent }
 
-    init(ref: ChannelRef, conversation: ChatChannelSession, close: @escaping () -> Void) {
+    init(ref: ChannelRef, conversation: ChatChannelSession, close: @escaping () -> Void, service: ChatService = .shared) {
         self.ref = ref
         self.conversation = conversation
         self.close = close
+        self.service = service
     }
 
     var body: some View {
@@ -140,7 +149,7 @@ struct ChannelTabView: View {
             switch state {
             case .ready(let card, let team, let offline):
                 if let key = current.model?.key {
-                    ChatChannelView(card: card, team: team, offline: offline, key: key, conversation: conversation)
+                    ChatChannelView(card: card, team: team, offline: offline, key: key, conversation: conversation, service: service)
                 }
             case .checking:
                 ProgressView().controlSize(.small)
@@ -162,11 +171,11 @@ struct ChannelTabView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onChange(of: state, initial: true) { _, state in
             let key = current.model?.key
-            conversation.update(state, key: key, store: key.flatMap { ChatService.shared.orgSessions[$0]?.store }, service: .shared)
+            conversation.update(state, key: key, store: key.flatMap { service.orgSessions[$0]?.store }, service: service)
         }
         .onChange(of: current.model?.view.generation) { _, _ in
             let key = current.model?.key
-            conversation.update(state, key: key, store: key.flatMap { ChatService.shared.orgSessions[$0]?.store }, service: .shared)
+            conversation.update(state, key: key, store: key.flatMap { service.orgSessions[$0]?.store }, service: service)
         }
     }
 }

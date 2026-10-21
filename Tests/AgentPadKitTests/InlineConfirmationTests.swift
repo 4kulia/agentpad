@@ -1,8 +1,50 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import AgentPadKit
 
 @MainActor
 final class InlineConfirmationTests: XCTestCase {
+    func testPopupDestructiveEscapeRequiresAnExplicitCancel() async throws {
+        _ = NSApplication.shared
+        let attribute = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previous = NSApp.accessibilityAttributeValue(attribute)
+        NSApp.accessibilitySetValue(true, forAttribute: attribute)
+        defer { NSApp.accessibilitySetValue(previous, forAttribute: attribute) }
+        for destructive in [false, true] {
+            let coordinator = ConfirmationCoordinator()
+            var decisions: [Bool] = []
+            XCTAssertTrue(coordinator.request(.init(tabID: UUID(), targetID: "fixture"),
+                title: "Confirm action", consequences: "Review this action.", verb: "Confirm",
+                destructive: destructive, stillValid: { true }, completion: { decisions.append($0) }) {
+                    XCTFail("Escape must never approve an action")
+                })
+            let view = InlineConfirmation(coordinator: coordinator, popup: true)
+            let host = FoldersUIHost(view, width: 580, height: 300)
+            defer { host.close() }
+            try await host.settle()
+            XCTAssertTrue(coordinator.isAwaiting)
+            XCTAssertTrue(host.labels().contains("Cancel"))
+            // Exercise the same handler wired to onExitCommand while the
+            // view is mounted. Native key delivery belongs to the UI selfcheck.
+            view.handleExitCommand()
+            try await host.settle()
+            if destructive {
+                XCTAssertEqual(coordinator.phase, .awaiting)
+                XCTAssertEqual(decisions, [])
+                if coordinator.isAwaiting {
+                    XCTAssertTrue(host.press("Cancel"))
+                    try await host.settle()
+                    XCTAssertEqual(coordinator.phase, .cancelled)
+                    XCTAssertEqual(decisions, [false])
+                }
+            } else {
+                XCTAssertEqual(coordinator.phase, .cancelled)
+                XCTAssertEqual(decisions, [false])
+            }
+        }
+    }
+
     func testBusyDoubleClickAndLateResultCompleteExactlyOnce() async throws {
         let coordinator = ConfirmationCoordinator()
         var calls = 0, results: [Bool] = []

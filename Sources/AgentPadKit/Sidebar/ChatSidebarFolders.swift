@@ -319,11 +319,15 @@ extension ChatSidebarView {
         Button("Hide from sidebar") { folders.setVisible(entry, false) }
         Button("Move up") { folders.move(entry, by: -1) }
         Button("Move down") { folders.move(entry, by: 1) }
-        Button("Folders…") { folders.sheetPresented = true }
+        Button("Folders…") { folders.popupRequested = true }
         switch entry.kind {
         case .custom(let id):
-            Button("Rename…") { folders.sheetPresented = true; folders.editing = id }
-            Button("Delete…") { folders.sheetPresented = true; folders.deleting = folders.snapshot.catalog.custom.first { $0.id == id } }
+            Button("Rename…") {
+                folders.editing = id
+                folders.editingName = folders.snapshot.catalog.custom.first { $0.id == id }?.name ?? ""
+                folders.popupRequested = true
+            }
+            Button("Delete…") { folders.popupRequested = true; folders.deleting = folders.snapshot.catalog.custom.first { $0.id == id } }
         case .telegram: Text("Edited in Telegram").disabled(true)
         case .myAgents: Button("New agent…") { LocalFormTabs.shared.newAgent(from: store) }
         case .people:
@@ -340,12 +344,12 @@ extension ChatSidebarView {
             HStack(spacing: 5) {
                 Text("Folder hidden").lineLimit(1)
                 Button("Undo") { folders.undoHide() }
-                Button("Folders…") { folders.sheetPresented = true; folders.hiddenToast = nil }
+                Button("Folders…") { folders.popupRequested = true; folders.hiddenToast = nil }
             }.font(Theme.display(10)).padding(8).help(entry.title)
         }
         SidebarFolderFailureView(model: folders).padding(.horizontal, 8)
         HStack {
-            Button("Folders…", systemImage: "folder") { folders.sheetPresented = true }.buttonStyle(.plain)
+            Button("Folders…", systemImage: "folder") { folders.popupRequested = true }.buttonStyle(.plain)
             Spacer()
         }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary).padding(.horizontal, 16).frame(height: 36)
             .overlay(alignment: .top) { Rectangle().fill(Theme.chromeSeparator).frame(height: 1) }

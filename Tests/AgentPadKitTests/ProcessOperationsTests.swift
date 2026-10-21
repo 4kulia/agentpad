@@ -80,7 +80,7 @@ final class ProcessOperationsTests: XCTestCase {
         let worktree = store.addWorkspace(workingDirectory: path, worktreeParent: source, worktreeBranch: "fixture")
         let original = try XCTUnwrap(worktree.activeSession)
         store.closeTab(original, in: worktree)
-        let review = try XCTUnwrap(store.allSessions.first { $0.tabState?.closeWorkspaces != nil })
+        let review = try XCTUnwrap(store.popups.sessions.first { $0.tabState?.closeWorkspaces != nil })
         let batch = try XCTUnwrap(review.tabState?.closeWorkspaces)
         XCTAssertEqual(batch.rows.first?.sessions, [original.id])
         XCTAssertFalse(batch.alsoDelete)
@@ -89,7 +89,7 @@ final class ProcessOperationsTests: XCTestCase {
         XCTAssertNil(result)
         XCTAssertTrue(FileManager.default.fileExists(atPath: path.path))
         XCTAssertFalse(store.workspaces.contains { $0 === worktree })
-        XCTAssertTrue(store.allSessions.contains { $0 === review }, "The review survives closing its original workspace")
+        XCTAssertTrue(store.popups.contains(review.id), "The window-owned review survives closing its original workspace")
         XCTAssertTrue(batch.completed)
     }
 
@@ -120,17 +120,17 @@ final class ProcessOperationsTests: XCTestCase {
         XCTAssertTrue(batch.completed)
     }
 
-    func testBulkCloseIncludesAnExistingWorkspaceDetailsTab() async throws {
+    func testBulkCloseExcludesAnExistingWindowOwnedDetailsPopup() async throws {
         let store = store(), workspace = try XCTUnwrap(store.active), router = router()
         let details = try XCTUnwrap(router.open(.workspaceDetails(workspace.id), from: store))
         let batch = try XCTUnwrap(ProcessTabs(router: router).close([workspace], from: store))
-        XCTAssertTrue(try XCTUnwrap(batch.rows.first).sessions.contains(details.id))
+        XCTAssertFalse(try XCTUnwrap(batch.rows.first).sessions.contains(details.id))
         XCTAssertTrue(batch.unchanged())
         let result = await batch.execute()
         XCTAssertNil(result)
         XCTAssertTrue(batch.completed)
-        XCTAssertFalse(store.allSessions.contains { $0 === details })
-        XCTAssertNotNil(router.owner(of: try XCTUnwrap(batch.tabID)), "Only the close review must survive")
+        XCTAssertTrue(store.popups.contains(details.id))
+        XCTAssertNotNil(router.owner(of: try XCTUnwrap(batch.tabID)), "The close review belongs to the window")
     }
 
     func testCloseReviewInvalidatesWhenANewTargetTabAppears() throws {
@@ -144,6 +144,129 @@ final class ProcessOperationsTests: XCTestCase {
         state.confirmation.confirm()
         XCTAssertEqual(state.confirmation.phase, .invalidated)
         XCTAssertTrue(store.workspaces.contains { $0 === workspace })
+    }
+
+    func testClosePopupCancelClosesOnlyTheReviewWithoutTouchingWorkspaces() throws {
+        let store = store(), workspace = try XCTUnwrap(store.active), router = router()
+        let batch = try XCTUnwrap(ProcessTabs(router: router).close([workspace], from: store))
+        let state = try XCTUnwrap(batch.state)
+        batch.request()
+        XCTAssertTrue(state.confirmation.isAwaiting)
+        batch.cancel()
+        XCTAssertTrue(state.isClosed)
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertNil(router.owner(of: try XCTUnwrap(batch.tabID)))
+        XCTAssertEqual(store.workspaces.map(\.id), [workspace.id])
+        XCTAssertFalse(batch.completed)
+        XCTAssertTrue(store.allSessions.isEmpty)
+    }
+
+    func testCloseReviewIgnoresIncidentalDismissalAndBackUntilExplicitCancel() throws {
+        let store = store(), workspace = try XCTUnwrap(store.active), router = router()
+        let batch = try XCTUnwrap(ProcessTabs(router: router).close([workspace], from: store))
+        let session = try XCTUnwrap(router.owner(of: try XCTUnwrap(batch.tabID))?.session)
+        XCTAssertTrue(store.popups.locksDismissal)
+        store.popups.dismiss(reason: .dismiss)
+        store.popups.back()
+        XCTAssertTrue(store.popups.isPresented)
+        XCTAssertTrue(store.popups.contains(session.id))
+        XCTAssertEqual(store.workspaces.map(\.id), [workspace.id])
+        XCTAssertFalse(batch.completed)
+        batch.cancel()
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertFalse(store.popups.contains(session.id))
+        XCTAssertEqual(store.workspaces.map(\.id), [workspace.id])
+    }
+
+    func testWorktreeDetailsAndSidebarCloseEntriesShareTheLockedReviewWithoutClosingAnything() async throws {
+        let store = store(), source = try XCTUnwrap(store.active)
+        let path = try write("review-worktree/file").deletingLastPathComponent()
+        let worktree = store.addWorkspace(workingDirectory: path, worktreeParent: source, worktreeBranch: "review")
+        let originalTabs = worktree.root.allPanes.flatMap(\.tabs).map(\.id)
+        let sharedRouter = TabRouter.shared
+        let admission = sharedRouter.admit, storesProvider = sharedRouter.stores
+        sharedRouter.admit = { _ in true }; sharedRouter.stores = { [store] }
+        defer { sharedRouter.admit = admission; sharedRouter.stores = storesProvider }
+        let tabs = LocalFormTabs(router: sharedRouter)
+        let session = try XCTUnwrap(tabs.details(worktree, from: store))
+        let state = try XCTUnwrap(session.tabState)
+        let attribute = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previous = NSApplication.shared.accessibilityAttributeValue(attribute)
+        NSApp.accessibilitySetValue(true, forAttribute: attribute)
+        defer { NSApp.accessibilitySetValue(previous, forAttribute: attribute) }
+        let host = FoldersUIHost(LocalFormView(state: state, tabs: tabs, form: tabs.form(state)), width: 640, height: 680)
+        defer { host.close() }
+        try await host.settle()
+
+        XCTAssertTrue(host.press("Close workspace…"))
+        try await host.settle()
+        let batch = try XCTUnwrap(state.closeWorkspaces)
+        XCTAssertEqual(state.navigation.selection, "close")
+        XCTAssertTrue(state.isCloseWorkspacesReview)
+        XCTAssertTrue(store.popups.locksDismissal)
+        store.popups.dismiss(reason: .dismiss); store.popups.back()
+        XCTAssertTrue(store.popups.isPresented)
+        XCTAssertEqual(worktree.root.allPanes.flatMap(\.tabs).map(\.id), originalTabs)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path.path))
+
+        XCTAssertTrue(host.press("Workspace details"))
+        try await host.settle()
+        XCTAssertNil(state.navigation.selection)
+        XCTAssertFalse(store.popups.locksDismissal)
+        store.popups.dismiss(reason: .dismiss)
+        XCTAssertFalse(store.popups.isPresented)
+        store.requestCloseWorkspace(worktree)
+        XCTAssertTrue(store.popups.isPresented)
+        XCTAssertTrue(store.popups.locksDismissal)
+        XCTAssertTrue(state.closeWorkspaces === batch)
+        XCTAssertEqual(state.navigation.selection, "close")
+        batch.cancel()
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertTrue(store.workspaces.contains { $0 === worktree })
+        XCTAssertEqual(worktree.root.allPanes.flatMap(\.tabs).map(\.id), originalTabs)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path.path))
+    }
+
+    func testConfirmedLastWorkspaceCloseKeepsEmptyHostAndClosesPopup() async throws {
+        let store = store(), workspace = try XCTUnwrap(store.active), router = router()
+        var becameEmpty = false
+        store.onBecameEmpty = { becameEmpty = true }
+        let batch = try XCTUnwrap(ProcessTabs(router: router).close([workspace], from: store))
+        let state = try XCTUnwrap(batch.state)
+        state.confirmation.canShow = { true }
+        batch.request(); state.confirmation.shown(true); state.confirmation.confirm()
+        try await settle { state.confirmation.phase == .completed }
+        XCTAssertTrue(batch.completed)
+        XCTAssertTrue(state.isClosed)
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertNil(router.owner(of: try XCTUnwrap(batch.tabID)))
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(store.workspaces.count, 1)
+        XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertFalse(becameEmpty)
+    }
+
+    func testClosePopupCannotCancelAnExecutingAcceptedOperation() async throws {
+        let store = store(), parent = try XCTUnwrap(store.active), router = router()
+        let child = store.addWorkspace(workingDirectory: directory.appendingPathComponent("child"),
+            worktreeParent: parent, worktreeBranch: "fixture")
+        let batch = try XCTUnwrap(ProcessTabs(router: router).close([child, parent], from: store))
+        let state = try XCTUnwrap(batch.state)
+        batch.alsoDelete = true
+        var release: CheckedContinuation<String?, Never>?
+        batch.removeDirectory = { _, _ in await withCheckedContinuation { release = $0 } }
+        state.confirmation.canShow = { true }
+        batch.request(); state.confirmation.shown(true); state.confirmation.confirm()
+        try await settle { release != nil }
+        batch.cancel()
+        XCTAssertTrue(batch.working)
+        XCTAssertTrue(state.confirmation.isExecuting)
+        XCTAssertFalse(state.isClosed)
+        XCTAssertTrue(store.popups.isPresented)
+        release?.resume(returning: nil)
+        try await settle { state.confirmation.phase == .completed }
+        XCTAssertTrue(batch.completed)
+        XCTAssertTrue(state.isClosed)
     }
 
     func testCloseReviewRefreshesNewChildrenBeforeRequestOrExecution() async throws {
@@ -227,6 +350,29 @@ final class ProcessOperationsTests: XCTestCase {
         return (monitor, source, store)
     }
 
+    func testImportDismissAndCancelNeverSignalOrResumeTheSource() async throws {
+        let (monitor, source, store) = try externalFixture(), router = router()
+        await monitor.refresh()
+        var signals = 0, resumes = 0
+        monitor.sendSignal = { _, _ in signals += 1; return 0 }
+        monitor.resume = { _, _ in resumes += 1; return .failure(.launchOptionsDisablePersistence) }
+        let model = try XCTUnwrap(ProcessTabs(router: router).importExternal(source, from: store, monitor: monitor))
+        let state = try XCTUnwrap(model.state)
+        store.popups.dismiss(reason: .dismiss)
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertFalse(state.isClosed)
+        let reopened = try XCTUnwrap(ProcessTabs(router: router).importExternal(source, from: store, monitor: monitor))
+        XCTAssertTrue(reopened === model)
+        XCTAssertTrue(reopened.state === state)
+        XCTAssertEqual(reopened.source, source)
+        store.popups.dismiss(reason: .cancel)
+        XCTAssertTrue(state.isClosed)
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertEqual(signals, 0)
+        XCTAssertEqual(resumes, 0)
+        XCTAssertTrue(store.allSessions.isEmpty)
+    }
+
     func testTakeoverRejectsRecycledPIDAndChangedExternalConversationBeforeSignal() async throws {
         for change in ["pid", "conversation", "cwd", "busy"] {
             let (monitor, source, store) = try externalFixture()
@@ -283,7 +429,7 @@ final class ProcessOperationsTests: XCTestCase {
         XCTAssertTrue(store.allSessions.isEmpty)
     }
 
-    func testExecutingImportFollowsItsTabToTheCurrentWindow() async throws {
+    func testExecutingImportStaysWithItsInitiatingWindow() async throws {
         let (monitor, source, original) = try externalFixture()
         let destination = store()
         destination.claudeProjectsRoot = original.claudeProjectsRoot
@@ -297,11 +443,11 @@ final class ProcessOperationsTests: XCTestCase {
         state.confirmation.canShow = { true }
         model.request(); state.confirmation.shown(true); state.confirmation.confirm()
         try await settle { finishExit != nil }
-        XCTAssertTrue(destination.handleTabDrop(droppedId: model.tabID, in: try XCTUnwrap(destination.active)))
+        XCTAssertFalse(destination.handleTabDrop(droppedId: model.tabID, in: try XCTUnwrap(destination.active)))
         finishExit?.resume(returning: true)
         try await settle { state.confirmation.phase == .completed }
-        XCTAssertFalse(original.allSessions.contains { $0.conversationId == source.sessionId })
-        XCTAssertTrue(destination.allSessions.contains { $0.conversationId == source.sessionId })
+        XCTAssertTrue(original.allSessions.contains { $0.conversationId == source.sessionId })
+        XCTAssertFalse(destination.allSessions.contains { $0.conversationId == source.sessionId })
     }
 
     func testResetCountsActualLossesAndBackupRetainsUndeliveredResult() throws {

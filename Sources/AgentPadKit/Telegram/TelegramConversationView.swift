@@ -29,6 +29,11 @@ struct TelegramConversationView: View {
     @State private var selection = NSRange(location: 0, length: 0)
     @State private var editor = ChatEditorControl()
     @State private var editorHeight: CGFloat = 64
+    @State private var popupOwner: PopupCoordinator?
+    @State private var botPopup: PopupCoordinator.NativePage?
+    @State private var botPopupID: UUID?
+    @State private var sponsoredPopup: PopupCoordinator.NativePage?
+    @State private var sponsoredPopupID: UUID?
     init(state: TabState, id: TelegramChatID, chats: TelegramChatsModel = TelegramService.chats, applicationInteractive: @escaping () -> Bool = { TelegramService.isInteractive }) {
         self.state = state; self.id = id; self.chats = chats; self.applicationInteractive = applicationInteractive
         let model = state.telegramModel.flatMap { $0.id == id ? $0 : nil } ?? TelegramService.conversations.model(id)
@@ -97,7 +102,7 @@ struct TelegramConversationView: View {
         }
         .background(ChatAppearance.surface)
         .attentionPlace([.telegram(id.root, message: 0)])
-        .background(WindowReader(box: box, didAttach: observe, visibilityChanged: { _ in observe() }))
+        .background(WindowReader(box: box, didAttach: { synchronizePopups(); observe() }, visibilityChanged: { _ in observe() }))
         .task(id: chats.snapshot.account) {
             guard connectedAccount, let provider = chats.provider as? any TelegramConversationProvider else { return }
             await model.observe(pane: pane, provider: provider)
@@ -113,17 +118,12 @@ struct TelegramConversationView: View {
             else if id.topic == nil { state.telegramTopicTitle = nil }
             observe()
         }
-        .alert(botDialog?.title ?? "Telegram", isPresented: Binding(get: { botDialog != nil }, set: { if !$0, botDialog != nil { model.botDialog = nil } }), presenting: botDialog) { dialog in
-            if dialog.url != nil { Button("Open") { model.confirmBotURL(dialog) } }
-            Button(dialog.url == nil ? "OK" : "Cancel", role: .cancel) { model.botDialog = nil }
-        } message: { dialog in Text(dialog.text) }
-        .sheet(item: Binding(get: { sponsoredDialog }, set: { if $0 == nil, sponsoredDialog != nil { model.dismissSponsoredDialog() } })) { dialog in
-            sponsoredDialogView(dialog)
-        }
-        .onChange(of: sponsoredDialog?.id) { _, _ in observe() }
-        .onChange(of: botDialog?.id) { _, _ in observe() }
+        .onChange(of: sponsoredDialog?.id, initial: true) { _, _ in synchronizePopups(); observe() }
+        .onChange(of: botDialog?.id, initial: true) { _, _ in synchronizePopups(); observe() }
+        .onChange(of: popupOwner?.locksDismissal) { _, locked in if locked == false { synchronizePopups() } }
         .onChange(of: editor.focused) { _, focused in if !focused { model.typing(false, pane: pane) } }
         .onDisappear {
+            dismissNativePopups()
             visibilityUpdates.cancel()
             sponsoredActive = false
             model.typing(false, pane: pane)
@@ -405,12 +405,44 @@ struct TelegramConversationView: View {
             }
             Text("⌘Return to send · Return for a new line").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
         }.padding(14)
+            .onChange(of: state.primaryInputFocusRequest) { _, _ in editor.focus() }
     }
     private func observe() {
         // Revoke queued views immediately; geometry evaluation can wait for
         // the rest of this turn's message, ad and overlay preference updates.
         model.invalidatePresentation(pane: pane)
         visibilityUpdates.schedule(evaluateVisibility)
+    }
+    private func synchronizePopups() {
+        guard let owner = TabRouter.shared.stores().first(where: {
+            $0.allSessions.contains { $0.tabState === state }
+        })?.popups else { return }
+        if popupOwner !== owner { dismissNativePopups(); popupOwner = owner }
+        if let page = botPopup, botPopupID != botDialog?.id {
+            owner.dismiss(page, reason: .applied); botPopup = nil; botPopupID = nil
+        }
+        if let page = sponsoredPopup, sponsoredPopupID != sponsoredDialog?.id {
+            owner.dismiss(page, reason: .applied); sponsoredPopup = nil; sponsoredPopupID = nil
+        }
+        if botPopup == nil, let dialog = botDialog,
+           let page = TelegramBotPopup.makePage(model: model, dialog: dialog, pane: pane, coordinator: owner) {
+            owner.presentNative(page)
+            if owner.page?.id == ObjectIdentifier(page) { botPopup = page; botPopupID = dialog.id }
+        }
+        if sponsoredPopup == nil, let dialog = sponsoredDialog,
+           let page = TelegramSponsoredPopup.makePage(model: model, dialog: dialog, pane: pane, coordinator: owner,
+                openChat: { [weak state] target in
+                    if let state { TelegramTabs.openSponsored(target, state: state) }
+                }) {
+            owner.presentNative(page)
+            if owner.page?.id == ObjectIdentifier(page) { sponsoredPopup = page; sponsoredPopupID = dialog.id }
+        }
+    }
+    private func dismissNativePopups() {
+        if let botPopup { popupOwner?.dismiss(botPopup, reason: .cancel) }
+        if let sponsoredPopup { popupOwner?.dismiss(sponsoredPopup, reason: .cancel) }
+        botPopup = nil; botPopupID = nil; sponsoredPopup = nil; sponsoredPopupID = nil
+        popupOwner = nil
     }
     private func evaluateVisibility() {
         let shown = box.view.map { view in
@@ -438,6 +470,91 @@ struct TelegramConversationView: View {
     }
     private func delivery(_ state: TelegramMessage.Delivery) -> String {
         switch state { case .received: ""; case .submitting: "Submitting…"; case .pending: "Sending…"; case .sent: "Sent"; case .read: "Read"; case .failed(let error): error; case .unknown: "Delivery unknown · Check Telegram" }
+    }
+}
+
+/// Bot text and URLs use the window's existing popup host. The request identity
+/// prevents a dismissed or replaced pane from approving a newer bot response.
+struct TelegramBotPopup: View {
+    @Bindable var model: TelegramConversationModel
+    let dialogID: UUID
+    let pane: UUID
+    let dismiss: (PopupCoordinator.DismissReason) -> Void
+
+    var dialog: TelegramBotDialog? {
+        model.botDialog.flatMap {
+            $0.id == dialogID && $0.epoch == model.snapshot.epoch
+                && ($0.pane == nil || $0.pane == pane) && model.panes.contains(pane) ? $0 : nil
+        }
+    }
+    static func makePage(model: TelegramConversationModel, dialog: TelegramBotDialog, pane: UUID,
+                         coordinator: PopupCoordinator) -> PopupCoordinator.NativePage? {
+        guard model.botDialog?.id == dialog.id, dialog.epoch == model.snapshot.epoch,
+              dialog.pane == nil || dialog.pane == pane, model.panes.contains(pane) else { return nil }
+        let page = PopupCoordinator.NativePage(title: "Telegram bot")
+        page.onDismiss = { [weak model] _ in
+            if model?.botDialog?.id == dialog.id { model?.botDialog = nil }
+        }
+        page.content = { [weak page, weak coordinator] in
+            AnyView(TelegramBotPopup(model: model, dialogID: dialog.id, pane: pane, dismiss: { reason in
+                if let page { coordinator?.dismiss(page, reason: reason) }
+            }))
+        }
+        return page
+    }
+    var body: some View {
+        if let dialog {
+            VStack(spacing: 0) {
+                PopupScrollBody(maxHeight: 360) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(dialog.title).font(Theme.display(18, weight: .semibold))
+                            Text(model.snapshot.title.isEmpty ? "Telegram" : "Telegram · " + model.snapshot.title)
+                                .font(Theme.display(11)).foregroundStyle(.secondary)
+                        }
+                        if !message(dialog).isEmpty {
+                            Text(message(dialog)).font(Theme.display(12)).textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if let url = dialog.url { TelegramPopupURL(url: url) }
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(24)
+                }
+                Divider()
+                HStack {
+                    Spacer()
+                    if dialog.url != nil {
+                        Button("Cancel") { dismiss(.cancel) }.keyboardShortcut(.cancelAction)
+                            .accessibilityIdentifier("telegram-bot-cancel")
+                        Button("Open") { open() }.buttonStyle(PopupPrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                            .disabled(!model.canConfirmBotURL(dialog)).accessibilityIdentifier("telegram-bot-open")
+                    } else {
+                        Button("OK") { dismiss(.applied) }.buttonStyle(PopupPrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                            .accessibilityIdentifier("telegram-bot-done")
+                    }
+                }.padding(.horizontal, 20).padding(.vertical, 14)
+            }.accessibilityElement(children: .contain).accessibilityIdentifier("telegram-bot-popup")
+        }
+    }
+    private func message(_ dialog: TelegramBotDialog) -> String {
+        guard let url = dialog.url?.absoluteString else { return dialog.text }
+        if dialog.text == url { return "" }
+        let suffix = "\n\n" + url
+        return dialog.text.hasSuffix(suffix) ? String(dialog.text.dropLast(suffix.count)) : dialog.text
+    }
+    func open() {
+        guard let dialog, model.canConfirmBotURL(dialog) else { return }
+        model.confirmBotURL(dialog)
+        dismiss(.applied)
+    }
+}
+
+struct TelegramPopupURL: View {
+    let url: URL
+    var body: some View {
+        Text(url.absoluteString).font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
+            .padding(13).background(Theme.chromeHover.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.chromeHairline))
     }
 }
 

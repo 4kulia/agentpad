@@ -1,6 +1,9 @@
 import AppKit
 import AgentPadHookKit
 import SwiftUI
+#if DEBUG
+import GhosttyKit
+#endif
 
 /// Namespace for the View menu's Tab/Workspace switch items. Tags share a
 /// single integer field on `NSMenuItem`, so we partition them: 1...9 for tabs
@@ -33,6 +36,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // window set, and no future mutation site can forget to.
         didSet { AgentMonitor.shared.windowGeneration += 1 }
     }
+    private var startupWindowController: AgentPadStartupWindowController?
     private let appPersistence: AppPersistence
     private let agentProfiles: AgentProfileStore
     /// Set in `applicationShouldTerminate` so `windowWillClose` (fired for
@@ -99,13 +103,25 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
 
     public override convenience init() {
-        self.init(appPersistence: AppPersistence(), agentProfiles: .shared)
+        self.init(appPersistence: AppPersistence(), agentProfiles: .shared,
+                  claudeTokenDirectory: ClaudeAccountLaunch.tokenDirectory,
+                  legacyClaudeTokenDirectory: FileManager.default.temporaryDirectory)
     }
 
-    init(appPersistence: AppPersistence, agentProfiles: AgentProfileStore) {
+    init(appPersistence: AppPersistence, agentProfiles: AgentProfileStore,
+         claudeTokenDirectory: URL? = nil, legacyClaudeTokenDirectory: URL? = nil,
+         windowControllers: [AgentPadWindowController] = []) {
         self.appPersistence = appPersistence
         self.agentProfiles = agentProfiles
+        self.windowControllers = windowControllers
         super.init()
+        // Before any restored tab can prepare a new credential source.
+        // Injected test delegates use fixture directories and never sweep the
+        // running user's sources. The app's public initializer supplies both.
+        if let claudeTokenDirectory {
+            try? ClaudeAccountLaunch.sweepAtStartup(directory: claudeTokenDirectory,
+                                                    legacyDirectory: legacyClaudeTokenDirectory)
+        }
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
@@ -130,15 +146,33 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // written to the user's plist, and the registration domain is lowest
         // priority, so anyone who set their own value system-wide still wins.
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 600])
-        // First-launch onboarding (blocking NSAlert if a ghostty config exists)
-        // — must run before any window is created and before any libghostty
-        // surface is spawned, since `LibghosttyApp` reads `~/.agentpad/settings.json`
-        // at process init when the first surface is created.
-        // Onboarding can construct the shared model before a potential import
-        // writes settings.json. Reload so first-launch imports are reflected
-        // in the windows created below.
-        SupportTabs.shared.navigation.loadConfiguration(onboarding: { AgentPadOnboarding.runIfNeeded() },
-                                                        load: { AgentPadSettingsModel.shared.load() })
+        installMainMenu()
+        beginStartupConfiguration { [weak self] in self?.finishLaunching() }
+    }
+
+    private func beginStartupConfiguration(ghosttyConfig: URL = AgentPadOnboarding.ghosttyConfig,
+                                           completion: @escaping () -> Void) {
+        let load = {
+            SupportTabs.shared.navigation.loadConfiguration { AgentPadSettingsModel.shared.load() }
+            completion()
+        }
+        guard let source = AgentPadOnboarding.prepare(ghosttyConfig: ghosttyConfig) else { load(); return }
+        AgentPadSettingsModel.shared.prepareFirstLaunchAppearance()
+        let controller = AgentPadStartupWindowController(ghosttyConfig: source, onChoice: load)
+        startupWindowController = controller
+        // Tool entries use the same startup gate as window commands. Reveal
+        // its pending choice before parking a Settings/Connection/etc. request.
+        let navigation = SupportTabs.shared.navigation
+        navigation.router.admit = { [weak self, weak navigation] deferred in
+            if self?.startupWindowController != nil { self?.revealHiddenWindow() }
+            return navigation?.admit(deferred) ?? false
+        }
+        NSApp.setActivationPolicy(.regular)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func finishLaunching() {
         let settings = AgentPadSettingsModel.shared
         // Keep the observable settings model independent of NSApplication.
         // These are the only two imperative app-wide effects a save needs;
@@ -186,7 +220,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        installMainMenu()
         // Wire the CLI verb executor before the socket opens so the first
         // request can't race an unset handler. The isTerminating guard is
         // the same discipline as the deep-link path: during the ⌘Q drain a
@@ -325,6 +358,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// window on a fresh install.
     private func restoreWindows() {
         guard SupportTabs.shared.navigation.configurationLoaded else {
+            revealHiddenWindow()
             _ = SupportTabs.shared.navigation.admit { [weak self] in
                 guard let self else { return }
                 if windowControllers.isEmpty { restoreWindows() } else { _ = revealHiddenWindow() }
@@ -370,8 +404,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             noteRecentFolder: { RecentFolders.shared.note($0) }
         )
         if let source { store.inheritNavigation(from: source) }
+        let startupWindow = startupWindowController?.takeWindow()
+        startupWindowController = nil
         let controller = AgentPadWindowController(windowId: windowId, store: store,
-                                                   restoring: appPersistence.frame(for: windowId))
+                                                   restoring: appPersistence.frame(for: windowId), adopting: startupWindow)
         persistence.frameProvider = { [weak controller] in controller?.persistableFrame }
         controller.onShouldClose = { [weak self] in self?.shouldCloseWindow($0) ?? true }
         controller.onWillClose = { [weak self] in self?.handleWindowWillClose($0) }
@@ -385,7 +421,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let reference = activeController?.persistableFrame
         windowControllers.append(controller)
         if let window = controller.window {
-            place(window, restoring: appPersistence.frame(for: windowId), inheritingSizeFrom: reference)
+            if startupWindow == nil {
+                place(window, restoring: appPersistence.frame(for: windowId), inheritingSizeFrom: reference)
+            }
             if show { window.makeKeyAndOrderFront(nil) }
         }
         return controller
@@ -591,6 +629,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         guard !isTerminating else { return }
         let links = urls.compactMap(AgentPadDeepLink.parse)
         guard deepLinksReady else {
+            if !links.isEmpty { revealHiddenWindow() }
             pendingDeepLinks.append(contentsOf: links)
             return
         }
@@ -892,6 +931,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private func handleCLIRequest(_ request: AgentPadCLIRequest, origin: AgentPadCallerOrigin,
                                   isCallerWaiting: @escaping @MainActor () -> Bool,
                                   completion: @escaping @MainActor (AgentPadCLIResponse) -> Void) {
+        let opensUI = request.verb == AgentPadCLIVerb.resume.rawValue
+            || request.verb == AgentPadCLIVerb.focus.rawValue
+            || (request.verb == AgentPadCLIVerb.open.rawValue && request.noFocus != true)
+        if !isTerminating, isCallerWaiting(), opensUI, startupWindowController != nil {
+            revealHiddenWindow()
+        }
         guard SupportTabs.shared.navigation.admit({ [weak self] in
             self?.handleCLIRequest(request, origin: origin, isCallerWaiting: isCallerWaiting, completion: completion)
         }) else { return }
@@ -1102,6 +1147,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// background `rename` can't pop the window. Returns whether one was shown.
     @discardableResult
     private func revealHiddenWindow() -> Bool {
+        if let startup = startupWindowController, let window = startup.window {
+            startup.presentChoice()
+            front(window)
+            NSApp.activate(ignoringOtherApps: true)
+            return true
+        }
         guard let window = windowControllers
             .first(where: { $0.hiddenOnClose && !$0.store.isTerminated })?.window
         else { return false }
@@ -1121,6 +1172,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var keyAuxiliaryWindow: NSWindow? {
         guard let key = NSApp.keyWindow, controller(for: key) == nil else { return nil }
         return key
+    }
+
+    private var keyWindowPopup: PopupCoordinator? {
+        if let startup = startupWindowController, startup.window === NSApp.keyWindow,
+           startup.popups.isPresented { return startup.popups }
+        if let controller = NSApp.keyWindow?.windowController as? AgentPadWindowController,
+           controller.store.popups.isPresented { return controller.store.popups }
+        return TelegramSponsoredVideoWindow.shared.popupCoordinator(for: NSApp.keyWindow)
     }
 
     /// Pushes edited agent templates into already-open tabs. Called from
@@ -1162,7 +1221,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// window back (AppKit's default reopen only un-minimizes), or, with no
     /// window at all, restore the persisted set as a relaunch would.
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
-        guard !isTerminating, !hasVisibleWindows else { return true }
+        guard !isTerminating else { return true }
+        if startupWindowController != nil {
+            revealHiddenWindow()
+            return false
+        }
+        guard !hasVisibleWindows else { return true }
         if revealHiddenWindow() { return false }
         guard windowControllers.isEmpty else { return true }
         restoreWindows()
@@ -1414,6 +1478,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             selfRow("All sessions", #selector(handleAllSessions), "h", modifiers: [.command, .shift]),
             selfRow("Next Session Needing You", #selector(handleNextWaitingSession), "u", modifiers: [.command, .shift]),
         ])
+        windowMenu.delegate = self
         mainMenu.addItem(submenu(windowMenu))
 
         // AgentPad: team work (Team/TeamUI.swift).
@@ -1539,12 +1604,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     // MARK: - Menu actions
 
     @objc private func handleNewWindow() {
+        revealHiddenWindow()
         guard SupportTabs.shared.navigation.admit({ [weak self] in self?.handleNewWindow() }) else { return }
         // ⌘⇧N is already in-app, but the Dock-tile "New Window" can fire while
         // AgentPad is in the background — without activating, the new window opens
         // behind whatever app is frontmost.
         NSApp.activate(ignoringOtherApps: true)
-        revealHiddenWindow()
         addWindow()
     }
 
@@ -1559,6 +1624,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     @objc private func handleNewAgent() {
+        revealHiddenWindow()
         LocalFormTabs.shared.newAgent(from: activeStore)
     }
 
@@ -1726,6 +1792,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     @objc private func handleOpenFolder() {
         revealHiddenWindow()
+        guard startupWindowController == nil else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -1752,6 +1819,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     @objc private func handleCloseTab() {
+        if let popup = keyWindowPopup {
+            popup.dismiss(reason: .dismiss)
+            return
+        }
         if let aux = keyAuxiliaryWindow {
             // ⌘W closes the auxiliary window itself, never a terminal tab
             // hidden behind it. Floating panels dismiss via their
@@ -1841,6 +1912,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     // MARK: - NSMenuDelegate
 
     public func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === NSApp.windowsMenu {
+            let popupIsPresented = keyWindowPopup != nil
+            // AppKit owns the dynamic window-list targets, so our ordinary
+            // item validator is not consulted for those navigation actions.
+            menu.autoenablesItems = !popupIsPresented
+            if popupIsPresented {
+                for item in menu.items where !item.isSeparatorItem {
+                    item.isEnabled = item.target === self && validateMenuItem(item)
+                }
+            }
+        }
         // Hidden NSMenuItems don't fire their keyEquivalents — pressing ⌘5
         // with 3 tabs is a no-op, matching what the menu shows.
         let store = activeStore
@@ -1859,6 +1941,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
     }
 
+    public func menuDidClose(_ menu: NSMenu) {
+        // Manual disabling lasts only for the open menu. Restore native
+        // validation so its shortcuts recover immediately after dismissal.
+        if menu === NSApp.windowsMenu { menu.autoenablesItems = true }
+    }
+
     /// App-scoped File/Window actions remain available while Settings or
     /// another auxiliary window is key. Terminal-scoped actions do not: a
     /// shortcut pressed in Settings must never mutate the last terminal
@@ -1866,6 +1954,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// key-equivalent routing, which keeps the responder boundary in one
     /// native validation hook instead of duplicating guards in every action.
     public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if let popup = keyWindowPopup {
+            if menuItemMatches(menuItem, #selector(handleCloseTab)) { return !popup.locksDismissal }
+            // These actions stay in the popup flow or do not navigate app
+            // content. Every terminal/tab/pane/workspace/window action waits
+            // until the popup relinquishes the keyboard.
+            return menuItemMatches(menuItem,
+                #selector(handleOpenSettings), #selector(handleAbout), #selector(handleCheckForUpdates(_:)),
+                #selector(handleNewAgent), #selector(handleNewSSHWorkspace),
+                #selector(handleClearRecentFolders), #selector(handleCenterWindow),
+                #selector(handleOpenIssues), #selector(handleOpenRepo))
+        }
         // AgentPad: scope Chat focus to the current main window and tab.
         if menuItem.action == #selector(handleChatFocus(_:)), let area = ChatFocusArea(rawValue: menuItem.tag) {
             guard keyAuxiliaryWindow == nil, let store = activeStore else { return false }
@@ -2257,77 +2356,278 @@ extension AppDelegate {
         router.stores = { [weak self] in self?.windowControllers.map(\.store) ?? [] }
         router.ensureHost = { [weak self] in self?.ensureWorkspaceHost()?.store }
         router.revealWindow = { [weak self] store in
-            self?.windowControllers.first { $0.store === store }?.window?.makeKeyAndOrderFront(nil)
+            if let window = self?.windowControllers.first(where: { $0.store === store })?.window {
+                AgentPadQuietUI.select(window)
+            }
         }
         SupportTabs.shared.install()
         installMainMenu()
         var cliAnswer: AgentPadCLIResponse?
-        var earlyError: Error?
-        var prompts = 0
+        var configured = false
+        let capture = mode == "capture"
+        if capture {
+            let model = AgentPadSettingsModel(read: { [:] }, write: { _ in }, appliesRuntimeEffects: false)
+            AgentPadSettingsModel.testModel = model
+            model.appearanceMode = .dark
+            model.activatePairedThemeSchemaAndSave()
+        }
+        beginStartupConfiguration(ghosttyConfig: ghostty) { configured = true }
+        let startup = startupWindowController
+        let firstWindow = startup?.window
         let earlyEntries: @MainActor () throws -> Void = { [self] in
             handleOpenSettings()
             let key = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
                 windowNumber: NSApp.keyWindow?.windowNumber ?? 0, context: nil, characters: ",",
                 charactersIgnoringModifiers: ",", isARepeat: false, keyCode: 43)!
             _ = NSApp.mainMenu?.performKeyEquivalent(with: key)
-            try require(router.open(.settings) == nil, "direct Settings router bypass")
+            // Popups are valid only for classified routes, and still obey the
+            // startup gate: Welcome must finish before a workspace exists.
+            try require(ToolRoute.settings.presentation == .popup, "Settings popup classification")
+            try require(router.open(.settings) == nil, "Settings popup bypassed Welcome")
             handleChatConnect()
-            try require(router.open(.connection) == nil, "direct Connection router bypass")
+            try require(ToolRoute.connection.presentation == .popup, "Connection popup classification")
+            try require(router.open(.connection) == nil, "Connection popup bypassed Welcome")
             handleNewWindow()
             restoreWindows()
             _ = applicationShouldHandleReopen(NSApp, hasVisibleWindows: false)
             handleCLIRequest(.init(verb: .open, agent: "terminal"), origin: .outside, isCallerWaiting: { true }) { cliAnswer = $0 }
             application(NSApp, open: [URL(string: "agentpad://resume?agent=claude&id=")!])
             try require(windowControllers.isEmpty, "entry created a workspace during Welcome")
-            try require(!NSApp.windows.contains { $0.isVisible && $0 !== NSApp.modalWindow }, "entry opened an auxiliary window during Welcome")
+            try require(!NSApp.windows.contains { $0.isVisible && $0 !== firstWindow }, "entry opened an auxiliary window during Welcome")
+            try require(NSApp.modalWindow == nil && firstWindow?.attachedSheet == nil, "Welcome used a native modal")
             try require(!LibghosttyApp.initialized, "entry initialized libghostty during Welcome")
             try require(cliAnswer == nil, "CLI executed before startup finished")
             try require((try? Data(contentsOf: AgentPadSettings.url)) == initial, "entry saved settings during Welcome")
             try require(!pendingDeepLinks.isEmpty, "deep link was not deferred")
         }
-        let timer = Timer(timeInterval: 0.05, repeats: true) { _ in
-            MainActor.assumeIsolated {
-                guard NSApp.modalWindow != nil else { return }
-                prompts += 1
-                do { try earlyEntries() } catch { earlyError = error }
-                let title = imported ? String(localized: "Use ghostty settings", bundle: .agentPadResources)
-                    : String(localized: "Start fresh", bundle: .agentPadResources)
-                func buttons(_ view: NSView) -> [NSButton] {
-                    (view as? NSButton).map { [$0] } ?? view.subviews.flatMap(buttons)
+        try require((startup != nil) == (!existing && mode != "no-config"), "Welcome shown or skipped incorrectly")
+        if let startup, let firstWindow {
+            _ = try await AgentPadFirstLaunchSelfCheck.ready(startup)
+            try require(firstWindow.isVisible, "main window must open before the choice")
+            try require(startup.popups.window === firstWindow && startup.popups.ownerStore == nil, "startup PopupHost has the wrong owner")
+            try require(!AgentPadFirstLaunchSelfCheck.nodes(firstWindow).contains { $0 is GhosttySurfaceView || $0 is PaneTreeHostView }, "startup constructed terminal/pane views")
+            try require(!configured && !navigation.configurationLoaded, "configuration completed before the choice")
+            if mode == "window-entries" {
+                func menuAction(_ menu: NSMenu?, _ action: Selector) throws {
+                    guard let menu, let index = menu.items.firstIndex(where: { $0.action == action }) else {
+                        throw AgentPadFirstLaunchSelfCheck.Failure.check("Missing window entry: \(action)")
+                    }
+                    menu.performActionForItem(at: index)
                 }
-                if let view = NSApp.modalWindow?.contentView, let button = buttons(view).first(where: { $0.title == title }) {
-                    button.performClick(nil)
-                } else {
-                    earlyError = AgentPadFirstLaunchSelfCheck.Failure.check("Welcome choice button is missing")
-                    NSApp.stopModal(withCode: .abort)
+                func shortcut(_ modifiers: NSEvent.ModifierFlags) throws {
+                    let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: firstWindow.windowNumber,
+                        context: nil, characters: "n", charactersIgnoringModifiers: "n", isARepeat: false, keyCode: 45)!
+                    try require(NSApp.mainMenu?.performKeyEquivalent(with: event) == true, "New shortcut was not dispatched")
                 }
+                let entries: [(String, () throws -> Void)] = [
+                    ("Dock New Window", { try menuAction(self.applicationDockMenu(NSApp), #selector(self.handleNewWindow)) }),
+                    ("Dock reopen", { _ = self.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false) }),
+                    ("Dock reopen with visible shell", {
+                        AgentPadQuietUI.select(firstWindow)
+                        _ = self.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true)
+                    }),
+                    ("File New Window", { try menuAction(NSApp.mainMenu?.items.first { $0.submenu?.title == "File" }?.submenu, #selector(self.handleNewWindow)) }),
+                    ("Command-Shift-N", { try shortcut([.command, .shift]) }),
+                    ("Command-N", { try shortcut(.command) }),
+                    ("New Tab", { self.handleNewTab() }),
+                    ("Open Recent", { self.openRecentFolder(atPath: directory.path) }),
+                    ("Open Folder", { self.handleOpenFolder() }),
+                    ("Menu bar Open", { self.openAgentPadFromMenuBar() }),
+                    ("Restore windows", { self.restoreWindows() }),
+                    ("Settings", { self.handleOpenSettings() }),
+                    ("New Agent", { self.handleNewAgent() }),
+                    ("Connection", { self.handleChatConnect() }),
+                    ("Popup router", { _ = router.open(.settings) }),
+                    ("URL open", { self.application(NSApp, open: [URL(string: "agentpad://resume?agent=claude&id=")!]) }),
+                    ("CLI open", { self.handleCLIRequest(.init(verb: .open, agent: "terminal"), origin: .outside, isCallerWaiting: { true }) { cliAnswer = $0 } }),
+                    ("CLI resume", { self.handleCLIRequest(.init(verb: .resume, agent: "claude", conversationId: ""), origin: .outside, isCallerWaiting: { true }) { cliAnswer = $0 } }),
+                    ("CLI focus", { self.handleCLIRequest(.init(verb: .focus, tab: UUID().uuidString), origin: .outside, isCallerWaiting: { true }) { cliAnswer = $0 } })
+                ]
+                for dismissed in [false, true] {
+                    for (name, action) in entries {
+                        startup.presentChoice()
+                        _ = try await AgentPadFirstLaunchSelfCheck.ready(startup)
+                        if dismissed { startup.popups.dismiss(reason: .dismiss) }
+                        firstWindow.performClose(nil)
+                        try require(!firstWindow.isVisible, "\(name): fixture did not hide startup")
+                        try await Task.sleep(for: .milliseconds(20))
+                        try action()
+                        try require(firstWindow.isVisible && startup.popups.isPresented, "\(name) (dismissed=\(dismissed)): pending startup stayed hidden or lost its popup")
+                        let dialog = try await AgentPadFirstLaunchSelfCheck.ready(startup)
+                        try require(dialog.window === firstWindow && dialog.isDescendant(of: firstWindow.contentView!), "\(name): popup left its original window")
+                        try require(startupWindowController === startup && startup.window === firstWindow, "\(name): replaced startup window")
+                        try require(windowControllers.isEmpty && !LibghosttyApp.initialized, "\(name): initialized workspace/runtime")
+                        try require(!configured && !navigation.configurationLoaded && cliAnswer == nil, "\(name): completed a deferred request")
+                        try require(!FileManager.default.fileExists(atPath: AgentPadSettings.url.path), "\(name): consumed the settings choice")
+                        try require(NSApp.modalWindow == nil && firstWindow.attachedSheet == nil && !NSApp.windows.contains { $0.isVisible && $0 !== firstWindow }, "\(name): opened another window or sheet")
+                    }
+                }
+                // Queries, background opens and departed callers keep their
+                // existing no-fronting contract while startup remains pending.
+                for request in [AgentPadCLIRequest(verb: .list), .init(verb: .status), .init(verb: .open, agent: "terminal", noFocus: true)] {
+                    firstWindow.performClose(nil)
+                    self.handleCLIRequest(request, origin: .outside, isCallerWaiting: { true }) { cliAnswer = $0 }
+                    try require(!firstWindow.isVisible && cliAnswer == nil, "A background CLI request revealed startup")
+                }
+                self.handleCLIRequest(.init(verb: .open, agent: "terminal"), origin: .outside, isCallerWaiting: { false }) { cliAnswer = $0 }
+                try require(!firstWindow.isVisible && cliAnswer == nil, "A departed CLI caller revealed startup")
+                return
             }
+            try earlyEntries()
+            let native = AgentPadFirstLaunchSelfCheck.screenUnlocked
+            let nativeRows = ["first eligible control", "focus containment", "menu gating", "Escape", "scrim", "close", "opener focus return"]
+            print("First-launch native interactions: \(native ? "running (screen unlocked)" : "not run (screen locked or console unavailable)")")
+            if native {
+                defer { AgentPadFirstLaunchSelfCheck.removeStartupOpenerProbe(in: firstWindow) }
+                var opener: NSObject?
+                var openerResponder: NSResponder?
+                func openFromStartupControl() async throws {
+                    startup.popups.dismiss(reason: .dismiss)
+                    try await AgentPadFirstLaunchSelfCheck.until("dismissed startup popup") { !startup.popups.isPresented }
+                    opener = try await AgentPadFirstLaunchSelfCheck.focusStartupOpener(in: firstWindow)
+                    openerResponder = firstWindow.firstResponder
+                    try AgentPadFirstLaunchSelfCheck.activateStartupOpener(opener!, in: firstWindow)
+                    _ = try await AgentPadFirstLaunchSelfCheck.ready(startup)
+                    try await Task.sleep(for: .milliseconds(80))
+                }
+                func assertStartupReturn() async throws {
+                    try require(!startup.popups.isPresented, "startup popup did not dismiss")
+                    try await AgentPadFirstLaunchSelfCheck.until("focus returned to Choose startup settings") {
+                        guard let opener else { return false }
+                        return AgentPadFirstLaunchSelfCheck.openerHasFocus(opener, in: firstWindow)
+                            && firstWindow.firstResponder === openerResponder
+                    }
+                    try require(!configured && !navigation.configurationLoaded && !LibghosttyApp.initialized && windowControllers.isEmpty,
+                                "native dismissal completed startup or initialized a runtime")
+                    try require(!FileManager.default.fileExists(atPath: AgentPadSettings.url.path), "native dismissal committed a choice")
+                }
+                for light in [false, true] {
+                    AgentPadSettingsModel.shared.appearanceMode = light ? .light : .dark
+                    firstWindow.appearance = Theme.windowAppearance
+                    for row in nativeRows {
+                        try await AgentPadFirstLaunchSelfCheck.nativeRow("\(light ? "light" : "dark") \(row)", in: firstWindow, reset: openFromStartupControl) {
+                            let dialog = try await AgentPadFirstLaunchSelfCheck.ready(startup)
+                            switch row {
+                            case "first eligible control":
+                                try AgentPadFirstLaunchSelfCheck.assertInitialFocus(dialog, in: firstWindow)
+                            case "focus containment":
+                                try require(AgentPadFirstLaunchSelfCheck.containsFocus(dialog, in: firstWindow), "initial focus escaped the popup")
+                                _ = try await AgentPadFirstLaunchSelfCheck.assertTraversal(dialog, window: firstWindow, name: "startup")
+                            case "menu gating":
+                                let blocked: Set<Selector> = [#selector(handleNewWindow), #selector(handleNewTab),
+                                    #selector(handleNewWorkspace), #selector(handleComposePrompt), #selector(handleNextTab),
+                                    #selector(handlePreviousTab), #selector(handleSplitRight), #selector(handleSplitDown)]
+                                var menus = NSApp.mainMenu.map { [$0] } ?? []
+                                var checked: Set<Selector> = []
+                                while let menu = menus.popLast() {
+                                    self.menuNeedsUpdate(menu)
+                                    menu.update()
+                                    for item in menu.items {
+                                        if let submenu = item.submenu { menus.append(submenu) }
+                                        if let action = item.action, blocked.contains(action) {
+                                            try require(!self.validateMenuItem(item) && !item.isEnabled,
+                                                        "Ghostty popup left \(item.title) enabled")
+                                            checked.insert(action)
+                                        }
+                                    }
+                                }
+                                try require(checked == blocked, "startup menu check omitted a navigation command")
+                                for (character, code, modifiers): (String, UInt16, NSEvent.ModifierFlags) in [
+                                    ("t", 17, .command), ("n", 45, [.command, .shift]),
+                                    ("l", 37, .command), ("\t", 48, .control)
+                                ] {
+                                    AgentPadFirstLaunchSelfCheck.key(character, code: code, in: firstWindow, modifiers: modifiers)
+                                    try require(startup.popups.isPresented && AgentPadFirstLaunchSelfCheck.containsFocus(dialog, in: firstWindow),
+                                                "navigation shortcut escaped the startup popup")
+                                }
+                                try require(windowControllers.isEmpty && !LibghosttyApp.initialized, "menu navigation initialized a workspace/runtime")
+                            case "Escape", "opener focus return":
+                                AgentPadFirstLaunchSelfCheck.key("\u{1b}", code: 53, in: firstWindow)
+                                try await assertStartupReturn()
+                            case "scrim":
+                                AgentPadFirstLaunchSelfCheck.scrim(firstWindow)
+                                try await assertStartupReturn()
+                            case "close":
+                                try AgentPadFirstLaunchSelfCheck.press("popup-close", in: firstWindow)
+                                try await assertStartupReturn()
+                            default: preconditionFailure("Unclassified startup matrix row: \(row)")
+                            }
+                        }
+                    }
+                }
+                AgentPadFirstLaunchSelfCheck.removeStartupOpenerProbe(in: firstWindow)
+                startup.presentChoice()
+                _ = try await AgentPadFirstLaunchSelfCheck.ready(startup)
+            } else {
+                for row in nativeRows { print("Ghostty matrix \(row): NOT RUN (screen locked or console unavailable)") }
+            }
+            if capture {
+                guard let path = ProcessInfo.processInfo.environment["AGENTPAD_POPUP_SHOTS"] else {
+                    throw AgentPadFirstLaunchSelfCheck.Failure.check("Capture requires a screenshot directory")
+                }
+                let shots = URL(fileURLWithPath: path, isDirectory: true)
+                try FileManager.default.createDirectory(at: shots, withIntermediateDirectories: true)
+                firstWindow.setContentSize(NSSize(width: 1180, height: 820))
+                for light in [false, true] {
+                    AgentPadSettingsModel.shared.appearanceMode = light ? .light : .dark
+                    firstWindow.appearance = Theme.windowAppearance
+                    let takeScreenshot = {
+                        _ = try await AgentPadFirstLaunchSelfCheck.ready(startup)
+                        try await Task.sleep(for: .milliseconds(180))
+                        try AgentPadFirstLaunchSelfCheck.screenshot(firstWindow,
+                            to: shots.appendingPathComponent("popups-ghostty\(light ? "-light" : "").png"))
+                    }
+                    if native {
+                        try await AgentPadFirstLaunchSelfCheck.nativeRow("\(light ? "light" : "dark") screenshot", in: firstWindow,
+                                                                        reset: {}, check: takeScreenshot)
+                    } else {
+                        try await takeScreenshot()
+                    }
+                    try require(!LibghosttyApp.initialized && windowControllers.isEmpty, "rendering initialized the runtime")
+                    try require(!FileManager.default.fileExists(atPath: AgentPadSettings.url.path), "rendering wrote startup settings")
+                }
+                print("First-launch screenshots: \(shots.path)")
+                return
+            }
+            try AgentPadFirstLaunchSelfCheck.press("popup-close", in: firstWindow)
+            try require(!startup.popups.isPresented, "close did not dismiss the choice")
+            try require(!configured && !navigation.configurationLoaded && !LibghosttyApp.initialized && windowControllers.isEmpty,
+                        "dismissal completed startup or initialized a runtime")
+            try require(!FileManager.default.fileExists(atPath: AgentPadSettings.url.path), "dismissal committed a choice")
+            try await AgentPadFirstLaunchSelfCheck.until("the reopen choice button") {
+                AgentPadFirstLaunchSelfCheck.element("startup-choose-settings", in: firstWindow) != nil
+            }
+            try AgentPadFirstLaunchSelfCheck.press("startup-choose-settings", in: firstWindow)
+            _ = try await AgentPadFirstLaunchSelfCheck.ready(startup)
+            if mode == "quit" {
+                try require(applicationShouldTerminate(NSApp) == .terminateNow, "pending startup did not quit")
+                try require(AgentPadOnboarding.prepare(ghosttyConfig: ghostty) == ghostty, "quitting consumed first launch")
+                try require(!LibghosttyApp.initialized && windowControllers.isEmpty, "quitting initialized runtime")
+                return
+            }
+            try AgentPadFirstLaunchSelfCheck.press(imported ? "ghostty-import" : "ghostty-fresh", in: firstWindow)
+            try require(configured && navigation.configurationLoaded, "choice did not load configuration")
+        } else {
+            try require(configured && navigation.configurationLoaded, "ordinary launch did not load synchronously")
         }
-        RunLoop.main.add(timer, forMode: .modalPanel)
-        if existing || mode == "no-config" { try earlyEntries() }
-        var events: [String] = []
-        navigation.loadConfiguration(onboarding: {
-            AgentPadOnboarding.runIfNeeded(ghosttyConfig: ghostty)
-            events.append("written")
-        }, load: {
-            AgentPadSettingsModel.shared.load()
-            events.append("loaded")
-        })
-        timer.invalidate()
-        if let earlyError { throw earlyError }
-        try require(prompts == (existing || mode == "no-config" ? 0 : 1), "Welcome shown or skipped incorrectly")
-        try require(events == ["written", "loaded"], "configuration load order changed")
         try require(windowControllers.isEmpty && !LibghosttyApp.initialized, "early empty window/runtime")
         try require(FileManager.default.fileExists(atPath: AgentPadSettings.url.path), "startup did not write settings")
         let settings = AgentPadSettingsModel.shared
         if existing { try require(try Data(contentsOf: AgentPadSettings.url) == initial, "existing settings overwritten") }
         if imported { try require(settings.fontSize == 17, "import was not loaded into Settings") }
-        if mode == "no-config" { try require(try String(contentsOf: AgentPadSettings.url, encoding: .utf8) == AgentPadSettings.defaultTemplate, "missing default template") }
+        if mode == "no-config" || mode == "fresh" {
+            try require(try String(contentsOf: AgentPadSettings.url, encoding: .utf8) == AgentPadSettings.defaultTemplate, "missing default template")
+        }
 
         // Even an empty main window exercises applyGlassBacking, which can be
         // the very first access to LibghosttyApp before a surface exists.
         let controller = addWindow(initiallyEmpty: true)
-        events.append("window")
+        if let firstWindow {
+            try require(controller.window === firstWindow, "workspace replaced the startup NSWindow")
+            try require(firstWindow.isVisible, "workspace hid the startup NSWindow")
+            try require(startupWindowController == nil && startup?.window == nil, "startup controller retained the adopted window")
+        }
         let store = controller.store
         let workspace = store.active!
         if imported {
@@ -2337,38 +2637,41 @@ extension AppDelegate {
             // PTY group, rather than the privileged /usr/bin/login wrapper.
             terminal.engine.start(config: TerminalSessionConfig(command: "/bin/bash --noprofile --norc",
                 arguments: [], workingDirectory: directory.path, environment: [:]))
-            NSApp.activate(ignoringOtherApps: true)
             try await AgentPadFirstLaunchSelfCheck.until("the first terminal foreground process") { terminal.engine.foregroundPid != nil }
+            guard let surface = (terminal.engine.view as? GhosttySurfaceView)?.surface else {
+                throw AgentPadFirstLaunchSelfCheck.Failure.check("first terminal has no libghostty surface")
+            }
+            try require(ghostty_surface_font_size(surface) == 17, "first terminal did not use the imported font size")
             terminal.engine.sendInput("/usr/bin/vi -u NONE -i NONE \(directory.path)/scratch.txt\r")
             try await AgentPadFirstLaunchSelfCheck.until("the editor to require quit confirmation") {
                 guard let pid = terminal.engine.foregroundPid, let info = try? await BackgroundInspection.run({ ProcessInfoReader.info(of: pid) }) else { return false }
                 return ["vi", "vim"].contains(info.name) && terminal.engine.needsConfirmQuit
             }
-            events.append("surface")
             let pid = terminal.engine.foregroundPid!
-            controller.window?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            try await AgentPadFirstLaunchSelfCheck.until("the terminal window to become key") {
-                controller.window?.isKeyWindow == true && terminal.engine.view.window === controller.window
+            if AgentPadFirstLaunchSelfCheck.screenUnlocked {
+                if let window = controller.window { AgentPadQuietUI.select(window) }
+                try await AgentPadFirstLaunchSelfCheck.until("the terminal view to mount off screen") {
+                    terminal.engine.view.window === controller.window
+                }
+                let close = ConfirmCloseTab.request(terminal, in: workspace, store: store)
+                try require(close == .presenting, "first terminal close: \(close), pid \(pid), process \(String(describing: terminal.engine.foregroundPid)), host \(terminal.engine.view.window != nil), phase \(terminal.terminalConfirmation.phase)")
+                try await AgentPadFirstLaunchSelfCheck.until("inline close confirmation to become visible") { terminal.terminalConfirmation.isVisible }
+                terminal.terminalConfirmation.cancel()
+                try require(store.allSessions.contains { $0 === terminal }, "Cancel closed the first terminal")
+                try require(kill(pid, 0) == 0 && terminal.engine.needsConfirmQuit, "Cancel stopped the editor")
+                try require(controller.window?.attachedSheet == nil && NSApp.modalWindow == nil, "terminal close used a modal")
             }
-            let close = ConfirmCloseTab.request(terminal, in: workspace, store: store)
-            try require(close == .presenting, "first terminal close: \(close), pid \(pid), process \(String(describing: terminal.engine.foregroundPid)), host \(terminal.engine.view.window != nil), phase \(terminal.terminalConfirmation.phase)")
-            try await AgentPadFirstLaunchSelfCheck.until("inline close confirmation to become visible") { terminal.terminalConfirmation.isVisible }
-            terminal.terminalConfirmation.cancel()
-            try require(store.allSessions.contains { $0 === terminal }, "Cancel closed the first terminal")
-            try require(kill(pid, 0) == 0 && terminal.engine.needsConfirmQuit, "Cancel stopped the editor")
-            try require(controller.window?.attachedSheet == nil && NSApp.modalWindow == nil, "terminal close used a modal")
             try require((Theme.glassStyle != nil) == (mode == "import-glass"), "glass configuration mismatch")
         }
         navigation.finishStartup()
         finishDeepLinkStartup()
-        try await AgentPadFirstLaunchSelfCheck.until("the deferred CLI response") { cliAnswer != nil }
-        try require(cliAnswer?.ok == true, "deferred CLI failed")
-        try require(pendingDeepLinks.isEmpty, "deferred link was not drained")
-        try require(router.find(.connection, windowID: store.windowID) != nil, "deferred Connection did not open")
-        try require(windowControllers.count > 1, "deferred New Window/restore did not run")
-        try require(events.prefix(3) == ["written", "loaded", "window"], "startup order changed")
-        try await AgentPadFirstLaunchSelfCheck.until("libghostty initialization") { LibghosttyApp.initialized }
+        if startup != nil {
+            try await AgentPadFirstLaunchSelfCheck.until("the deferred CLI response") { cliAnswer != nil }
+            try require(cliAnswer?.ok == true, "deferred CLI failed")
+            try require(pendingDeepLinks.isEmpty, "deferred link was not drained")
+            try require(router.find(.connection, windowID: store.windowID) != nil, "deferred Connection did not open")
+            try require(windowControllers.count > 1, "deferred New Window/restore did not run")
+        }
         if mode == "restart" {
             try require(settings.customAgents.count == 1 && !settings.notificationSound, "post-Welcome edits were lost after restart")
         } else if imported || mode == "fresh" {
@@ -2380,11 +2683,13 @@ extension AppDelegate {
         }
         // A repeated launch step must skip Welcome and preserve later edits.
         let saved = try Data(contentsOf: AgentPadSettings.url)
-        AgentPadOnboarding.runIfNeeded(ghosttyConfig: ghostty)
+        try require(AgentPadOnboarding.prepare(ghosttyConfig: ghostty) == nil, "completed launch still requires a choice")
         try require(try Data(contentsOf: AgentPadSettings.url) == saved, "onboarding ran twice")
     }
 
     func endFirstLaunchCheck() async {
+        startupWindowController?.popups.terminate()
+        startupWindowController?.window?.orderOut(nil)
         for controller in windowControllers { controller.store.terminate(); controller.window?.orderOut(nil) }
         // Surface teardown is asynchronous; allow the PTYs to finish before
         // the subprocess exits, including on a failed assertion.

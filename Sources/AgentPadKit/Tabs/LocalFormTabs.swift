@@ -63,7 +63,8 @@ final class LocalFormTabs {
 
     @discardableResult
     func newAgent(from store: WorkspaceStore? = nil) -> Session? {
-        let existing = existingDraft { if case .newAgent = $0 { true } else { false } }
+        guard let store = store ?? router.ensureHost(), !store.isTerminated else { return nil }
+        let existing = existingDraft(from: store) { if case .newAgent = $0 { true } else { false } }
         return router.open(existing ?? .newAgent(draftID: UUID()), from: store)
     }
 
@@ -93,10 +94,7 @@ final class LocalFormTabs {
     }
 
     func owner(_ state: TabState) -> TabRouter.Location? {
-        for store in router.stores() {
-            if let session = store.allSessions.first(where: { $0.tabState === state }) { return router.owner(of: session.id) }
-        }
-        return nil
+        router.owner(of: state)
     }
     func workspace(_ id: UUID) -> (store: WorkspaceStore, workspace: Workspace)? {
         for store in router.stores() where !store.isTerminated {
@@ -104,15 +102,18 @@ final class LocalFormTabs {
         }
         return nil
     }
-    private func existingDraft(where matches: (ToolRoute) -> Bool) -> ToolRoute? {
-        let stores = router.stores().filter { !$0.isTerminated }
-        return stores.flatMap(\.allSessions).compactMap(\.toolRoute).first(where: matches)
-            ?? stores.flatMap { $0.drafts.drafts }.sorted { $0.revision > $1.revision }.map(\.route).first(where: matches)
+    private func existingDraft(from initiator: WorkspaceStore?, where matches: (ToolRoute) -> Bool) -> ToolRoute? {
+        guard let store = initiator ?? router.ensureHost(), !store.isTerminated else { return nil }
+        let occupied = Set(router.stores().filter { $0 !== store && !$0.isTerminated }
+            .flatMap { $0.popups.sessions }.compactMap(\.toolRoute))
+        return (store.popups.sessions + store.allSessions).compactMap(\.toolRoute).first(where: matches)
+            ?? store.drafts.drafts.sorted { $0.revision > $1.revision }.map(\.route)
+                .first { matches($0) && !occupied.contains($0) }
     }
 
     @discardableResult
     func newSSH(from store: WorkspaceStore, newDraft: Bool = false) -> Session? {
-        let existing = newDraft ? nil : existingDraft { if case .newSSH = $0 { true } else { false } }
+        let existing = newDraft ? nil : existingDraft(from: store) { if case .newSSH = $0 { true } else { false } }
         guard let session = router.open(existing ?? .newSSH(draftID: UUID()), from: store), let state = session.tabState else { return nil }
         let form = form(state)
         if state.draft == nil {
@@ -124,7 +125,7 @@ final class LocalFormTabs {
 
     @discardableResult
     func newWorktree(source: Workspace, from store: WorkspaceStore, newDraft: Bool = false) -> Session? {
-        let existing = newDraft ? nil : existingDraft {
+        let existing = newDraft ? nil : existingDraft(from: store) {
             if case .newWorktree(_, let id, _) = $0 { id == source.id } else { false }
         }
         let route: ToolRoute
@@ -300,6 +301,9 @@ final class LocalFormTabs {
             pickedHex: hex, name: form.tag.name), for: target.workspace)
         form.error = nil
         clearDraft(state)
+        if state.isPopup, state.saveError == nil, let location = owner(state) {
+            location.store.popups.dismiss(location.session, reason: .applied)
+        }
     }
 
     func clearTag(_ state: TabState) {
@@ -318,6 +322,11 @@ final class LocalFormTabs {
             state.changed()
         } catch { state.saveError = error.localizedDescription }
     }
+    func cancel(_ state: TabState) {
+        guard let location = owner(state) else { return }
+        if state.isPopup { location.store.popups.dismiss(location.session, reason: .cancel) }
+        else { location.store.closeTab(location.session, in: location.workspace) }
+    }
     private func finish(_ state: TabState, submittedDraft: TabDraft?) {
         // Equality includes the draft ID and revision; a late result cannot consume newer input.
         guard state.draft == submittedDraft else { return }
@@ -327,7 +336,9 @@ final class LocalFormTabs {
             if case .newAgent = state.route { form(state).completed = false }
             return
         }
-        if case .newAgent = state.route {
+        if state.isPopup {
+            location.store.popups.dismiss(location.session, reason: .applied)
+        } else if case .newAgent = state.route {
             location.store.closeCompletedAgentForm(location.session, in: location.workspace)
         } else { location.store.closeTab(location.session, in: location.workspace) }
     }

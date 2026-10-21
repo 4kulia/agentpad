@@ -375,34 +375,31 @@ enum AgentPadSettings {
 /// so subsequent launches skip this branch.
 @MainActor
 enum AgentPadOnboarding {
-    static func runIfNeeded(ghosttyConfig: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/ghostty/config")) {
+    static var ghosttyConfig: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/ghostty/config")
+    }
+
+    /// Returns the pending choice without creating a runtime or writing defaults
+    /// over it. The main window can host this choice before its workspace mounts.
+    static func prepare(ghosttyConfig: URL = ghosttyConfig) -> URL? {
         // Gate on the settings.json file existing rather than the directory —
         // a previous run could have created `~/.agentpad/` but failed to write
         // the file (disk full, perms), and skipping onboarding forever in
         // that state leaves the user with no settings at all.
         let fm = FileManager.default
-        guard !fm.fileExists(atPath: AgentPadSettings.url.path) else { return }
+        guard !fm.fileExists(atPath: AgentPadSettings.url.path) else { return nil }
 
         if fm.fileExists(atPath: ghosttyConfig.path) {
-            promptGhosttyImport(from: ghosttyConfig)
+            return ghosttyConfig
         } else {
             AgentPadSettings.writeDefaultTemplate()
+            return nil
         }
     }
 
-    private static func promptGhosttyImport(from path: URL) {
-        let alert = NSAlert()
-        alert.messageText = "Welcome to \(AppIdentity.appName)"
-        alert.informativeText = "We found your existing ghostty configuration. Would you like to import it into \(AppIdentity.appName)?\n\nYou can change settings any time via Help → Open Settings."
-        alert.addButton(withTitle: String(localized: "Use ghostty settings", bundle: .agentPadResources))
-        alert.addButton(withTitle: String(localized: "Start fresh", bundle: .agentPadResources))
-
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            importGhosttyConfig(from: path)
-        default:
-            AgentPadSettings.writeDefaultTemplate()
-        }
+    static func complete(importSettings: Bool, from path: URL) {
+        if importSettings { importGhosttyConfig(from: path) }
+        else { AgentPadSettings.writeDefaultTemplate() }
     }
 
     /// Reads a ghostty flat-format config, drops comments, and writes the

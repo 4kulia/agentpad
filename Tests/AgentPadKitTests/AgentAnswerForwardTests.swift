@@ -69,6 +69,34 @@ final class AgentAnswerForwardTests: XCTestCase {
         await model.loadThreads()
     }
 
+    func testAccountSignatureUsesCachedMemberNameAndFallsBackWithoutOne() async throws {
+        let model = try await makeModel(), f = try XCTUnwrap(fixture)
+        let account = try XCTUnwrap(model.key?.accountId)
+        try await f.store.queue.write { db in
+            try db.execute(sql: "UPDATE members SET name = ? WHERE account_id = ?", arguments: ["Andrew", account])
+        }
+        await model.refreshPresentation()
+        XCTAssertEqual(model.accountSignature, "Andrew")
+
+        try await f.store.queue.write { db in
+            try db.execute(sql: "UPDATE members SET name = ? WHERE account_id = ?", arguments: ["Andrew Updated", account])
+        }
+        await model.refreshPresentation()
+        XCTAssertEqual(model.accountSignature, "Andrew Updated")
+
+        try await f.store.queue.write { db in
+            try db.execute(sql: "UPDATE members SET name = ? WHERE account_id = ?", arguments: ["  ", account])
+        }
+        await model.refreshPresentation()
+        XCTAssertEqual(model.accountSignature, account)
+
+        try await f.store.queue.write { db in
+            try db.execute(sql: "DELETE FROM members WHERE account_id = ?", arguments: [account])
+        }
+        await model.refreshPresentation()
+        XCTAssertEqual(model.accountSignature, account)
+    }
+
     private func bindSource(_ model: AgentAnswerForward, store: WorkspaceStore,
                             processes: AnswerProcessFixture, gate: Gate) async throws -> AgentAnswerSource.Answer {
         let source = try XCTUnwrap(store.active?.activeSession)
@@ -555,6 +583,8 @@ final class AgentAnswerForwardTests: XCTestCase {
         let model = fromSession ? original : AgentAnswerForward(draft: original.draft, caller: nil, service: f.service, sourceIsCurrent: { false })
         await model.refreshPresentation()
         await prepare(model)
+        var completions = 0
+        model.completed = { completions += 1 }
         var saved: ForwardDraft?
         model.persist = {
             saved = model.draft
@@ -563,6 +593,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         }
         if fromSession { await model.send() } else { await model.sendAsUser() }
         XCTAssertTrue(try f.store.outbox.commands().isEmpty)
+        XCTAssertEqual(completions, 0, "A failed draft save must leave the popup open")
         // Even a failed save retains the attempt; retry must persist it before queueing.
         XCTAssertNotNil(model.problem)
         let id = try XCTUnwrap(saved?.attemptID)
@@ -573,6 +604,7 @@ final class AgentAnswerForwardTests: XCTestCase {
         XCTAssertEqual(saved?.attemptID, id)
         XCTAssertNotNil(saved?.attemptID); XCTAssertEqual(saved?.attemptAuthor, fromSession ? .session : .account)
         XCTAssertEqual(try f.store.outbox.commands().count, 1)
+        XCTAssertEqual(completions, 1, "An explicit successful retry completes its popup for either author")
         await f.service.disconnect(); fixture = nil
         }
     }
@@ -631,10 +663,13 @@ final class AgentAnswerForwardTests: XCTestCase {
         model.text = String(repeating: "Готово 👩🏽‍💻\n", count: 2000)
         XCTAssertTrue(model.truncated)
         XCTAssertTrue(model.canSend)
+        var completions = 0
+        model.completed = { completions += 1 }
         await model.send()
         XCTAssertNil(model.problem)
         XCTAssertTrue(model.submitted)
         await model.send()
+        XCTAssertEqual(completions, 1)
         let posts = try f.store.outbox.commands().filter { $0.type == "message.post_from_session" }
         XCTAssertEqual(posts.count, 1)
         let envelope = try JSONDecoder().decode(ChatCommandEnvelope.self, from: XCTUnwrap(posts.first).bodyBytes)

@@ -218,18 +218,35 @@ final class ChatCLITests: XCTestCase {
 
     // MARK: logout
 
+    private func connectionPopup() throws -> Session {
+        let session = try XCTUnwrap(workspace.popups.sessions.first { $0.toolRoute == .connection })
+        XCTAssertEqual(workspace.popups.sessions.map(\.toolRoute), [.connection])
+        XCTAssertEqual(workspace.popups.page?.id, ObjectIdentifier(session))
+        XCTAssertTrue(session.tabState?.isPopup == true)
+        XCTAssertTrue(workspace.allSessions.isEmpty, "Connection must stay outside workspace panes")
+        return session
+    }
+
+    private func awaitingConnectionDecision() async throws -> ConfirmationCoordinator {
+        let until = Date().addingTimeInterval(3)
+        while workspace.popups.sessions.first(where: { $0.toolRoute == .connection })?.tabState?.confirmation.isAwaiting != true,
+              Date() < until {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let session = try connectionPopup()
+        let coordinator = try XCTUnwrap(session.tabState?.confirmation)
+        XCTAssertTrue(coordinator.isAwaiting)
+        XCTAssertEqual(coordinator.context?.tabID, session.id)
+        coordinator.canShow = { true }
+        coordinator.shown(true)
+        return coordinator
+    }
+
     private func decision(_ work: @escaping @MainActor () async -> ChatCLI.Answer,
                           press: (ConfirmationCoordinator) -> Void) async throws -> ChatCLI.Answer {
         var answer: ChatCLI.Answer?
         let task = Task { @MainActor in answer = await work() }
-        let until = Date().addingTimeInterval(3)
-        while workspace.allSessions.first?.tabState?.confirmation.isAwaiting != true, Date() < until {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        let coordinator = try XCTUnwrap(workspace.allSessions.first?.tabState?.confirmation)
-        XCTAssertTrue(coordinator.isAwaiting)
-        coordinator.canShow = { true }
-        coordinator.shown(true)
+        let coordinator = try await awaitingConnectionDecision()
         press(coordinator)
         await task.value
         return try XCTUnwrap(answer)
@@ -239,7 +256,14 @@ final class ChatCLITests: XCTestCase {
         let (service, _) = try signedIn()
         var disconnected: [ChatConnection] = []
         tabs.disconnectCall = { disconnected.append($1); return .done }
-        let answer1 = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { true }) }) { $0.confirm() }
+        let answer1 = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { true }) }) {
+            XCTAssertTrue(self.workspace.popups.locksDismissal)
+            self.workspace.popups.dismiss(reason: .dismiss)
+            XCTAssertTrue(self.workspace.popups.isPresented)
+            XCTAssertTrue($0.isAwaiting)
+            XCTAssertEqual(disconnected, [])
+            $0.confirm()
+        }
         XCTAssertEqual(info(answer1).outcome, "disconnected")
         XCTAssertEqual(disconnected, [connection])
 
@@ -250,7 +274,7 @@ final class ChatCLITests: XCTestCase {
         let unfinished = try await decision({ await ChatCLI.logout(service, isCallerWaiting: { true }) }) { $0.confirm() }
         XCTAssertEqual(info(unfinished).outcome, "not_finished")
         XCTAssertEqual(unfinished.error, "Disconnect could not finish: x. Try Disconnect again.")
-        guard case .failed = workspace.allSessions.first?.tabState?.confirmation.phase else { return XCTFail("missing inline error") }
+        guard case .failed = try connectionPopup().tabState?.confirmation.phase else { return XCTFail("missing inline error") }
 
         let off = ChatService(files: ChatFiles(directory: root.appendingPathComponent("off")), tokens: FakeTokenStore())
         let answer3 = await ChatCLI.logout(off, isCallerWaiting: { true })
@@ -298,18 +322,19 @@ final class ChatCLITests: XCTestCase {
         tabs.disconnectCall = { _, _ in await gate.wait(); ended = true; return .done }
         let first = Task { await self.tabs.confirmAndDisconnect(expecting: self.connection, service: service, answerBy: Date().addingTimeInterval(0.1)) }
         let until = Date().addingTimeInterval(3)
-        while workspace.allSessions.first?.tabState?.confirmation.isAwaiting != true, Date() < until {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        let c = try XCTUnwrap(workspace.allSessions.first?.tabState?.confirmation)
-        c.canShow = { true }; c.shown(true); c.confirm(); c.confirm()
+        let c = try await awaitingConnectionDecision()
+        let state = try XCTUnwrap(try connectionPopup().tabState)
+        c.confirm(); c.confirm()
         let started = await first.value
         XCTAssertEqual(started, .started)
         XCTAssertFalse(ended)
         let answer = await ChatCLI.logout(service, isCallerWaiting: { true })
         XCTAssertEqual(info(answer).outcome, "busy")
-        // Already sent work survives closing the tab; consent itself cannot be reused.
-        workspace.closeTab(workspace.allSessions[0], in: workspace.active!)
+        // Already sent work survives closing the popup; consent itself cannot be reused.
+        tabs.close(state)
+        XCTAssertFalse(workspace.popups.isPresented)
+        XCTAssertTrue(workspace.popups.sessions.isEmpty)
+        XCTAssertTrue(state.isClosed)
         XCTAssertTrue(tabs.busy)
         await gate.open()
         while tabs.busy, Date() < until { try await Task.sleep(for: .milliseconds(5)) }

@@ -114,6 +114,41 @@ final class TelegramSettingsViewModelTests: XCTestCase {
         await model.shutdown()
     }
 
+    func testLocalRemovalPopupIgnoresDismissAndRequiresItsNamedAction() async throws {
+        let connector = SettingsTelegramConnector(), model = TelegramSettingsViewModel(connector: connector)
+        model.start(environment: [:]); await model.whenInitialized()
+        let restored = await connector.restoreCount, connected = await connector.connectCount
+        XCTAssertEqual(restored, 1); XCTAssertEqual(connected, 0)
+        let coordinator = PopupCoordinator()
+        let host = FoldersUIHost(Color.clear.popupHost(coordinator), width: 800, height: 650)
+        defer { host.close(); coordinator.terminate() }
+        let parent = PopupCoordinator.NativePage(title: "Settings")
+        coordinator.presentNative(parent)
+        TelegramSettingsView.presentLocalRemoval(model: model, coordinator: coordinator)
+        guard case .confirmation = coordinator.page else { return XCTFail("Local removal must use the existing locked confirmation") }
+        try await assertPopupInventoryPresentation(in: host.window, root: host.view, coordinator: coordinator,
+            title: "Remove Telegram local data")
+        XCTAssertEqual(coordinator.page?.title, "Remove Telegram local data")
+        XCTAssertTrue(coordinator.locksDismissal)
+        coordinator.dismiss(reason: .dismiss); coordinator.back()
+        XCTAssertEqual(coordinator.page?.title, "Remove Telegram local data")
+        let beforeCancel = await connector.removalCount
+        XCTAssertEqual(beforeCancel, 0)
+        coordinator.dismiss(reason: .cancel)
+        XCTAssertEqual(coordinator.page?.id, ObjectIdentifier(parent))
+        let afterCancel = await connector.removalCount
+        XCTAssertEqual(afterCancel, 0)
+        TelegramSettingsView.presentLocalRemoval(model: model, coordinator: coordinator)
+        guard case .confirmation(let confirmation) = coordinator.page else { return XCTFail("Removal confirmation missing") }
+        XCTAssertEqual(confirmation.verb, "Remove local data")
+        confirmation.shown(true); confirmation.confirm()
+        await eventually { await connector.removalCount == 1 }
+        let removals = await connector.removalCount, logouts = await connector.disconnectCount
+        XCTAssertEqual(removals, 1); XCTAssertEqual(logouts, 0)
+        XCTAssertEqual(coordinator.page?.id, ObjectIdentifier(parent))
+        coordinator.terminate(); await model.shutdown()
+    }
+
     func testLateQRRenderingCannotReplacePasswordForm() async {
         let connector = SettingsTelegramConnector(), model: TelegramSettingsViewModel
         model = TelegramSettingsViewModel(connector: connector)

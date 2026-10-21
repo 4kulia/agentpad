@@ -46,7 +46,9 @@ struct ChatPinnedMessages: View {
     let model: ChatChannelModel
     let members: [ChatOrgView.Member]
     var width: Double = 1000
+    var hasComposer = true
     var dismiss: () -> Void = {}
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         @Bindable var presentation = model.pins
@@ -72,6 +74,7 @@ struct ChatPinnedMessages: View {
             Divider()
             VStack(spacing: 10) {
                 TextField("Search text or author", text: $presentation.query).textFieldStyle(.roundedBorder)
+                    .focused($searchFocused)
                     .accessibilityLabel("Search pinned messages")
                 HStack {
                     Picker("Authors", selection: $presentation.filter) {
@@ -120,6 +123,11 @@ struct ChatPinnedMessages: View {
             .onChange(of: state.pinMessages) { _, _ in b1.loadPinBodies() }
             .onChange(of: presentation.query) { _, _ in presentation.scrollID = nil }
             .onChange(of: presentation.filter) { _, _ in presentation.scrollID = nil }
+            .onChange(of: model.focusRequest) { _, request in
+                if request?.area == .composer, !hasComposer || presentation.coversConversation(width: width) {
+                    searchFocused = true
+                }
+            }
     }
 
     private func empty(_ text: String) -> some View {

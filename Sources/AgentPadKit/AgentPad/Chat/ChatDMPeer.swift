@@ -8,6 +8,8 @@ import SwiftUI
 @MainActor @Observable
 final class ChatDMPeerModel: ChatDMComposing {
     let key: ChatOrgKey
+    var focusRequest: ChatFocusRequest?
+    var threadRoot: String? { nil }
     let peer: String
     private weak var service: ChatService?
     private var stopped = false
@@ -215,6 +217,9 @@ struct ChatDMPeerTab: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }.background(ChatAppearance.surface).foregroundStyle(Theme.chromeForeground)
+            .onChange(of: state.primaryInputFocusRequest) { _, _ in
+                state.dmPeerModel?.focusRequest = ChatFocusRequest(area: .composer)
+            }
             .onChange(of: !state.isClosed && service.dmAllowed(key), initial: true) { _, allowed in
                 if allowed, state.dmPeerModel == nil { state.dmPeerModel = service.dmPeer(key, peer: peer) }
                 else if !allowed { state.dmPeerModel?.stop(); state.dmPeerModel = nil }

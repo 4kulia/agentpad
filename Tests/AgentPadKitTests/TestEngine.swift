@@ -39,10 +39,13 @@ final class TestEngine: TerminalEngine {
     }
 
     private(set) var startedConfigs: [TerminalSessionConfig] = []
+    var preparesClaudeAccountLaunch = true
     private(set) var terminateCount = 0
     var onTerminate: (() -> Void)?
 
     func start(config: TerminalSessionConfig) {
+        var config = config
+        if preparesClaudeAccountLaunch, !config.prepareForProcessStart() { return }
         startedConfigs.append(config)
     }
 

@@ -537,6 +537,7 @@ private struct PaneStatusBar: View {
             if sessionWantsCodexUsage(session), let usage = session.codexUsage {
                 CodexUsagePill(usage: usage)
             }
+            PopupFileOperationsStatus(coordinator: store.popups)
             // Flow wraps overflowing segments to a new row instead of hiding
             // them — narrow panes still surface every status at the cost of
             // a taller chrome row. Each row is right-aligned so the visual
@@ -1552,10 +1553,6 @@ private struct PaneComposerBar: View {
     let pane: Pane
     let workspace: Workspace
     let store: WorkspaceStore
-    /// The composer stays mounted across pane/workspace switches. Tell its
-    /// text view to reclaim the caret when this pane becomes active again.
-    @State private var paneRefocus = UUID()
-
     private var isPaneActive: Bool {
         store.activeWorkspaceId == workspace.id && workspace.activePaneId == pane.id
     }
@@ -1568,7 +1565,7 @@ private struct PaneComposerBar: View {
                 pane: pane,
                 workspace: workspace,
                 store: store,
-                refocusToken: paneRefocus,
+                refocusToken: session.composerRefocusToken,
                 onSend: send,
                 onCancel: close
             )
@@ -1613,7 +1610,7 @@ private struct PaneComposerBar: View {
         })
         .onAppear { store.focusPane(pane, in: workspace) }
         .onChange(of: isPaneActive) { _, active in
-            if active { paneRefocus = UUID() }
+            if active { session.composerRefocusToken = UUID() }
         }
     }
 
@@ -1723,8 +1720,8 @@ private struct ComposerTextView: NSViewRepresentable {
     let pane: Pane
     let workspace: Workspace
     let store: WorkspaceStore
-    /// Changes when the pane becomes active again with this composer
-    /// still open — `updateNSView` re-claims first responder for it.
+    /// Changes on pane activation or primary-input restoration with this
+    /// composer still open — `updateNSView` reclaims first responder for it.
     var refocusToken: UUID
     var onSend: () -> Void
     var onCancel: () -> Void

@@ -62,7 +62,7 @@ final class AgentProfileSessionTests: XCTestCase {
         XCTAssertNotEqual(a.id, b.id)
         XCTAssertNil(a.resumedConversationId); XCTAssertNil(b.resumedConversationId)
         XCTAssertEqual(owner.active?.id, workspace.id); XCTAssertEqual(owner.workspaces.count, 1)
-        XCTAssertNil(a.sshWorkspaceHost)
+        XCTAssertEqual(a.sshWorkspaceHost, "remote-host")
         XCTAssertEqual(a.profileID, profile.id)
         XCTAssertEqual(try config(a).workingDirectory, path.path)
         XCTAssertTrue(try XCTUnwrap(config(a).environment["AGENTPAD_AGENT"]).contains("--model own"))
@@ -332,16 +332,31 @@ final class AgentProfileSessionTests: XCTestCase {
         XCTAssertTrue(reopened.tabState?.message?.contains(path.path) == true)
     }
 
-    func testDuplicateProfileKeepsOwnOptionsAndLocalConnectionInSSHWorkspace() throws {
+    func testLocalProfileHistoryOpensInLocalWorkspaceWhenSSHWorkspaceIsActive() throws {
+        let path = try folder("history"), owner = store(), remote = try XCTUnwrap(owner.active)
+        remote.sshRemoteHost = "remote-host"
+        let profile = try profiles.add(template: .codex, folder: path, launchOptions: "--model own")
+        let history = record(path)
+        try profiles.bind(history, to: profile.id,
+            origin: AgentLaunchOrigin(template: .codex, folder: path, options: "--model own"))
+        let binding = try XCTUnwrap(profiles.binding(agentID: history.agentId, conversationID: history.conversationId))
+        let resumed = try owner.resumeProfileConversation(binding).get()
+        XCTAssertNil(resumed.sshWorkspaceHost)
+        XCTAssertNil(owner.active?.sshRemoteHost)
+        XCTAssertNotEqual(owner.active?.id, remote.id)
+        XCTAssertEqual(resumed.resumedConversationId, history.conversationId)
+        XCTAssertTrue(try XCTUnwrap(config(resumed).environment["AGENTPAD_AGENT"]).contains(history.conversationId))
+    }
+
+    func testDuplicateProfileKeepsOwnOptionsAndRemoteConnectionInSSHWorkspace() throws {
         let path = try folder("project"), owner = store(), workspace = try XCTUnwrap(owner.active)
         workspace.sshRemoteHost = "remote-host"
         let profile = try profiles.add(template: .codex, folder: path, launchOptions: "--model own")
         let source = try owner.startAgentProfile(profile.id).get()
-        try bindHistory(source, in: owner, id: conversation)
         let duplicate = try XCTUnwrap(owner.duplicateTab(source, in: workspace))
         XCTAssertNotEqual(duplicate.id, source.id)
         XCTAssertEqual(duplicate.profileID, profile.id)
-        XCTAssertNil(duplicate.sshWorkspaceHost)
+        XCTAssertEqual(duplicate.sshWorkspaceHost, "remote-host")
         XCTAssertNil(duplicate.conversationId)
         XCTAssertEqual(try config(duplicate).workingDirectory, path.path)
         let command = try XCTUnwrap(config(duplicate).environment["AGENTPAD_AGENT"])

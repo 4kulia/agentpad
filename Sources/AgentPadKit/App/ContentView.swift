@@ -78,6 +78,7 @@ struct ContentView: View {
         .glassWindowBackground(fallback: chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
         .ignoresSafeArea(.all)
+        .popupHost(store.popups)
         .onChange(of: store.navigationPresentation.obscuresContent || store.search.suggestions) { _, _ in
             NavigationPresentationGate.recheck(store.navigationWindow)
         }
@@ -199,6 +200,17 @@ struct ContentView: View {
             }
             MainAreaWithPreview(store: store) {
                 PaneTreeHostRepresentable(host: paneHost)
+            }
+            if store.active?.activeSession?.hasProcess != true,
+               store.popups.sessions.contains(where: { $0.tabState?.fileOperation != nil }) {
+                HStack {
+                    PopupFileOperationsStatus(coordinator: store.popups)
+                    Spacer(minLength: 0)
+                }
+                .font(Theme.mono(11))
+                .padding(.horizontal, Theme.chromeBarEdgeInset)
+                .padding(.vertical, Theme.chromeBottomBarVerticalPadding)
+                .glassChromeBackground()
             }
         }
     }

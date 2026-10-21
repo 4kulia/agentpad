@@ -125,33 +125,80 @@ struct InlineConfirmation<Details: View>: View {
     @Bindable var coordinator: ConfirmationCoordinator
     @FocusState private var cancelFocused: Bool
     let details: Details
-    init(coordinator: ConfirmationCoordinator, @ViewBuilder details: () -> Details) {
-        self.coordinator = coordinator; self.details = details()
+    let popup: Bool
+    init(coordinator: ConfirmationCoordinator, popup: Bool = false, @ViewBuilder details: () -> Details) {
+        self.coordinator = coordinator; self.popup = popup; self.details = details()
     }
     var body: some View {
         if coordinator.showsBlock {
-            VStack(alignment: .leading, spacing: 10) {
-                Text(coordinator.title).font(.headline)
-                Text(coordinator.consequences).fixedSize(horizontal: false, vertical: true)
-                details
-                if case .failed(let error) = coordinator.phase {
-                    Text(error).foregroundStyle(.red).accessibilityIdentifier("inline-confirmation-error")
-                    Button("Keep editing") { coordinator.cancel() }.focused($cancelFocused)
-                } else {
-                    ViewThatFits(in: .horizontal) {
-                        HStack { buttons }
-                        VStack(alignment: .leading) { buttons }
-                    }
-                }
+            Group {
+                if popup { popupContent }
+                else { inlineContent }
             }
-            .padding(16).frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.chromeBackground, in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.chromeSeparator))
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("inline-confirmation")
             .task(id: coordinator.context?.actionID) { coordinator.shown(true); cancelFocused = coordinator.isVisible }
             .onDisappear { coordinator.shown(false) }
-            .onExitCommand { coordinator.cancel() }
+            .onExitCommand(perform: handleExitCommand)
+        }
+    }
+    func handleExitCommand() {
+        guard !popup || !coordinator.destructive else { return }
+        coordinator.cancel()
+    }
+    private var inlineContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(coordinator.title).font(.headline)
+            Text(coordinator.consequences).fixedSize(horizontal: false, vertical: true)
+            details
+            if case .failed(let error) = coordinator.phase {
+                Text(error).foregroundStyle(.red).accessibilityIdentifier("inline-confirmation-error")
+                Button("Keep editing") { coordinator.cancel() }.focused($cancelFocused)
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack { buttons }
+                    VStack(alignment: .leading) { buttons }
+                }
+            }
+        }
+        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.chromeBackground, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.chromeSeparator))
+    }
+    private var popupContent: some View {
+        VStack(spacing: 0) {
+            PopupScrollBody {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text(coordinator.title).font(.title3.weight(.semibold))
+                    Text(coordinator.consequences).font(.subheadline).fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                        .background((coordinator.destructive ? Color.orange : Color.accentColor).opacity(0.10),
+                                    in: RoundedRectangle(cornerRadius: 7))
+                    details
+                    if coordinator.destructive {
+                        Text("Choose an explicit action. Outside click and Esc are disabled.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    if case .failed(let error) = coordinator.phase {
+                        Text(error).foregroundStyle(.red).accessibilityIdentifier("inline-confirmation-error")
+                    }
+                }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Divider()
+            HStack {
+                Spacer()
+                if case .failed = coordinator.phase {
+                    Button("Keep editing") { coordinator.cancel() }.focused($cancelFocused)
+                        .accessibilityIdentifier("inline-confirmation-cancel")
+                } else {
+                    Button(coordinator.cancelTitle) { coordinator.cancel() }.focused($cancelFocused)
+                        .disabled(coordinator.isExecuting).accessibilityIdentifier("inline-confirmation-cancel")
+                    Button(coordinator.verb, role: coordinator.destructive ? .destructive : nil) { coordinator.confirm() }
+                        .buttonStyle(PopupPrimaryButtonStyle(destructive: coordinator.destructive))
+                        .disabled(coordinator.isExecuting).accessibilityIdentifier("inline-confirmation-accept")
+                    if coordinator.isExecuting { ProgressView().controlSize(.small) }
+                }
+            }.padding(.horizontal, 20).padding(.vertical, 14)
         }
     }
     @ViewBuilder private var buttons: some View {
@@ -164,5 +211,5 @@ struct InlineConfirmation<Details: View>: View {
 }
 
 extension InlineConfirmation where Details == EmptyView {
-    init(coordinator: ConfirmationCoordinator) { self.init(coordinator: coordinator) { EmptyView() } }
+    init(coordinator: ConfirmationCoordinator, popup: Bool = false) { self.init(coordinator: coordinator, popup: popup) { EmptyView() } }
 }

@@ -2,19 +2,20 @@ import SwiftUI
 
 struct SidebarFolderSettings: View {
     var compact = false
+    @Environment(\.popupCoordinator) private var coordinator
     @State private var folders = SidebarFoldersModel()
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if !compact { Text("Choose which folders appear in the sidebar. Your folders are local to this Mac.").font(Theme.display(12)) }
-            Button("Folders…") { folders.sheetPresented = true }
+            Button("Folders…") {
+                guard let coordinator else { return }
+                folders.presentPopup(in: coordinator, entries: { entries })
+            }
         }.padding(compact ? 0 : 28)
             .task { folders.start() }
-            .sheet(isPresented: $folders.sheetPresented) {
-                FoldersSheet(model: folders, entries: entries) { folders.sheetPresented = false }
-            }
     }
     private var entries: [SidebarFolderEntry] {
-        if let store = TabRouter.shared.stores().first {
+        if let store = coordinator?.ownerStore {
             let sidebar = ChatSidebarView(store: store, navigation: store.chatNavigation, model: ChatOrgCurrent.shared.model, folders: folders)
             return sidebar.folderEntries(sidebar.snapshot, includeHidden: true)
         }

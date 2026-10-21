@@ -16,15 +16,16 @@ struct ChatChannelView: View {
     }
     private var ownerModel: ChatChannelOwnerModel? { conversation.ownerModel }
     @State private var window = WindowBox()
-    private var org = ChatOrgCurrent.shared
-    private var service = ChatService.shared
+    private var org: ChatOrgCurrent { service.orgCurrent }
+    private let service: ChatService
 
-    init(card: ChatChannelCard, team: String?, offline: Bool, key: ChatOrgKey, conversation: ChatChannelSession) {
+    init(card: ChatChannelCard, team: String?, offline: Bool, key: ChatOrgKey, conversation: ChatChannelSession, service: ChatService = .shared) {
         self.card = card
         self.team = team
         self.offline = offline
         self.key = key
         self.conversation = conversation
+        self.service = service
     }
 
     var body: some View {
@@ -64,7 +65,7 @@ struct ChatChannelView: View {
                         conversationPanes(model, narrow: narrow, pinsShown: pinsShown, width: geometry.size.width)
                     }
                     if pinsShown, let b1 = model.b1 {
-                        ChatPinnedMessages(b1: b1, model: model, members: members, width: geometry.size.width)
+                        ChatPinnedMessages(b1: b1, model: model, members: members, width: geometry.size.width, hasComposer: !card.archived)
                             .frame(minWidth: coversConversation ? 0 : 340, idealWidth: 400,
                                    maxWidth: coversConversation ? .infinity : 520)
                     }
@@ -218,7 +219,8 @@ struct ChatChannelView: View {
                 .frame(maxWidth: .infinity)
                 .padding(10)
         } else {
-            ChatUX1Composer(model: model, root: root, members: members, mentionable: mentionable, agents: agents)
+            ChatUX1Composer(model: model, root: root, members: members, mentionable: mentionable, agents: agents,
+                            threadHidden: conversation.pinsShown)
         }
     }
 }

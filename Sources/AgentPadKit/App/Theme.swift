@@ -56,6 +56,13 @@ enum Theme {
     /// permanently pressed button.
     static var chromeSelection: Color { resolved.chromeSelection }
 
+    /// Account tag from the approved Claude accounts mockup; distinct from activity.
+    static var claudeAccount: Color {
+        resolvedAppearanceIsDark
+            ? Color(.sRGB, red: 181 / 255, green: 161 / 255, blue: 221 / 255)
+            : Color(.sRGB, red: 120 / 255, green: 88 / 255, blue: 173 / 255)
+    }
+
     /// Color libghostty draws inside the terminal surface. Exposed as NSColor
     /// so AppKit code (engines, etc.) can reach it without bridging.
     static var terminalSurface: NSColor { resolved.backgroundColor }

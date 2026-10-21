@@ -31,6 +31,14 @@ final class NativeTabEngine: TerminalEngine {
         if let rememberedFocus, rememberedFocus.window === window { window.makeFirstResponder(rememberedFocus) }
         else { window.makeFirstResponder(nil); window.selectNextKeyView(host) }
     }
+    func focusPrimaryInput() {
+        guard let owner, owner.active?.activeSession?.id == tabID, let window = host.window,
+              window.isKeyWindow, !host.isHiddenOrHasHiddenAncestor else { return }
+        window.makeFirstResponder(host)
+        // The mounted content handles this through its own editor/focus state.
+        // No handler means this tab has no primary input: leave the host focused.
+        state.primaryInputFocusRequest = UUID()
+    }
     func renderNowIfNeeded() {}
     func setOnScreen(_ onScreen: Bool) { if !onScreen { state.leave() } }
     var backgroundColor: NSColor { .windowBackgroundColor }
@@ -69,7 +77,7 @@ private struct NativeTabRoot: View {
     let engine: NativeTabEngine
     var body: some View {
         VStack(spacing: 0) {
-            NativeTabEngine.content(engine.state)
+            if !engine.state.presentsPopupDecision { NativeTabEngine.content(engine.state) }
             if let error = engine.state.saveError {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Changes could not be saved").font(.headline)
@@ -82,12 +90,33 @@ private struct NativeTabRoot: View {
                     .accessibilityIdentifier("tab-save-error")
             }
             if engine.state.canShowConfirmation() {
-                InlineConfirmation(coordinator: engine.state.confirmation).padding(.horizontal, 16)
+                InlineConfirmation(coordinator: engine.state.confirmation, popup: engine.state.presentsPopupDecision)
+                    .padding(.horizontal, engine.state.presentsPopupDecision ? 0 : 16)
             }
         }
+        .fixedSize(horizontal: false, vertical: engine.state.isPopup && engine.state.route.fitsPopupContent)
         .foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground)
+        .environment(\.popupMaximumBodyHeight, engine.state.popupMaximumBodyHeight)
+        .background {
+            if engine.state.isPopup {
+                GeometryReader { geometry in
+                    Color.clear.preference(key: PopupFormHeightKey.self, value: geometry.size.height)
+                }
+            }
+        }
+        .onPreferenceChange(PopupFormHeightKey.self) { height in
+            guard height > 0 else { return }
+            Task { @MainActor in
+                if engine.state.popupContentHeight != height { engine.state.popupContentHeight = height }
+            }
+        }
+        .onPreferenceChange(PopupViewportHeightKey.self) { height in
+            Task { @MainActor in
+                if engine.state.popupViewportHeight != height { engine.state.popupViewportHeight = height }
+            }
+        }
         .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("tool-tab-" + engine.tabID.uuidString)
+        .accessibilityIdentifier((engine.state.isPopup ? "popup-content-" : "tool-tab-") + engine.tabID.uuidString)
     }
     @ViewBuilder private var recovery: some View {
         Button("Keep editing") { engine.owner?.tabCloseCoordinator.keepEditing(engine.tabID); engine.state.saveError = nil }
@@ -100,5 +129,24 @@ private struct NativeTabRoot: View {
             else { engine.owner?.tabCloseCoordinator.discardEdits(engine.state) }
         }
         .disabled(engine.state.localForm?.working == true || engine.state.publicationForm?.working == true)
+    }
+}
+
+extension TabState {
+    var isCloseWorkspacesReview: Bool {
+        guard closeWorkspaces != nil else { return false }
+        switch route {
+        case .closeWorkspaces: return true
+        case .workspaceDetails: return navigation.selection == "close"
+        default: return false
+        }
+    }
+    var presentsPopupDecision: Bool {
+        guard isPopup, confirmation.showsBlock else { return false }
+        switch route {
+        case .organization, .fileOperations, .closeWorkspaces: return true
+        case .workspaceDetails: return navigation.selection == "close"
+        default: return false
+        }
     }
 }

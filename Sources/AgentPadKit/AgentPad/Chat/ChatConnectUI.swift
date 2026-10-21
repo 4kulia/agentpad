@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 /// The steps of Team → Connect to a Server… (docs/agentpad/CHAT-PLAN.md C5),
-/// kept in the tab state, independently of SwiftUI mounts.
+/// kept in the runtime form state, independently of popup mounts.
 @MainActor
 @Observable
 final class ChatConnectModel {
@@ -35,6 +35,7 @@ final class ChatConnectModel {
     private(set) var error: String?
     private(set) var busy = false
     private(set) var codeSentAt: Date?
+    private(set) var organizationName: String?
 
     private let service: ChatService
     /// Nothing of team work runs here (no call, no run not confirmed gone):
@@ -82,6 +83,20 @@ final class ChatConnectModel {
     var canResend: Bool {
         guard step == .code, let codeSentAt else { return false }
         return now().timeIntervalSince(codeSentAt) >= Self.resendAfter
+    }
+
+    var progressIndex: Int {
+        switch step {
+        case .address: 0
+        case .code: 1
+        case .chooseOrg, .noOrganization: 2
+        case .name: 3
+        case .done: 4
+        }
+    }
+
+    var connectedSummary: String {
+        [organizationName, email.isEmpty ? nil : email].compactMap { $0 }.joined(separator: " · ")
     }
 
     // MARK: Steps
@@ -191,6 +206,7 @@ final class ChatConnectModel {
             throw error
         }
         guard !isClosed else { return }
+        organizationName = org.orgName
         if org.name == org.handle, let key = connection.orgKey {
             displayName = ""
             step = .name(key)
@@ -214,14 +230,16 @@ final class ChatConnectModel {
 
     func back() {
         guard !busy, !isClosed else { return }
+        let previous: Step = if case .chooseOrg = step { .code } else { .address }
         discardPendingSignIn()
-        step = .address
+        step = previous
         error = nil
         code = ""
-        codeSentAt = nil
+        if previous == .address { codeSentAt = nil }
     }
 
-    /// Closing forgets all input synchronously. A late authentication answer
+    /// Explicit Cancel or final cleanup forgets all input synchronously.
+    /// Incidental popup dismissal does not call this method. A late authentication answer
     /// is revoked by submitCode; a chosen, committed sign-in belongs to the core.
     func close() {
         isClosed = true
@@ -230,6 +248,7 @@ final class ChatConnectModel {
         displayName = ""
         error = nil
         codeSentAt = nil
+        organizationName = nil
         step = .address
         // finish owns the answer while it is committing, including cleanup.
         if !busy { discardPendingSignIn() } else { answer = nil }
@@ -279,80 +298,160 @@ struct ChatConnectView: View {
     @Bindable var model: ChatConnectModel
     let onClose: () -> Void
     let onDisconnect: () -> Void
+    let onCancel: () -> Void
     @State private var tick = Date()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            content
-            if let error = model.error {
-                Text(error).font(Theme.display(11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+        VStack(spacing: 0) {
+            PopupScrollBody {
+                VStack(alignment: .leading, spacing: 18) {
+                    progress
+                    content.disabled(model.busy)
+                    if let error = model.error {
+                        Text(error).font(Theme.display(11)).foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true).accessibilityIdentifier("connect-error")
+                    }
+                    if model.teamWorkInTheWay {
+                        Button("Show Team…") { TeamUI.showTeam() }.disabled(model.busy)
+                    }
+                    if model.busy {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Connecting…").font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
+                        }.accessibilityIdentifier("connect-busy")
+                    }
+                }.padding(24).frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            if model.teamWorkInTheWay {
-                Button("Show Team…") { TeamUI.showTeam() }.disabled(model.busy)
+            Divider()
+            footer.padding(.horizontal, 20).frame(height: 56)
+        }
+        .attentionPlace([.connect])
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { tick = $0 }
+    }
+
+    private var progress: some View {
+        HStack(alignment: .top, spacing: 4) {
+            ForEach(Array(["Server", "Code", "Organization", "Name", "Connected"].enumerated()), id: \.offset) { index, label in
+                VStack(spacing: 6) {
+                    Text(index < model.progressIndex ? "✓" : "\(index + 1)")
+                        .font(Theme.display(10)).frame(width: 24, height: 24)
+                        .background(progressColor(index).opacity(index <= model.progressIndex ? 0.12 : 0.04), in: Circle())
+                        .overlay(Circle().stroke(progressColor(index).opacity(index == model.progressIndex ? 1 : 0.25)))
+                    Text(label).font(Theme.display(9))
+                }.foregroundStyle(progressColor(index)).frame(maxWidth: .infinity)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(label), \(index < model.progressIndex ? "completed" : index == model.progressIndex ? "current step" : "upcoming")")
+            }
+        }.padding(.bottom, 6).accessibilityIdentifier("connect-progress")
+    }
+
+    private func progressColor(_ index: Int) -> Color {
+        index == model.progressIndex ? .accentColor : index < model.progressIndex ? .green : Theme.chromeMuted
+    }
+
+    private func heading(_ title: String, detail: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(Theme.display(18, weight: .semibold))
+            if let detail {
+                Text(detail).font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(18)
-        .frame(maxWidth: 520, alignment: .leading)
-        .attentionPlace([.connect])
-        .disabled(model.busy)
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { tick = $0 }
+    }
+
+    private func field(_ title: String, text: Binding<String>, id: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
+            TextField(title, text: text).textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier(id)
+        }
     }
 
     @ViewBuilder
     private var content: some View {
         switch model.step {
         case .address:
-            Text("Connect to an AgentPad server").font(Theme.display(14, weight: .semibold))
-            TextField("Server address", text: $model.serverText)
-            TextField("Email", text: $model.email)
-            HStack {
-                Spacer()
-                Button("Cancel", action: onClose)
-                Button("Send Code") { Task { await model.sendCode() } }.keyboardShortcut(.defaultAction)
-            }
+            heading("Connect to an AgentPad server")
+            field("Server address", text: $model.serverText, id: "connect-server")
+            field("Email", text: $model.email, id: "connect-email")
         case .code:
-            Text("Enter the code from the letter").font(Theme.display(14, weight: .semibold))
-            Text("Sent to \(model.email). The code is valid for 10 minutes.")
-                .font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
-            TextField("8-digit code", text: $model.code)
-            HStack {
-                Button("Back") { model.back() }
-                let _ = tick
-                Button("Send the Code Again") { Task { await model.resendCode() } }.disabled(!model.canResend)
-                Spacer()
-                Button("Sign In") { Task { await model.submitCode() } }.keyboardShortcut(.defaultAction)
-            }
+            heading("Enter the code from the letter", detail: "Sent to \(model.email). The code is valid for 10 minutes.")
+            field("8-digit code", text: $model.code, id: "connect-code")
+            let _ = tick
+            Button("Send the Code Again") { Task { await model.resendCode() } }
+                .disabled(!model.canResend).accessibilityIdentifier("connect-resend")
         case .chooseOrg(let orgs):
-            Text("Choose an organization").font(Theme.display(14, weight: .semibold))
-            Text("To open another one later, disconnect and connect again.")
-                .font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
+            heading("Choose an organization", detail: "To open another one later, disconnect and connect again.")
             ForEach(orgs, id: \.orgId) { org in
-                Button("\(org.orgName) — \(org.role)") { Task { await model.choose(org.orgId) } }
+                Button { Task { await model.choose(org.orgId) } } label: {
+                    HStack(spacing: 12) {
+                        Text(String(org.orgName.prefix(1))).font(Theme.display(14, weight: .semibold))
+                            .frame(width: 32, height: 32).background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+                        Text("\(org.orgName) — \(org.role)").font(Theme.display(12))
+                        Spacer()
+                        Image(systemName: "arrow.right").foregroundStyle(Theme.chromeMuted)
+                    }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Theme.chromeMuted.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.chromeMuted.opacity(0.2)))
+                }.buttonStyle(.plain).accessibilityIdentifier("connect-organization-\(org.orgId)")
             }
-            Button("Back") { model.back() }
         case .name:
-            Text("Your name in the organization").font(Theme.display(14, weight: .semibold))
-            Text("Colleagues see it next to your messages and agents.")
-                .font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
-            TextField("Name", text: $model.displayName)
-            HStack {
-                Spacer()
-                Button("Later") { model.skipName() }
-                Button("Save") { Task { await model.saveName() } }.keyboardShortcut(.defaultAction)
-            }
+            heading("Your name in the organization", detail: "Colleagues see it next to your messages and agents.")
+            field("Name", text: $model.displayName, id: "connect-name")
         case .noOrganization:
             Text("Your account is not a member of any organization on this server.")
                 .font(Theme.display(13)).fixedSize(horizontal: false, vertical: true)
-            HStack { Spacer(); Button("Close", action: onClose).keyboardShortcut(.defaultAction) }
         case .done:
-            Text("Connected").font(Theme.display(14, weight: .semibold))
-            // A Claude session reads the team tools once, at its start (DESIGN-D6 §7.2).
+            VStack(spacing: 12) {
+                Image(systemName: "checkmark").font(.system(size: 22, weight: .semibold)).foregroundStyle(.green)
+                    .padding(12).background(.green.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                Text("Connected").font(Theme.display(20, weight: .semibold))
+                if !model.connectedSummary.isEmpty {
+                    Text(model.connectedSummary).font(Theme.display(12)).foregroundStyle(Theme.chromeMuted)
+                }
+            }.frame(maxWidth: .infinity).padding(.vertical, 8).accessibilityIdentifier("connect-success")
             Text(ChatConnectModel.restartClaudeHint)
                 .font(Theme.display(12)).foregroundStyle(Theme.chromeMuted).fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Button("Disconnect…", action: onDisconnect)
-                Spacer()
-                Button("Close", action: onClose)
+                .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            switch model.step {
+            case .code, .chooseOrg:
+                Button("Back") { model.back() }.disabled(model.busy).accessibilityIdentifier("connect-back")
+            case .name:
+                Button("Later") { model.skipName() }.disabled(model.busy).accessibilityIdentifier("connect-later")
+            case .done:
+                Button("Disconnect…", role: .destructive, action: onDisconnect)
+                    .buttonStyle(PopupDestructiveButtonStyle()).accessibilityIdentifier("connect-disconnect")
+            default: EmptyView()
+            }
+            Spacer()
+            switch model.step {
+            case .address, .code, .chooseOrg:
+                Button("Cancel", action: onCancel).accessibilityIdentifier("connect-cancel")
+            default: EmptyView()
+            }
+            switch model.step {
+            case .address:
+                Button("Send Code") { Task { await model.sendCode() } }
+                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    .disabled(model.busy).accessibilityIdentifier("connect-send-code")
+            case .code:
+                Button("Sign In") { Task { await model.submitCode() } }
+                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    .disabled(model.busy).accessibilityIdentifier("connect-sign-in")
+            case .name:
+                Button("Save") { Task { await model.saveName() } }
+                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    .disabled(model.busy).accessibilityIdentifier("connect-save-name")
+            case .noOrganization, .done:
+                Button("Close", action: onClose).buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction).accessibilityIdentifier("connect-close")
+            case .chooseOrg: EmptyView()
             }
         }
     }

@@ -11,6 +11,7 @@ struct FileNameDraft: Codable, Equatable {
 @MainActor @Observable
 final class FileNameEdit {
     var isVisible = false
+    var focusRequest: UUID?
     var draft: FileNameDraft? { didSet { changed(draft) } }
     var errors: [String: String] = [:]
     @ObservationIgnored var changed: (FileNameDraft?) -> Void = { _ in }
@@ -63,6 +64,7 @@ struct FileNameField: View {
             .onSubmit { edit.commit() }
             .onExitCommand { edit.cancel() }
             .onAppear { focused = true }
+            .onChange(of: edit.focusRequest) { _, _ in focused = true }
     }
 }
 
@@ -108,6 +110,9 @@ struct FilesTabView: View {
     var body: some View {
         if case .files(let path) = state.route, let owner = tabs.owner(state) {
             FileTreeView(store: owner.store, model: tabs.filesModel(state), pinnedRoot: URL(fileURLWithPath: path))
+                .onChange(of: state.primaryInputFocusRequest) { _, _ in
+                    tabs.filesModel(state).nameEdit.focusRequest = UUID()
+                }
         }
     }
 }

@@ -1049,10 +1049,10 @@ extension ChatInboxTests {
             XCTAssertEqual(workspace.active?.activeSession?.inbox?.kind, kind)
             if let output {
                 let path = URL(fileURLWithPath: output).appendingPathComponent("fix-unread-\(name).png")
-                let capture = Process(); capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-                capture.arguments = ["-x", "-o", "-l", String(window.windowNumber), path.path]
-                try capture.run(); capture.waitUntilExit()
-                XCTAssertEqual(capture.terminationStatus, 0)
+                let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                try png.write(to: path)
                 XCTAssertTrue(FileManager.default.fileExists(atPath: path.path))
             }
             if name == "list" {

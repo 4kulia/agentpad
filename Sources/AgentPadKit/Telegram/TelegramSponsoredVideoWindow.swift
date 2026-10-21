@@ -7,6 +7,7 @@ import SwiftUI
 /// never a sheet or the user's uncompleted request to enter fullscreen.
 @MainActor @Observable final class TelegramSponsoredVideoWindow: NSObject, NSWindowDelegate {
     static let shared = TelegramSponsoredVideoWindow()
+    let popups = PopupCoordinator()
     private(set) var fullscreen = false
     @ObservationIgnored private var window: NSWindow?
     @ObservationIgnored private weak var model: TelegramConversationModel?
@@ -31,36 +32,70 @@ import SwiftUI
             let target: TelegramSponsoredClick = mediaClick ? .fullscreenMedia : self.fullscreen ? .fullscreenButton : .button
             model.sponsoredAction(.click(ad.ref, target, confirmed: false), pane: pane, ref: ad.ref, openChat: openChat)
         }
-        window.contentView = NSHostingView(rootView: content)
+        window.contentView = NSHostingView(rootView: content.popupHost(popups))
         window.center(); window.makeKeyAndOrderFront(nil); window.toggleFullScreen(nil)
     }
     func reconcile(model: TelegramConversationModel) {
         guard self.model === model else { return }
         if epoch != model.snapshot.epoch || ref.flatMap(model.currentAd) == nil { close() }
     }
+    func popupCoordinator(for window: NSWindow?) -> PopupCoordinator? {
+        guard let window, self.window === window, popups.isPresented else { return nil }
+        return popups
+    }
     func confirm(_ url: URL, ref: TelegramSponsoredRef, model: TelegramConversationModel, pane: UUID,
                  target: TelegramSponsoredClick, openChat: @escaping (TelegramChatID) -> Void) -> Bool {
-        guard self.model === model, self.ref == ref, let window else { return false }
-        let alert = NSAlert()
-        alert.messageText = "Open \(url.host ?? "website")?"; alert.informativeText = url.absoluteString
-        alert.addButton(withTitle: "Open website"); alert.addButton(withTitle: "Cancel")
-        alert.beginSheetModal(for: window) { [weak model] response in
-            guard response == .alertFirstButtonReturn, let model, model.currentAd(ref) != nil, model.panes.contains(pane) else { return }
-            model.sponsoredAction(.click(ref, target, confirmed: true), pane: pane, ref: ref, openChat: openChat)
+        let epoch = model.snapshot.epoch
+        guard canConfirm(model: model, ref: ref, pane: pane, epoch: epoch) else { return false }
+        let page = PopupCoordinator.NativePage(title: "Sponsored message")
+        page.content = { [weak self, weak model, weak page] in
+            guard let self, let model, let page else { return AnyView(EmptyView()) }
+            return AnyView(TelegramSponsoredVideoWebsitePopup(model: model, controller: self, ref: ref, pane: pane,
+                epoch: epoch, url: url, cancel: { [weak self, weak page] in
+                    if let page { self?.popups.dismiss(page, reason: .cancel) }
+                }, open: { [weak self, weak model, weak page] in
+                    guard let self, let model, let page, !model.sponsoredBusy,
+                          self.canConfirm(model: model, ref: ref, pane: pane, epoch: epoch) else { return }
+                    self.popups.dismiss(page, reason: .applied)
+                    model.sponsoredAction(.click(ref, target, confirmed: true), pane: pane, ref: ref, openChat: openChat)
+                }))
         }
+        popups.presentNative(page)
         return true
+    }
+    fileprivate func canConfirm(model: TelegramConversationModel, ref: TelegramSponsoredRef, pane: UUID, epoch: UUID) -> Bool {
+        self.model === model && self.ref == ref && self.pane == pane && self.epoch == epoch
+            && model.snapshot.epoch == epoch && model.panes.contains(pane) && model.currentAd(ref) != nil && window != nil
     }
     func close(pane: UUID? = nil) {
         guard pane == nil || pane == self.pane else { return }
         let old = window; window = nil; old?.delegate = nil; old?.close(); clear()
     }
     private func clear() {
+        popups.terminate()
         TelegramSponsoredRenderCache.shared.release(owner)
         model = nil; pane = nil; epoch = nil; ref = nil; fullscreen = false
     }
     func windowWillClose(_ notification: Notification) { window = nil; clear() }
     func windowDidEnterFullScreen(_ notification: Notification) { fullscreen = true }
     func windowDidExitFullScreen(_ notification: Notification) { fullscreen = false }
+}
+
+private struct TelegramSponsoredVideoWebsitePopup: View {
+    @Bindable var model: TelegramConversationModel
+    let controller: TelegramSponsoredVideoWindow
+    let ref: TelegramSponsoredRef
+    let pane: UUID
+    let epoch: UUID
+    let url: URL
+    let cancel: () -> Void
+    let open: () -> Void
+    var body: some View {
+        if controller.canConfirm(model: model, ref: ref, pane: pane, epoch: epoch), let ad = model.currentAd(ref) {
+            TelegramWebsitePopup(title: "Open \(url.host ?? "website")?", subtitle: "Sponsored video · " + ad.title,
+                url: url, busy: model.sponsoredBusy, cancel: cancel, open: open)
+        }
+    }
 }
 
 private struct TelegramSponsoredVideoContent: View {

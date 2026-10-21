@@ -27,6 +27,9 @@ struct ChatDMTab: View {
                     _ = service.dmList(key)
                 } else if !available { state.dmModel?.stop(); state.dmModel = nil; state.confirmation.invalidate() }
             }
+            .onChange(of: state.primaryInputFocusRequest) { _, _ in
+                state.dmModel?.focusRequest = ChatFocusRequest(area: .composer)
+            }
             .environment(\.openURL, OpenURLAction { ChatMarkdownText.open($0) })
     }
     private var status: String {
@@ -146,6 +149,8 @@ struct ChatDMView: View {
 @MainActor
 protocol ChatDMComposing: AnyObject {
     var key: ChatOrgKey { get }
+    var focusRequest: ChatFocusRequest? { get }
+    var threadRoot: String? { get }
     var writable: Bool { get }
     var problem: String? { get }
     var attachmentManager: ChatAttachmentManager? { get }
@@ -233,6 +238,9 @@ struct ChatDMComposer: View {
             }
         }.padding(root == nil ? 20 : 14)
             .onAppear { loadDraft() }
+            .onChange(of: model.focusRequest) { _, request in
+                if request?.area == .composer, root == model.threadRoot, isActive() { control.focus() }
+            }
             .onChange(of: root) { _, _ in loadDraft() }
             .onChange(of: model.draft(root: root)) { _, draft in
                 if draft?.version != version { text = draft?.text ?? ""; version = draft?.version }

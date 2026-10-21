@@ -103,7 +103,7 @@ import XCTest
         let finalActions = await fake.sponsoredActions
         XCTAssertEqual(finalActions.count, 1)
     }
-    func testReportStepsKeepThePresentedSheetIdentity() async {
+    func testReportStepsKeepThePresentedPopupIdentity() async {
         let model = TelegramConversationModel(id: id), fake = ConversationUIFake(), pane = UUID()
         model.receive(snapshot()); model.provider = fake; model.panes.insert(pane)
         let ref = model.snapshot.sponsored.messages[0].ref, first = UUID(), second = UUID()
@@ -111,15 +111,144 @@ import XCTest
         await fake.setSponsoredResult(.reportOptions(ref, step: first, title: "Reason", options: options))
         model.sponsoredAction(.report(ref, step: nil, option: nil), pane: pane, ref: ref)
         for _ in 0..<100 { if model.sponsoredDialog?.step == first { break }; await Task.yield() }
-        let sheet = model.sponsoredDialog?.id
-        XCTAssertNotNil(sheet)
+        let popup = model.sponsoredDialog?.id
+        XCTAssertNotNil(popup)
         await fake.setSponsoredResult(.reportOptions(ref, step: second, title: "More detail", options: options))
         model.sponsoredAction(.report(ref, step: first, option: options[0].id), pane: pane, ref: ref)
         for _ in 0..<100 { if model.sponsoredDialog?.step == second { break }; await Task.yield() }
-        XCTAssertEqual(model.sponsoredDialog?.id, sheet)
+        XCTAssertEqual(model.sponsoredDialog?.id, popup)
         XCTAssertEqual(model.sponsoredDialog?.title, "More detail")
         XCTAssertEqual(model.sponsoredDialog?.step, second)
         XCTAssertFalse(model.sponsoredBusy)
+    }
+    func testPopupReportUpdatesInPlaceAndDismissalCancelsOnlyItsReport() async throws {
+        let model = TelegramConversationModel(id: id), fake = ConversationUIFake(), pane = UUID(), coordinator = PopupCoordinator()
+        model.receive(snapshot()); model.provider = fake; model.panes.insert(pane)
+        let ref = model.snapshot.sponsored.messages[0].ref, first = UUID(), second = UUID()
+        let option = TelegramSponsoredReportOption(id: "AP8=", text: "Server choice")
+        model.sponsoredDialog = .init(epoch: model.snapshot.epoch, pane: pane, ref: ref, title: "Reason",
+            text: "Choose the option supplied by Telegram.", step: first, options: [option])
+        let dialog = try XCTUnwrap(model.sponsoredDialog)
+        let page = try XCTUnwrap(TelegramSponsoredPopup.makePage(model: model, dialog: dialog, pane: pane, coordinator: coordinator))
+        coordinator.presentNative(page)
+        _ = NSApplication.shared
+        let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previous = NSApp.accessibilityAttributeValue(enhanced)
+        NSApp.accessibilitySetValue(true, forAttribute: enhanced)
+        let host = FoldersUIHost(Color.clear.popupHost(coordinator), width: 800, height: 650)
+        defer { host.close(); coordinator.terminate(); NSApp.accessibilitySetValue(previous, forAttribute: enhanced) }
+        try await host.settle()
+        try await assertPopupInventoryPresentation(in: host.window, root: host.view, coordinator: coordinator,
+            title: "Sponsored message")
+        XCTAssertTrue(host.labels().contains("Reason"))
+        XCTAssertTrue(host.labels().contains("Server choice"))
+        await fake.setSponsoredResult(.reportOptions(ref, step: second, title: "More detail", options: [option]))
+        let content = TelegramSponsoredPopup(model: model, dialogID: dialog.id, pane: pane, openChat: { _ in },
+            dismiss: { coordinator.dismiss(page, reason: $0) })
+        content.report(option)
+        for _ in 0..<100 { if model.sponsoredDialog?.step == second { break }; await Task.yield() }
+        try await host.settle()
+        XCTAssertEqual(coordinator.page?.id, ObjectIdentifier(page))
+        XCTAssertEqual(model.sponsoredDialog?.id, dialog.id)
+        XCTAssertTrue(host.labels().contains("More detail"))
+        XCTAssertFalse(host.labels().contains("Reason"))
+        XCTAssertNil(host.window.attachedSheet)
+        coordinator.dismiss(reason: .dismiss)
+        for _ in 0..<100 { if await fake.sponsoredActions.count == 2 { break }; await Task.yield() }
+        let actions = await fake.sponsoredActions
+        XCTAssertEqual(actions.count, 2)
+        if case .report(let actualRef, let step, let selected) = actions.first {
+            XCTAssertEqual(actualRef, ref); XCTAssertEqual(step, first); XCTAssertEqual(selected, option.id)
+        } else { XCTFail("Missing server-supplied report choice") }
+        if case .cancelReport(let actualRef) = actions.last { XCTAssertEqual(actualRef, ref) }
+        else { XCTFail("Popup dismissal must cancel the active report") }
+        XCTAssertNil(model.sponsoredDialog); XCTAssertFalse(model.sponsoredBusy)
+        XCTAssertTrue(coordinator.retainedRuntimeDrafts.isEmpty)
+    }
+    func testWebsiteModeRequiresExplicitOpenAndPreservesCurrentRequestGuards() async throws {
+        let model = TelegramConversationModel(id: id), fake = ConversationUIFake(), pane = UUID(), coordinator = PopupCoordinator()
+        let host = FoldersUIHost(Color.clear.popupHost(coordinator), width: 800, height: 650)
+        defer { host.close(); coordinator.terminate() }
+        model.receive(snapshot()); model.provider = fake; model.panes.insert(pane)
+        let ad = model.snapshot.sponsored.messages[0]
+        model.sponsoredInfo(ad, pane: pane, why: true)
+        let first = try XCTUnwrap(model.sponsoredDialog)
+        let firstPage = try XCTUnwrap(TelegramSponsoredPopup.makePage(model: model, dialog: first, pane: pane, coordinator: coordinator))
+        coordinator.presentNative(firstPage)
+        try await assertPopupInventoryPresentation(in: host.window, root: host.view, coordinator: coordinator,
+            title: "Sponsored message")
+        let firstView = TelegramSponsoredPopup(model: model, dialogID: first.id, pane: pane, openChat: { _ in },
+            dismiss: { coordinator.dismiss(firstPage, reason: $0) })
+        firstView.chooseWebsite()
+        let website = try XCTUnwrap(model.sponsoredDialog)
+        let beforeOpen = await fake.sponsoredActions
+        XCTAssertTrue(beforeOpen.isEmpty, "Choosing Website only presents the supplied URL")
+        XCTAssertEqual(website.text, ad.url)
+        coordinator.dismiss(firstPage, reason: .applied)
+        XCTAssertEqual(model.sponsoredDialog?.id, website.id, "Removing an old page must preserve the replacement")
+        XCTAssertNil(TelegramSponsoredPopup.makePage(model: model, dialog: website, pane: UUID(), coordinator: coordinator))
+        let page = try XCTUnwrap(TelegramSponsoredPopup.makePage(model: model, dialog: website, pane: pane, coordinator: coordinator))
+        coordinator.presentNative(page)
+        try await assertPopupInventoryPresentation(in: host.window, root: host.view, coordinator: coordinator,
+            title: "Sponsored message")
+        let content = TelegramSponsoredPopup(model: model, dialogID: website.id, pane: pane, openChat: { _ in },
+            dismiss: { coordinator.dismiss(page, reason: $0) })
+        firstView.openWebsite()
+        model.panes.remove(pane); content.openWebsite()
+        let staleActions = await fake.sponsoredActions
+        XCTAssertTrue(staleActions.isEmpty)
+        XCTAssertTrue(coordinator.isPresented)
+        model.panes.insert(pane); content.openWebsite()
+        for _ in 0..<100 { if await fake.sponsoredActions.count == 1 { break }; await Task.yield() }
+        let actions = await fake.sponsoredActions
+        XCTAssertEqual(actions.count, 1)
+        if case .click(let ref, let target, let confirmed) = actions.first {
+            XCTAssertEqual(ref, ad.ref); XCTAssertEqual(target, .button); XCTAssertTrue(confirmed)
+        } else { XCTFail("The explicit button must confirm the exact sponsored target") }
+        XCTAssertNil(model.sponsoredDialog); XCTAssertFalse(coordinator.isPresented)
+        model.receive(.init(destination: id, epoch: UUID()))
+        model.sponsoredDialog = website
+        XCTAssertNil(TelegramSponsoredPopup.makePage(model: model, dialog: website, pane: pane, coordinator: coordinator))
+        coordinator.terminate()
+    }
+    func testVideoWebsiteConfirmationBelongsToItsMediaWindowAndEndsOnClose() async throws {
+        _ = NSApplication.shared
+        let root = try await fixtureMedia(), lease = UUID()
+        let controller = TelegramSponsoredVideoWindow(), model = TelegramConversationModel(id: id), pane = UUID()
+        let fake = ConversationUIFake(), movie = root.appendingPathComponent("video.mp4")
+        defer { controller.close(); TelegramSponsoredRenderCache.shared.release(lease); try? FileManager.default.removeItem(at: root) }
+        var value = snapshot()
+        value.sponsored.messages[0].media = [.init(id: 1, kind: .video, role: .content, width: 24, height: 24, size: 1024, url: movie)]
+        model.receive(value); model.provider = fake; model.panes.insert(pane)
+        let ad = model.snapshot.sponsored.messages[0], url = URL(string: ad.url)!
+        TelegramSponsoredRenderCache.shared.retain(lease, media: ad.media)
+        for _ in 0..<200 {
+            if TelegramSponsoredRenderCache.shared.assets[movie] != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNotNil(TelegramSponsoredRenderCache.shared.assets[movie])
+        controller.show(ad, model: model, pane: pane, openChat: { _ in })
+        for _ in 0..<100 { if controller.popups.window != nil { break }; try await Task.sleep(for: .milliseconds(10)) }
+        let window = try XCTUnwrap(controller.popups.window)
+        let rootView = try XCTUnwrap(window.contentView)
+        XCTAssertFalse(controller.confirm(url, ref: ad.ref, model: model, pane: UUID(), target: .fullscreenButton, openChat: { _ in }))
+        XCTAssertTrue(controller.confirm(url, ref: ad.ref, model: model, pane: pane, target: .fullscreenButton, openChat: { _ in }))
+        try await assertPopupInventoryPresentation(in: window, root: rootView, coordinator: controller.popups,
+            title: "Sponsored message")
+        XCTAssertTrue(controller.popupCoordinator(for: window) === controller.popups)
+        XCTAssertNil(controller.popupCoordinator(for: nil))
+        XCTAssertNil(window.attachedSheet)
+        XCTAssertEqual(controller.popups.page?.title, "Sponsored message")
+        XCTAssertTrue(NavigationPresentationGate.obscures(window))
+        controller.popups.dismiss(reason: .dismiss)
+        let actions = await fake.sponsoredActions
+        XCTAssertTrue(actions.isEmpty)
+        XCTAssertNil(controller.popupCoordinator(for: window))
+        XCTAssertTrue(controller.confirm(url, ref: ad.ref, model: model, pane: pane, target: .fullscreenButton, openChat: { _ in }))
+        controller.close(pane: pane)
+        XCTAssertFalse(controller.popups.isPresented)
+        XCTAssertFalse(NavigationPresentationGate.obscures(window))
+        XCTAssertFalse(controller.confirm(url, ref: ad.ref, model: model, pane: pane, target: .fullscreenButton, openChat: { _ in }))
     }
     private func fixtureMedia() async throws -> URL {
         try await Task.detached {

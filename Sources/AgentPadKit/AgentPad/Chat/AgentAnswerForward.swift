@@ -30,6 +30,7 @@ final class AgentAnswerForward {
     var text: String { didSet { edited() } }
     private var presentationAllowed = false
     private var organizationTitle = "Organization"
+    private var accountName: String?
     private var sessionSignature: String?
     var organization = ""
     var channel = "" { didSet { edited() } }
@@ -60,6 +61,7 @@ final class AgentAnswerForward {
     @ObservationIgnored var changed: () -> Void = {}
     @ObservationIgnored var persist: () throws -> Void = {}
     @ObservationIgnored var isOpen: () -> Bool = { true }
+    @ObservationIgnored var completed: () -> Void = {}
     @ObservationIgnored private var initialDestinationsLoaded = false
 
     var draft: ForwardDraft {
@@ -153,7 +155,8 @@ final class AgentAnswerForward {
                     (try String.fetchOne(db, sql: "SELECT org_name FROM meta WHERE id = 1"),
                      try String.fetchOne(db, sql: "SELECT generation FROM meta WHERE id = 1"),
                      try Bool.fetchOne(db, sql: "SELECT NOT rights_in_doubt AND rights_session = ? AND channels_served FROM meta WHERE id = 1",
-                                       arguments: [connection.sessionId]) ?? false)
+                                       arguments: [connection.sessionId]) ?? false,
+                     try ChatOrgView.Member.read(db, account: key.accountId).first?.name)
                 }
                 let agents: [String]
                 if let journal, let caller, let generation = info.1 {
@@ -166,11 +169,12 @@ final class AgentAnswerForward {
                             """, arguments: [key.server.description, key.accountId, key.orgId, caller.surface, connection.sessionId, generation])
                     }
                 } else { agents = [] }
-                return (info.0, info.2, agents)
+                return (info.0, info.2, agents, info.3)
             }
             guard connectionCurrent else { presentationAllowed = false; return }
             organizationTitle = snapshot.0 ?? "Organization"
             presentationAllowed = snapshot.1
+            accountName = snapshot.3?.trimmingCharacters(in: .whitespacesAndNewlines)
             let agents = snapshot.2.compactMap { service.localAgent($0) }.filter { $0.enabled && $0.isSession }
             sessionSignature = agents.count == 1 ? agents[0].name : caller?.signature
         } catch { presentationAllowed = false }
@@ -267,6 +271,7 @@ final class AgentAnswerForward {
                 return author
             }
             status = result["status"]?.string == "sent" ? "Sent." : "Queued for delivery. Check the destination chat for delivery status."
+            completed()
         } catch {
             sendFailed(error)
         }
@@ -330,7 +335,10 @@ final class AgentAnswerForward {
                 epoch: try Int.fetchOne(db, sql: "SELECT channel_access_epoch FROM meta WHERE id = 1") ?? -1, store: ObjectIdentifier(store))
         }
     }
-    var accountSignature: String { key?.accountId ?? "" }
+    var accountSignature: String {
+        if let accountName, !accountName.isEmpty { return accountName }
+        return key?.accountId ?? ""
+    }
     func refreshDestinations() async {
         guard !sending, let current = service.connection,
               destination == nil || current.orgKey == destination?.chatKey else { return }
@@ -382,6 +390,7 @@ final class AgentAnswerForward {
                     text: message, mentions: [], messageId: messageID)
             }
             status = "Queued from your account. Check the destination chat for delivery status."
+            completed()
         } catch {
             sendFailed(error)
         }

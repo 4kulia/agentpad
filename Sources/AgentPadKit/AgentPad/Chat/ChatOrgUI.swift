@@ -113,50 +113,80 @@ struct ChatOrgTabContent: View {
         })
     }
     private var sections: [AttentionOrganizationSection] {
-        var sections: [AttentionOrganizationSection] = model == nil ? [] : [.members, .teams]
-        if model?.actions.contains(.invite) == true { sections.append(.invitations) }
-        if devices != nil { sections.append(.devices) }
-        if model?.actions.contains(.seeAudit) == true { sections.append(.audit) }
-        return sections
+        OrganizationTabs.sections(actions: model?.actions, hasDevices: devices != nil)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if model == nil, let reason = ChatOrgSidebarSection.reason(ChatService.shared.state) {
-                Text(reason).font(Theme.display(11)).foregroundStyle(.orange)
-            }
-            if let notice = model?.notice {
-                Text(notice).font(Theme.display(11)).foregroundStyle(.orange)
-            }
-            TabView(selection: selected) {
-                if let model {
-                    ChatOrgMembersTab(model: model, state: state, form: form, act: act).tabItem { Text("Members") }.tag(AttentionOrganizationSection.members)
-                    ChatOrgTeamsTab(model: model, state: state, form: form, act: act).tabItem { Text("Teams") }.tag(AttentionOrganizationSection.teams)
-                    if model.actions.contains(.invite) {
-                        ChatOrgInvitationsTab(model: model, state: state, form: form, act: act).tabItem { Text("Invitations") }.tag(AttentionOrganizationSection.invitations)
+        HStack(alignment: .top, spacing: 0) {
+            sidebar
+            PopupScrollBody(maxHeight: 560) {
+                VStack(alignment: .leading, spacing: 18) {
+                    if model == nil, let reason = ChatOrgSidebarSection.reason(ChatService.shared.state) {
+                        Text(reason).font(.caption).foregroundStyle(.orange)
                     }
+                    if let notice = model?.notice { Text(notice).font(.caption).foregroundStyle(.orange) }
+                    sectionContent
+                    if let model, !model.refused.isEmpty {
+                        ForEach(model.refused, id: \.id) { item in
+                            Text("\(item.title): refused by the server (\(item.code)).").font(.caption).foregroundStyle(.orange)
+                        }
+                        Button("Dismiss") { model.dismissRefusals(Set(model.refused.map(\.id))) }
+                    }
+                    if let answer = form.error { Text(answer).font(.caption).foregroundStyle(.orange) }
+                    if let problem = model?.problem { Text(problem).font(.caption).foregroundStyle(.orange) }
                 }
-                // The account's devices, in an organization or not (review C6 p1-9).
-                if let devices {
-                    ChatOrgDevicesTab(model: devices, state: state).tabItem { Text("Devices") }.tag(AttentionOrganizationSection.devices)
-                }
-                if let model, model.actions.contains(.seeAudit) {
-                    ChatOrgAuditTab(model: model).tabItem { Text("Security Log") }.tag(AttentionOrganizationSection.audit)
-                }
+                .padding(24).frame(maxWidth: .infinity, alignment: .leading)
             }
-            if let model, !model.refused.isEmpty {
-                ForEach(model.refused, id: \.id) { item in
-                    Text("\(item.title): refused by the server (\(item.code)).").font(Theme.display(11)).foregroundStyle(.orange)
-                }
-                Button("Dismiss") { model.dismissRefusals(Set(model.refused.map(\.id))) }
-            }
-            if let answer = form.error { Text(answer).font(Theme.display(11)).foregroundStyle(.orange) }
-            if let problem = model?.problem { Text(problem).font(Theme.display(11)).foregroundStyle(.orange) }
         }
-        .padding(12)
+        .background(alignment: .leading) {
+            HStack(spacing: 0) {
+                Theme.chromeHover.opacity(0.25).frame(width: 176)
+                Rectangle().fill(Theme.chromeHairline).frame(width: 1)
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityElement(children: .contain).accessibilityIdentifier("organization-content")
         .attentionPlace(ChatService.shared.connection?.orgKey.map { [.organization($0.orgId, section: selected.wrappedValue)] } ?? [])
         .onChange(of: sections, initial: true) { _, sections in
             if !sections.contains(selected.wrappedValue), let first = sections.first { selected.wrappedValue = first }
+        }
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 10) {
+                Text(String((model?.orgName ?? "Organization").prefix(1)).uppercased())
+                    .font(.headline).foregroundStyle(.white).frame(width: 30, height: 30)
+                    .background(.orange, in: RoundedRectangle(cornerRadius: 7))
+                Text(model?.orgName ?? "Organization").font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+            }.padding(.horizontal, 7).padding(.bottom, 12)
+            ForEach(sections, id: \.self) { section in
+                Button { selected.wrappedValue = section } label: {
+                    Label(section.popupTitle, systemImage: section.popupSymbol)
+                        .font(.subheadline).frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 9).padding(.vertical, 9)
+                        .background(selected.wrappedValue == section ? Theme.chromeHover : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: 6))
+                }.buttonStyle(.plain)
+                    .accessibilityAddTraits(selected.wrappedValue == section ? .isSelected : [])
+                    .accessibilityIdentifier("organization-section-" + section.rawValue)
+            }
+        }.padding(12).frame(width: 177, alignment: .leading)
+            .accessibilityElement(children: .contain).accessibilityLabel("Organization sections")
+    }
+
+    @ViewBuilder private var sectionContent: some View {
+        switch selected.wrappedValue {
+        case .members:
+            if let model { ChatOrgMembersTab(model: model, state: state, form: form, act: act) }
+        case .teams:
+            if let model { ChatOrgTeamsTab(model: model, state: state, form: form, act: act) }
+        case .invitations:
+            if let model, model.actions.contains(.invite) { ChatOrgInvitationsTab(model: model, state: state, form: form, act: act) }
+        case .devices:
+            if let devices { ChatOrgDevicesTab(model: devices, state: state) }
+        case .audit:
+            if let model, model.actions.contains(.seeAudit) { ChatOrgAuditTab(model: model) }
         }
     }
 
@@ -173,6 +203,27 @@ struct ChatOrgTabContent: View {
     }
 }
 
+private extension AttentionOrganizationSection {
+    var popupTitle: String {
+        switch self {
+        case .members: "Members"
+        case .teams: "Teams"
+        case .invitations: "Invitations"
+        case .devices: "Devices"
+        case .audit: "Audit"
+        }
+    }
+    var popupSymbol: String {
+        switch self {
+        case .members: "person.2"
+        case .teams: "sidebar.left"
+        case .invitations: "envelope"
+        case .devices: "desktopcomputer"
+        case .audit: "clock"
+        }
+    }
+}
+
 typealias ChatOrgAct = (@escaping @MainActor () async throws -> Void) -> Void
 
 private struct ChatOrgMembersTab: View {
@@ -182,25 +233,33 @@ private struct ChatOrgMembersTab: View {
     let act: ChatOrgAct
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                TextField("Your name", text: $form.fields.name)
-                Button("Change Name") {
-                    let text = form.fields.name
-                    act { try model.setName(text) }
-                }
-                .disabled(form.fields.name.trimmingCharacters(in: .whitespaces).isEmpty || !model.actions.contains(.setOwnName))
-            }
-            List(model.members) { member in
+        VStack(alignment: .leading, spacing: 18) {
+            OrganizationSectionHeading(title: "Members",
+                subtitle: (model.orgName.map { $0 + " · " } ?? "") + "Manage who has access to this organization.")
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Your name").font(.caption).foregroundStyle(.secondary)
                 HStack {
-                    VStack(alignment: .leading) {
-                        Text(member.name + (member.accountId == model.me ? " (you)" : ""))
+                    TextField("Your name", text: $form.fields.name).textFieldStyle(.roundedBorder)
+                    Button("Change Name") {
+                        let text = form.fields.name
+                        act { try model.setName(text) }
+                    }
+                    .disabled(form.fields.name.trimmingCharacters(in: .whitespaces).isEmpty || !model.actions.contains(.setOwnName))
+                }
+                Text("Use Change Name to apply your name. Role changes require confirmation.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(model.members) { member in
+                HStack(spacing: 12) {
+                    ContactAvatar(stableID: member.accountId, name: member.name, kind: .person, size: 32)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(member.name + (member.accountId == model.me ? " (you)" : "")).font(.subheadline.weight(.semibold))
                         Text("@\(member.handle) · \(member.role)").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
                     let roles = model.roles(for: member)
                     if !roles.isEmpty {
-                        Menu("Role") {
+                        Menu(member.role.capitalized) {
                             ForEach(roles, id: \.self) { role in
                                 Button("Make \(role.capitalized)") {
                                     OrganizationTabs.confirm(state, target: member.id, title: "Make \(member.name) \(role)?",
@@ -212,19 +271,25 @@ private struct ChatOrgMembersTab: View {
                             }
                         }
                         .fixedSize()
+                        .accessibilityLabel("Role for " + member.name)
+                    } else {
+                        Text(member.role.capitalized).font(.caption).foregroundStyle(.secondary)
+                            .padding(.horizontal, 7).padding(.vertical, 4)
+                            .background(Theme.chromeHover, in: RoundedRectangle(cornerRadius: 5))
                     }
                     if model.canRemove(member) {
-                        Button("Remove…") {
+                        Button("Remove…", role: .destructive) {
                             OrganizationTabs.confirm(state, target: member.id, title: "Remove \(member.name) from the organization?",
-                                text: "Their devices lose access to the organization; they leave every team.", verb: "Remove", destructive: true,
+                                text: "Their devices lose access to the organization; they leave every team.", verb: "Remove member", destructive: true,
                                 valid: { model.member(member.id) == member && model.canRemove(member) }) { try model.remove(member) }
-                        }
+                        }.buttonStyle(PopupDestructiveButtonStyle())
+                            .accessibilityIdentifier("organization-remove-member-" + member.id)
                     }
                 }
+                Divider()
             }
         }
-        .padding(8)
-
+        .accessibilityElement(children: .contain).accessibilityIdentifier("organization-members")
     }
 }
 
@@ -236,7 +301,8 @@ private struct ChatOrgTeamsTab: View {
     @FocusState private var renameFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 18) {
+            OrganizationSectionHeading(title: "Teams", subtitle: "Create a team and manage its members.")
             if model.actions.contains(.createTeam) {
                 HStack {
                     TextField("New team name", text: $form.fields.newTeam)
@@ -247,18 +313,20 @@ private struct ChatOrgTeamsTab: View {
                             form.fields.newTeam = ""
                         }
                     }
+                    .buttonStyle(PopupPrimaryButtonStyle())
                     .disabled(form.fields.newTeam.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
+                .textFieldStyle(.roundedBorder)
             }
-            List(model.teams) { team in
+            ForEach(model.teams) { team in
                 teamRow(team)
             }
         }
-        .padding(8)
+        .accessibilityElement(children: .contain).accessibilityIdentifier("organization-teams")
     }
 
     private func teamRow(_ team: ChatOrgView.Team) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack {
                 if form.fields.renameTeamID == team.id {
                     VStack(alignment: .leading) {
@@ -270,18 +338,32 @@ private struct ChatOrgTeamsTab: View {
                         if let error = form.renameError { Text(error).font(.caption).foregroundStyle(.red) }
                     }
                 } else { Text(team.name).font(.headline) }
-                if team.archived { Text("archived").font(.caption).foregroundStyle(.secondary) }
-                if team.mine { Text("you are in it").font(.caption).foregroundStyle(.secondary) }
+                if team.archived { Text("Archived").font(.caption).foregroundStyle(.secondary) }
+                if team.mine { Text("You are in it").font(.caption).foregroundStyle(.green) }
                 Spacer()
+            }
+            members(team)
+            ViewThatFits(in: .horizontal) {
+                HStack { actions(team) }
+                VStack(alignment: .leading) { actions(team) }
+            }
+        }
+        .textFieldStyle(.roundedBorder)
+        .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.chromeHover.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.chromeHairline))
+    }
+
+    @ViewBuilder private func actions(_ team: ChatOrgView.Team) -> some View {
                 if model.canChange(team) {
                     Button("Rename…") {
                         form.fields.renameTeamID = team.id; form.fields.renameText = team.name; form.renameError = nil
                     }
-                    Button("Archive…") {
+                    Button("Archive…", role: .destructive) {
                         OrganizationTabs.confirm(state, target: team.id, title: "Archive \(team.name)?",
                             text: "An archived team cannot be changed.", verb: "Archive", destructive: true,
                             valid: { current(team) == team && model.canChange(team) }) { try model.archiveTeam(team) }
-                    }
+                    }.buttonStyle(PopupDestructiveButtonStyle())
                 }
                 if model.canJoin(team) {
                     Button("Join…") {
@@ -297,8 +379,10 @@ private struct ChatOrgTeamsTab: View {
                             valid: { current(team) == team && model.canLeave(team) }) { try model.leave(team) }
                     }
                 }
-            }
-            HStack(spacing: 6) {
+    }
+
+    private func members(_ team: ChatOrgView.Team) -> some View {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 86), alignment: .leading)], alignment: .leading, spacing: 8) {
                 ForEach(team.members, id: \.self) { account in
                     let name = model.member(account)?.name ?? "unknown"
                     if model.canRemoveMember(account, from: team) {
@@ -309,10 +393,11 @@ private struct ChatOrgTeamsTab: View {
                                     try model.removeMember(account, from: team)
                                 }
                         }
-                            .buttonStyle(.borderless)
+                            .buttonStyle(.bordered)
                             .help("Remove \(name) from \(team.name)")
                     } else {
-                        Text(name).font(.caption)
+                        Text(name).font(.caption).padding(.horizontal, 7).padding(.vertical, 5)
+                            .background(Theme.chromeHover, in: RoundedRectangle(cornerRadius: 5))
                     }
                 }
                 let others = model.candidates(for: team)
@@ -331,8 +416,7 @@ private struct ChatOrgTeamsTab: View {
                     .fixedSize()
                 }
             }
-        }
-        .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// The team as the model has it now; nil once it is gone or not visible.
@@ -350,56 +434,68 @@ private struct ChatOrgInvitationsTab: View {
     private var choosable: [ChatOrgView.Team] { model.invitable }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                TextField("Email", text: $form.fields.email)
-                Picker("", selection: $form.fields.role) {
-                    Text("Member").tag("member")
-                    Text("Admin").tag("admin")
+        VStack(alignment: .leading, spacing: 18) {
+            OrganizationSectionHeading(title: "Invitations",
+                subtitle: model.orgName.map { "Invite a colleague to \($0)." } ?? "Invite a colleague to this organization.")
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Email").font(.caption).foregroundStyle(.secondary)
+                    TextField("Email", text: $form.fields.email)
+                }.frame(maxWidth: .infinity)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Role").font(.caption).foregroundStyle(.secondary)
+                    Picker("Role", selection: $form.fields.role) {
+                        Text("Member").tag("member")
+                        Text("Admin").tag("admin")
+                    }.labelsHidden().frame(maxWidth: .infinity)
                 }
-                .labelsHidden()
-                .fixedSize()
-                Button("Invite") {
-                    let (address, chosen, ids) = (form.fields.email, form.fields.role, Array(form.fields.teams))
-                    OrganizationTabs.confirm(state, target: address, title: "Invite \(address)?",
-                        text: "They will join as \(chosen), with access to General and the selected teams.", verb: "Invite",
-                        valid: { model.manages && Set(ids).isSubset(of: Set(model.invitable.map(\.teamId))) }) {
-                        try model.invite(email: address, role: chosen, teams: ids)
-                        form.fields.email = ""
-                        form.fields.teams = []
-                    }
-                }
-                 .disabled(!form.fields.email.contains("@"))
-            }
+                .frame(maxWidth: .infinity)
+            }.textFieldStyle(.roundedBorder)
             if !form.fields.teams.isSubset(of: Set(choosable.map(\.teamId))) {
                 Text("A chosen team is no longer available. Update the invitation before sending.").font(.caption).foregroundStyle(.orange)
                 Button("Remove unavailable teams") { form.fields.teams.formIntersection(choosable.map(\.teamId)) }
             }
-            if !choosable.isEmpty {
-                HStack {
-                    Text("Teams:").font(.caption)
+            if !model.teams.isEmpty {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("Teams").font(.subheadline.weight(.semibold))
+                    if let general = model.teams.first(where: \.isGeneral) {
+                        Toggle(general.name, isOn: .constant(true)).disabled(true)
+                    }
                     ForEach(choosable) { team in
                         Toggle(team.name, isOn: Binding(get: { form.fields.teams.contains(team.teamId) },
                                                         set: { if $0 { form.fields.teams.insert(team.teamId) } else { form.fields.teams.remove(team.teamId) } }))
                     }
                 }
             }
-            List(model.invitations, id: \.invitationId) { invitation in
+            Button("Invite") {
+                let (address, chosen, ids) = (form.fields.email, form.fields.role, Array(form.fields.teams))
+                OrganizationTabs.confirm(state, target: address, title: "Invite \(address)?",
+                    text: "They will join as \(chosen), with access to General and the selected teams.", verb: "Invite",
+                    valid: { model.manages && Set(ids).isSubset(of: Set(model.invitable.map(\.teamId))) }) {
+                    try model.invite(email: address, role: chosen, teams: ids)
+                    form.fields.email = ""
+                    form.fields.teams = []
+                }
+            }.buttonStyle(PopupPrimaryButtonStyle()).disabled(!form.fields.email.contains("@"))
+            Text("Pending invitations").font(.headline).padding(.top, 6)
+            ForEach(model.invitations, id: \.invitationId) { invitation in
                 HStack {
-                    VStack(alignment: .leading) {
-                        Text(invitation.email)
-                        Text("\(invitation.role) · until \(invitation.expiresAt ?? "—")").font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(invitation.email).font(.subheadline.weight(.semibold))
+                        Text("\(invitation.role.capitalized) · until \(OrganizationTabs.readableDate(invitation.expiresAt, includesTime: false))")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Revoke") {
+                    Button("Revoke", role: .destructive) {
                         OrganizationTabs.confirm(state, target: invitation.invitationId, title: "Revoke invitation for \(invitation.email)?",
                             text: "This invitation can no longer be accepted.", verb: "Revoke", destructive: true,
                             valid: { model.invitations.contains(invitation) }) { try model.revoke(invitation) }
-                    }
+                    }.buttonStyle(PopupDestructiveButtonStyle())
                 }
+                Divider()
             }
         }
-        .padding(8)
+        .accessibilityElement(children: .contain).accessibilityIdentifier("organization-invitations")
     }
 }
 
@@ -408,27 +504,28 @@ struct ChatOrgDevicesTab: View {
     let state: TabState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Devices signed in to your account on this server.").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("Refresh") { Task { await model.load() } }
-            }
+        VStack(alignment: .leading, spacing: 16) {
+            OrganizationSectionHeading(title: "Devices", subtitle: "Devices signed in to your account on this server.")
+            Button("Refresh") { Task { await model.load() } }
             if let problem = model.problem {
                 Text(problem).font(Theme.display(11)).foregroundStyle(.orange)
             }
-            List(model.devices ?? []) { device in
-                HStack {
-                    VStack(alignment: .leading) {
-                        Text(device.deviceName + (device.current ? " (this Mac)" : ""))
-                        Text("signed in \(device.createdAt) · last seen \(device.lastSeenAt ?? "—")").font(.caption).foregroundStyle(.secondary)
+            ForEach(model.devices ?? []) { device in
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "desktopcomputer").padding(.top, 3)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(device.deviceName + (device.current ? " (this Mac)" : "")).font(.headline)
+                            Text("Signed in \(OrganizationTabs.readableDate(device.createdAt, includesTime: false)) · last seen \(OrganizationTabs.readableDate(device.lastSeenAt))")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
-                    Spacer()
                     if device.current {
                         // This Mac: the core's Disconnect, with its own confirmation (review C6e p1-5).
-                        Button("Disconnect…") { Task { await model.close(device) } }
+                        Button("Disconnect…", role: .destructive) { Task { await model.close(device) } }
+                            .buttonStyle(PopupDestructiveButtonStyle())
                     } else {
-                        Button("Close Session…") {
+                        Button("Close Session…", role: .destructive) {
                             OrganizationTabs.confirm(state, target: device.id, title: "Close the session of \(device.deviceName)?",
                                 text: "Closes that device's access to the whole server, every organization on it included.",
                                 verb: "Close Session", destructive: true, requiresOrganization: false,
@@ -436,12 +533,19 @@ struct ChatOrgDevicesTab: View {
                                     await model.close(device)
                                     if let problem = model.problem { throw ChatError.storage(problem) }
                                 }
-                        }
+                        }.buttonStyle(PopupDestructiveButtonStyle())
                     }
                 }
+                .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.chromeHover.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.chromeHairline))
             }
+            Text("Closing a device session affects the whole server, every organization on it included.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
         }
-        .padding(8)
+        .accessibilityElement(children: .contain).accessibilityIdentifier("organization-devices")
         .task { if model.devices == nil { await model.load() } }
     }
 }
@@ -450,23 +554,33 @@ private struct ChatOrgAuditTab: View {
     let model: ChatOrgModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Spacer()
-                Button("Refresh") { Task { await model.loadAudit() } }
-            }
-            List(model.audit ?? []) { record in
-                VStack(alignment: .leading) {
-                    Text("\(record.action) · \(record.result)")
-                    Text("\(record.at) · \(record.actorAccountId.flatMap { model.member($0)?.name } ?? record.actorAccountId ?? "operator") · \(record.object ?? "")")
+        VStack(alignment: .leading, spacing: 16) {
+            OrganizationSectionHeading(title: "Security Log", subtitle: "Audit · Organization activity and access changes.")
+            Button("Refresh") { Task { await model.loadAudit() } }
+            ForEach(model.audit ?? []) { record in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("\(record.action) · \(record.result)").font(.subheadline.weight(.semibold))
+                    Text("\(OrganizationTabs.readableDate(record.at)) · \(record.actorAccountId.flatMap { model.member($0)?.name } ?? record.actorAccountId ?? "operator") · \(record.object ?? "")")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                Divider()
             }
             if model.auditNext != nil {
                 Button("Older") { Task { await model.loadAudit(more: true) } }
             }
         }
-        .padding(8)
+        .accessibilityElement(children: .contain).accessibilityIdentifier("organization-audit")
         .task { if model.audit == nil { await model.loadAudit() } }
+    }
+}
+
+private struct OrganizationSectionHeading: View {
+    let title: String
+    let subtitle: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.title3.weight(.semibold))
+            Text(subtitle).font(.caption).foregroundStyle(.secondary)
+        }
     }
 }

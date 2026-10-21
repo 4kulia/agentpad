@@ -74,11 +74,11 @@ extension WorkspaceStore {
             agentProfileErrors[id] = ResumeRefusal.templateUnavailable.message(agentId: profile.rosterID, conversationId: "")
             return .failure(.templateUnavailable)
         }
-        // Profile launches are local even when the current workspace holds SSH tabs.
+        // Profiles follow the workspace's connection, just like other agent tabs.
         let workspace = active ?? addEmptyWorkspace()
         agentProfileErrors[id] = nil
         let session = addTab(in: workspace, template: template, initialCwd: profile.folder,
-            connection: .local, profile: profile)
+            connection: .inheritWorkspace, profile: profile)
         expandedAgentProfiles.insert(id)
         return .success(session)
     }
@@ -156,7 +156,11 @@ extension WorkspaceStore {
         if let refusal = Self.resumeRefusal(agentId: template.rosterId, conversationId: record.conversationId,
             options: { _ in options }, visibility: conversationVisibility(),
             claudeProjectsRoot: claudeProjectsRoot, claudeResolution: resolution) { return refuse(refusal) }
-        let workspace = active ?? addEmptyWorkspace()
+        // A local history item cannot be resumed on a server. Use the existing
+        // local-spawn destination policy so it never creates a local agent in
+        // an SSH workspace or silently drops the requested conversation ID.
+        let workspace = (active?.sshRemoteHost == nil ? active : nil)
+            ?? workspaces.first { $0.sshRemoteHost == nil } ?? addEmptyWorkspace()
         agentProfileErrors[id] = nil
         let session = addTab(in: workspace, template: template, initialCwd: record.cwd,
             conversationId: record.conversationId, forceResume: true, claudeResolution: resolution,
@@ -165,6 +169,7 @@ extension WorkspaceStore {
         if origin == nil, let profile, profile.rosterID == template.rosterId {
             session.profileID = profile.id; session.profileOriginalCwd = record.cwd
         }
+        activateWorkspace(workspace)
         return .success(session)
     }
 }

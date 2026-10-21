@@ -53,16 +53,19 @@ final class NativeTabsTests: XCTestCase {
         let a = empty(peers: { stores }), b = empty(peers: { stores }); stores = [a, b]
         defer { stores.forEach { $0.terminate() } }
         let router = TabRouter(); router.stores = { stores }
-        let settingsA = try XCTUnwrap(router.open(.settings, from: a))
-        let settingsB = try XCTUnwrap(router.open(.settings, from: b))
-        XCTAssertFalse(settingsA === settingsB)
+        let notificationsA = try XCTUnwrap(router.open(.notifications, from: a))
+        let notificationsB = try XCTUnwrap(router.open(.notifications, from: b))
+        XCTAssertFalse(notificationsA === notificationsB)
         let workspace = try XCTUnwrap(b.active), originalCwd = workspace.workingDirectory
-        XCTAssertFalse(b.handleTabDrop(droppedId: settingsA.id, in: workspace))
-        XCTAssertTrue(a.allSessions.contains { $0 === settingsA })
-        XCTAssertTrue(workspace.activeSession === settingsB)
-        let source = try XCTUnwrap(router.open(.newSSH(draftID: UUID()), from: a))
+        XCTAssertFalse(b.handleTabDrop(droppedId: notificationsA.id, in: workspace))
+        XCTAssertTrue(a.allSessions.contains { $0 === notificationsA })
+        XCTAssertTrue(workspace.activeSession === notificationsB)
+        let popup = try XCTUnwrap(router.open(.settings, from: a))
+        XCTAssertFalse(b.handleTabDrop(droppedId: popup.id, in: workspace))
+        XCTAssertTrue(a.popups.contains(popup.id))
+        let source = try XCTUnwrap(router.open(.files(canonicalPath: "/tmp"), from: a))
         let state = try XCTUnwrap(source.tabState)
-        state.edit(.ssh(name: "invalid draft", host: "", directory: "relative"))
+        state.edit(.fileName(.init(kind: .newFile, path: "/tmp", name: "unfinished.txt")))
         state.transient["password"] = "not-persisted"
         let oldRevision = state.revision
         let pane = try XCTUnwrap(workspace.activePane)
@@ -75,20 +78,21 @@ final class NativeTabsTests: XCTestCase {
         XCTAssertFalse(state.accept(revision: oldRevision) { XCTFail("late picker changed a moved draft") })
         XCTAssertTrue((source.engine as? NativeTabEngine)?.owner === b)
         XCTAssertEqual((source.engine as? NativeTabEngine)?.terminations, 0)
-        XCTAssertTrue(router.rekey(source.id, to: .workspaceDetails(workspace.id)) === source)
-        XCTAssertTrue(router.open(.workspaceDetails(workspace.id), from: a) === source)
+        let target = ToolRoute.unavailable(UUID())
+        XCTAssertTrue(router.rekey(source.id, to: target) === source)
+        XCTAssertTrue(router.open(target, from: a) === source)
     }
 
     func testSplittingOpeningAndChangingWorkspaceInvalidatePendingDecision() throws {
         for operation in 0..<3 {
             let store = empty(); defer { store.terminate() }
-            let tab = store.openToolTab(.settings), coordinator = tab.tabState!.confirmation
+            let tab = store.openToolTab(.notifications), coordinator = tab.tabState!.confirmation
             var decisions: [Bool] = []
             XCTAssertTrue(coordinator.request(.init(tabID: tab.id, targetID: "target"), title: "Remove", consequences: "", verb: "Remove",
                 stillValid: { true }, completion: { decisions.append($0) }) { XCTFail("navigation accepted consent") })
             switch operation {
             case 0: _ = store.splitPane(store.active!.activePane!, orientation: .horizontal, in: store.active!)
-            case 1: _ = store.openToolTab(.notifications)
+            case 1: _ = store.openToolTab(.allSessions)
             default: _ = store.addEmptyWorkspace()
             }
             XCTAssertEqual(coordinator.phase, .invalidated)
@@ -96,23 +100,28 @@ final class NativeTabsTests: XCTestCase {
         }
     }
 
-    func testCreateChannelRekeysSameTabAndReusesExistingChannel() throws {
+    func testCreateChannelClosesPopupAndReusesExistingChannelTab() throws {
         let store = empty(); defer { store.terminate() }
         let router = TabRouter(); router.stores = { [store] }
         let route = ToolRoute.newChannel(try scope(), teamID: "team", draftID: UUID())
         let tab = try XCTUnwrap(router.open(route, from: store))
         let oldState = try XCTUnwrap(tab.tabState)
         let channel = ChannelRef(server: "https://example.com:443", account: "me", org: "org", channel: "created")
-        XCTAssertTrue(router.rekey(tab.id, to: channel) === tab)
-        XCTAssertEqual(tab.channel, channel)
+        let created = try XCTUnwrap(router.rekey(tab.id, to: channel))
+        XCTAssertFalse(created === tab)
+        XCTAssertEqual(created.channel, channel)
         XCTAssertTrue(oldState.isClosed)
-        XCTAssertEqual((tab.engine as? ChannelTabEngine)?.starts, 0)
+        XCTAssertFalse(store.popups.contains(tab.id))
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertEqual((created.engine as? ChannelTabEngine)?.starts, 0)
         let second = try XCTUnwrap(router.open(.newChannel(try scope(), teamID: "team", draftID: UUID()), from: store))
-        XCTAssertTrue(router.rekey(second.id, to: channel) === tab)
+        XCTAssertTrue(router.rekey(second.id, to: channel) === created)
+        XCTAssertTrue(try XCTUnwrap(second.tabState).isClosed)
+        XCTAssertFalse(store.popups.contains(second.id))
         XCTAssertEqual(store.allSessions.count, 1)
     }
 
-    func testRoundTripMultiWindowEmptySplitSecretsAndRestoreDeduplication() throws {
+    func testRoundTripMultiWindowEmptySplitSecretsAndExplicitPopupDraftRecovery() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("state-v2.json")
@@ -127,7 +136,7 @@ final class NativeTabsTests: XCTestCase {
         for secret in ["OTP-MARKER", "TOKEN-MARKER", "CLIPBOARD-MARKER", "ENV-MARKER", "SIGNED-URL-MARKER"] { state.transient[secret] = secret }
         let workspace = try XCTUnwrap(a.active)
         _ = a.splitPane(try XCTUnwrap(workspace.activePane), orientation: .horizontal, in: workspace)
-        _ = b.openToolTab(route) // Simulate duplicate persisted addresses from an older build.
+        _ = b.openToolTab(route)
         XCTAssertTrue(a.flushPersistence()); XCTAssertTrue(b.flushPersistence())
         for file in [url, root.appendingPathComponent("tab-drafts-v1.json")] {
             let text = try String(contentsOf: file, encoding: .utf8)
@@ -137,12 +146,17 @@ final class NativeTabsTests: XCTestCase {
         let restored = loaded.windowIds.map { empty(WindowPersistence(windowId: $0, app: loaded)) }
         defer { restored.forEach { $0.terminate() } }
         let router = TabRouter(); router.stores = { restored }; router.reconcileRestoredTabs()
-        XCTAssertEqual(restored.flatMap(\.allSessions).count, 1)
+        XCTAssertTrue(restored.flatMap(\.allSessions).isEmpty)
+        XCTAssertTrue(restored.allSatisfy { $0.popups.sessions.isEmpty && !$0.popups.isPresented })
         XCTAssertEqual(restored[0].active?.root.allPanes.count, 2)
-        let restoredState = try XCTUnwrap(restored[0].allSessions.first?.tabState)
-        XCTAssertEqual(restoredState.draft?.payload, state.draft?.payload)
-        XCTAssertEqual(restoredState.navigation.anchor, "field-host")
+        XCTAssertEqual(loaded.drafts.draft(try XCTUnwrap(state.draft?.id)), state.draft)
+        let reopened = try XCTUnwrap(router.open(route, from: restored[0]))
+        let restoredState = try XCTUnwrap(reopened.tabState)
+        XCTAssertEqual(restoredState.draft, state.draft)
+        XCTAssertNil(restoredState.navigation.anchor, "Popup navigation is presentation state, not a persisted tab")
         XCTAssertTrue(restoredState.transient.isEmpty)
+        XCTAssertTrue(restored[0].allSessions.isEmpty)
+        XCTAssertTrue(restored[0].popups.isPresented)
     }
 
     func testLegacyImportIsOneTimeAndCorruptOrUnknownTabsNeverSpawnShell() throws {
@@ -206,35 +220,43 @@ final class NativeTabsTests: XCTestCase {
             if failing { throw CocoaError(.fileWriteOutOfSpace) }
         })
         let store = empty(drafts: repository); defer { store.terminate() }
-        let tab = store.openToolTab(.newSSH(draftID: UUID())), workspace = try XCTUnwrap(store.active)
+        let tab = store.openToolTab(.newSSH(draftID: UUID()))
         let state = try XCTUnwrap(tab.tabState)
         state.edit(.ssh(name: "", host: "broken input", directory: "not absolute"))
         let stale = try XCTUnwrap(state.draft)
-        store.closeTab(tab, in: workspace); store.closeTab(tab, in: workspace)
-        XCTAssertTrue(store.allSessions.contains { $0 === tab }); XCTAssertNotNil(state.saveError)
+        store.popups.dismiss(reason: .dismiss); store.popups.dismiss(reason: .dismiss)
+        XCTAssertTrue(store.popups.contains(tab.id)); XCTAssertTrue(store.popups.isPresented)
+        XCTAssertNotNil(state.saveError)
         state.edit(.ssh(name: "new", host: "still broken", directory: ""))
         failing = false
-        store.tabCloseCoordinator.retry(tab.id)
-        XCTAssertFalse(store.allSessions.contains { $0 === tab })
+        store.popups.dismiss(reason: .dismiss)
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertTrue(store.popups.contains(tab.id), "Dismissal retains the live draft for reopening")
+        XCTAssertTrue(store.allSessions.isEmpty)
         XCTAssertEqual(repository.draft(stale.id)?.revision, 2)
         XCTAssertThrowsError(try repository.save(stale))
         XCTAssertEqual(repository.conflicts, [stale])
         XCTAssertEqual(repository.draft(stale.id)?.revision, 2)
         // Re-entering the action works without the runtime closed-tab stack.
         let reopened = store.openToolTab(stale.route)
+        XCTAssertTrue(reopened === tab)
         XCTAssertEqual(reopened.tabState?.draft, repository.draft(stale.id))
     }
 
     func testTransferWriteFailureKeepsBothLayoutsAndLiveDraft() throws {
         var fail = false, writes = 0
-        let app = AppPersistence(fileURL: URL(fileURLWithPath: "/nonexistent-\(UUID())/state-v2.json"), writer: { _, _ in
+        let app = AppPersistence(fileURL: URL(fileURLWithPath: "/nonexistent-\(UUID())/state-v2.json"), writer: { _, url in
+            guard url.lastPathComponent == "state-v2.json" else { return }
             writes += 1; if fail { throw CocoaError(.fileWriteOutOfSpace) }
         })
         var stores: [WorkspaceStore] = []
         let a = empty(WindowPersistence(windowId: UUID(), app: app), peers: { stores })
         let b = empty(WindowPersistence(windowId: UUID(), app: app), peers: { stores }); stores = [a, b]
         defer { stores.forEach { $0.terminate() } }
-        let tab = a.openToolTab(.settings)
+        let tab = a.openToolTab(.files(canonicalPath: "/tmp"))
+        let state = try XCTUnwrap(tab.tabState)
+        state.edit(.fileName(.init(kind: .newFile, path: "/tmp", name: "unfinished.txt")))
+        let draft = state.draft
         XCTAssertTrue(a.flushPersistence()); XCTAssertTrue(b.flushPersistence())
         let savedA = app.state(for: a.windowID), savedB = app.state(for: b.windowID)
         let before = writes; fail = true
@@ -242,6 +264,7 @@ final class NativeTabsTests: XCTestCase {
         XCTAssertEqual(writes, before + 1)
         XCTAssertEqual(app.state(for: a.windowID), savedA); XCTAssertEqual(app.state(for: b.windowID), savedB)
         XCTAssertTrue(a.allSessions.first === tab); XCTAssertTrue(b.allSessions.isEmpty)
+        XCTAssertEqual(state.draft, draft)
         XCTAssertEqual((tab.engine as? NativeTabEngine)?.terminations, 0)
     }
 }

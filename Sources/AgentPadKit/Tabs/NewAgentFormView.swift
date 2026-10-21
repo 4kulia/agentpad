@@ -13,12 +13,33 @@ struct NewAgentFormView: View {
     @Bindable var form: LocalFormState
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                Text("New agent").font(Theme.display(22, weight: .semibold))
+        VStack(spacing: 0) {
+            PopupScrollBody { fields }
+            Divider()
+            HStack(spacing: 8) {
+                Spacer()
+                if state.isPopup {
+                    Button("Cancel") { tabs.cancel(state) }
+                        .accessibilityIdentifier("new-agent-cancel")
+                }
+                Button("Add agent") { tabs.addAgent(state) }
+                    .buttonStyle(.borderedProminent).disabled(!canAdd)
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("add-agent")
+            }
+            .padding(.horizontal, 20).padding(.vertical, 14)
+        }
+        .disabled(form.completed)
+    }
+
+    private var fields: some View {
+        VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Agent type").font(.headline)
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], spacing: 8) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("New agent").font(Theme.display(18, weight: .semibold))
+                        Text("Agent type").font(Theme.display(12, weight: .semibold))
+                    }
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
                         ForEach(tabs.agentTemplates()) { template in
                             Button { form.newAgent.templateID = template.id } label: {
                                 HStack(spacing: 8) {
@@ -29,33 +50,41 @@ struct NewAgentFormView: View {
                                         Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold))
                                     }
                                 }
-                                .padding(10).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                .padding(8).frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
                                 .background(form.newAgent.templateID == template.id ? Theme.chromeSelection : Theme.chromeHover,
                                             in: RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8)
+                                    .stroke(form.newAgent.templateID == template.id ? Theme.activityRunning : Theme.chromeHairline,
+                                            lineWidth: 1))
                                 .contentShape(RoundedRectangle(cornerRadius: 8))
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel(template.title)
                             .accessibilityValue(form.newAgent.templateID == template.id ? "Selected" : "")
+                            .accessibilityIdentifier("new-agent-type-" + template.id)
                         }
                     }
                 }
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Folder").font(.headline)
-                    HStack {
-                        Image(systemName: "folder").foregroundStyle(.secondary)
-                        Text(form.newAgent.folder.isEmpty ? "Choose a folder" : form.newAgent.folder)
-                            .font(Theme.mono(12)).lineLimit(2).truncationMode(.middle)
-                            .textSelection(.enabled)
-                        Spacer(minLength: 8)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Folder").font(Theme.display(12)).foregroundStyle(Theme.chromeMuted)
+                    HStack(spacing: 10) {
+                        TextField("Choose a folder", text: $form.newAgent.folder)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("Folder")
+                            .accessibilityIdentifier("new-agent-folder")
+                            .onSubmit { if canAdd { tabs.addAgent(state) } }
                         Button("Choose…", action: chooseFolder).accessibilityLabel("Choose agent folder")
+                            .accessibilityIdentifier("new-agent-choose-folder")
                     }
                 }
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Name (optional)").font(.headline)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Name (optional)").font(Theme.display(12)).foregroundStyle(Theme.chromeMuted)
                     TextField(defaultName, text: $form.newAgent.name)
                         .textFieldStyle(.roundedBorder).accessibilityLabel("Agent name (optional)")
+                        .accessibilityIdentifier("new-agent-name")
                         .onSubmit { if canAdd { tabs.addAgent(state) } }
+                    Text("Folder name is used when no name is provided.")
+                        .font(Theme.display(11)).foregroundStyle(Theme.chromeMuted)
                 }
                 if let duplicate = tabs.duplicateAgent(state) {
                     VStack(alignment: .leading, spacing: 8) {
@@ -64,15 +93,13 @@ struct NewAgentFormView: View {
                         Button("Show \(duplicate.name) in Agents") { tabs.addAgent(state) }
                     }
                 }
-                if let error = form.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
-                Button("Add agent") { tabs.addAgent(state) }
-                    .buttonStyle(.borderedProminent).disabled(!canAdd)
-                    .accessibilityIdentifier("add-agent")
-            }
-            .padding(28).frame(maxWidth: 680, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
+                if let error = form.error {
+                    Text(error).foregroundStyle(.red).textSelection(.enabled)
+                        .accessibilityIdentifier("new-agent-error")
+                }
         }
-        .disabled(form.completed)
+        .padding(24).frame(maxWidth: 700, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 
     private var defaultName: String {

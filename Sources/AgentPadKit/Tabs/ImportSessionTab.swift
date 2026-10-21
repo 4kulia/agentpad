@@ -87,27 +87,71 @@ final class ImportSessionModel {
 struct ImportSessionView: View {
     let state: TabState
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Import session").font(.title2)
-                if let model = state.importSession {
-                    Text(model.source.displayTitle).font(.headline)
-                    Text(model.source.cwd.path).textSelection(.enabled)
-                    if let message = model.message { Text(message).textSelection(.enabled) }
-                    if !model.completed {
-                        if model.step == .sourceStopped {
-                            Button("Resume conversation…") { model.retryResume() }.disabled(state.confirmation.isExecuting)
-                        } else {
-                            Button(model.message == nil ? "Move here…" : "Retry…") { model.request() }.disabled(!model.current() || state.confirmation.isExecuting)
+        VStack(spacing: 0) {
+            PopupScrollBody {
+                VStack(alignment: .leading, spacing: 18) {
+                    if !state.isPopup { Text("Import session").font(.title2) }
+                    if let model = state.importSession {
+                        HStack(spacing: 12) {
+                            AgentIconView(asset: AgentTemplate.claudeCode.iconAsset,
+                                fallbackSymbol: AgentTemplate.claudeCode.symbol, size: 32)
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("Claude Code · " + model.source.displayTitle).font(.headline)
+                                Text(model.source.kind.map { "External session · " + $0.capitalized } ?? "External session")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                         }
-                        if model.step != .sourceStopped {
+                        Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 12) {
+                            GridRow {
+                                Text("Folder").foregroundStyle(.secondary)
+                                Text(model.source.cwd.path).textSelection(.enabled)
+                            }
+                            GridRow {
+                                Text("Conversation").foregroundStyle(.secondary)
+                                Text(model.source.displayTitle).textSelection(.enabled)
+                            }
+                        }.font(.subheadline)
+                        Text("Move here stops the original process before resuming this conversation in AgentPad. Closing this popup takes no process action.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                            .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
+                        if let message = model.message { Text(message).textSelection(.enabled) }
+                        if !model.completed, model.step != .sourceStopped {
                             Button("Go to source") { ExternalSessionActions.focus(model.source) }
+                                .accessibilityIdentifier("import-session-source")
                         }
+                    } else {
+                        Text(state.message ?? "This import ended. Choose the live source again; no process action is restored.")
                     }
-                } else {
-                    Text(state.message ?? "This import ended. Choose the live source again; no process action is restored.")
+                }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Divider()
+            HStack {
+                Spacer()
+                Button(state.importSession?.completed == true ? "Done" : "Cancel") { close() }
+                    .disabled(state.confirmation.isExecuting)
+                    .accessibilityIdentifier("import-session-cancel")
+                if let model = state.importSession, !model.completed {
+                    if model.step == .sourceStopped {
+                        Button("Resume conversation…") { model.retryResume() }
+                            .buttonStyle(PopupPrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                            .disabled(state.confirmation.showsBlock)
+                            .accessibilityIdentifier("import-session-resume")
+                    } else {
+                        Button(model.message == nil ? "Move here…" : "Retry…") { model.request() }
+                            .buttonStyle(PopupPrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                            .disabled(!model.current() || state.confirmation.showsBlock)
+                            .accessibilityIdentifier("import-session-move")
+                    }
                 }
-            }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
+            }.padding(.horizontal, 24).padding(.vertical, 14)
         }
+        .accessibilityElement(children: .contain).accessibilityIdentifier("import-session-content")
+    }
+    private func close() {
+        let model = state.importSession
+        let owner = model.flatMap { $0.router.owner(of: $0.tabID) } ?? SupportTabs.shared.owner(state)
+        guard let owner, !state.confirmation.isExecuting else { return }
+        owner.store.popups.dismiss(owner.session, reason: model?.completed == true ? .applied : .cancel)
     }
 }

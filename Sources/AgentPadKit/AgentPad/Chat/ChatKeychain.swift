@@ -20,6 +20,7 @@ protocol ChatTokenStore: Sendable {
 struct ChatKeychain: ChatTokenStore {
     static let service = "com.4kulia.agentpad.chat"
     var service = ChatKeychain.service
+    var label = "AgentPad server session"
 
     private func query(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
@@ -47,12 +48,12 @@ struct ChatKeychain: ChatTokenStore {
         var status = SecTrustedApplicationCreateFromPath(nil, &me)
         guard status == errSecSuccess, let me else { throw ChatError.keychain(Self.message(status)) }
         var access: SecAccess?
-        status = SecAccessCreate("AgentPad server session" as CFString, [me] as CFArray, &access)
+        status = SecAccessCreate(label as CFString, [me] as CFArray, &access)
         guard status == errSecSuccess, let access else { throw ChatError.keychain(Self.message(status)) }
         var q = query(account)
         q[kSecValueData as String] = Data(token.utf8)
         q[kSecAttrAccess as String] = access
-        q[kSecAttrLabel as String] = "AgentPad server session"
+        q[kSecAttrLabel as String] = label
         status = SecItemAdd(q as CFDictionary, nil)
         guard status == errSecSuccess else { throw ChatError.keychain(Self.message(status)) }
     }

@@ -19,6 +19,7 @@ final class SupportTabsTests: XCTestCase {
             for section in SettingsTabSection.allCases { XCTAssertNil(gate.open(.settings, section: section)) }
             XCTAssertNil(gate.open(.notifications)); XCTAssertNil(gate.open(.linkFailure))
             XCTAssertEqual(hosts, 0); XCTAssertTrue(store.allSessions.isEmpty)
+            XCTAssertTrue(store.popups.sessions.isEmpty); XCTAssertFalse(store.popups.isPresented)
             // The unchanged startup operation commits first; only then is the
             // Settings model constructed. Both import and fresh follow this gate.
             var values: [String: Any] = imported ? ["terminal": ["font-size": 17]] : [:]
@@ -26,8 +27,9 @@ final class SupportTabsTests: XCTestCase {
             let model = AgentPadSettingsModel(read: { values }, write: { values = $0; writes += 1 }, appliesRuntimeEffects: false)
             XCTAssertEqual(writes, 0)
             gate.finishStartup()
-            XCTAssertEqual(store.allSessions.count, 3)
-            XCTAssertEqual(store.allSessions.first { $0.toolRoute == .settings }?.tabState?.navigation.settingsSection, .updates)
+            XCTAssertEqual(store.allSessions.map(\.toolRoute), [.notifications])
+            XCTAssertEqual(store.popups.sessions.map(\.toolRoute), [.settings, .linkFailure])
+            XCTAssertEqual(store.popups.sessions.first { $0.toolRoute == .settings }?.tabState?.navigation.settingsSection, .updates)
             model.addCustomAgent()
             try model.flushSaveChecked()
             let restored = AgentPadSettingsModel(read: { values }, write: { _ in }, appliesRuntimeEffects: false)
@@ -35,7 +37,7 @@ final class SupportTabsTests: XCTestCase {
             if imported { XCTAssertEqual(restored.fontSize, 17) }
         }
     }
-    func testSupportSectionsUseOneTabPerWindowAndRestoreSection() throws {
+    func testSupportSectionsUseOnePopupPerWindowAndRetainSectionUntilRelaunch() throws {
         let memory = InMemoryPersistence(), store = empty(InMemoryPersistence())
         let other = empty(memory)
         defer { store.terminate(); other.terminate() }
@@ -48,11 +50,19 @@ final class SupportTabsTests: XCTestCase {
         }
         let second = try XCTUnwrap(navigation.open(.settings, from: other, section: .advanced))
         XCTAssertFalse(first === second)
+        XCTAssertEqual(first.tabState?.navigation.settingsSection, .updates)
+        XCTAssertTrue(store.allSessions.isEmpty); XCTAssertTrue(other.allSessions.isEmpty)
         XCTAssertTrue(other.flushPersistence())
         let restored = empty(InMemoryPersistence(initial: memory.saved)); defer { restored.terminate() }
-        XCTAssertEqual(restored.allSessions.first?.tabState?.navigation.settingsSection, .advanced)
-        other.closeTab(second, in: try XCTUnwrap(other.active))
-        XCTAssertEqual(other.reopenLastClosedTab()?.tabState?.navigation.settingsSection, .advanced)
+        XCTAssertTrue(restored.allSessions.isEmpty)
+        XCTAssertTrue(restored.popups.sessions.isEmpty); XCTAssertFalse(restored.popups.isPresented)
+        other.popups.dismiss(reason: .dismiss)
+        XCTAssertFalse(other.popups.isPresented)
+        let reopened = try XCTUnwrap(navigation.open(.settings, from: other))
+        XCTAssertTrue(reopened === second)
+        XCTAssertEqual(reopened.tabState?.navigation.settingsSection, .advanced)
+        XCTAssertNil(other.reopenLastClosedTab(), "Popup dismissal does not create closed tab history")
+        XCTAssertEqual(restored.openToolTab(.settings).tabState?.navigation.settingsSection, .general)
     }
     func testUpdateCheckIsSingleFlightAndResultSurvivesReopening() async throws {
         var fetches = 0
@@ -84,15 +94,48 @@ final class SupportTabsTests: XCTestCase {
         let support = SupportTabs(router: router, ledger: ledger); support.navigation.finishStartup()
         let marker = "SECRET-OTP-TOKEN-RAW-URL"
         for _ in 0..<5 { support.linkFailed("Invalid agentpad://resume?token=\(marker)") }
-        XCTAssertEqual(store.allSessions.count, 1)
-        let state = try XCTUnwrap(store.allSessions.first?.tabState)
+        XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertEqual(store.popups.sessions.count, 1)
+        let popup = try XCTUnwrap(store.popups.sessions.first)
+        let state = try XCTUnwrap(popup.tabState)
         XCTAssertEqual(state.message, LinkFailureMessage.parameters.text)
-        let snapshot = try JSONEncoder().encode(PersistedTab(store.allSessions[0]))
+        let snapshot = try JSONEncoder().encode(PersistedTab(popup))
         XCTAssertFalse(String(decoding: snapshot, as: UTF8.self).contains(marker))
         for event in ledger.events where event.source == "link-failure" {
             XCTAssertFalse(event.body.contains(marker))
             XCTAssertFalse(String(decoding: try JSONEncoder().encode(event), as: UTF8.self).contains(marker))
         }
+    }
+
+    func testLinkFailureOKClosesAndNotificationsOpensItsExistingTab() async throws {
+        let store = empty(); defer { store.terminate() }
+        let router = TabRouter(); router.stores = { [store] }; router.ensureHost = { store }
+        let support = SupportTabs(router: router, ledger: AttentionLedger())
+        support.navigation.finishStartup()
+        _ = NSApplication.shared
+        let attribute = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previous = NSApp.accessibilityAttributeValue(attribute)
+        NSApp.accessibilitySetValue(true, forAttribute: attribute)
+        defer { NSApp.accessibilitySetValue(previous, forAttribute: attribute) }
+        support.linkFailed("Unavailable session")
+        let state = try XCTUnwrap(store.popups.sessions.first?.tabState)
+        let host = FoldersUIHost(support.content(state), width: 580, height: 280)
+        defer { host.close() }
+        try await host.settle()
+        XCTAssertTrue(host.press("OK"))
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertTrue(store.allSessions.isEmpty)
+
+        let notifications = try XCTUnwrap(router.open(.notifications, from: store))
+        support.linkFailed("Unavailable session")
+        let next = try XCTUnwrap(store.popups.sessions.first?.tabState)
+        let secondHost = FoldersUIHost(support.content(next), width: 580, height: 280)
+        defer { secondHost.close() }
+        try await secondHost.settle()
+        XCTAssertTrue(secondHost.press("Open Notifications"))
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertEqual(store.allSessions.map(\.id), [notifications.id])
+        XCTAssertEqual(store.allSessions.map(\.toolRoute), [.notifications])
     }
     func testSettingsCloseFailureCannotBeBypassedAndDiscardRestoresSharedModel() throws {
         let store = empty(); defer { store.terminate() }
@@ -101,14 +144,16 @@ final class SupportTabsTests: XCTestCase {
         let session = store.openToolTab(.settings), state = try XCTUnwrap(session.tabState)
         _ = support.content(state)
         model.addCustomAgent()
-        store.closeTab(session, in: try XCTUnwrap(store.active))
-        XCTAssertNotNil(state.saveError); XCTAssertEqual(store.allSessions.count, 1)
-        store.closeTab(session, in: try XCTUnwrap(store.active))
-        XCTAssertEqual(store.allSessions.count, 1)
-        store.tabCloseCoordinator.discard(session.id)
+        store.popups.dismiss(reason: .dismiss)
+        XCTAssertNotNil(state.saveError); XCTAssertTrue(store.popups.isPresented)
+        store.popups.dismiss(reason: .dismiss)
+        XCTAssertTrue(store.popups.isPresented); XCTAssertTrue(store.popups.contains(session.id))
+        store.popups.dismiss(reason: .cancel)
         XCTAssertTrue(model.customAgents.isEmpty)
         XCTAssertNil(model.saveError); XCTAssertFalse(model.isSaving)
         XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertFalse(store.popups.isPresented); XCTAssertFalse(store.popups.contains(session.id))
+        XCTAssertTrue(state.isClosed)
     }
     func testSettingsReloadPreservesUnsavedEditsAndReadsExternalChangesWhenClean() throws {
         var values: [String: Any] = [:]
@@ -133,8 +178,9 @@ final class SupportTabsTests: XCTestCase {
         values["terminal"] = ["font-size": 19]
         XCTAssertTrue(store.flushPersistence())
         XCTAssertEqual((values["terminal"] as? [String: Any])?["font-size"] as? Int, 19)
-        store.closeTab(session, in: try XCTUnwrap(store.active))
+        store.popups.dismiss(reason: .dismiss)
         XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertFalse(store.popups.isPresented)
         XCTAssertEqual(writes, 0, "layout saves and closing clean Settings must not write stale values")
     }
     func testSettingsDirtySaveRejectsExternalEditsUntilDiscarded() throws {
@@ -173,19 +219,20 @@ final class SupportTabsTests: XCTestCase {
         }, appliesRuntimeEffects: false)
         let support = SupportTabs(ledger: AttentionLedger()); support.settingsModel = { model }
         let session = store.openToolTab(.settings), state = try XCTUnwrap(session.tabState)
-        let workspace = try XCTUnwrap(store.active)
         _ = support.content(state)
         model.addCustomAgent()
-        store.closeTab(session, in: workspace)
-        XCTAssertTrue(store.tabCloseCoordinator.hasPending(session.id))
+        store.popups.dismiss(reason: .dismiss)
+        XCTAssertTrue(store.popups.isPresented)
+        XCTAssertTrue(store.popups.contains(session.id))
         XCTAssertNotNil(state.saveError)
 
         failing = false
-        // The Settings "Retry saving" button saves directly, outside the coordinator.
+        // The Settings "Retry saving" button saves directly, then Close retries dismissal.
         try model.flushSaveChecked(); state.saveError = nil
         XCTAssertNil(model.saveError)
-        store.closeTab(session, in: workspace)
+        store.popups.dismiss(reason: .dismiss)
         XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertFalse(store.popups.isPresented)
         XCTAssertFalse(store.tabCloseCoordinator.hasPending(session.id))
     }
     func testPickerCallbackRejectsMovedClosedAndEditedTarget() {
@@ -214,8 +261,10 @@ final class SupportTabsTests: XCTestCase {
         }
         support.settings(.about)
         XCTAssertEqual(models, 0); XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertTrue(store.popups.sessions.isEmpty)
         support.navigation.finishStartup()
-        XCTAssertEqual(store.allSessions.count, 1)
+        XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertEqual(store.popups.sessions.count, 1); XCTAssertTrue(store.popups.isPresented)
         support.settings(.updates)
         XCTAssertEqual(models, 1)
     }

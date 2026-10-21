@@ -77,3 +77,4 @@ docs/agentpad/
 # AgentPad: local scratch and review output
 *.local.md
 .scratch/
+reviews/

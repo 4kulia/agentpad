@@ -152,8 +152,10 @@ struct ChatSidebarView: View {
             focus = SidebarFocusRegion.next(focus, backwards: press.modifiers == .shift)
             return .handled
         }
-        .sheet(isPresented: $folders.sheetPresented) {
-            FoldersSheet(model: folders, entries: folderEntries(snapshot, includeHidden: true), telegram: telegram) { folders.sheetPresented = false }
+        .onChange(of: folders.popupRequested) { _, requested in
+            if requested {
+                folders.presentPopup(in: store.popups, entries: { folderEntries(self.snapshot, includeHidden: true) }, telegram: telegram)
+            }
         }
     }
 

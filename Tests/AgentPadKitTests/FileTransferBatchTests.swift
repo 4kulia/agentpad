@@ -5,13 +5,17 @@ import XCTest
 final class FileTransferBatchTests: XCTestCase {
     private var directory: URL!
     private var fm: TestTransferFileManager!
+    private var stores: [WorkspaceStore] = []
     override func setUp() async throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("file-batch-\(UUID())")
         fm = TestTransferFileManager(trashDirectory: directory.appendingPathComponent("Trash"))
         try fm.createDirectory(at: directory.appendingPathComponent("src"), withIntermediateDirectories: true)
         try fm.createDirectory(at: directory.appendingPathComponent("dst"), withIntermediateDirectories: true)
     }
-    override func tearDown() async throws { try? fm.removeItem(at: directory) }
+    override func tearDown() async throws {
+        stores.forEach { $0.terminate() }; stores = []
+        try? fm.removeItem(at: directory)
+    }
     @discardableResult private func write(_ path: String, _ text: String) throws -> URL {
         let url = directory.appendingPathComponent(path)
         try Data(text.utf8).write(to: url)
@@ -34,6 +38,64 @@ final class FileTransferBatchTests: XCTestCase {
         let batch = FileTransferBatch(.init(sources: sources, directory: directory.appendingPathComponent("dst"), mode: .copy), state: state, tabID: UUID())
         batch.fileManager = TransferFileIO(fm); state.fileOperation = batch
         return (state, batch)
+    }
+    private func popupFixture(_ names: [String]) throws -> (WorkspaceStore, TabState, FileTransferBatch) {
+        let sources = try names.map { name in
+            try write("dst/\(name)", "old-\(name)")
+            return try write("src/\(name)", "new-\(name)")
+        }
+        let store = makeTestStore(); stores.append(store)
+        let router = TabRouter(); router.stores = { [store] }
+        let batch = try XCTUnwrap(ProcessTabs(router: router).transfer(sources,
+            into: directory.appendingPathComponent("dst"), mode: .copy, from: store))
+        batch.fileManager = TransferFileIO(fm)
+        return (store, try XCTUnwrap(batch.state), batch)
+    }
+
+    func testDismissedWaitingConflictReopensSameChoiceAndApplyToAllDraft() async throws {
+        let (store, state, batch) = try popupFixture(["a", "b"])
+        let operation = Task { await batch.start() }
+        try await settle { batch.conflict?.lastPathComponent == "a" }
+        let conflict = batch.conflict
+        batch.applyToAll = true
+        store.popups.dismiss(reason: .dismiss)
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertTrue(batch.running)
+        XCTAssertFalse(batch.interrupted)
+        XCTAssertEqual(batch.conflict, conflict)
+        XCTAssertTrue(batch.applyToAll)
+        XCTAssertEqual(try read("dst/a"), "old-a")
+        let reopened = store.popups.present(state.route)
+        XCTAssertTrue(reopened.tabState === state)
+        XCTAssertTrue(reopened.tabState?.fileOperation === batch)
+        XCTAssertEqual(batch.conflict, conflict)
+        XCTAssertTrue(batch.applyToAll)
+        batch.choose(.keepBoth)
+        let result = await operation.value
+        XCTAssertEqual(result.done.map(\.lastPathComponent), ["a 2", "b 2"])
+        XCTAssertTrue(result.issues.isEmpty)
+        XCTAssertTrue(batch.snapshot.finished)
+        XCTAssertTrue(fm.trashed.isEmpty)
+    }
+
+    func testConflictReachedWhilePopupHiddenWaitsForExplicitChoice() async throws {
+        let (store, state, batch) = try popupFixture(["a"])
+        store.popups.dismiss(reason: .dismiss)
+        let operation = Task { await batch.start() }
+        try await settle { batch.conflict != nil || batch.interrupted }
+        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertEqual(batch.conflict?.lastPathComponent, "a")
+        XCTAssertTrue(batch.running)
+        XCTAssertFalse(batch.interrupted)
+        XCTAssertFalse(batch.snapshot.finished)
+        XCTAssertEqual(try read("dst/a"), "old-a")
+        XCTAssertTrue(store.popups.present(state.route).tabState === state)
+        batch.choose(.skip)
+        let result = await operation.value
+        XCTAssertEqual(result.skipped.map(\.lastPathComponent), ["a"])
+        XCTAssertTrue(result.done.isEmpty)
+        XCTAssertTrue(result.issues.isEmpty)
+        XCTAssertTrue(fm.trashed.isEmpty)
     }
 
     func testReplaceStagesThenTrashesAndKeepsOriginalInFixtureTrash() async throws {
@@ -105,6 +167,45 @@ final class FileTransferBatchTests: XCTestCase {
         XCTAssertEqual(fm.trashed.count, 2)
         XCTAssertEqual(try read("dst/a"), "new-a")
         XCTAssertEqual(try read("dst/b"), "new-b")
+    }
+
+    func testCancelReplaceReturnsToWaitingConflictWithoutStoppingTheOperation() async throws {
+        let (state, batch) = try fixture(["a"])
+        let operation = Task { await batch.start() }
+        try await settle { batch.conflict != nil }
+        let conflict = batch.conflict
+        batch.applyToAll = true
+        batch.replace(); state.confirmation.shown(true)
+        state.confirmation.cancel()
+        XCTAssertEqual(state.confirmation.phase, .cancelled)
+        XCTAssertEqual(batch.conflict, conflict)
+        XCTAssertTrue(batch.running)
+        XCTAssertTrue(batch.applyToAll)
+        XCTAssertEqual(try read("dst/a"), "old-a")
+        XCTAssertTrue(fm.trashed.isEmpty)
+        batch.choose(.skip)
+        let result = await operation.value
+        XCTAssertEqual(result, .init(done: [], doneSources: [], skipped: [directory.appendingPathComponent("src/a")], issues: []))
+        XCTAssertTrue(batch.snapshot.finished)
+    }
+
+    func testConflictIdentityAndProgressUseTheExistingTransferResult() async throws {
+        let (state, batch) = try fixture(["a", "b"])
+        let operation = Task { await batch.start() }
+        try await settle { batch.conflict?.lastPathComponent == "a" }
+        XCTAssertEqual(batch.conflictingSource, directory.appendingPathComponent("src/a"))
+        XCTAssertEqual(batch.completedCount, 0)
+        XCTAssertEqual(batch.progressTitle, "Files waiting for a choice")
+        batch.choose(.skip)
+        try await settle { batch.conflict?.lastPathComponent == "b" }
+        XCTAssertEqual(batch.conflictingSource, directory.appendingPathComponent("src/b"))
+        XCTAssertEqual(batch.completedCount, 1)
+        batch.choose(.keepBoth)
+        _ = await operation.value
+        XCTAssertEqual(batch.completedCount, 2)
+        XCTAssertEqual(batch.progressTitle, "Files completed")
+        XCTAssertNil(batch.conflictingSource)
+        XCTAssertTrue(state.navigation.fileTransfer?.finished == true)
     }
 
     func testStopCloseAndRestartNeverResumeAutomatically() async throws {

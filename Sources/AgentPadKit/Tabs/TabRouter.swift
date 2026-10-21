@@ -29,6 +29,7 @@ final class TabRouter {
 
     func owner(of id: TabID) -> Location? {
         for store in stores() where !store.isTerminated {
+            if let location = store.popups.location(of: id) { return location }
             for workspace in store.workspaces {
                 for pane in workspace.root.allPanes {
                     if let session = pane.tabs.first(where: { $0.id == id }) {
@@ -39,7 +40,18 @@ final class TabRouter {
         }
         return nil
     }
+    func owner(of state: TabState) -> Location? {
+        for store in stores() where !store.isTerminated {
+            if let session = (store.allSessions + store.popups.sessions).first(where: { $0.tabState === state }) {
+                return owner(of: session.id)
+            }
+        }
+        return nil
+    }
     func find(_ route: ToolRoute, windowID: UUID) -> Location? {
+        if route.presentation == .popup {
+            return stores().first { !$0.isTerminated && $0.windowID == windowID }?.popups.find(route)
+        }
         let key = route.key(windowID: windowID)
         var matches: [Location] = []
         for store in stores() where !store.isTerminated {
@@ -95,6 +107,15 @@ final class TabRouter {
             self?.open(route, from: initiator, section: section, load: load)
         }) { return nil }
         guard let store = initiator ?? ensureHost(), !store.isTerminated else { return nil }
+        if route.presentation == .popup {
+            let existing = store.popups.find(route)
+            let session = store.popups.present(route)
+            if let section { session.tabState?.select(section) }
+            revealWindow(store)
+            if existing == nil, let load, let state = session.tabState { Task { await load(state) } }
+            return session
+        }
+        store.popups.dismiss(reason: .dismiss)
         if let existing = find(route, windowID: store.windowID) {
             if let section { existing.session.tabState?.select(section) }
             reveal(existing); return existing.session
@@ -107,6 +128,11 @@ final class TabRouter {
         return session
     }
     func reveal(_ location: Location) {
+        if location.store.popups.contains(location.session.id), let route = location.session.toolRoute {
+            location.store.popups.present(route)
+            revealWindow(location.store)
+            return
+        }
         location.workspace.zoomedPaneId = nil
         location.store.activateWorkspace(location.workspace)
         location.store.activateTab(location.session, in: location.workspace)
@@ -115,6 +141,19 @@ final class TabRouter {
     @discardableResult
     func rekey(_ id: TabID, to route: ToolRoute) -> Session? {
         guard let current = owner(of: id), let state = current.session.tabState else { return nil }
+        if current.store.popups.contains(id) {
+            if route.presentation == .popup {
+                state.route = route; current.session.content = .tool(route)
+                return current.session
+            }
+            current.store.popups.dismiss(current.session, reason: .applied)
+            return open(route, from: current.store)
+        }
+        if route.presentation == .popup {
+            guard current.store.tabCloseCoordinator.prepare([current.session]) else { return nil }
+            current.store.closeTab(current.session, in: current.workspace)
+            return open(route, from: current.store)
+        }
         if let existing = find(route, windowID: current.store.windowID), existing.session.id != id {
             // Save before coalescing; a conflicting edit stays in DraftRepository.
             guard current.store.tabCloseCoordinator.prepare([current.session]) else { return nil }
@@ -127,6 +166,12 @@ final class TabRouter {
     }
     @discardableResult
     func rekey(_ id: TabID, to channel: ChannelRef) -> Session? {
+        if let current = owner(of: id), current.store.popups.contains(id) {
+            current.store.popups.dismiss(current.session, reason: .applied)
+            let session = current.store.showChannel(channel)
+            revealWindow(current.store)
+            return session
+        }
         guard let current = owner(of: id), current.session.toolRoute != nil,
               current.store.tabCloseCoordinator.prepare([current.session]) else { return nil }
         for store in stores() where !store.isTerminated {

@@ -45,6 +45,7 @@ struct ChatUX1Composer: View {
     let members: [ChatOrgView.Member]
     let mentionable: [(account: String, handle: String)]
     let agents: [ChatChannelAgent]
+    var threadHidden = false
     @State private var text = ""
     @State private var control = ChatEditorControl()
     @State private var editorHeight: CGFloat = 58
@@ -92,7 +93,7 @@ struct ChatUX1Composer: View {
 
     }
 
-    private var org: ChatOrgModel? { ChatOrgCurrent.shared.model }
+    private var org: ChatOrgModel? { model.service.orgCurrent.model }
     private var card: ChatChannelCard? { org?.visibleChannel(model.channel) }
     private var candidates: [ChatMentionCandidate] {
         let people = mentionable.map { member in
@@ -209,7 +210,7 @@ struct ChatUX1Composer: View {
             }
         }
         .onChange(of: model.focusRequest) { _, request in
-            if request?.area == .composer, root == model.threadRoot { control.focus() }
+            if request?.area == .composer, root == (threadHidden ? nil : model.threadRoot) { control.focus() }
         }
         .task(id: root ?? "") {
             let draft = model.composerDraft(root: root)

@@ -60,8 +60,12 @@ final class TelegramSearchModel {
         guard let row = resolved else {
             value.notice = "This Telegram chat could not be opened. Try again when connected."; return false
         }
-        guard TelegramTabs.open(row, from: store, beside: beside, router: router) != nil else { return false }
-        if addToFolder { SidebarFolderActions.shared.present(.telegram(row.id.chat), binding: binding, windowID: store.windowID) }
+        let opened = store.popups.performSearchAction {
+            guard TelegramTabs.open(row, from: store, beside: beside, router: router) != nil else { return false }
+            if addToFolder { SidebarFolderActions.shared.present(.telegram(row.id.chat), binding: binding, windowID: store.windowID) }
+            return true
+        }
+        guard opened else { return false }
         await provider.didOpenChat(row.id)
         return true
     }

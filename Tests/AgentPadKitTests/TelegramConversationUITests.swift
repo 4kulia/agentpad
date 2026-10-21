@@ -1,5 +1,6 @@
 import AgentPadTelegram
 import AppKit
+import SwiftUI
 import XCTest
 @testable import AgentPadKit
 @testable import AgentPadTelegram
@@ -43,6 +44,64 @@ actor ConversationUIFake: TelegramConversationProvider {
 
 @MainActor final class TelegramConversationUITests: XCTestCase {
     let id = TelegramChatID(environment: .test, account: 101, chat: -202)
+    func testBotPopupRendersSuppliedTextAndDismissesOnlyItsRequest() async throws {
+        let model = TelegramConversationModel(id: id), pane = UUID(), coordinator = PopupCoordinator()
+        var snapshot = TelegramConversationSnapshot(destination: id)
+        snapshot.title = "Product updates bot"; snapshot.kind = .bot; snapshot.capabilities.canRead = true
+        model.receive(snapshot); model.panes.insert(pane)
+        let url = URL(string: "https://example.com/product-guide")!
+        model.applyBotResult(.answerWithURL("The bot asks you to open its documentation.", alert: false, url: url), pane: pane)
+        let dialog = try XCTUnwrap(model.botDialog)
+        let page = try XCTUnwrap(TelegramBotPopup.makePage(model: model, dialog: dialog, pane: pane, coordinator: coordinator))
+        XCTAssertTrue(coordinator.presentNative(page))
+        let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        _ = NSApplication.shared
+        let previous = NSApp.accessibilityAttributeValue(enhanced)
+        NSApp.accessibilitySetValue(true, forAttribute: enhanced)
+        let host = FoldersUIHost(Color.clear.popupHost(coordinator), width: 800, height: 600)
+        defer { host.close(); coordinator.terminate(); NSApp.accessibilitySetValue(previous, forAttribute: enhanced) }
+        try await host.settle()
+        try await assertPopupInventoryPresentation(in: host.window, root: host.view, coordinator: coordinator,
+            title: "Telegram bot")
+        XCTAssertEqual(coordinator.page?.title, "Telegram bot")
+        XCTAssertTrue(host.labels().contains("The bot asks you to open its documentation."))
+        XCTAssertTrue(host.labels().contains(url.absoluteString))
+        XCTAssertNil(host.window.attachedSheet)
+        XCTAssertTrue(coordinator.retainedRuntimeDrafts.isEmpty)
+        let originalDraft = model.draft
+        coordinator.dismiss(reason: .dismiss)
+        XCTAssertNil(model.botDialog)
+        XCTAssertEqual(model.draft, originalDraft)
+        XCTAssertFalse(coordinator.isPresented)
+    }
+
+    func testBotPopupRejectsStaleEpochPaneAndReplacedActions() throws {
+        let model = TelegramConversationModel(id: id), pane = UUID(), coordinator = PopupCoordinator()
+        var snapshot = TelegramConversationSnapshot(destination: id)
+        snapshot.capabilities.canRead = true; model.receive(snapshot)
+        model.panes.insert(pane)
+        model.applyBotResult(.confirmURL(URL(string: "https://example.com")!), pane: pane)
+        let first = try XCTUnwrap(model.botDialog)
+        XCTAssertNil(TelegramBotPopup.makePage(model: model, dialog: first, pane: UUID(), coordinator: coordinator))
+        let page = try XCTUnwrap(TelegramBotPopup.makePage(model: model, dialog: first, pane: pane, coordinator: coordinator))
+        coordinator.presentNative(page)
+        var dismissed = false
+        let staleView = TelegramBotPopup(model: model, dialogID: first.id, pane: pane, dismiss: { _ in dismissed = true })
+        model.applyBotResult(.alert("A newer response"), pane: pane)
+        let replacement = try XCTUnwrap(model.botDialog)
+        staleView.open()
+        XCTAssertFalse(dismissed, "An old action must not approve or close a replacement response")
+        coordinator.dismiss(page, reason: .cancel)
+        XCTAssertEqual(model.botDialog?.id, replacement.id)
+        model.panes.remove(pane)
+        XCTAssertNil(TelegramBotPopup.makePage(model: model, dialog: replacement, pane: pane, coordinator: coordinator))
+        model.panes.insert(pane)
+        model.receive(.init(destination: id, epoch: UUID()))
+        model.botDialog = replacement
+        XCTAssertNil(TelegramBotPopup.makePage(model: model, dialog: replacement, pane: pane, coordinator: coordinator))
+        coordinator.terminate()
+    }
+
     func testModelPublishesVisibilityGenerationBeforeEnqueuingAndInvalidatesOldEpoch() async throws {
         let model = TelegramConversationModel(id: id), provider = ConversationUIFake(), pane = UUID()
         model.provider = provider

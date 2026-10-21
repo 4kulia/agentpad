@@ -60,6 +60,12 @@ final class Session: Identifiable {
     var tabState: TabState? { (engine as? NativeTabEngine)?.state }
     /// A temporary restore failure must not replace the saved terminal tab.
     var unavailableTab: PersistedTab?
+    /// Revision-only SSH preflight and its blocked-tab presentation are runtime state.
+    var remoteClaudeAccountBlock: RemoteClaudeAccountBlock?
+    /// Names the account/host accepted by preflight so a later remote guard
+    /// refusal cannot be attributed to a newly selected profile account.
+    var remoteClaudeAccountLaunch: (id: UUID, block: RemoteClaudeAccountBlock)?
+    @ObservationIgnored var remoteClaudeAccountCheck: Task<Void, Never>?
     var hasProcess: Bool { content.hasProcess }
     var isChat: Bool { channel != nil || inbox != nil }
     /// Initial template the tab was opened with. Promoted at runtime when an
@@ -298,6 +304,17 @@ final class Session: Identifiable {
     /// re-seeds the `TextEditor` on re-appear). Runtime-only, not persisted.
     var composerActive = false
     var composerDraft = ""
+    /// Shared by pane activation and popup dismissal so the mounted composer
+    /// can reclaim focus through its own native text view.
+    var composerRefocusToken = UUID()
+
+    func focusPrimaryInput() {
+        if hasProcess && composerActive {
+            composerRefocusToken = UUID()
+        } else {
+            engine.focusPrimaryInput()
+        }
+    }
 
     /// URL under a ⌘-hover (`link-previews`) — drives the preview badge in
     /// the pane's bottom-left corner. Runtime-only, not persisted.
@@ -449,6 +466,8 @@ final class Session: Identifiable {
     var attentionReason: SessionAttentionReason = .input
     var awaitingAgentExitOutcome = false
     var pendingAgentLaunch: (id: UUID, isAgent: Bool)?
+    /// Runtime-only one-shot source; never part of saved session state.
+    var claudeAccountLaunch: ClaudeAccountLaunch?
     /// Some shells emit a first-prompt D after the explicit launch result.
     /// A preexec command marker opens the next command's result again.
     var reportedAgentLaunchExit = false
@@ -546,6 +565,7 @@ final class Session: Identifiable {
     var title: String { displayTitle }
 
     var displayTitle: String {
+        if let remoteClaudeAccountBlock { return remoteClaudeAccountBlock.profileName }
         if case .telegram = toolRoute { return tabState?.telegramTopicTitle ?? tabState?.telegramRow?.title ?? "Telegram" }
         // AgentPad: a channel tab shows its channel's name while it may be seen (DESIGN-F2).
         if case .directMessage(let ref) = toolRoute { return ChatDMTabs.title(ref) }

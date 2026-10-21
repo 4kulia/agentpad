@@ -168,29 +168,166 @@ extension TelegramConversationView {
             TelegramTabs.openSponsored(target, state: state)
         }
     }
-    func sponsoredDialogView(_ dialog: TelegramSponsoredDialog) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(dialog.title).font(Theme.display(17, weight: .semibold))
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(dialog.text).font(Theme.display(13)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                    ForEach(dialog.options) { option in
-                        Button(option.text) { sponsoredAction(.report(dialog.ref, step: dialog.step, option: option.id), ref: dialog.ref) }
-                            .frame(maxWidth: .infinity, alignment: .leading).disabled(model.sponsoredBusy)
+}
+
+struct TelegramSponsoredPopup: View {
+    @Bindable var model: TelegramConversationModel
+    let dialogID: UUID
+    let pane: UUID
+    let openChat: (TelegramChatID) -> Void
+    let dismiss: (PopupCoordinator.DismissReason) -> Void
+
+    var dialog: TelegramSponsoredDialog? {
+        model.sponsoredDialog.flatMap {
+            $0.id == dialogID && $0.pane == pane && $0.epoch == model.snapshot.epoch
+                && model.panes.contains(pane) && model.currentAd($0.ref) != nil ? $0 : nil
+        }
+    }
+    static func makePage(model: TelegramConversationModel, dialog: TelegramSponsoredDialog, pane: UUID,
+                         coordinator: PopupCoordinator,
+                         openChat: @escaping (TelegramChatID) -> Void = { _ in }) -> PopupCoordinator.NativePage? {
+        guard model.sponsoredDialog?.id == dialog.id, dialog.pane == pane, dialog.epoch == model.snapshot.epoch,
+              model.panes.contains(pane), model.currentAd(dialog.ref) != nil else { return nil }
+        let page = PopupCoordinator.NativePage(title: "Sponsored message")
+        page.onDismiss = { [weak model] _ in
+            if model?.sponsoredDialog?.id == dialog.id { model?.dismissSponsoredDialog() }
+        }
+        page.content = { [weak page, weak coordinator] in
+            AnyView(TelegramSponsoredPopup(model: model, dialogID: dialog.id, pane: pane, openChat: openChat, dismiss: { reason in
+                if let page { coordinator?.dismiss(page, reason: reason) }
+            }))
+        }
+        return page
+    }
+    var body: some View {
+        if let dialog, let ad = model.currentAd(dialog.ref) {
+            VStack(spacing: 0) {
+                PopupScrollBody(maxHeight: 420) {
+                    VStack(alignment: .leading, spacing: 20) {
+                        HStack(spacing: 3) {
+                            mode("Why this ad?", selected: dialog.step == nil && dialog.click == nil,
+                                 identifier: "telegram-sponsored-why", action: chooseWhy)
+                            if ad.canReport {
+                                mode("Report", selected: dialog.step != nil, identifier: "telegram-sponsored-report", action: chooseReport)
+                            }
+                            if TelegramSponsoredURL.checked(ad.url) != nil {
+                                mode("Website", selected: dialog.click != nil, identifier: "telegram-sponsored-website", action: chooseWebsite)
+                            }
+                        }.padding(3).background(Theme.chromeHover.opacity(0.35), in: RoundedRectangle(cornerRadius: 7))
+                            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.chromeHairline))
+                            .disabled(model.sponsoredBusy)
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text(dialog.title).font(Theme.display(18, weight: .semibold))
+                                Spacer()
+                                if model.sponsoredBusy { ProgressView().controlSize(.small) }
+                            }
+                            if dialog.click != nil, let url = URL(string: dialog.text) { TelegramPopupURL(url: url) }
+                            else {
+                                Text(dialog.text).font(Theme.display(12)).foregroundStyle(.secondary).textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        if !dialog.options.isEmpty {
+                            VStack(spacing: 8) {
+                                ForEach(dialog.options) { option in
+                                    Button { report(option) } label: {
+                                        HStack {
+                                            Text(option.text).frame(maxWidth: .infinity, alignment: .leading)
+                                            Image(systemName: "chevron.right").font(.system(size: 10))
+                                        }.font(Theme.display(12)).padding(12)
+                                            .background(Theme.chromeHover.opacity(0.35), in: RoundedRectangle(cornerRadius: 7))
+                                            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.chromeHairline))
+                                    }.buttonStyle(.plain).disabled(model.sponsoredBusy)
+                                }
+                            }
+                        }
+                        if dialog.why {
+                            Link("About Telegram Ads", destination: URL(string: "https://core.telegram.org/api/sponsored-messages")!)
+                                .buttonStyle(.bordered).font(Theme.display(11))
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(24)
+                }
+                Divider()
+                HStack {
+                    Spacer()
+                    if dialog.click != nil {
+                        Button("Cancel") { dismiss(.cancel) }.keyboardShortcut(.cancelAction)
+                            .accessibilityIdentifier("telegram-sponsored-cancel")
+                        Button("Open website") { openWebsite() }.buttonStyle(PopupPrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                            .disabled(model.sponsoredBusy).accessibilityIdentifier("telegram-sponsored-open")
+                    } else if dialog.step != nil {
+                        Button("Cancel") { dismiss(.cancel) }.keyboardShortcut(.cancelAction)
+                            .accessibilityIdentifier("telegram-sponsored-cancel")
+                    } else {
+                        Button("Done") { dismiss(.applied) }.buttonStyle(PopupPrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                            .accessibilityIdentifier("telegram-sponsored-done")
                     }
-                }
-            }.frame(maxHeight: 300)
-            HStack {
-                if dialog.why { Link("About Telegram Ads", destination: URL(string: "https://core.telegram.org/api/sponsored-messages")!) }
-                Spacer()
-                Button(dialog.click == nil && dialog.step == nil ? "Done" : "Cancel") { model.dismissSponsoredDialog() }.keyboardShortcut(.cancelAction)
-                if let target = dialog.click {
-                    Button("Open website") {
-                        model.sponsoredDialog = nil
-                        sponsoredAction(.click(dialog.ref, target, confirmed: true), ref: dialog.ref)
-                    }.keyboardShortcut(.defaultAction)
-                }
+                }.padding(.horizontal, 20).padding(.vertical, 14)
+            }.accessibilityElement(children: .contain).accessibilityIdentifier("telegram-sponsored-popup")
+        }
+    }
+    private func mode(_ title: String, selected: Bool, identifier: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title).font(Theme.display(11)).frame(maxWidth: .infinity).padding(.vertical, 6)
+                .background(selected ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 4))
+        }.buttonStyle(.plain).accessibilityIdentifier(identifier).accessibilityValue(selected ? "Selected" : "")
+    }
+    func chooseWhy() {
+        guard let dialog, !model.sponsoredBusy, let ad = model.currentAd(dialog.ref) else { return }
+        if dialog.step != nil { model.dismissSponsoredDialog() }
+        model.sponsoredInfo(ad, pane: pane, why: true)
+    }
+    func chooseReport() {
+        guard let dialog, !model.sponsoredBusy, model.currentAd(dialog.ref)?.canReport == true, dialog.step == nil else { return }
+        model.sponsoredAction(.report(dialog.ref, step: nil, option: nil), pane: pane, ref: dialog.ref, openChat: openChat)
+    }
+    func chooseWebsite() {
+        guard let dialog, !model.sponsoredBusy, let ad = model.currentAd(dialog.ref),
+              let url = TelegramSponsoredURL.checked(ad.url) else { return }
+        if dialog.step != nil { model.dismissSponsoredDialog() }
+        model.sponsoredDialog = .init(epoch: dialog.epoch, pane: pane, ref: dialog.ref,
+            title: "Open \(url.host ?? "website")?", text: url.absoluteString, click: .button)
+    }
+    func report(_ option: TelegramSponsoredReportOption) {
+        guard let dialog, !model.sponsoredBusy, dialog.options.contains(option) else { return }
+        model.sponsoredAction(.report(dialog.ref, step: dialog.step, option: option.id), pane: pane, ref: dialog.ref, openChat: openChat)
+    }
+    func openWebsite() {
+        guard let dialog, !model.sponsoredBusy, let target = dialog.click else { return }
+        // Removal must precede the new operation: the close callback cancels
+        // only an outstanding dialog, never the explicitly accepted click.
+        model.sponsoredDialog = nil
+        dismiss(.applied)
+        model.sponsoredAction(.click(dialog.ref, target, confirmed: true), pane: pane, ref: dialog.ref, openChat: openChat)
+    }
+}
+
+struct TelegramWebsitePopup: View {
+    let title: String
+    let subtitle: String
+    let url: URL
+    var busy = false
+    let cancel: () -> Void
+    let open: () -> Void
+    var body: some View {
+        VStack(spacing: 0) {
+            PopupScrollBody(maxHeight: 340) {
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(title).font(Theme.display(18, weight: .semibold))
+                        Text(subtitle).font(Theme.display(11)).foregroundStyle(.secondary)
+                    }
+                    TelegramPopupURL(url: url)
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(24)
             }
-        }.padding(24).frame(width: 440)
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction).accessibilityIdentifier("telegram-video-website-cancel")
+                Button("Open website", action: open).buttonStyle(PopupPrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                    .disabled(busy).accessibilityIdentifier("telegram-video-website-open")
+            }.padding(.horizontal, 20).padding(.vertical, 14)
+        }.accessibilityElement(children: .contain).accessibilityIdentifier("telegram-video-website-popup")
     }
 }

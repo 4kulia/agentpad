@@ -76,6 +76,7 @@ struct AgentProfileRow: View {
 
     private var expanded: Bool { showsSessions && store.expandedAgentProfiles.contains(profile.id) }
     private var template: AgentTemplate? { store.profileTemplates().first { $0.id == profile.templateID } }
+    var accountName: String? { profile.claudeAccountID.flatMap { store.agentProfiles.claudeAccounts.account($0)?.name } }
 
     var body: some View {
         let items = expanded ? store.profileSessionItems(profile) : []
@@ -99,7 +100,16 @@ struct AgentProfileRow: View {
                     HStack(alignment: .top, spacing: 7) {
                         ContactAvatar(stableID: profile.id.uuidString, name: profile.name, kind: .agent, size: 24, image: store.agentProfiles.details.image(profile.id))
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(profile.name).font(Theme.display(showsSessions ? 12 : 11, weight: .medium)).lineLimit(1)
+                            HStack(spacing: 6) {
+                                Text(profile.name).font(Theme.display(showsSessions ? 12 : 11, weight: .medium)).lineLimit(1)
+                                if let accountName {
+                                    Text(accountName).font(Theme.display(10.5, weight: .semibold)).lineLimit(1)
+                                        .padding(.horizontal, 6).frame(height: 17)
+                                        .foregroundStyle(Theme.claudeAccount)
+                                        .background(Theme.claudeAccount.opacity(Theme.chromeColorScheme == .dark ? 0.13 : 0.10), in: Capsule())
+                                        .help("Claude account: \(accountName)")
+                                }
+                            }
                             Text(folderCaption ?? (folderExists ? (template?.title ?? profile.templateID) + (expanded ? " · \(items.isEmpty ? "No sessions yet" : "\(items.count) sessions")" : "") : "Folder not found"))
                                 .font(Theme.display(showsSessions ? 10 : 9)).foregroundStyle(folderExists ? Theme.chromeMuted : .orange)
                         }

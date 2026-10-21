@@ -50,10 +50,7 @@ final class CompositionTabs {
         self.router = router; self.chat = chat; teamOverride = team; self.orgModel = orgModel
     }
     func owner(_ state: TabState) -> TabRouter.Location? {
-        for store in router.stores() {
-            if let session = store.allSessions.first(where: { $0.tabState === state }) { return router.owner(of: session.id) }
-        }
-        return nil
+        router.owner(of: state)
     }
     @discardableResult func open(_ route: ToolRoute, from store: WorkspaceStore? = nil) -> Session? {
         router.open(route, from: store)
@@ -70,12 +67,28 @@ final class CompositionTabs {
         state.discardEdits = { [weak model] in model?.reloadDraft() }
         return model
     }
+    func cancel(_ state: TabState) {
+        guard let owner = owner(state), state.forwardForm?.sending != true else { return }
+        do {
+            try state.askForm?.discard()
+            owner.store.popups.dismiss(owner.session, reason: .cancel)
+        } catch { state.saveError = error.localizedDescription }
+    }
+    func complete(_ state: TabState) {
+        guard let owner = owner(state), state.isPopup else { return }
+        owner.store.popups.dismiss(owner.session, reason: .applied)
+    }
     func newChannel(key: ChatOrgKey, teamID: String, from store: WorkspaceStore? = nil, fresh: Bool = false) {
         let scope = OrgKey(key)
-        let saved = router.stores().flatMap { $0.drafts.drafts }.first {
-            if case .newChannel(let key, let team, _) = $0.route { return key == scope && team == teamID }; return false
+        guard let store = store ?? router.ensureHost(), !store.isTerminated else { return }
+        let occupied = Set(router.stores().filter { $0 !== store && !$0.isTerminated }
+            .flatMap { $0.popups.sessions }.compactMap(\.toolRoute))
+        let saved = store.drafts.drafts.first {
+            if case .newChannel(let key, let team, _) = $0.route {
+                return key == scope && team == teamID && !occupied.contains($0.route)
+            }; return false
         }
-        let existing = router.stores().flatMap(\.allSessions).compactMap(\.toolRoute).first {
+        let existing = (store.popups.sessions + store.allSessions).compactMap(\.toolRoute).first {
             if case .newChannel(let key, let team, _) = $0 { return key == scope && team == teamID }; return false
         }
         let route = fresh ? .newChannel(scope, teamID: teamID, draftID: UUID()) : existing ?? saved?.route ?? .newChannel(scope, teamID: teamID, draftID: UUID())
@@ -154,6 +167,9 @@ final class CompositionTabs {
             guard let self, let state else { throw ChatError.notConnected }; try self.save(state)
         }
         model.isOpen = { [weak state] in state?.isClosed == false }
+        model.completed = { [weak self, weak state] in
+            guard let self, let state else { return }; self.complete(state)
+        }
         return model
     }
     func viewer(key: ChatOrgKey, message: ChatMessage, file: ChatAttachment, from store: WorkspaceStore? = nil) {
@@ -174,12 +190,13 @@ final class CompositionTabs {
             return draft.route.organizationScope == scope
         }
         for store in router.stores() {
+            let sessions = store.popups.sessions + store.allSessions
             for draft in store.drafts.drafts where matches(draft) {
                 if case .forward(_, let id) = draft.route { sources[id] = nil; snapshots = snapshots.filter { $0.value.id != id } }
                 do { try store.drafts.discard(draft.id) }
-                catch { store.allSessions.first { $0.tabState?.draft?.id == draft.id }?.tabState?.saveError = error.localizedDescription }
+                catch { sessions.first { $0.tabState?.draft?.id == draft.id }?.tabState?.saveError = error.localizedDescription }
             }
-            for state in store.allSessions.compactMap(\.tabState) where state.route.organizationScope == scope || state.draft.map(matches) == true {
+            for state in sessions.compactMap(\.tabState) where state.route.organizationScope == scope || state.draft.map(matches) == true {
                 if case .forward(_, let id) = state.route { sources[id] = nil; snapshots = snapshots.filter { $0.value.id != id } }
                 state.confirmation.invalidate()
                 state.forwardForm?.changed = {}; state.forwardForm?.active = false; state.forwardForm = nil
@@ -231,6 +248,20 @@ final class PersonalAskModel {
         }
     }
     var sentRequest: ChatRequest? { history.first { $0.requestId == fields.requestID } }
+    var receiptTitle: String { sentRequest == nil ? "Ask agent" : "Sent — Open request" }
+    func openRequest() {
+        guard let request = sentRequest, let state, let owner = tabs.owner(state) else { return }
+        RequestTabs.shared.open(request.requestId, scope: .server(OrgKey(key)), from: owner.store)
+    }
+    func closeReceipt() {
+        guard sentRequest != nil, let state else { return }
+        do {
+            // Consume only the form's saved request ID. The queued/running
+            // request remains in the request store and can still be opened.
+            try discard()
+            tabs.complete(state)
+        } catch { state.saveError = error.localizedDescription }
+    }
     var canSend: Bool {
         guard readable, sentRequest == nil, ChatChannelAsk.textProblem(prompt) == nil,
               let actions, let model = tabs.orgModel(), tabs.team.calls.serverKey == key else { return false }
@@ -255,6 +286,18 @@ final class PersonalAskModel {
         guard readable, let store = tabs.chat.orgSessions[key]?.store else { throw ChatError.notConnected }
         try ChatCompositionDrafts.save(fields, id: "ask:" + agentID, store: store)
         dirty = false; state?.saveError = nil
+    }
+    func discard() throws {
+        if let store = tabs.chat.orgSessions[key]?.store {
+            try store.queue.write { db in
+                guard let body = try String.fetchOne(db, sql: "SELECT body FROM composition_drafts WHERE id = ?",
+                                                     arguments: ["ask:" + agentID]),
+                      try JSONDecoder().decode(PersonalAskDraft.self, from: Data(body.utf8)).requestID == fields.requestID
+                else { return }
+                try db.execute(sql: "DELETE FROM composition_drafts WHERE id = ?", arguments: ["ask:" + agentID])
+            }
+        }
+        fields = .init(); dirty = false
     }
     func invalidate() { revoked = true; fields = .init(); dirty = false; watch = nil; followed = nil }
     func send() {
@@ -295,8 +338,10 @@ final class NewChannelModel {
         state.edit(.newChannelForm(fields))
     }
     var model: ChatOrgModel? { tabs.orgModel().flatMap { $0.key == key && $0.isCurrent() ? $0 : nil } }
+    var teamName: String { model?.channelTeams.first(where: { $0.teamId == teamID })?.name ?? "Team" }
     var readable: Bool { !revoked && state?.isClosed == false && ChatAttention.personalAllowed(key, tabs.chat) }
     func invalidate() { revoked = true; fields = .init() }
+    func cancel() { if let state { tabs.cancel(state) } }
     var canCreate: Bool {
         guard readable, !fields.submitted, let model,
               let team = model.channelTeams.first(where: { $0.teamId == teamID }), model.canCreateChannel(in: team),
@@ -324,7 +369,7 @@ final class NewChannelModel {
         guard readable, let state, let model, let owner = tabs.owner(state) else { return }
         // Checking the stable object ID also covers a crash between queueing and
         // saving submitted=true; opening never reissues channel.create.
-        guard model.visibleChannel(fields.channelID) != nil else { return }
+        guard fields.submitted || model.visibleChannel(fields.channelID) != nil else { return }
         guard tabs.router.rekey(owner.session.id, to: ChannelRef(key, channel: fields.channelID)) != nil else { return }
         if let id = state.navigation.draftID { try? owner.store.drafts.discard(id) }
     }

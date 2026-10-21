@@ -34,7 +34,7 @@ final class RequestTabs {
         return model
     }
     func tabID(_ state: TabState) -> UUID? {
-        router.stores().flatMap(\.allSessions).first { $0.tabState === state }?.id
+        router.owner(of: state)?.session.id
     }
     func clearReason(_ state: TabState) {
         guard let id = tabID(state), let owner = router.owner(of: id) else { return }
@@ -228,7 +228,15 @@ final class RequestTabModel {
         return state.confirmation.request(.init(tabID: tabID, targetID: id, scope: key.map(OrgKey.init),
             generation: reviewed.identity?.generation, revision: request.map { String($0.version) }, deadline: deadline),
             title: title, consequences: consequences, verb: verb, destructive: action == .decline || action == .withhold,
-            stillValid: valid) { [self] in
+            stillValid: valid, completion: { [weak self, weak state] accepted in
+                guard accepted, let self, let state, state.isPopup else { return }
+                // Version approval is one part of the request's review. The
+                // named request/folder/publication decision completes its form.
+                if case .version = action { return }
+                if let owner = self.tabs.router.owner(of: state) {
+                    owner.store.popups.dismiss(owner.session, reason: .applied)
+                }
+            }) { [self] in
                 var problem: String?
                 switch action {
                 case .allow, .decline:

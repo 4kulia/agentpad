@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import AgentPadKit
 
@@ -77,6 +79,10 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         let scope = try XCTUnwrap(state.route.teamScope)
         try await tabs.save(state, fields: tabs.form(state).fields, scope: scope, identity: tabs.connectionIdentity())
     }
+    private func reopen(_ agent: TeamPublishedAgent, from store: WorkspaceStore) throws -> TabState {
+        let editing = TeamAgentEditing(agent: agent, key: service.calls.serverKey)
+        return try XCTUnwrap(tabs.showPublication(editing, from: store)?.tabState)
+    }
     private func settle(_ condition: () -> Bool) async throws {
         for _ in 0..<500 {
             if condition() { return }
@@ -95,7 +101,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         return id
     }
 
-    func testListCardAndSessionConvergeAndTransferKeepsTheEditor() async throws {
+    func testListCardAndSessionConvergeWithinEachWindow() async throws {
         let a = store(), b = store(), conversation = try conversation()
         var agent = TeamPublishedAgent(name: "backend", description: "Backend", folder: root.path)
         agent.access = .read; agent.sessionId = conversation
@@ -104,13 +110,14 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         let first = try XCTUnwrap(tabs.showPublication(editing, from: a))
         let state = try XCTUnwrap(first.tabState)
         tabs.form(state).fields.budgetText = "invalid budget"
-        XCTAssertTrue(tabs.showPublication(editing, from: b) === first)
-        XCTAssertTrue(tabs.publish(sessionID: conversation, folder: root, surfaceID: UUID(), from: b) === first)
-        XCTAssertTrue(b.handleTabDrop(droppedId: first.id, in: try XCTUnwrap(b.active)))
-        XCTAssertTrue(router.owner(of: first.id)?.store === b)
+        let other = try XCTUnwrap(tabs.showPublication(editing, from: b))
+        XCTAssertFalse(other === first)
+        XCTAssertTrue(tabs.publish(sessionID: conversation, folder: root, surfaceID: UUID(), from: b) === other)
+        XCTAssertFalse(b.handleTabDrop(droppedId: first.id, in: try XCTUnwrap(b.active)))
+        XCTAssertTrue(router.owner(of: first.id)?.store === a)
         XCTAssertEqual(tabs.form(state).fields.budgetText, "invalid budget")
         XCTAssertEqual((first.engine as? NativeTabEngine)?.starts, 0)
-        XCTAssertEqual(stores.flatMap(\.allSessions).filter { $0.toolRoute == first.toolRoute }.count, 1)
+        XCTAssertEqual(stores.flatMap { $0.popups.sessions }.filter { $0.toolRoute == first.toolRoute }.count, 2)
     }
 
     func testResumedPrivateTitlesNeverSeedNewPublications() async throws {
@@ -139,6 +146,30 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         }
     }
 
+    func testSessionPublishRendersFriendlySourceConversationName() async throws {
+        let owner = store(), conversation = try conversation()
+        try await owner.sessionDisplaySources.names.rename("Review notification banners",
+            for: SessionNameKey(AgentTemplate.claudeCodeID, conversation))
+        let state = try XCTUnwrap(tabs.publish(sessionID: conversation, folder: root, from: owner)?.tabState)
+        let form = tabs.form(state)
+        await tabs.loadSource(state)
+        XCTAssertEqual(form.fields.sessionTitle, "Review notification banners")
+        let original = form.fields
+
+        _ = NSApplication.shared
+        let enhancedUI = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previous = NSApp.accessibilityAttributeValue(enhancedUI)
+        NSApp.accessibilitySetValue(true, forAttribute: enhancedUI)
+        defer { NSApp.accessibilitySetValue(previous, forAttribute: enhancedUI) }
+        let host = FoldersUIHost(TeamPublicationEditor(state: state, form: form, scope: .local, tabs: tabs),
+            width: 700, height: 850)
+        defer { host.close() }
+        try await host.settle()
+        XCTAssertEqual(Set(host.labels().filter { $0.hasPrefix("Source conversation:") }),
+            ["Source conversation: Review notification banners"])
+        XCTAssertEqual(form.fields, original, "Displaying the source name must not edit publication data")
+    }
+
     func testRenameDoesNotRefreshOpenSavedOrRestoredPublicationText() async throws {
         let closed = try ClosedSessionNameFixture(root: root.appendingPathComponent("rename"),
             metadata: ClosedSessionNameFixture.privateMetadata[2])
@@ -156,18 +187,21 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         XCTAssertEqual(tabs.form(state).fields, initial)
         try await save(state)
         let saved = try XCTUnwrap(service.calls.agents.first)
+        XCTAssertTrue(state.isClosed)
+        XCTAssertFalse(closed.store.popups.isPresented)
+        let editing = try reopen(saved, from: closed.store)
         try await closed.store.renameTab(source, to: "Refactor auth")?.value
         XCTAssertEqual(service.calls.agents.first, saved)
-        XCTAssertEqual(tabs.form(state).fields.name, "public-a")
-        XCTAssertEqual(tabs.form(state).fields.description, "public-a")
-        state.publicationForm = nil
-        XCTAssertEqual(tabs.form(state).fields.name, "public-a")
-        XCTAssertEqual(tabs.form(state).fields.description, "public-a")
+        XCTAssertEqual(tabs.form(editing).fields.name, "public-a")
+        XCTAssertEqual(tabs.form(editing).fields.description, "public-a")
+        editing.publicationForm = nil
+        XCTAssertEqual(tabs.form(editing).fields.name, "public-a")
+        XCTAssertEqual(tabs.form(editing).fields.description, "public-a")
 
         var draft = initial
         draft.name = "review"
         draft.description = "PRIVATE-TITLE-MARKER " + String(repeating: "confirmed details ", count: 8)
-        let restored = TabState(route: state.route)
+        let restored = TabState(route: editing.route)
         restored.edit(.publicationForm(try JSONDecoder().decode(PublicationDraft.self, from: JSONEncoder().encode(draft))))
         XCTAssertEqual(tabs.form(restored).fields, draft, "Saved drafts are restored verbatim, without title heuristics")
     }
@@ -201,16 +235,17 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         try await save(state)
         let saved = try XCTUnwrap(service.calls.agents.first)
         XCTAssertNil(saved.sessionId)
-        state.publicationForm = nil
-        let editing = tabs.form(state)
+        XCTAssertTrue(state.isClosed); XCTAssertFalse(a.popups.isPresented)
+        let editingState = try reopen(saved, from: a)
+        let editing = tabs.form(editingState)
         XCTAssertNil(editing.fields.sourceConversationID)
         // A draft saved by the earlier implementation may still carry this ID.
         editing.fields.sourceConversationID = id
-        await tabs.loadSource(state)
+        await tabs.loadSource(editingState)
         XCTAssertNil(editing.error)
         editing.fields.description = "Updated after the source was deleted"
         editing.fields.access = .editFiles
-        try await save(state)
+        try await save(editingState)
         XCTAssertEqual(service.calls.agents.first?.description, editing.fields.description)
         XCTAssertEqual(service.calls.agents.first?.access, .editFiles)
         XCTAssertEqual(service.calls.agents.first?.id, saved.id)
@@ -251,27 +286,30 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         XCTAssertNotEqual(second.toolRoute, restored.route)
     }
 
-    func testSaveRekeysSameTabAfterMoveAndDoubleConfirmationDoesNotDuplicate() async throws {
+    func testSaveKeepsInitiatingWindowAndDoubleConfirmationDoesNotDuplicate() async throws {
         let a = store(), b = store()
         let session = try XCTUnwrap(tabs.publish(from: a)), state = try XCTUnwrap(session.tabState)
         let form = fields(state), agentID = form.fields.agentID
         tabs.requestSave(state)
         XCTAssertTrue(state.confirmation.isAwaiting)
-        XCTAssertTrue(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
-        XCTAssertEqual(state.confirmation.phase, .invalidated)
-        tabs.requestSave(state); state.confirmation.canShow = { true }; state.confirmation.shown(true)
+        XCTAssertFalse(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
+        state.confirmation.canShow = { true }; state.confirmation.shown(true)
         state.confirmation.confirm(); state.confirmation.confirm()
         try await settle { state.confirmation.phase == .completed }
         XCTAssertEqual(service.calls.agents.map(\.id), [agentID])
-        XCTAssertEqual(session.toolRoute, .publication(.local, publicationID: agentID.uuidString.lowercased()))
-        XCTAssertTrue(router.owner(of: session.id)?.store === b)
+        XCTAssertTrue(state.isClosed); XCTAssertFalse(a.popups.isPresented)
+        XCTAssertNil(router.owner(of: session.id))
         XCTAssertNil(state.draft); XCTAssertTrue(drafts.drafts.isEmpty)
+        let reopened = try reopen(XCTUnwrap(service.calls.agents.first), from: a)
+        XCTAssertEqual(reopened.route, .publication(.local, publicationID: agentID.uuidString.lowercased()))
+        XCTAssertTrue(router.owner(of: reopened)?.store === a)
     }
 
     func testRightsAndVersionAreCheckedAfterPreparationWithoutLosingEdits() async throws {
         try server(); let a = store()
-        let session = try XCTUnwrap(tabs.publish(from: a)), state = try XCTUnwrap(session.tabState)
-        let form = fields(state), entered = form.fields
+        let session = try XCTUnwrap(tabs.publish(from: a))
+        var state = try XCTUnwrap(session.tabState), form = fields(state)
+        let entered = form.fields
         service.calls.afterPrepare = { [unowned self] in org.set(ChatOrgView(rightsInDoubt: true)) }
         do { try await save(state); XCTFail("Rights were lost") } catch {}
         XCTAssertEqual(form.fields, entered); XCTAssertTrue(service.calls.agents.isEmpty)
@@ -279,6 +317,8 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         try server(); service.calls.afterPrepare = {}
         try await save(state)
         let old = try XCTUnwrap(service.calls.agents.first)
+        XCTAssertTrue(state.isClosed); XCTAssertFalse(a.popups.isPresented)
+        state = try reopen(old, from: a); form = tabs.form(state)
         form.fields.description = "My unsaved edit"
         service.calls.afterPrepare = { [unowned self] in
             var changed = old; changed.description = "Changed elsewhere"
@@ -290,36 +330,39 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         XCTAssertEqual(publishing.sent.count, 1)
     }
 
-    func testSaveCompletionUsesTheNewOwnerAfterTransferDuringPreparation() async throws {
+    func testSaveCompletionKeepsInitiatingOwnerDuringPreparation() async throws {
         try server(); let a = store(), b = store()
         let session = try XCTUnwrap(tabs.publish(from: a)), state = try XCTUnwrap(session.tabState)
         let form = fields(state), id = form.fields.agentID
         service.calls.afterPrepare = {
-            XCTAssertTrue(b.handleTabDrop(droppedId: session.id, in: b.active!))
-            a.terminate()
+            XCTAssertFalse(b.handleTabDrop(droppedId: session.id, in: b.active!))
         }
         try await save(state)
-        XCTAssertTrue(router.owner(of: session.id)?.store === b)
-        XCTAssertEqual(session.toolRoute, .publication(.server(OrgKey(key)), publicationID: id.uuidString.lowercased()))
+        XCTAssertTrue(state.isClosed); XCTAssertFalse(a.popups.isPresented)
+        XCTAssertNil(router.owner(of: session.id))
         XCTAssertEqual(publishing.sent.count, 1)
         XCTAssertNil(state.draft); XCTAssertTrue(drafts.drafts.isEmpty)
+        let reopened = try reopen(XCTUnwrap(service.calls.agents.first), from: a)
+        XCTAssertTrue(router.owner(of: reopened)?.store === a)
+        XCTAssertEqual(reopened.route, .publication(.server(OrgKey(key)), publicationID: id.uuidString.lowercased()))
     }
 
     func testLateSavePreservesNewerDraftAfterCloseReopenAndClose() async throws {
-        try server(); let a = store(), workspace = try XCTUnwrap(a.active)
+        try server(); let a = store()
         let session = try XCTUnwrap(tabs.publish(from: a)), state = try XCTUnwrap(session.tabState)
         let form = fields(state), submittedText = form.fields.description
+        let route = state.route
         try a.tabCloseCoordinator.save(state)
         let submitted = try XCTUnwrap(state.draft)
         var newer: TabDraft?
         service.calls.afterPrepare = { [unowned self] in
-            a.closeTab(session, in: workspace)
-            let reopened = try! XCTUnwrap(a.reopenLastClosedTab())
+            a.popups.dismiss(reason: .dismiss)
+            let reopened = try! XCTUnwrap(router.open(route, from: a))
             let reopenedState = try! XCTUnwrap(reopened.tabState)
             tabs.form(reopenedState).fields.description = "New edits while the first Save is running"
             try! a.tabCloseCoordinator.save(reopenedState)
             newer = reopenedState.draft
-            a.closeTab(reopened, in: workspace)
+            a.popups.dismiss(reason: .dismiss)
         }
         try await save(state)
         let kept = try XCTUnwrap(newer)
@@ -328,8 +371,22 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         XCTAssertEqual(service.calls.agents.first?.description, submittedText)
         XCTAssertEqual(drafts.draft(kept.id), kept)
         XCTAssertEqual(DraftRepository(fileURL: root.appendingPathComponent("drafts.json")).draft(kept.id), kept)
-        let reopened = try XCTUnwrap(a.reopenLastClosedTab()?.tabState)
+        let reopened = try XCTUnwrap(router.open(route, from: a)?.tabState)
         XCTAssertEqual(tabs.form(reopened).fields.description, "New edits while the first Save is running")
+    }
+
+    func testSaveCompletionDoesNotReopenDismissedPopup() async throws {
+        let a = store()
+        let state = try XCTUnwrap(tabs.publish(from: a)?.tabState)
+        let form = fields(state)
+        var expected = TeamPublishedAgent(name: "backend", description: "Answers about the backend", folder: root.path)
+        expected.id = form.fields.agentID
+        service.calls.afterPrepare = { a.popups.dismiss(reason: .dismiss) }
+        try await save(state)
+        XCTAssertEqual(service.calls.agents, [expected])
+        XCTAssertNil(state.draft); XCTAssertTrue(drafts.drafts.isEmpty)
+        XCTAssertFalse(a.popups.isPresented)
+        XCTAssertTrue(a.allSessions.allSatisfy { $0.toolRoute != state.route })
     }
 
     func testLateSavePreservesNewerInputInTheSameEditor() async throws {
@@ -442,14 +499,14 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         XCTAssertNil(state.draft)
     }
 
-    func testPinnedSourceSurvivesMoveAndSaveWithoutReauthorizingAStoredSurface() async throws {
+    func testPinnedSourceSurvivesWindowCwdChangeAndSaveWithoutReauthorizingAStoredSurface() async throws {
         try server(); let a = store(), b = store(), conversation = try conversation(), surface = UUID()
         let session = try XCTUnwrap(tabs.publish(sessionID: conversation, folder: root, surfaceID: surface, from: a))
         let state = try XCTUnwrap(session.tabState)
         await tabs.loadSource(state)
         let form = tabs.form(state), folder = form.fields.folder
-        XCTAssertTrue(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
-        b.active?.workingDirectory = root.appendingPathComponent("elsewhere")
+        XCTAssertFalse(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
+        a.active?.workingDirectory = root.appendingPathComponent("elsewhere")
         var bound: [UUID?] = []
         tabs.bindPublication = { requestedKey, _, surface in
             XCTAssertEqual(requestedKey, self.key); bound.append(surface)
@@ -472,7 +529,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         XCTAssertEqual(form.fields.description, "My exact input\n")
         XCTAssertTrue(service.calls.agents.isEmpty)
         var closed = false
-        a.tabCloseCoordinator.request(try XCTUnwrap(a.active?.activeSession)) { closed = true }
+        a.tabCloseCoordinator.request(try XCTUnwrap(router.owner(of: state)?.session)) { closed = true }
         XCTAssertFalse(closed); XCTAssertNotNil(state.saveError)
     }
 
@@ -494,9 +551,11 @@ final class OrganizationPublicationTabsTests: XCTestCase {
 
     func testScopeAndUnpublishDecisionsCannotFollowAnotherAccountOrLocalMode() async throws {
         try server(); let a = store()
-        let state = try XCTUnwrap(tabs.publish(from: a)?.tabState)
+        var state = try XCTUnwrap(tabs.publish(from: a)?.tabState)
         _ = fields(state); try await save(state)
         let agent = try XCTUnwrap(service.calls.agents.first)
+        XCTAssertTrue(state.isClosed); XCTAssertFalse(a.popups.isPresented)
+        state = try reopen(agent, from: a)
         tabs.requestUnpublish([agent], state: state)
         state.confirmation.canShow = { true }; state.confirmation.shown(true)
         let other = ChatOrgKey(server: key.server, accountId: "another", orgId: key.orgId)
@@ -535,6 +594,44 @@ final class OrganizationPublicationTabsTests: XCTestCase {
         form.fields.renameTeamID = team.id; form.fields.renameText = "Cannot rename"
         form.rename(team, model: model)
         XCTAssertNotNil(form.renameError); XCTAssertEqual(sent, ["team.rename"])
+    }
+
+    func testOrganizationSectionsKeepApprovedOrderAndExistingPermissions() {
+        XCTAssertEqual(OrganizationTabs.sections(actions: Set(ChatOrgAction.allCases), hasDevices: true),
+            [.members, .teams, .invitations, .devices, .audit])
+        XCTAssertEqual(OrganizationTabs.sections(actions: ChatOrgAction.everyone, hasDevices: true),
+            [.members, .teams, .devices])
+        XCTAssertEqual(OrganizationTabs.sections(actions: nil, hasDevices: true), [.devices])
+        XCTAssertEqual(OrganizationTabs.sections(actions: nil, hasDevices: false), [])
+    }
+
+    func testOrganizationDismissKeepsAllUnsubmittedFieldsAndSelectedSection() throws {
+        let owner = store(), route = ToolRoute.organization(OrgKey(key))
+        let popup = try XCTUnwrap(router.open(route, from: owner)), state = try XCTUnwrap(popup.tabState)
+        let form = OrganizationFormState.form(state, model: nil)
+        let expected = OrganizationDraft(name: "Andrew", newTeam: "Design", email: "jane@example.test",
+            role: "admin", teams: ["engineering"], renameTeamID: "team", renameText: "Platform")
+        form.fields = expected
+        state.navigation.selection = AttentionOrganizationSection.invitations.rawValue
+        owner.popups.dismiss(reason: .dismiss)
+        XCTAssertFalse(owner.popups.isPresented)
+        let reopened = try XCTUnwrap(router.open(route, from: owner))
+        XCTAssertTrue(reopened === popup)
+        XCTAssertTrue(OrganizationFormState.form(try XCTUnwrap(reopened.tabState), model: nil) === form)
+        XCTAssertEqual(form.fields, expected)
+        XCTAssertEqual(state.navigation.selection, AttentionOrganizationSection.invitations.rawValue)
+        XCTAssertTrue(owner.popups.showsDraftNotice)
+        XCTAssertTrue(publishing.sent.isEmpty)
+        XCTAssertTrue(publishing.removed.isEmpty)
+    }
+
+    func testOrganizationDatesAreReadableWithoutInventingMissingValues() throws {
+        let locale = Locale(identifier: "en_US_POSIX"), zone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        XCTAssertEqual(OrganizationTabs.readableDate("2026-10-20T09:30:00Z", includesTime: false, locale: locale, timeZone: zone), "Oct 20, 2026")
+        XCTAssertEqual(OrganizationTabs.readableDate("2026-10-20T09:30:00.123Z", includesTime: false, locale: locale, timeZone: zone), "Oct 20, 2026")
+        XCTAssertEqual(OrganizationTabs.readableDate(nil), "Not available")
+        XCTAssertEqual(OrganizationTabs.readableDate(""), "Not available")
+        XCTAssertEqual(OrganizationTabs.readableDate("Not recorded by server"), "Not recorded by server")
     }
 
     func testArchiveFromContextMenuOpensChannelForInlineConfirmation() async throws {
@@ -595,7 +692,7 @@ final class OrganizationPublicationTabsTests: XCTestCase {
     func testArchiveConfirmationInvalidatesOnNavigationTransferAndConnectionChange() throws {
         let previousIdentity = TeamTabs.shared.connectionIdentity
         defer { TeamTabs.shared.connectionIdentity = previousIdentity }
-        for reason in ["tab", "window", "move", "close", "connection", "rights"] {
+        for reason in ["tab", "popup", "window", "move", "close", "connection", "rights"] {
             let a = store(), b = store()
             var identity = "sign-in-1"
             TeamTabs.shared.connectionIdentity = { identity }
@@ -611,7 +708,8 @@ final class OrganizationPublicationTabsTests: XCTestCase {
             XCTAssertTrue(confirmation.isAwaiting)
             confirmation.canShow = { true }; confirmation.shown(true)
             switch reason {
-            case "tab": _ = a.openToolTab(.settings)
+            case "tab": _ = a.openToolTab(.notifications)
+            case "popup": _ = a.openToolTab(.settings)
             case "window": a.setOnScreen(false)
             case "move": XCTAssertTrue(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
             case "close": a.closeTab(session, in: try XCTUnwrap(a.active))

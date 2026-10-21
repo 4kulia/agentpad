@@ -40,10 +40,7 @@ final class TeamTabs {
         return service.calls.serverKey.map { .server(OrgKey($0)) }
     }
     func owner(_ state: TabState) -> TabRouter.Location? {
-        for store in router.stores() {
-            if let session = store.allSessions.first(where: { $0.tabState === state }) { return router.owner(of: session.id) }
-        }
-        return nil
+        router.owner(of: state)
     }
     func canRead(_ scope: TeamScope) -> Bool {
         guard scope == currentScope else { return false }
@@ -106,9 +103,12 @@ final class TeamTabs {
             if case .publish(let s, _, let surface, let id) = $0 { return s == scope && surface == surfaceID && id == conversation }
             return false
         }
-        let stores = router.stores().filter { !$0.isTerminated }
-        let existing = newDraft ? nil : stores.flatMap(\.allSessions).compactMap(\.toolRoute).first(where: matches)
-            ?? stores.flatMap { $0.drafts.drafts }.sorted { $0.revision > $1.revision }.map(\.route).first(where: matches)
+        guard let store = store ?? router.ensureHost(), !store.isTerminated else { return nil }
+        let occupied = Set(router.stores().filter { $0 !== store && !$0.isTerminated }
+            .flatMap { $0.popups.sessions }.compactMap(\.toolRoute))
+        let existing = newDraft ? nil : (store.popups.sessions + store.allSessions).compactMap(\.toolRoute).first(where: matches)
+            ?? store.drafts.drafts.sorted { $0.revision > $1.revision }.map(\.route)
+                .first { matches($0) && !occupied.contains($0) }
         let route = existing ?? .publish(scope, draftID: UUID(), sourceSessionID: surfaceID, conversationID: conversation)
         guard let session = open(route, from: store), let state = session.tabState else { return nil }
         if state.publicationForm == nil, state.draft == nil { state.transient["publicationSourceFolder"] = folder?.path }

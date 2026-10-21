@@ -65,6 +65,14 @@ Click a row to open it. Opening a session clears its current input or error entr
 
 Sessions running in *other* terminals are detected for Claude Code only for now.
 
+### Claude accounts and SSH
+
+Settings → Claude accounts stores named Claude subscription tokens in the macOS Keychain. Choose an account in a Claude Code agent profile; Main account uses Claude's existing login on the machine running the agent.
+
+Profiles started in an SSH workspace run on that server. For a named account, install its token explicitly on each trusted SSH host from Settings → Claude accounts. Install, Update, Retry, Remove and Refresh status operate on the selected account and host. Replacing a token on this Mac does not send it anywhere automatically; hosts with the previous revision show **Out of date**. Missing, outdated or unreadable remote records block new sessions without switching to Main account.
+
+Installation sends the token once through an encrypted, non-PTY SSH input pipe. Later starts send account and revision identifiers only. The remote record is private to the remote user; server administrators and programs running as that user can still read it. Removing a record does not revoke the token or stop running sessions. See [Claude accounts over SSH](docs/claude-accounts-ssh.md) for storage, launch and security details.
+
 ## Files
 
 - **File tree** of the session's folder. It updates live as the agent creates, changes or deletes files, and shows git line counts on changed files.
@@ -180,8 +188,20 @@ AgentPad uses its own bundle id (`com.4kulia.agentpad`), its own settings (`~/.a
 ```sh
 swift build
 swift run                            # dev build
-swift test                           # unit tests
+python3 scripts/test-quiet.py         # unit/UI tests, offscreen and silent
 ```
+
+Native popup checks use `bash scripts/test-no-modals-ui.sh`. Both test runners
+isolate home/state under `.build`, inject the test audio/input guard, and log that
+the test app never becomes frontmost and its windows never intersect a screen.
+The harnesses refuse to start without the guard. Screenshots render the window's
+views. Selected-window routing is modeled separately from AppKit's real key/main
+ownership, which must remain false. Focus checks use each window's first
+responder; product Tab dispatch uses offscreen following/preceding responder
+APIs. Shortcuts check the installed menu's keys, modifiers, validation and actions
+through that same responder model. Native OS shortcut dispatch, key-window
+traversal and fullscreen/Space transitions are explicitly not run. Pass XCTest filters
+through `scripts/test-quiet.py --filter <pattern>`.
 
 Development happens on the `agentpad` branch.
 

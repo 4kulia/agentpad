@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import XCTest
 @testable import AgentPadKit
+@testable import AgentPadTelegram
 
 @MainActor
 final class SearchSuggestionsFocusTests: XCTestCase {
@@ -10,8 +11,12 @@ final class SearchSuggestionsFocusTests: XCTestCase {
     private var model: EverywhereSearchModel!
     private var window: SearchTestWindow!
     private var host: NSHostingView<SearchEverywhereField>!
+    private var previousEnhancedUI: Any?
 
     override func setUp() async throws {
+        _ = NSApplication.shared
+        previousEnhancedUI = NSApp.accessibilityAttributeValue(NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
+        NSApp.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
         root = FileManager.default.temporaryDirectory.appendingPathComponent("search-focus-\(UUID())")
         store = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true,
             agentProfiles: AgentProfileStore(fileURL: root.appendingPathComponent("profiles.json")),
@@ -21,7 +26,8 @@ final class SearchSuggestionsFocusTests: XCTestCase {
             XCTFail("Focus tests must not use the network"); return .init(hits: [], next: nil)
         }), indexing: .init(index: ConversationIndex(directory: root.appendingPathComponent("index"), roots: [:])),
             catalog: .init(scan: { _ in .init(records: [], scanned: 0, total: 0, skipped: 0) }),
-            names: SessionNames(url: root.appendingPathComponent("names.sqlite")))
+            names: SessionNames(url: root.appendingPathComponent("names.sqlite")),
+            telegram: .init(chats: TelegramChatsModel()))
         store.searchModel = model
         host = NSHostingView(rootView: SearchEverywhereField(store: store, model: model))
         host.frame = NSRect(x: 0, y: 250, width: 600, height: 40)
@@ -39,6 +45,7 @@ final class SearchSuggestionsFocusTests: XCTestCase {
         window.close(); store.terminate()
         host = nil; window = nil; model = nil; store = nil
         try? FileManager.default.removeItem(at: root)
+        NSApp.accessibilitySetValue(previousEnhancedUI, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
     }
 
     private func settle(_ condition: () -> Bool) async throws {
@@ -547,6 +554,250 @@ final class SearchSuggestionsFocusTests: XCTestCase {
         XCTAssertTrue(window.firstResponder === store.active?.activeSession?.engine.view)
     }
 
+    func testCommandCommaRestoresFocusedPersistentSearchAfterSettingsDismissal() async throws {
+        let content = try XCTUnwrap(window.contentView)
+        let popupHost = NSHostingView(rootView: SearchPopupTestContent(content: content).popupHost(store.popups))
+        popupHost.frame = content.frame
+        window.contentView = popupHost
+        popupHost.layoutSubtreeIfNeeded()
+        let terminal = try XCTUnwrap(store.active?.activeSession?.engine.view as? InputSink)
+        let router = TabRouter.shared
+        let previousAdmit = router.admit, previousStores = router.stores, previousHost = router.ensureHost
+        let previousSettings = SupportTabs.shared.settingsModel
+        let previousMenu = NSApp.mainMenu, previousWindows = NSApp.windowsMenu, previousHelp = NSApp.helpMenu
+        router.admit = nil; router.stores = { [self.store] }; router.ensureHost = { self.store }
+        SupportTabs.shared.settingsModel = { AgentPadSettingsModel(read: { [:] }, write: { _ in }, appliesRuntimeEffects: false) }
+        defer {
+            router.admit = previousAdmit; router.stores = previousStores; router.ensureHost = previousHost
+            SupportTabs.shared.settingsModel = previousSettings
+            NSApp.mainMenu = previousMenu; NSApp.windowsMenu = previousWindows; NSApp.helpMenu = previousHelp
+        }
+        let delegate = AppDelegate(appPersistence: AppPersistence(fileURL: root.appendingPathComponent("windows.json")),
+                                   agentProfiles: store.agentProfiles)
+        delegate.installMainMenu()
+        _ = try await open()
+        let field = try XCTUnwrap(model.fieldFocus.field)
+        XCTAssertTrue(window.firstResponder === field.currentEditor())
+        XCTAssertTrue(NSApp.mainMenu?.performKeyEquivalent(with: try key(43, ",", modifiers: .command)) == true)
+        guard case .tool(let settings) = store.popups.page else { return XCTFail("Command-comma must open Settings") }
+        XCTAssertEqual(settings.toolRoute, .settings)
+        try await assertPopupInventoryPresentation(in: window, root: popupHost, coordinator: store.popups,
+            title: "Settings", content: settings.engine.view)
+        XCTAssertFalse(model.fieldFocused); XCTAssertFalse(model.suggestions)
+        let query = model.query
+        NSApp.sendEvent(try key(7, "x"))
+        XCTAssertEqual(model.query, query)
+        XCTAssertEqual(terminal.input, "", "Typing while Settings is open must not reach the terminal")
+
+        NSApp.sendEvent(try key(53, "\u{1b}"))
+        XCTAssertFalse(store.popups.isPresented)
+        try await settle { self.model.fieldFocused }
+        XCTAssertTrue(model.fieldFocus.field === field, "The persistent search opener remains mounted")
+        XCTAssertTrue(window.firstResponder === field.currentEditor())
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+        NSApp.sendEvent(try key(6, "z"))
+        XCTAssertEqual(model.query, query + "z", "Typing after dismissal must return to search")
+        XCTAssertEqual(terminal.input, "")
+    }
+
+    private func withPopupRouting(_ body: (NSView) async throws -> Void) async throws {
+        _ = SupportTabs.shared
+        let content = try XCTUnwrap(window.contentView)
+        let popupHost = NSHostingView(rootView: SearchPopupTestContent(content: content).popupHost(store.popups))
+        popupHost.frame = content.frame
+        window.contentView = popupHost
+        popupHost.layoutSubtreeIfNeeded()
+        let router = TabRouter.shared
+        let previousAdmit = router.admit, previousStores = router.stores, previousHost = router.ensureHost
+        router.admit = nil; router.stores = { [self.store] }; router.ensureHost = { self.store }
+        defer {
+            router.admit = previousAdmit; router.stores = previousStores; router.ensureHost = previousHost
+        }
+        try await body(popupHost)
+    }
+
+    private func closePopupBackToSearch(in popupHost: NSView, field: SearchTextField) async throws {
+        let page = try XCTUnwrap(store.popups.page, "Expected a search popup")
+        let content: NSView?
+        if case .tool(let session) = page { content = session.engine.view } else { content = nil }
+        try await assertPopupInventoryPresentation(in: window, root: popupHost, coordinator: store.popups,
+            title: page.presentationTitle, content: content)
+        let terminals = store.allSessions.compactMap { $0.engine.view as? InputSink }
+        XCTAssertFalse(terminals.isEmpty)
+        let query = model.query
+        XCTAssertFalse(model.suggestions); XCTAssertFalse(model.fieldFocused)
+        NSApp.sendEvent(try key(7, "x"))
+        XCTAssertEqual(model.query, query)
+        XCTAssertEqual(terminals.map(\.input), Array(repeating: "", count: terminals.count), "A search popup must isolate terminal input")
+        NSApp.sendEvent(try key(53, "\u{1b}"))
+        XCTAssertFalse(store.popups.isPresented)
+        try await settle { self.model.fieldFocused }
+        XCTAssertTrue(model.fieldFocus.field === field)
+        XCTAssertTrue(window.firstResponder === field.currentEditor())
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+        NSApp.sendEvent(try key(6, "z"))
+        XCTAssertEqual(model.query, query + "z")
+        XCTAssertEqual(terminals.map(\.input), Array(repeating: "", count: terminals.count))
+    }
+
+    func testAllQuickPopupRoutesRestoreSurvivingSearchOpener() async throws {
+        try await withPopupRouting { popupHost in
+            let workspace = try XCTUnwrap(self.store.active)
+            let scope = try OrgKey(server: "https://example.com", accountID: "me", orgID: "org")
+            let entries: [(String, PaletteItemKind, () -> Void)] = [
+                ("New SSH Workspace…", .createSSHWorkspace, { self.store.requestCreateSSHWorkspace() }),
+                ("Create Worktree", .createWorktree(workspaceId: workspace.id, windowId: self.store.windowID), {
+                    self.store.requestCreateWorktree(workspace)
+                }),
+                ("Published agent", .teamAgent(scope, "agent"), {
+                    SupportTabs.shared.navigation.open(.agent(scope, agentID: "agent"), from: self.store)
+                })
+            ]
+            for (title, kind, action) in entries {
+                let item = PaletteItem(id: title, title: title, subtitle: "release", kind: kind, symbol: "network", iconAsset: nil)
+                self.model.quickItems = { [item] }
+                self.model.activateQuick = { picked in XCTAssertEqual(picked, item); action() }
+                self.model.dismiss()
+                _ = try await self.open()
+                try await self.settle { self.model.quick == [item] }
+                let field = try XCTUnwrap(self.model.fieldFocus.field)
+                self.model.activate("q:" + item.id)
+                try await self.closePopupBackToSearch(in: popupHost, field: field)
+            }
+        }
+    }
+
+    private func searchButton(_ title: String, in root: NSView) throws -> FoldersAXNode {
+        var queue: [NSObject] = [root], seen: Set<ObjectIdentifier> = []
+        while let object = queue.popLast() {
+            guard seen.insert(ObjectIdentifier(object)).inserted else { continue }
+            let node = FoldersAXNode(object: object)
+            if (node.accessibilityLabel() == title || node.accessibilityTitle() == title),
+               object.responds(to: NSSelectorFromString("accessibilityPerformPress")) { return node }
+            queue += node.children
+            if let view = object as? NSView { queue += view.subviews }
+        }
+        return try XCTUnwrap(nil as FoldersAXNode?, "Missing button: \(title)")
+    }
+
+    func testBothTelegramSuggestionButtonsRestoreSearchAfterMouseClick() async throws {
+        try await withPopupRouting { popupHost in
+            for source in [SearchSource.all, .telegram] {
+                self.model.source = source
+                let panel = NSHostingView(rootView: SearchSuggestionsView(model: self.model))
+                panel.frame = NSRect(x: 70, y: 0, width: 460, height: 240)
+                self.host.superview?.addSubview(panel)
+                defer { panel.removeFromSuperview() }
+                _ = try await self.open()
+                try await self.settle { !self.model.localLoading }
+                panel.layoutSubtreeIfNeeded()
+                let field = try XCTUnwrap(self.model.fieldFocus.field)
+                let button = try self.searchButton("Connect Telegram…", in: panel)
+                let frame = panel.convert(self.window.convertFromScreen(button.accessibilityFrame()), from: nil)
+                try self.click(at: NSPoint(x: frame.midX, y: frame.midY), in: panel)
+                XCTAssertEqual(self.store.popups.sessions.last?.tabState?.navigation.settingsSection, .telegram)
+                panel.removeFromSuperview()
+                try await self.closePopupBackToSearch(in: popupHost, field: field)
+                @MainActor func hasDialog(_ view: NSView) -> Bool {
+                    view.accessibilityIdentifier() == "popup-dialog" || view.subviews.contains(where: hasDialog)
+                }
+                // Closing restores the responder synchronously; wait for the
+                // SwiftUI overlay to unmount before the next physical click.
+                try await self.settle {
+                    popupHost.layoutSubtreeIfNeeded()
+                    return !hasDialog(popupHost)
+                }
+            }
+        }
+    }
+
+    func testResultsPopupButtonsRestoreSurvivingSearchOpener() async throws {
+        await model.indexing.enable()
+        await model.indexing.pause(true)
+        try await withPopupRouting { popupHost in
+            let state = TabState(route: .search)
+            let panel = NSHostingView(rootView: SearchResultsTab(model: self.model, state: state, store: self.store))
+            panel.frame = NSRect(x: 0, y: 0, width: 600, height: 800)
+            self.host.superview?.addSubview(panel)
+            defer { panel.removeFromSuperview() }
+            for title in ["Connect Telegram…", "Connect a team…", "Search settings"] {
+                _ = try await self.open()
+                try await self.settle { !self.model.localLoading }
+                panel.layoutSubtreeIfNeeded()
+                let field = try XCTUnwrap(self.model.fieldFocus.field)
+                // Keyboard/AX activation preserves the focused search opener;
+                // an ordinary click outside search first focuses the results.
+                XCTAssertTrue(try self.searchButton(title, in: panel).accessibilityPerformPress())
+                try await self.closePopupBackToSearch(in: popupHost, field: field)
+            }
+        }
+    }
+
+    func testTelegramCommandShiftReturnFolderPopupRestoresSurvivingSearchOpener() async throws {
+        try await telegramFolderPopup(existingInOtherWindow: false)
+    }
+
+    func testTelegramFolderPopupPreservesSearchBeforeRevealingAnotherWindow() async throws {
+        try await telegramFolderPopup(existingInOtherWindow: true)
+    }
+
+    private func telegramFolderPopup(existingInOtherWindow: Bool) async throws {
+        let row = TelegramChatRow(id: .init(environment: .test, account: 42, chat: 7), title: "release folder",
+            username: "", kind: .person, unreadCount: 0, unreadMentionCount: 0, inMain: true, inArchive: false,
+            pinned: false, hidden: false, lastMessageDate: 100, knownRelevant: true)
+        var snapshot = TelegramChatSnapshot()
+        snapshot.state = .complete
+        snapshot.account = .init(environment: .test, account: 42, chat: 0)
+        snapshot.binding = .init(environment: .test, account: 42, connectionID: UUID())
+        snapshot.mainRows = [row]; snapshot.suggestionRows = [row]
+        snapshot.mainList.capacity = 1; snapshot.mainList.counts.rows = 1
+        let provider = FoldersUIProvider(snapshot: snapshot, rows: [.main: [row]])
+        model.telegram.chats.attach(provider)
+        try await settle { self.model.telegram.chats.connected }
+        model.source = .telegram
+        let completed = expectation(description: "Telegram selection and folder popup completed")
+        model.openTelegram = { hit, beside, addToFolder in
+            XCTAssertFalse(beside); XCTAssertTrue(addToFolder)
+            Task {
+                let opened = await self.model.telegram.open(hit, from: self.store, beside: beside, addToFolder: addToFolder)
+                XCTAssertTrue(opened)
+                if opened { self.model.dismiss() }
+                completed.fulfill()
+            }
+        }
+        try await withPopupRouting { popupHost in
+            let other = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: {
+                XCTFail("Opening Telegram must not create a terminal"); return TestEngine()
+            })
+            defer { other.terminate() }
+            let router = TabRouter.shared, previousReveal = TabRouter.shared.revealWindow
+            defer { router.revealWindow = previousReveal }
+            if existingInOtherWindow {
+                router.stores = { [self.store, other] }
+                _ = TelegramTabs.open(row, from: other)
+                router.revealWindow = { owner in
+                    if owner === other {
+                        // Revealing an existing chat's window ends the source
+                        // field's editing before the folder chooser opens.
+                        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: self.window)
+                    }
+                }
+            }
+            _ = try await self.open()
+            try await self.settle { self.model.telegram.hits.count == 1 }
+            let field = try XCTUnwrap(self.model.fieldFocus.field)
+            self.model.selected = "t:" + self.model.telegram.hits[0].id
+            XCTAssertTrue(self.window.performKeyEquivalent(with: try self.key(36, "\r", modifiers: [.command, .shift])))
+            await self.fulfillment(of: [completed], timeout: 2)
+            guard case .native(let page) = self.store.popups.page else { return XCTFail("Expected Add to folder popup") }
+            XCTAssertEqual(page.title, "Add to folder…")
+            XCTAssertEqual((existingInOtherWindow ? other : self.store).active?.activeSession?.toolRoute, .telegram(row.id))
+            try await self.closePopupBackToSearch(in: popupHost, field: field)
+        }
+    }
+
     func testPopoverResultViewAllAndSearchSettingsButtonsReceiveMouseClicks() async throws {
         let item = PaletteItem(id: "release", title: "Release tab", subtitle: "tab", kind: .agent(templateId: "terminal"), symbol: "terminal", iconAsset: nil)
         model.quickItems = { [item] }
@@ -556,6 +807,13 @@ final class SearchSuggestionsFocusTests: XCTestCase {
         panel.frame = NSRect(x: 80, y: 0, width: 450, height: 240)
         window.contentView?.addSubview(panel)
         defer { panel.removeFromSuperview() }
+        let content = try XCTUnwrap(window.contentView)
+        let popupHost = NSHostingView(rootView: SearchPopupTestContent(content: content).popupHost(store.popups))
+        popupHost.frame = content.frame
+        window.contentView = popupHost
+        popupHost.layoutSubtreeIfNeeded()
+        let originalSession = try XCTUnwrap(store.active?.activeSession)
+        let originalTabs = store.allSessions.map(\.id)
         var picked = false, opened = false
         model.activateQuick = { picked = $0.id == item.id }
         model.openResults = { opened = true }
@@ -590,12 +848,52 @@ final class SearchSuggestionsFocusTests: XCTestCase {
         try await settle { !self.model.quick.isEmpty && !self.model.localLoading }
         panel.layoutSubtreeIfNeeded()
         try click(at: NSPoint(x: 218, y: 110), in: panel) {
-            if self.store.active?.activeSession?.toolRoute != .settings { XCTAssertTrue(self.model.suggestions) }
+            if self.store.popups.sessions.first(where: { $0.toolRoute == .settings }) == nil {
+                XCTAssertTrue(self.model.suggestions, "Keep Search settings mounted until its action runs")
+            }
         }
+        guard case .tool(let settings) = store.popups.page else { return XCTFail("Search settings must open a popup") }
+        XCTAssertEqual(settings.toolRoute, .settings)
+        XCTAssertEqual(settings.tabState?.navigation.settingsSection, .search)
+        XCTAssertEqual(store.popups.sessions.map(\.id), [settings.id])
+        try await assertPopupInventoryPresentation(in: window, root: popupHost, coordinator: store.popups,
+            title: "Settings", content: settings.engine.view)
         try await settle { !self.model.suggestions }
-        XCTAssertEqual(store.active?.activeSession?.toolRoute, .settings)
-        XCTAssertEqual(store.active?.activeSession?.tabState?.navigation.settingsSection, .search)
+        XCTAssertFalse(model.fieldFocused)
+        func insidePopup(_ view: NSView) -> Bool {
+            if view.accessibilityIdentifier() == "popup-dialog" { return true }
+            return view.superview.map(insidePopup) ?? false
+        }
+        let responder = try XCTUnwrap(window.firstResponder as? NSView)
+        XCTAssertTrue(insidePopup(responder) || (responder as? NSTextView).flatMap { $0.delegate as? NSView }.map(insidePopup) == true,
+                      "Search settings must move keyboard focus inside the popup")
+        XCTAssertTrue(store.active?.activeSession === originalSession)
+        XCTAssertEqual(store.allSessions.map(\.id), originalTabs, "Opening Settings must preserve the underlying tabs")
+        let terminal = try XCTUnwrap(originalSession.engine.view as? InputSink)
+        let query = model.query
+        NSApp.sendEvent(try key(7, "x"))
+        XCTAssertEqual(model.query, query)
+        XCTAssertEqual(terminal.input, "", "Search settings must isolate terminal input")
+        // The suggestions popover disappears on dismissal. Its keyboard
+        // opener is the still-mounted search field, not the transient button.
+        panel.removeFromSuperview()
+        NSApp.sendEvent(try key(53, "\u{1b}"))
+        XCTAssertFalse(store.popups.isPresented)
+        try await settle { self.model.fieldFocused }
+        let field = try XCTUnwrap(model.fieldFocus.field)
+        XCTAssertTrue(window.firstResponder === field.currentEditor())
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+        NSApp.sendEvent(try key(6, "z"))
+        XCTAssertEqual(model.query, query + "z", "Closing Search settings must restore its surviving search opener")
+        XCTAssertEqual(terminal.input, "")
     }
+}
+
+private struct SearchPopupTestContent: NSViewRepresentable {
+    let content: NSView
+    func makeNSView(context: Context) -> NSView { content }
+    func updateNSView(_ view: NSView, context: Context) {}
 }
 
 private final class SearchTestMenu: NSMenu {

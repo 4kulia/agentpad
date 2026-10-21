@@ -3,7 +3,7 @@ import SwiftUI
 
 struct TelegramSettingsView: View {
     @Bindable var model: TelegramSettingsViewModel
-    @State private var confirmLocalRemoval = false
+    @Environment(\.popupCoordinator) private var popupCoordinator
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -53,12 +53,6 @@ struct TelegramSettingsView: View {
         .frame(maxWidth: 680, alignment: .leading)
         .disabled(model.isWorking)
         .task { model.start() }
-        .alert("Remove Telegram data only from this Mac?", isPresented: $confirmLocalRemoval) {
-            Button("Cancel", role: .cancel) {}
-            Button("Remove local data", role: .destructive) { Task { await model.removeLocalData() } }
-        } message: {
-            Text("This does not log out the session on Telegram. Revoke AgentPad in Telegram → Settings → Devices. The local session, cache, and settings will be removed from this Mac.")
-        }
         .accessibilityIdentifier("telegram-settings")
     }
 
@@ -183,6 +177,15 @@ struct TelegramSettingsView: View {
     }
     private var cancel: some View { Button("Cancel") { Task { await model.disconnect() } } }
     private var localRemoval: some View {
-        Button("Remove data only from this Mac…", role: .destructive) { confirmLocalRemoval = true }
+        Button("Remove data only from this Mac…", role: .destructive) {
+            if let popupCoordinator { Self.presentLocalRemoval(model: model, coordinator: popupCoordinator) }
+        }.accessibilityIdentifier("telegram-remove-local-data")
+    }
+    static func presentLocalRemoval(model: TelegramSettingsViewModel, coordinator: PopupCoordinator) {
+        coordinator.presentConfirmation(title: "Remove Telegram local data",
+            message: "Remove Telegram data only from this Mac?\n\nThis does not log out the session on Telegram. Revoke AgentPad in Telegram → Settings → Devices. The local session, cache, and settings will be removed from this Mac.",
+            verb: "Remove local data") {
+                Task { await model.removeLocalData() }
+            }
     }
 }

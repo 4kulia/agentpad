@@ -93,7 +93,7 @@ struct SearchSuggestionsView: View {
                         if model.telegram.opening { noticeText("Opening Telegram chat…") }
                         if let notice = model.telegram.value.notice { noticeText(notice) }
                         if !model.telegram.chats.connected {
-                            Button("Connect Telegram…") { model.dismiss(); SupportTabs.shared.settings(.telegram) }.buttonStyle(.plain).padding(9)
+                            Button("Connect Telegram…") { SupportTabs.shared.settings(.telegram) }.buttonStyle(.plain).padding(9)
                         } else if model.telegram.hits.isEmpty && !model.telegram.value.searching {
                             noticeText("No matches in available Telegram sources")
                         }
@@ -126,7 +126,7 @@ struct SearchSuggestionsView: View {
                     if !model.query.isEmpty, (try? SearchQuery(model.query)) == nil { noticeText(SearchProblem.invalidQuery.localizedDescription) }
                     if !model.hasTeam, model.source != .telegram { noticeText(ChatSearchAvailability.noTeam.message!) }
                     if model.source == .all, !model.telegram.chats.connected {
-                        Button("Connect Telegram…") { model.dismiss(); SupportTabs.shared.settings(.telegram) }.buttonStyle(.plain).padding(9)
+                        Button("Connect Telegram…") { SupportTabs.shared.settings(.telegram) }.buttonStyle(.plain).padding(9)
                     }
                 }.padding(8)
             }.frame(maxHeight: 490)

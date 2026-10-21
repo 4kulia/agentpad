@@ -42,9 +42,12 @@ final class SidebarFoldersModel {
     private(set) var custom: [UUID:SidebarCustomProjection] = [:]
     private(set) var summaryMembers: Set<SidebarAgentPadReference> = []
     @ObservationIgnored private(set) var summarySource: SidebarFolderSummarySource?
-    var sheetPresented = false
+    var popupRequested = false
     var editing: UUID?
+    var editingName = ""
+    var popupSelection: String?
     var deleting: SidebarCustomFolder?
+    @ObservationIgnored weak var popup: PopupCoordinator.NativePage?
     var error: String?
     struct FailedOperation {
         let id = UUID()

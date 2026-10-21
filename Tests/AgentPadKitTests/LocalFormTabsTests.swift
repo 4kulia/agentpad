@@ -51,12 +51,86 @@ final class LocalFormTabsTests: XCTestCase {
         XCTAssertTrue(router.owner(of: session.id)?.store === store)
     }
 
+    func testLocalPopupDismissalKeepsInputAndCancelDiscardsWithoutApplying() throws {
+        let owner = store(), workspace = try XCTUnwrap(owner.active)
+        let originalSessions = owner.allSessions.map(\.id)
+        let routes: [ToolRoute] = [.newSSH(draftID: UUID()),
+            .newWorktree(repository: directory.path, sourceWorkspaceID: workspace.id, draftID: UUID()),
+            .workspaceDetails(workspace.id)]
+        for route in routes {
+            let session = try XCTUnwrap(router.open(route, from: owner))
+            let state = try XCTUnwrap(session.tabState), form = tabs.form(state)
+            switch route {
+            case .newSSH: form.name = "Remote draft"; form.host = "alice@build"
+            case .newWorktree:
+                form.worktree = WorktreeFormDraft(branch: "popup-draft", startRef: "HEAD",
+                    directory: directory.appendingPathComponent("unused").path)
+            case .workspaceDetails:
+                form.tag = WorkspaceTagDraft(name: "Review draft", hex: "123ABC")
+            default: XCTFail("Unexpected route")
+            }
+            let expected = try XCTUnwrap(state.draft)
+            XCTAssertTrue(state.isPopup)
+            XCTAssertEqual(owner.allSessions.map(\.id), originalSessions)
+            owner.popups.dismiss(reason: .dismiss)
+            XCTAssertFalse(owner.popups.isPresented)
+            XCTAssertFalse(state.isClosed)
+            XCTAssertEqual(owner.drafts.draft(expected.id), expected)
+            XCTAssertTrue(router.open(route, from: owner) === session)
+            XCTAssertTrue(owner.popups.draftKept)
+            XCTAssertEqual(state.draft, expected)
+            tabs.cancel(state)
+            XCTAssertTrue(state.isClosed)
+            XCTAssertNil(router.owner(of: session.id))
+            XCTAssertNil(owner.drafts.draft(expected.id))
+            XCTAssertEqual(owner.workspaces.map(\.id), [workspace.id])
+            XCTAssertNil(workspace.tag)
+            XCTAssertNil(workspace.sshRemoteHost)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("unused").path))
+        }
+    }
+
+    func testWorktreeOperationFinishesAfterPopupDismissalWithoutRunningGit() async throws {
+        let owner = store(), source = try XCTUnwrap(owner.active)
+        let route = ToolRoute.newWorktree(repository: directory.path, sourceWorkspaceID: source.id, draftID: UUID())
+        let session = try XCTUnwrap(router.open(route, from: owner)), state = try XCTUnwrap(session.tabState)
+        let form = tabs.form(state), destination = directory.appendingPathComponent("not-created-by-test")
+        form.worktree = WorktreeFormDraft(branch: "popup-branch", startRef: "HEAD", directory: destination.path)
+        var calls = 0
+        tabs.addWorktree = { root, path, mode in
+            calls += 1
+            XCTAssertEqual(root.path, self.directory.path)
+            XCTAssertEqual(path, destination)
+            if case .newBranch(let name, let base) = mode {
+                XCTAssertEqual(name, "popup-branch"); XCTAssertEqual(base, "HEAD")
+            } else { XCTFail("Expected a new-branch request") }
+            XCTAssertTrue(form.working)
+            owner.popups.dismiss(reason: .dismiss)
+            XCTAssertFalse(owner.popups.isPresented)
+            XCTAssertFalse(state.isClosed)
+            return .success(())
+        }
+        await tabs.createWorktree(state)
+        XCTAssertEqual(calls, 1)
+        XCTAssertFalse(form.working)
+        XCTAssertTrue(form.completed)
+        XCTAssertTrue(state.isClosed)
+        XCTAssertFalse(owner.popups.isPresented)
+        XCTAssertNil(router.owner(of: session.id))
+        XCTAssertTrue(owner.drafts.drafts.isEmpty)
+        let created = try XCTUnwrap(owner.workspaces.first { $0.id != source.id })
+        XCTAssertEqual(created.worktreeParentId, source.id)
+        XCTAssertEqual(created.diskPath, destination)
+        XCTAssertEqual(created.worktreeBranch, "popup-branch")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
     func testSSHValidationPersistsExactInvalidInputAndReopensDraft() throws {
         let archive = directory.appendingPathComponent("drafts.json")
         let a = store(drafts: DraftRepository(fileURL: archive))
         a.setSidebarMode(.hidden)
         a.requestCreateSSHWorkspace(tabs: tabs)
-        let session = try XCTUnwrap(a.active?.activeSession), state = try XCTUnwrap(session.tabState)
+        let session = try XCTUnwrap(a.popups.sessions.first), state = try XCTUnwrap(session.tabState)
         let form = tabs.form(state)
         XCTAssertEqual(a.sidebarMode, .hidden)
         XCTAssertTrue(tabs.newSSH(from: a) === session)
@@ -78,33 +152,34 @@ final class LocalFormTabsTests: XCTestCase {
         XCTAssertEqual(DraftRepository(fileURL: archive).draft(saved.id), saved)
         let route = state.route
         XCTAssertTrue(a.tabCloseCoordinator.prepare([session]))
-        a.closeTab(session, in: try XCTUnwrap(a.active))
+        a.popups.dismiss(reason: .dismiss)
         let reopened = try XCTUnwrap(tabs.newSSH(from: a)?.tabState)
         XCTAssertEqual(reopened.route, route)
         XCTAssertEqual(tabs.form(reopened).name, "bad\nname")
         XCTAssertEqual(tabs.form(reopened).host, "valid-alias")
     }
 
-    func testSSHTransferCreatesAtCurrentOwnerWithPinnedHostAndDirectory() throws {
+    func testSSHPopupCreatesAtInitiatingWindowWithPinnedHostAndDirectory() throws {
         let a = store(), b = store()
         let session = try XCTUnwrap(tabs.newSSH(from: a)), state = try XCTUnwrap(session.tabState)
         let form = tabs.form(state)
         form.name = "Remote"; form.host = "alice@build"
         let pinned = form.directory
-        try move(session, to: b)
+        XCTAssertFalse(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
+        XCTAssertTrue(tabs.owner(state)?.store === a)
         a.active?.workingDirectory = directory.appendingPathComponent("changed-a")
         b.active?.workingDirectory = directory.appendingPathComponent("changed-b")
         tabs.createSSH(state)
-        let created = try XCTUnwrap(b.active)
+        let created = try XCTUnwrap(a.active)
         XCTAssertEqual(created.sshRemoteHost, "alice@build")
         XCTAssertEqual(created.workingDirectory.path, pinned)
         XCTAssertEqual(created.customTitle, "Remote")
-        XCTAssertEqual(a.workspaces.count, 1)
-        XCTAssertEqual(b.workspaces.count, 2)
+        XCTAssertEqual(a.workspaces.count, 2)
+        XCTAssertEqual(b.workspaces.count, 1)
         XCTAssertNil(router.owner(of: session.id))
-        XCTAssertTrue(b.drafts.drafts.isEmpty)
+        XCTAssertTrue(a.drafts.drafts.isEmpty)
         tabs.createSSH(state)
-        XCTAssertEqual(b.workspaces.count, 2)
+        XCTAssertEqual(a.workspaces.count, 2)
     }
 
     func testDiscardRestoresCachedLocalFormsAfterDraftSaveFailure() throws {
@@ -310,7 +385,7 @@ final class LocalFormTabsTests: XCTestCase {
         }
     }
 
-    func testWorktreeUsesPinnedRepositoryAndSourceAfterTransferAndCwdChange() async throws {
+    func testWorktreePopupUsesPinnedRepositoryAndSourceAfterCwdChange() async throws {
         let root = try repo("source"), unrelated = try repo("unrelated")
         let a = store(), b = store(), source = try XCTUnwrap(a.active)
         let nested = root.appendingPathComponent("nested")
@@ -328,7 +403,8 @@ final class LocalFormTabsTests: XCTestCase {
         }
         let operation = Task { await tabs.createWorktree(state) }
         await fulfillment(of: [started], timeout: 2)
-        try move(session, to: b)
+        XCTAssertFalse(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
+        XCTAssertTrue(tabs.owner(state)?.store === a)
         source.workingDirectory = unrelated
         b.active?.workingDirectory = unrelated
         XCTAssertTrue(tabs.newWorktree(source: source, from: a) === session)
@@ -440,26 +516,28 @@ final class LocalFormTabsTests: XCTestCase {
         XCTAssertEqual(b.workspaces.filter { canonicalDiskPath($0.diskPath) == canonicalDiskPath(paths[0]) }.count, 1)
     }
 
-    func testWorkspaceDetailsEditsOriginalTargetAfterTransferAndPersistsTagInput() throws {
+    func testWorkspaceDetailsPopupEditsOriginalTargetAndPersistsTagInput() throws {
         let a = store(), b = store(), target = try XCTUnwrap(a.active), unrelated = try XCTUnwrap(b.active)
         let session = try XCTUnwrap(tabs.details(target, from: a)), state = try XCTUnwrap(session.tabState)
         let form = tabs.form(state)
         form.tag.name = "Release"; form.tag.hex = "not a color"
-        try move(session, to: b)
+        XCTAssertFalse(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
         target.workingDirectory = directory.appendingPathComponent("changed")
         tabs.saveTag(state)
         XCTAssertNotNil(form.error)
         XCTAssertEqual(form.tag.hex, "not a color")
         XCTAssertNil(target.tag)
-        b.flushPersistence()
-        XCTAssertEqual(b.drafts.draft(try XCTUnwrap(state.navigation.draftID))?.payload, .workspaceTag(form.tag))
+        a.flushPersistence()
+        XCTAssertEqual(a.drafts.draft(try XCTUnwrap(state.navigation.draftID))?.payload, .workspaceTag(form.tag))
         form.tag.hex = "123ABC"
         tabs.saveTag(state)
         XCTAssertEqual(target.tag?.name, "Release")
         XCTAssertEqual(target.tag?.colorHex, "123ABC")
         XCTAssertNil(unrelated.tag)
-        XCTAssertTrue(tabs.details(target, from: b) === session)
-        tabs.clearTag(state)
+        XCTAssertTrue(state.isClosed)
+        XCTAssertNil(router.owner(of: session.id))
+        let reopened = try XCTUnwrap(tabs.details(target, from: a)?.tabState)
+        tabs.clearTag(reopened)
         XCTAssertNil(target.tag)
     }
 

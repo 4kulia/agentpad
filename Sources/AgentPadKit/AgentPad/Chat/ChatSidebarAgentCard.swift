@@ -10,54 +10,66 @@ struct ChatSidebarAgentCard: View {
     @State private var problem: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 20) {
             if let model, let actions = ChatSidebarAgentActions(agentID: agentID, active: active, model: model) {
                 let agent = actions.agent
-                HStack {
-                    ContactAvatar(stableID: agentID, name: agent.name, kind: .agent, remote: .agent(agentID, model.key))
-                    Text(agent.name).font(Theme.display(14, weight: .semibold))
-                    Text("BOT").font(Theme.mono(10)).foregroundStyle(ChatSidebarStyle.secondary)
-                }
-                Text("Owner: \(agent.owner)").font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary)
-                if !agent.description.isEmpty { Text(agent.description).font(Theme.display(12)) }
-                Text(actions.accessLabel).font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help(TeamAccessProfile(rawValue: agent.access)?.summary ?? "")
-                Divider()
-                ForEach(actions.channels, id: \.channelId) { channel in
-                    Button("Open #\(channel.name)") {
-                        if !ChatSidebarAgentActions.open(agentID: agentID, channel: channel.channelId, model: model, show: { store.showChannel($0) }) { problem = "The agent's channel is no longer available." }
-                    }
-                }
-                if let channel = actions.mentionChannel {
-                    Button("Mention in #\(channel.name)") {
-                        let ref = ChannelRef(actions.key, channel: channel.channelId)
-                        let window = store.active?.activeSession?.engine.view.window ?? window
-                        _ = store.showChannel(ref)
-                        if !ChatSidebarMention.insert(agentID: agentID, ref: ref, window: window, model: model, store: store) { problem = "The channel editor is not available. Finish composing text and try again." }
-                    }
-                    if let member = model.agents(in: channel.channelId).first(where: { $0.agentId == agentID }) {
-                        if model.canRemoveAgent(member) {
-                            Button("Remove from Channel…") { ChatSidebarActions.removeAgent(member, from: channel, model, from: store) }
+                HStack(spacing: 12) {
+                    ContactAvatar(stableID: agentID, name: agent.name, kind: .agent, size: 64, remote: .agent(agentID, model.key))
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            Text(agent.name).font(Theme.display(20, weight: .semibold))
+                            Text("BOT").font(Theme.mono(9)).foregroundStyle(.purple)
+                                .padding(.horizontal, 7).padding(.vertical, 3)
+                                .background(.purple.opacity(0.14), in: RoundedRectangle(cornerRadius: 4))
                         }
-                    } else if let own = model.addableAgents(channel).first(where: { $0.agentId == agentID }) {
-                        Button("Add to #\(channel.name)…") { ChatSidebarActions.addAgent(own, to: channel, model, from: store) }
+                        Text("Owner: \(agent.owner)").font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary)
                     }
                 }
-                if agent.mine {
-                    Button("Edit publication…") {
-                        guard let current = ChatSidebarAgentActions(agentID: agentID, active: active, model: model), current.agent.mine,
-                              let editing = TeamAgentEditing.resolve(agentID: agentID, key: current.key,
-                                  currentKey: TeamService.shared.calls.serverKey, agents: TeamService.shared.calls.agents) else {
-                            problem = "This publication cannot be edited here. Open it on the Mac that publishes this agent."; return
+                let description = agent.description.isEmpty
+                    ? model.view.myAgents.first(where: { $0.agentId == agentID })?.description ?? ""
+                    : agent.description
+                if !description.isEmpty { Text(description).font(Theme.display(12)) }
+                Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
+                    fact("Rights", TeamAccessProfile(rawValue: agent.access)?.title ?? agent.access)
+                        .help(TeamAccessProfile(rawValue: agent.access)?.summary ?? "")
+                    let audience = publishedTo(actions, model: model)
+                    if !audience.isEmpty { fact("Published to", audience) }
+                    fact("Availability", [agent.enabled ? (agent.available ? "Online" : "Unavailable") : "Disabled", agent.device]
+                        .compactMap { $0 }.joined(separator: " · "))
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(actions.channels, id: \.channelId) { channel in
+                        HStack(spacing: 8) {
+                            Button("Open #\(channel.name)") {
+                                if !ChatSidebarAgentActions.open(agentID: agentID, channel: channel.channelId, model: model, show: {
+                                    closeCard(); _ = store.showChannel($0)
+                                }) { problem = "The agent's channel is no longer available." }
+                            }.accessibilityIdentifier("publishedAgentOpenChannel-\(channel.channelId)")
+                            if actions.mentionChannel?.channelId == channel.channelId {
+                                mentionActions(channel, model: model)
+                            }
                         }
-                        TeamTabs.shared.showPublication(editing)
                     }
-                } else {
-                    Button("Ask…") { ChatSidebarActions.askAgent(actions, model, from: store) }
-                        .disabled(actions.address == nil)
+                    if let channel = actions.mentionChannel, !actions.channels.contains(where: { $0.channelId == channel.channelId }) {
+                        HStack(spacing: 8) { mentionActions(channel, model: model) }
+                    }
+                    HStack(spacing: 8) {
+                        if agent.mine {
+                            Button("Edit publication…") {
+                                guard let current = ChatSidebarAgentActions(agentID: agentID, active: active, model: model), current.agent.mine,
+                                      let editing = TeamAgentEditing.resolve(agentID: agentID, key: current.key,
+                                          currentKey: TeamService.shared.calls.serverKey, agents: TeamService.shared.calls.agents) else {
+                                    problem = "This publication cannot be edited here. Open it on the Mac that publishes this agent."; return
+                                }
+                                TeamTabs.shared.showPublication(editing, from: store)
+                            }
+                        } else {
+                            Button("Ask…") { ChatSidebarActions.askAgent(actions, model, from: store) }
+                                .disabled(actions.address == nil)
+                        }
+                        Button("Published Agents…") { TeamTabs.shared.showAgents(from: store) }
+                    }
                 }
-                Button("Published Agents…") { TeamUI.showAgents() }
                 if let problem { Text(problem).font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary) }
             } else {
                 Text("Agent unavailable").font(Theme.display(12))
@@ -66,6 +78,53 @@ struct ChatSidebarAgentCard: View {
         .padding(24).frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
+        .accessibilityIdentifier("publishedAgentCard")
+    }
+
+    private func fact(_ label: String, _ value: String) -> some View {
+        GridRow(alignment: .top) {
+            Text(label).font(Theme.display(11)).foregroundStyle(ChatSidebarStyle.secondary)
+            Text(value).font(Theme.display(12)).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func publishedTo(_ actions: ChatSidebarAgentActions, model: ChatOrgModel) -> String {
+        let channels = actions.channels.map { channel in
+            [model.channelTeams.first(where: { $0.teamId == channel.teamId })?.name, "# \(channel.name)"]
+                .compactMap { $0 }.joined(separator: " · ")
+        }
+        if !channels.isEmpty { return channels.joined(separator: ", ") }
+        let teams = model.view.myAgents.first(where: { $0.agentId == agentID })?.teamIds ?? []
+        return model.channelTeams.filter { teams.contains($0.teamId) }.map(\.name).joined(separator: ", ")
+    }
+
+    @ViewBuilder private func mentionActions(_ channel: ChatChannelCard, model: ChatOrgModel) -> some View {
+        Button("Mention in #\(channel.name)") {
+            guard let current = ChatSidebarAgentActions(agentID: agentID, active: active, model: model),
+                  current.mentionChannel?.channelId == channel.channelId else { return }
+            let ref = ChannelRef(current.key, channel: channel.channelId)
+            let window = window ?? store.active?.activeSession?.engine.view.window
+            closeCard()
+            _ = store.showChannel(ref)
+            if !ChatSidebarMention.insert(agentID: agentID, ref: ref, window: window, model: model, store: store) {
+                problem = "The channel editor is not available. Finish composing text and try again."
+            }
+        }.accessibilityIdentifier("publishedAgentMention")
+        if let member = model.agents(in: channel.channelId).first(where: { $0.agentId == agentID }) {
+            if model.canRemoveAgent(member) {
+                Button("Remove from Channel…", role: .destructive) {
+                    ChatSidebarActions.removeAgent(member, from: channel, model, from: store)
+                }.buttonStyle(PopupDestructiveButtonStyle())
+            }
+        } else if let own = model.addableAgents(channel).first(where: { $0.agentId == agentID }) {
+            Button("Add to #\(channel.name)…") { ChatSidebarActions.addAgent(own, to: channel, model, from: store) }
+        }
+    }
+
+    private func closeCard() {
+        guard case .tool(let session) = store.popups.page,
+              case .agent(_, let id) = session.toolRoute, id == agentID else { return }
+        store.popups.dismiss(session, reason: .applied)
     }
 }
 

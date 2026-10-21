@@ -118,6 +118,9 @@ struct AllSessionsTab: View {
             .onChange(of: model.names.values) { _, _ in model.refilter() }
             .onChange(of: model.query) { _, _ in model.refilter(debounce: true) }
             .onChange(of: model.renamingID) { _, id in focus = id.map(Focus.rename) }
+            .onChange(of: model.state.primaryInputFocusRequest) { _, _ in
+                focus = model.renamingID.map(Focus.rename) ?? .search
+            }
             .onKeyPress(characters: CharacterSet(charactersIn: "f")) { press in
                 guard press.modifiers == .command else { return .ignored }; focus = .search; return .handled
             }

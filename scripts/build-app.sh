@@ -52,6 +52,7 @@ done
     echo "missing SPM resource bundle: .build/release/AgentPad_AgentPadKit.bundle" >&2
     exit 1
 }
+python3 -I scripts/verify-app-linkage.py --binary .build/release/AgentPad
 
 echo "==> Assembling ${APP} (v${VERSION})"
 rm -rf "$APP"

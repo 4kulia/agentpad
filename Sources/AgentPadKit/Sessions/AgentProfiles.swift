@@ -11,6 +11,7 @@ struct AgentProfile: Codable, Equatable, Identifiable, Sendable {
     /// Frozen at creation. An empty value deliberately bypasses global options.
     var launchOptions: String
     let createdAt: Date
+    var claudeAccountID: UUID? = nil
 }
 
 struct AgentProfileBinding: Codable, Equatable, Identifiable, Sendable {
@@ -24,7 +25,7 @@ final class AgentProfileStore {
     static let shared = AgentProfileStore(fileURL: NSClassFromString("XCTestCase") == nil ? SessionCatalogFiles.directory.appendingPathComponent("agent-profiles.json") : nil)
 
     enum Problem: Error, LocalizedError {
-        case unreadable, missingFolder, missingProfile, duplicate(AgentProfile), shell
+        case unreadable, missingFolder, missingProfile, duplicate(AgentProfile), shell, accountSettingsOptions
         var errorDescription: String? {
             switch self {
             case .unreadable: "Agent profiles could not be read. The saved file has not been replaced."
@@ -32,6 +33,7 @@ final class AgentProfileStore {
             case .missingProfile: "This agent is no longer available."
             case .duplicate(let profile): "\(profile.name) already uses this agent type in that folder."
             case .shell: "Choose an agent type."
+            case .accountSettingsOptions: "Claude account launches cannot use --settings or --setting-sources. Remove those options or use Main account."
             }
         }
     }
@@ -52,6 +54,11 @@ final class AgentProfileStore {
         func save(_ archive: Archive) throws { try write(JSONEncoder().encode(archive), fileURL) }
     }
     let details: AgentProfileDetailsStore
+    @ObservationIgnored private let accountFileURL: URL?
+    @ObservationIgnored private let accountTokens: any ChatTokenStore
+    @ObservationIgnored lazy var claudeAccounts = ClaudeAccountStore(fileURL: accountFileURL, tokens: accountTokens,
+        isUsed: { [weak self] id in self?.profiles.contains { $0.claudeAccountID == id } ?? true })
+    @ObservationIgnored lazy var remoteClaudeAccounts = RemoteClaudeAccountService(accounts: claudeAccounts)
     private var archive = Archive()
     @ObservationIgnored private let writer: Writer?
     @ObservationIgnored private let canonicalize: (URL) -> URL
@@ -74,12 +81,16 @@ final class AgentProfileStore {
     /// Preserve dictionary storage when handing a snapshot to a worker actor.
     var bindingsSnapshot: [String: AgentProfileBinding] { archive.bindings }
 
-    init(fileURL: URL? = nil, details: AgentProfileDetailsStore? = nil, write: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
+    init(fileURL: URL? = nil, details: AgentProfileDetailsStore? = nil,
+         accountTokens: any ChatTokenStore = ChatKeychain(service: ClaudeAccountStore.service, label: "AgentPad Claude account"),
+         write: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
     }, canonicalize: @escaping (URL) -> URL = canonicalDiskPath, adoptionIO: AgentProfileAdoption.IO = .init()) {
         let details = details ?? AgentProfileDetailsStore(fileURL: fileURL?.deletingLastPathComponent().appendingPathComponent("agent-profile-details.json"))
         self.details = details
+        self.accountFileURL = fileURL?.deletingLastPathComponent().appendingPathComponent("claude-accounts.json")
+        self.accountTokens = accountTokens
         self.writer = fileURL.map { Writer(fileURL: $0, write: write) }
         self.canonicalize = canonicalize
         self.adoptionIO = adoptionIO
@@ -273,6 +284,30 @@ final class AgentProfileStore {
         guard let index = profiles.firstIndex(where: { $0.id == id }) else { throw Problem.missingProfile }
         guard let name = normalizedTitle(name), InlineNameEdit.problem(name) == nil else { throw CocoaError(.validationMissingMandatoryProperty) }
         var next = archive; next.profiles[index].name = name
+        try commit(next)
+    }
+
+    func setClaudeAccount(profileID: UUID, accountID: UUID?) throws {
+        guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { throw Problem.missingProfile }
+        if let accountID, claudeAccounts.account(accountID) == nil { throw ClaudeAccountStore.Problem.missingAccount }
+        if accountID != nil, ClaudeAccountSettings.optionsFailure(profiles[index].launchOptions) != nil {
+            throw Problem.accountSettingsOptions
+        }
+        var next = archive; next.profiles[index].claudeAccountID = accountID
+        try commit(next)
+    }
+
+    /// The editor's Save is one atomic archive write for both fields.
+    func editProfile(_ id: UUID, name: String, claudeAccountID: UUID?) throws {
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { throw Problem.missingProfile }
+        guard let name = normalizedTitle(name), InlineNameEdit.problem(name) == nil else { throw CocoaError(.validationMissingMandatoryProperty) }
+        if let claudeAccountID, claudeAccounts.account(claudeAccountID) == nil { throw ClaudeAccountStore.Problem.missingAccount }
+        if claudeAccountID != nil, ClaudeAccountSettings.optionsFailure(profiles[index].launchOptions) != nil {
+            throw Problem.accountSettingsOptions
+        }
+        var next = archive
+        next.profiles[index].name = name
+        next.profiles[index].claudeAccountID = claudeAccountID
         try commit(next)
     }
 

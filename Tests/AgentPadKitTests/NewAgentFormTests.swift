@@ -34,22 +34,30 @@ final class NewAgentFormTests: XCTestCase {
         stores.append(store); return store
     }
 
-    func testBothEntriesReuseDraftAcrossWindowsAndAddClosesWithoutLaunching() throws {
+    func testEachWindowKeepsItsOwnDraftAndAddClosesWithoutLaunching() throws {
         let a = store(), b = store()
         let session = try XCTUnwrap(tabs.newAgent(from: a)), state = try XCTUnwrap(session.tabState)
         let form = tabs.form(state)
         form.newAgent.folder = root.path
         form.newAgent.name = "My agent"
-        XCTAssertTrue(tabs.newAgent(from: b) === session)
+        let other = try XCTUnwrap(tabs.newAgent(from: b)), otherState = try XCTUnwrap(other.tabState)
+        tabs.form(otherState).newAgent.name = "Other draft"
+        XCTAssertFalse(other === session)
+        XCTAssertTrue(tabs.newAgent(from: a) === session)
         XCTAssertEqual(tabs.form(state).newAgent.name, "My agent")
-        XCTAssertTrue(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
+        XCTAssertTrue(tabs.owner(state)?.store === a)
+        XCTAssertTrue(tabs.owner(otherState)?.store === b)
+        XCTAssertFalse(b.handleTabDrop(droppedId: session.id, in: try XCTUnwrap(b.active)))
         tabs.addAgent(state)
         let profile = try XCTUnwrap(profiles.profiles.first)
         XCTAssertEqual(profile.name, "My agent")
         XCTAssertEqual(profile.launchOptions, "--model example")
-        XCTAssertEqual(b.revealedAgentProfileID, profile.id)
-        XCTAssertEqual(b.sidebarContent, .chat)
-        XCTAssertEqual(b.workspaces.count, 1, "The list must stay visible after the last form tab closes")
+        XCTAssertEqual(a.revealedAgentProfileID, profile.id)
+        XCTAssertEqual(a.sidebarContent, .chat)
+        XCTAssertEqual(a.workspaces.count, 1, "The list stays visible after the popup closes")
+        XCTAssertNil(b.revealedAgentProfileID)
+        XCTAssertTrue(tabs.newAgent(from: b) === other)
+        XCTAssertEqual(tabs.form(otherState).newAgent.name, "Other draft")
         XCTAssertNil(router.owner(of: session.id)); XCTAssertTrue(state.isClosed)
         XCTAssertTrue(drafts.drafts.isEmpty)
         XCTAssertEqual(starts, 0, "Adding a profile must never create an engine")
@@ -81,8 +89,14 @@ final class NewAgentFormTests: XCTestCase {
         tabs.addAgent(state)
         XCTAssertNotNil(form.error); XCTAssertFalse(state.isClosed); XCTAssertTrue(profiles.profiles.isEmpty)
         try owner.tabCloseCoordinator.save(state)
-        owner.closeTab(session, in: try XCTUnwrap(owner.active))
+        owner.popups.dismiss(reason: .dismiss)
+        XCTAssertFalse(owner.popups.isPresented)
+        XCTAssertFalse(state.isClosed)
+        XCTAssertTrue(profiles.profiles.isEmpty)
+        XCTAssertEqual(starts, 0)
         let reopened = try XCTUnwrap(tabs.newAgent(from: owner)?.tabState)
+        XCTAssertTrue(reopened === state)
+        XCTAssertTrue(owner.popups.draftKept)
         XCTAssertEqual(reopened.route, state.route)
         XCTAssertEqual(tabs.form(reopened).newAgent, form.newAgent)
         tabs.form(reopened).newAgent.folder = root.path
@@ -148,6 +162,38 @@ final class NewAgentFormTests: XCTestCase {
         fail = false
         tabs.addAgent(state)
         XCTAssertTrue(state.isClosed); XCTAssertEqual(profiles.profiles.count, 1)
+        XCTAssertEqual(starts, 0)
+    }
+
+    func testCancelKeepsFailedDraftCleanupOpenAndDiscardsOnlyItsWindowOnRetry() throws {
+        var fail = false
+        drafts = DraftRepository(fileURL: root.appendingPathComponent("drafts.json")) { data, url in
+            if fail { throw CocoaError(.fileWriteOutOfSpace) }
+            try data.write(to: url)
+        }
+        let a = store(), b = store()
+        let state = try XCTUnwrap(tabs.newAgent(from: a)?.tabState)
+        tabs.form(state).newAgent.name = "Cancel this"
+        try a.tabCloseCoordinator.save(state)
+        let other = try XCTUnwrap(tabs.newAgent(from: b)?.tabState)
+        tabs.form(other).newAgent.name = "Keep this"
+        try b.tabCloseCoordinator.save(other)
+        let otherDraft = try XCTUnwrap(other.draft)
+        fail = true
+        tabs.cancel(state)
+        XCTAssertNotNil(state.saveError)
+        XCTAssertFalse(state.isClosed)
+        XCTAssertTrue(tabs.owner(state)?.store === a)
+        fail = false
+        tabs.cancel(state)
+        XCTAssertTrue(state.isClosed)
+        XCTAssertNil(tabs.owner(state))
+        XCTAssertEqual(drafts.drafts, [otherDraft])
+        XCTAssertTrue(tabs.owner(other)?.store === b)
+        XCTAssertEqual(tabs.form(other).newAgent.name, "Keep this")
+        let reopened = try XCTUnwrap(tabs.newAgent(from: a)?.tabState)
+        XCTAssertNotEqual(reopened.route, state.route)
+        XCTAssertEqual(tabs.form(reopened).newAgent.name, "")
         XCTAssertEqual(starts, 0)
     }
 }

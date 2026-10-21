@@ -261,7 +261,10 @@ struct AgentTemplate: Identifiable, Hashable {
         rawLaunchCommand: String? = nil,
         claudeProjectsRoot: URL = ClaudeSessionResume.projectsRoot(),
         visibility: ChannelConversationFilter = .current(),
-        claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil
+        claudeResolution: Result<String, ClaudeSessionResume.Refusal>? = nil,
+        claudeAccountLaunch: ClaudeAccountLaunch? = nil,
+        remoteClaudeAccount: ClaudeAccount? = nil,
+        remoteClaudeAccountLaunchID: UUID? = nil
     ) -> TerminalSessionConfig {
         // Pick a shell that has a AgentPad integration wrapper. Plain terminal
         // sessions respect $SHELL where we have a wrapper (zsh/bash/fish); other
@@ -305,7 +308,12 @@ struct AgentTemplate: Identifiable, Hashable {
                 claudeProjectsRoot: claudeProjectsRoot,
                 visibility: visibility
             )
-                .map { " -- \($0)" } ?? ""
+                .map { launch in
+                    guard id == Self.claudeCodeID, let remoteClaudeAccount else { return " -- \(launch)" }
+                    return " -- " + RemoteClaudeAccount.command(accountID: remoteClaudeAccount.id,
+                        revision: remoteClaudeAccount.credentialRevision, launch: launch,
+                        launchID: remoteClaudeAccountLaunchID)
+                } ?? ""
             config.environment["AGENTPAD_AGENT"] = "agentpad-ssh \(AgentPadShellIntegration.quote(sshHost))\(agentSuffix)"
         } else if let rawLaunchCommand {
             config.environment["AGENTPAD_AGENT"] = rawLaunchCommand
@@ -318,7 +326,19 @@ struct AgentTemplate: Identifiable, Hashable {
             visibility: visibility,
             claudeResolution: claudeResolution
         ) {
-            config.environment["AGENTPAD_AGENT"] = launch
+            // A resume refusal is a compound diagnostic command, not a Claude
+            // invocation. Preserve its trailing failure status and no-token path.
+            if id == Self.claudeCodeID, let claudeAccountLaunch, let initialCommand,
+               launch == initialCommand || launch.hasPrefix(initialCommand + " ") {
+                if let failure = ClaudeAccountSettings.optionsFailure(extraOptions) {
+                    config.environment["AGENTPAD_AGENT"] = "printf '%s\\n' \(AgentPadShellIntegration.quote(failure)) >&2; false"
+                } else {
+                    config.claudeAccountLaunch = claudeAccountLaunch
+                    config.environment["AGENTPAD_AGENT"] = claudeAccountLaunch.command(launch)
+                }
+            } else {
+                config.environment["AGENTPAD_AGENT"] = launch
+            }
         }
         return config
     }

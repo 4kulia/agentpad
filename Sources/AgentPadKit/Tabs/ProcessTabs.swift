@@ -118,8 +118,11 @@ final class CloseWorkspaceBatch {
             verb: delete ? "Close and delete" : "Close workspaces", destructive: true,
             stillValid: { [weak self] in self?.unchanged() == true && self?.alsoDelete == delete },
             completion: { [weak self] accepted in
-                guard let self, !accepted, !self.working, !self.unchanged() else { return }
-                self.refreshReview()
+                guard let self else { return }
+                if accepted, self.completed, let state = self.state, state.isPopup,
+                   let tabID = self.tabID, let location = self.router.owner(of: tabID) {
+                    location.store.popups.dismiss(location.session, reason: .applied)
+                } else if !accepted, !self.working, !self.unchanged() { self.refreshReview() }
             },
             operation: { [weak self] in
                 guard let self else { return }
@@ -135,10 +138,12 @@ final class CloseWorkspaceBatch {
         let sessions = store.allSessions.filter { session in rows.contains { !$0.done && $0.sessions.contains(session.id) } }
         guard store.tabCloseCoordinator.prepare(sessions) else { return "Some drafts could not be saved. Keep editing or retry before closing." }
         // The review is never part of the close targets, even for a last-tab close.
-        if let tabID, let location = router.owner(of: tabID), rows.contains(where: { $0.id == location.workspace.id }) {
-            guard location.store.moveTabToNewWorkspace(tabID) != nil else { return "The close review could not be kept open." }
-        } else if let tabID, let location = store.location(ofSessionId: tabID), rows.contains(where: { $0.id == location.workspace.id }) {
-            guard store.moveTabToNewWorkspace(tabID) != nil else { return "The close review could not be kept open." }
+        if state?.isPopup != true {
+            if let tabID, let location = router.owner(of: tabID), rows.contains(where: { $0.id == location.workspace.id }) {
+                guard location.store.moveTabToNewWorkspace(tabID) != nil else { return "The close review could not be kept open." }
+            } else if let tabID, let location = store.location(ofSessionId: tabID), rows.contains(where: { $0.id == location.workspace.id }) {
+                guard store.moveTabToNewWorkspace(tabID) != nil else { return "The close review could not be kept open." }
+            }
         }
         working = true
         defer { working = false }
@@ -165,6 +170,7 @@ final class CloseWorkspaceBatch {
                 rows[i].error = rows[i].directoryDeleted ? "The directory was removed, but the workspace changed and remains open." : "The workspace changed and remains open."
                 continue
             }
+            if state?.isPopup == true, store.workspaces.count == 1 { _ = store.addEmptyWorkspace() }
             store.closeWorkspace(workspace)
             rows[i].done = !store.workspaces.contains { $0.id == workspace.id }
             if !rows[i].done { rows[i].error = "The workspace could not be closed." }
@@ -172,29 +178,73 @@ final class CloseWorkspaceBatch {
         if !unchanged() { refreshReview(); return Self.changedMessage }
         return rows.compactMap(\.error).first
     }
+
+    func cancel() {
+        guard !working, state?.confirmation.isExecuting != true,
+              let tabID, let location = router.owner(of: tabID) else { return }
+        state?.confirmation.cancel()
+        if state?.isPopup == true { location.store.popups.dismiss(location.session, reason: .cancel) }
+        else { location.store.closeTab(location.session, in: location.workspace) }
+    }
 }
 
 struct CloseWorkspacesView: View {
     @Bindable var batch: CloseWorkspaceBatch
+    var showWorkspaceDetails: (() -> Void)?
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Close workspaces").font(.title2)
-            if let message = batch.message { Text(message).foregroundStyle(.secondary) }
-            ForEach(batch.rows) { row in
-                VStack(alignment: .leading) {
-                    Text(row.title).font(.headline)
-                    Text(row.path.path).font(.caption).textSelection(.enabled)
-                    if row.done { Text("Closed") }
-                    if let error = row.error { Text(error).foregroundStyle(.red) }
+        VStack(spacing: 0) {
+            PopupScrollBody {
+                VStack(alignment: .leading, spacing: 16) {
+                    if batch.state?.isPopup != true { Text("Close workspaces").font(.title2) }
+                    Text("Review \(batch.rows.count) \(batch.rows.count == 1 ? "workspace" : "workspaces") before closing.")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                    if let message = batch.message { Text(message).foregroundStyle(.orange) }
+                    ForEach(batch.rows) { row in
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text(row.title + (row.parentID == nil ? "" : " · worktree")).font(.headline)
+                            Text(row.path.path).font(.caption.monospaced()).textSelection(.enabled)
+                            if row.done { Text("Closed").font(.caption).foregroundStyle(.green) }
+                            if let error = row.error { Text(error).foregroundStyle(.red) }
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(14)
+                            .background(Theme.chromeHover.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.chromeHairline))
+                    }
+                    if !batch.completed {
+                        if batch.rows.contains(where: { $0.parentID != nil && !$0.done }) {
+                            Toggle("Also delete worktree directories and merged branches", isOn: $batch.alsoDelete)
+                                .disabled(batch.working || batch.state?.confirmation.isAwaiting == true)
+                                .accessibilityIdentifier("close-workspaces-delete-worktrees")
+                        }
+                        Text(batch.alsoDelete
+                            ? "Running processes in these workspaces will stop. Worktree directories will be removed; merged branches may be deleted."
+                            : "Running processes in these workspaces will stop. Directories and branches stay on disk.")
+                            .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                            .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
+                        Text("Outside click and Esc cannot dismiss this confirmation.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Divider()
+            HStack {
+                if let showWorkspaceDetails {
+                    Button("Workspace details", action: showWorkspaceDetails)
+                        .disabled(batch.working || batch.state?.confirmation.isExecuting == true)
+                        .accessibilityIdentifier("close-workspaces-details")
+                }
+                Spacer()
+                Button("Cancel") { batch.cancel() }
+                    .disabled(batch.working || batch.state?.confirmation.isExecuting == true)
+                    .accessibilityIdentifier("close-workspaces-cancel")
+                if !batch.completed {
+                    Button("Close remaining workspaces…", role: .destructive) { batch.request() }
+                        .buttonStyle(PopupPrimaryButtonStyle(destructive: true))
+                        .disabled(batch.working || batch.state?.confirmation.showsBlock == true)
+                        .accessibilityIdentifier("close-workspaces-accept")
                 }
             }
-            if !batch.completed {
-                if batch.rows.contains(where: { $0.parentID != nil && !$0.done }) {
-                    Toggle("Also delete worktree directories and merged branches", isOn: $batch.alsoDelete)
-                        .disabled(batch.working || batch.state?.confirmation.isAwaiting == true)
-                }
-                Button("Close remaining workspaces…") { batch.request() }.disabled(batch.working)
-            }
-        }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 24).padding(.vertical, 14)
+        }.accessibilityElement(children: .contain).accessibilityIdentifier("close-workspaces-content")
     }
 }
