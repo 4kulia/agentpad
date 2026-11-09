@@ -9,6 +9,7 @@ import SwiftUI
 final class ChatDMPeerModel: ChatDMComposing {
     let key: ChatOrgKey
     var focusRequest: ChatFocusRequest?
+    var isPopup = false
     var threadRoot: String? { nil }
     let peer: String
     private weak var service: ChatService?
@@ -17,6 +18,9 @@ final class ChatDMPeerModel: ChatDMComposing {
     private var content = Snapshot()
     private(set) var result: String?
     private(set) var problem: String?
+    private(set) var draftSaveProblem: String?
+    private var pendingDraft: ChatDMContent.Draft?
+    private var resolving = false
     @ObservationIgnored private var observation: AnyDatabaseCancellable?
     private var draftID: String { "peer:\(peer)" }
     private var store: ChatStore? { service?.orgSessions[key]?.store }
@@ -102,17 +106,39 @@ final class ChatDMPeerModel: ChatDMComposing {
         do { try resolve(card.dmId) }
         catch { problem = error.localizedDescription }
     }
-    func draft(root: String?) -> ChatDMContent.Draft? { readable && root == nil ? content.draft : nil }
+    func draft(root: String?) -> ChatDMContent.Draft? { readable && root == nil ? pendingDraft ?? content.draft : nil }
     @discardableResult func saveDraft(_ text: String, root: String?) -> String? {
         guard writable, root == nil, let store else { return nil }
+        pendingDraft = .init(text: text, version: UUID().uuidString)
         do {
             let version = try store.dmWrite { try ChatDMStore.saveDraft($0, draftID, root: nil, text: text) }
             content.draft = .init(text: text, version: version)
+            pendingDraft = nil; draftSaveProblem = nil
             return version
-        } catch { problem = "The draft could not be saved on this Mac."; return nil }
+        } catch { draftSaveProblem = "The draft could not be saved on this Mac. Retry before closing."; return nil }
+    }
+
+    func flushConversationDrafts() throws {
+        guard let pendingDraft else { draftSaveProblem = nil; return }
+        do {
+            guard readable, let store else { throw ChatError.storage("The conversation is unavailable on this Mac.") }
+            let version = try store.dmWrite { try ChatDMStore.saveDraft($0, draftID, root: nil, text: pendingDraft.text) }
+            content.draft = .init(text: pendingDraft.text, version: version)
+            self.pendingDraft = nil; draftSaveProblem = nil
+        } catch {
+            draftSaveProblem = "The draft could not be saved on this Mac. Retry before closing."
+            throw error
+        }
+    }
+
+    func retryDraftSave() { try? flushConversationDrafts() }
+
+    var hasConversationDraft: Bool {
+        draft(root: nil)?.text.isEmpty == false
+            || attachmentOwner.map { owner in attachmentManager?.drafts.contains { $0.owner == owner } == true } == true
     }
     func send(_ text: String, root: String?, members: [(account: String, handle: String)], version: String?) -> Bool {
-        guard readable, root == nil, let version, let service else { return false }
+        guard readable, pendingDraft == nil, root == nil, let version, let service else { return false }
         do {
             _ = try service.postDMToPeer(key, peer: peer, text: text,
                 mentions: ChatChannelModel.mentions(in: text, members: members), draftVersion: version)
@@ -126,7 +152,10 @@ final class ChatDMPeerModel: ChatDMComposing {
         catch { problem = error.localizedDescription }
     }
     private func resolve(_ dm: String) throws {
-        guard let store else { return }
+        guard !resolving, let store else { return }
+        resolving = true
+        defer { resolving = false }
+        try flushConversationDrafts()
         try store.dmWrite { db in
             guard let local = try ChatDMStore.draft(db, draftID, root: nil) else { return }
             if !local.text.isEmpty {
@@ -166,15 +195,17 @@ struct ChatDMPeerTab: View {
             if !state.isClosed, let model = state.dmPeerModel, model.readable {
                 VStack(spacing: 0) {
                     if let person = model.person {
-                        HStack(spacing: 10) {
-                            ContactAvatar(stableID: peer, name: person.name, kind: .person, size: 34, remote: .account(peer, key))
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(person.name).font(Theme.display(15, weight: .semibold))
-                                Label("Only the two of you", systemImage: "lock").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
-                            }
-                            Spacer()
-                        }.padding(16)
-                        Divider()
+                        if !state.isPopup {
+                            HStack(spacing: 10) {
+                                ContactAvatar(stableID: peer, name: person.name, kind: .person, size: 34, remote: .account(peer, key))
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(person.name).font(Theme.display(15, weight: .semibold))
+                                    Label("Only the two of you", systemImage: "lock").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
+                                }
+                                Spacer()
+                            }.padding(16)
+                            Divider()
+                        }
                         Spacer()
                         if model.outgoing.isEmpty {
                             Text("No messages yet").font(Theme.display(14)).foregroundStyle(ChatAppearance.secondary)
@@ -220,8 +251,14 @@ struct ChatDMPeerTab: View {
             .onChange(of: state.primaryInputFocusRequest) { _, _ in
                 state.dmPeerModel?.focusRequest = ChatFocusRequest(area: .composer)
             }
+            .onChange(of: state.isPopup, initial: true) { _, isPopup in
+                state.dmPeerModel?.isPopup = isPopup
+            }
             .onChange(of: !state.isClosed && service.dmAllowed(key), initial: true) { _, allowed in
-                if allowed, state.dmPeerModel == nil { state.dmPeerModel = service.dmPeer(key, peer: peer) }
+                if allowed, state.dmPeerModel == nil {
+                    state.dmPeerModel = service.dmPeer(key, peer: peer)
+                    state.dmPeerModel?.isPopup = state.isPopup
+                }
                 else if !allowed { state.dmPeerModel?.stop(); state.dmPeerModel = nil }
             }
     }

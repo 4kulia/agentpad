@@ -9,20 +9,21 @@ enum ChatDMTabs {
         return service.dmList(key)?.people.first { $0.id == peer }?.route(key)
     }
     @discardableResult static func open(_ key: ChatOrgKey, peer: String, from store: WorkspaceStore? = nil,
-                                       service: ChatService = .shared, navigation: SupportTabNavigation = SupportTabs.shared.navigation) -> Session? {
+                                       service: ChatService = .shared, navigation: SupportTabNavigation = SupportTabs.shared.navigation,
+                                       asTab: Bool = false) -> Session? {
         guard let route = route(key, peer: peer, service: service) else { return nil }
-        return navigation.open(route, from: store)
+        return navigation.open(route, from: store, asTab: asTab)
     }
     static func title(_ ref: ChatDMRef, service: ChatService = .shared) -> String {
         guard let key = ref.key, service.dmAllowed(key, ref.dm) else { return "Direct message" }
         return service.orgSessions[key]?.dmList?.entries.first { $0.id == ref.dm }?.card.peer.name ?? "Direct message"
     }
     @discardableResult static func open(_ ref: ChatDMRef, from store: WorkspaceStore? = nil, service: ChatService = .shared,
-                                       navigation: SupportTabNavigation = SupportTabs.shared.navigation) -> Session? {
+                                       navigation: SupportTabNavigation = SupportTabs.shared.navigation, asTab: Bool = false) -> Session? {
         guard let key = ref.key, service.dmAllowed(key, ref.dm) else { return nil }
         used(ref, service: service)
         _ = service.dmList(key)
-        return navigation.open(.directMessage(ref), from: store)
+        return navigation.open(.directMessage(ref), from: store, asTab: asTab)
     }
     static func used(_ ref: ChatDMRef, service: ChatService) {
         guard let key = ref.key, service.dmAllowed(key, ref.dm) else { return }

@@ -29,9 +29,9 @@ struct TabBarView: View {
                 .padding(.horizontal, 10)
             }
 
-            // Split controls pinned to the trailing edge — outside the
+            // Pane controls pinned to the trailing edge — outside the
             // ScrollView so they stay put while the tabs scroll.
-            splitButtons
+            paneButtons
         }
         .frame(height: Theme.contentHeaderHeight)
         .background {
@@ -45,7 +45,7 @@ struct TabBarView: View {
     /// Right is the `.horizontal` orientation (panes side by side), Split
     /// Down is `.vertical` (panes stacked) — same mapping as
     /// `AppDelegate.handleSplitRight` / `handleSplitDown`.
-    private var splitButtons: some View {
+    private var paneButtons: some View {
         HStack(spacing: Theme.chromeControlSpacing) {
             HoverableIconButton(
                 systemName: "square.split.2x1",
@@ -62,6 +62,20 @@ struct TabBarView: View {
                 help: "Split Down (⌘⇧D)"
             ) {
                 store.splitPane(pane, orientation: .vertical, in: workspace)
+            }
+            if pane.tabs.isEmpty && workspace.root.hasMultiplePanes {
+                HoverableIconButton(
+                    systemName: "xmark",
+                    fontSize: 12,
+                    size: Theme.chromeToolbarButtonSize,
+                    help: "Close pane"
+                ) {
+                    guard pane.tabs.isEmpty, workspace.root.hasMultiplePanes else { return }
+                    store.focusPane(pane, in: workspace)
+                    store.closePane(pane, in: workspace)
+                }
+                // Leave an 8pt gap after the split pair.
+                .padding(.leading, Theme.space2 - Theme.chromeControlSpacing)
             }
         }
         .padding(.trailing, Theme.space2)

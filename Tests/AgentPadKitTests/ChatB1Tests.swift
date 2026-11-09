@@ -490,6 +490,9 @@ final class ChatB1Tests: XCTestCase {
         let shownMessage = try XCTUnwrap(model.message("m"))
         let settings = AgentPadSettingsModel.shared
         let prior = (settings.appearanceMode, settings.lightTerminalThemeSelection, settings.darkTerminalThemeSelection)
+        let previousPairedSchema = settings.pairedThemeSchemaEnabled
+        settings.prepareFirstLaunchAppearance()
+        defer { if !previousPairedSchema { settings.load() } }
         defer { settings.appearanceMode = prior.0; settings.lightTerminalThemeSelection = prior.1; settings.darkTerminalThemeSelection = prior.2 }
         settings.lightTerminalThemeSelection = AgentPadSettingsModel.defaultLightThemeSelection
         settings.darkTerminalThemeSelection = AgentPadSettingsModel.defaultDarkThemeSelection
@@ -499,7 +502,7 @@ final class ChatB1Tests: XCTestCase {
             let content = VStack(alignment: .leading, spacing: 0) {
                 HStack { Text("# New").font(Theme.display(16, weight: .semibold)); Spacer(); Image(systemName: "pin"); Image(systemName: "magnifyingglass") }.padding(24)
                 Divider()
-                ChatMessageRow(model: model, message: shownMessage, members: members, mentionable: [], me: "me", archived: false, replies: 205, selected: true)
+                ChatNativeRowFixture(model: model, message: shownMessage, members: members, mentionable: [], me: "me", archived: false, replies: 205, selected: true)
                 Divider().padding(.vertical, 18)
                 ChatReactionPicker(b1: b1, message: "m")
                 Spacer()

@@ -150,6 +150,7 @@ struct ChatUX1Composer: View {
     }
     private func key(_ code: UInt16, _ modifiers: NSEvent.ModifierFlags) -> Bool {
         if code == 53, modifiers.intersection([.command, .control, .option, .shift]).isEmpty, matches.isEmpty {
+            if model.isPopup { return false }
             return model.dismissTransient()
         }
         switch ChatComposerKey.action(code: code, modifiers: modifiers, hasCandidates: !matches.isEmpty, text: text, inThread: model.threadRoot != nil) {
@@ -160,6 +161,7 @@ struct ChatUX1Composer: View {
         case .chooseCandidate: choose(matches[min(selected, matches.count - 1)])
         case .dismissCandidates: dismissedQuery = token?.query
         case .closeThread:
+            if model.isPopup { return false }
             model.dismissTransient()
         case .native: return false
         }
@@ -173,24 +175,46 @@ struct ChatUX1Composer: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(dropping ? "Attach to: \(recipient)" : recipient)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/channel/composer/" + (root ?? "feed") + "/recipient", text: dropping ? "Attach to: \(recipient)" : recipient, colors: ["foreground": ChatAppearance.secondary])
+                    #endif
                 Spacer()
-                if !text.isEmpty { Label("Draft", systemImage: "pencil").font(Theme.display(9)) }
+                if !text.isEmpty || !uploads.isEmpty {
+                    Label(model.isPopup && model.draftSaveProblem == nil ? "Draft kept" : "Draft", systemImage: model.isPopup ? "checkmark" : "pencil")
+                        .font(Theme.display(9))
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/channel/composer/" + (root ?? "feed") + "/draft", text: model.isPopup && model.draftSaveProblem == nil ? "Draft kept" : "Draft", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(9))
+                        #endif
+                }
             }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
             inputBox
             if fileUI, let limits = attachments?.limits {
                 Text("Up to \(limits.messageFiles) files · \(ByteCountFormatter.string(fromByteCount: Int64(limits.fileBytes), countStyle: .file)) each · \(ByteCountFormatter.string(fromByteCount: Int64(limits.messageBytes), countStyle: .file)) total")
                     .font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/channel/composer/" + (root ?? "feed") + "/limits", text: "Up to \(limits.messageFiles) files · \(ByteCountFormatter.string(fromByteCount: Int64(limits.fileBytes), countStyle: .file)) each · \(ByteCountFormatter.string(fromByteCount: Int64(limits.messageBytes), countStyle: .file)) total", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(9))
+                    #endif
             }
             agentContext
             if choosingContext { contextPicker }
             if let contextPause { Text(contextPause).font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary) }
             if let problem = model.problem { Text(problem).foregroundStyle(ChatAppearance.failure).font(Theme.display(11)).textSelection(.enabled) }
+            if let problem = model.draftSaveProblem {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(problem)
+                    Button("Retry") { model.retryDraftSave() }.buttonStyle(.link)
+                }.foregroundStyle(ChatAppearance.failure).font(Theme.display(11))
+            }
             HStack {
                 if text.utf8.count > ChatChannelModel.maxBytes * 3 / 4 {
                     Text("\(text.utf8.count) / \(ChatChannelModel.maxBytes) bytes").foregroundStyle(ChatAppearance.failure)
                 }
-                Spacer()
                 Text("⌘↩ Send · Return for a new line")
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/channel/composer/" + (root ?? "feed") + "/keys", text: "⌘↩ Send · Return for a new line", colors: ["foreground": ChatAppearance.secondary])
+                    #endif
+                Spacer()
+                if model.isPopup { Text("Esc to close") }
             }.font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
         }
         .padding(.horizontal, root == nil ? 24 : 16).padding(.top, 10).padding(.bottom, 12)
@@ -203,6 +227,9 @@ struct ChatUX1Composer: View {
         }
         .onChange(of: model.problem) { _, problem in
             if let problem, control.focused { ChatAccessibility.announce(problem, in: control.view) }
+        }
+        .onChange(of: model.draftSaveProblem) { _, problem in
+            if problem == nil { version = model.draftVersion(root: root) }
         }
         .onChange(of: selected) { _, value in
             if control.focused, matches.indices.contains(value) {
@@ -233,7 +260,7 @@ struct ChatUX1Composer: View {
         ChatComposerBox(control: control, attachments: attachments, owner: .channel(model.channel), root: root,
                         fileUI: fileUI, mentionTitle: "Mention a person or agent", canSend: canSend, chooseFiles: chooseFiles, send: send) {
             ChatMentionEditor(text: Binding(get: { text }, set: { changed($0) }), selection: $selection, candidates: candidates,
-                autofocus: root != nil, navigationTarget: root == nil && draftLoaded ? ChannelRef(model.key, channel: model.channel) : nil,
+                autofocus: root != nil || model.isPopup, navigationTarget: root == nil && draftLoaded ? ChannelRef(model.key, channel: model.channel) : nil,
                 control: control, heightChanged: { if editorHeight != $0 { editorHeight = $0 } }, placeholder: recipient,
                 accessibilityName: recipient, suggestions: .init(sections: sections, selected: min(selected, max(0, matches.count - 1)),
                     title: "Mention in \(root == nil ? "channel" : "thread")", choose: choose, key: model.key),

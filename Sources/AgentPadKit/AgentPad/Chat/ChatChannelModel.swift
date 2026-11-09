@@ -33,18 +33,24 @@ final class ChatChannelModel {
     @ObservationIgnored var log: (String) -> Void = { NSLog("%@", $0) }
     weak var confirmation: ConfirmationCoordinator?
     var tabID: UUID?
+    var isPopup = false {
+        didSet { if isPopup { preparePopupOpeningPosition() } }
+    }
     var channelAsk: ChannelAskModel?
     var deletionRoot: String?
     private(set) var feed = Feed()
     private(set) var thread: [ChatMessage] = []
     private(set) var threadRoot: String?
     private(set) var threadHasEarlier = false
+    private var threadLoaded = false
+    private var popupOpeningThreads = Set<String>()
     private(set) var entryReadSequence = 0
     private var readBoundaries: [String: ChatUnread.Boundary] = [:]
     private var reading = Set<String>()
     private(set) var threadUnreadID: String?
     var positions: [String: ChatScrollPosition] = [:]
-    var revealMessageID: String?
+    var revealMessageID: String? { didSet { revealRequest += 1 } }
+    private(set) var revealRequest: UInt64 = 0
     var focusedMessageID: String?
     var focusRequest: ChatFocusRequest?
     private(set) var readingPositionRestored = 0
@@ -81,7 +87,13 @@ final class ChatChannelModel {
                     }
                     saved.root = draft.root; saved.message = draft.message; saved.problem = draft.problem
                     draft = saved
-                } catch { /* Keep unsaved work in the editor on a storage failure. */ }
+                    pendingEditDrafts.remove(draft.messageId)
+                    if pendingEditDrafts.isEmpty && pendingDrafts.isEmpty { draftSaveProblem = nil }
+                } catch {
+                    pendingEditDrafts.insert(draft.messageId)
+                    draftSaveProblem = "The draft could not be saved on this Mac. Retry before closing."
+                    draft.problem = draftSaveProblem
+                }
             }
             editDrafts[draft.messageId] = draft
             activeEditing = draft
@@ -89,6 +101,7 @@ final class ChatChannelModel {
     }
     /// Navigation changes the active editor, never these per-message drafts.
     private var editDrafts: [String: Editing] = [:]
+    private var pendingEditDrafts = Set<String>()
     private var editOrder: [String] = []
     private(set) var b1: ChatB1Channel?
     let pins = ChatPinsPresentation()
@@ -98,6 +111,8 @@ final class ChatChannelModel {
     private(set) var threadRequests: [ChatChannelRequests.Card] = []
     /// The last problem of an action, in words.
     private(set) var problem: String?
+    private(set) var draftSaveProblem: String?
+    private var pendingDrafts: [String: Draft] = [:]
     /// F5: "Ask" offered after the user's own messages named an agent of
     /// the channel; and the asks the queue holds (living or refused).
     private(set) var offers: [ChatChannelAsk.Offer] = []
@@ -191,6 +206,7 @@ final class ChatChannelModel {
             .removeDuplicates()
             .start(in: store.queue, scheduling: .immediate, onError: { _ in }) { [weak self] feed in
                 self?.feed = feed
+                self?.preparePopupOpeningPosition()
                 self?.completeShown(feed.messages)
                 self?.updateB1Window()
                 if feed.boundaryDismissed {
@@ -287,10 +303,14 @@ final class ChatChannelModel {
 
     func openThread(_ root: String?) {
         guard root != threadRoot else { observeThread(); return }
+        if isPopup {
+            do { try flushConversationDrafts() } catch { return }
+            if root == nil, let target = revealMessageID.flatMap(message), target.threadRootId != nil { finishNavigation() }
+        }
         if let old = threadRoot { endReading(root: old) }
         editing = nil
         restoreEditing(root: root)
-        focusedMessageID = root == nil ? threadRoot : nil
+        focusedMessageID = isPopup ? nil : (root == nil ? threadRoot : nil)
         threadRoot = root
         threadUnreadID = nil
         if let root { captureReadBoundary(root: root) }
@@ -299,9 +319,51 @@ final class ChatChannelModel {
         thread = []
         threadRequests = []
         threadHasEarlier = false
+        threadLoaded = false
         cancelThreadRead()
         observeThreadRequests()
         observeThread()
+        preparePopupOpeningPosition()
+        if isPopup, root == nil { readingPositionRestored += 1 }
+    }
+
+    /// A popup uses the same timeline and retained positions as its tab. Seed
+    /// a first visit before the timeline's normal bottom-following bootstrap.
+    /// An explicit navigation target is handled by that timeline before this
+    /// anchor, while a retained position always wins over the unread boundary.
+    func preparePopupOpeningPosition() {
+        guard isPopup, accessConfirmed else { return }
+        let root = threadRoot, slot = root ?? ""
+        if revealMessageID != nil { popupOpeningThreads.remove(slot); return }
+        guard positions[slot]?.initialized != true || popupOpeningThreads.contains(slot) else { return }
+        let messages = conversationMessages(root: root)
+        let unread = root == nil ? feed.unreadID : threadUnreadID
+        let unreadIndex = unread.flatMap { id in messages.firstIndex { $0.id == id } }
+        // Inbox can cache an unread reply outside the thread's current window.
+        // A cursor only proves that one page arrived. Keep resolving a missing
+        // anchor while earlier pages remain, without following their latest row.
+        if let root, unreadIndex == nil, !threadLoaded || (unread != nil && threadHasEarlier) {
+            popupOpeningThreads.insert(root)
+            if threadLoaded {
+                let mounted = positions[slot]?.initialized == true
+                var position = ChatScrollPosition()
+                _ = position.update(messages, me: key.accountId)
+                position.measured(bottom: false, anchor: positions[slot]?.anchor ?? messages.first?.id)
+                if positions[slot] != position {
+                    positions[slot] = position
+                    if mounted { readingPositionRestored += 1 }
+                }
+            }
+            return
+        }
+        let mounted = positions[slot]?.initialized == true
+        popupOpeningThreads.remove(slot)
+        guard let index = unreadIndex else { return }
+        var position = ChatScrollPosition()
+        _ = position.update(messages, me: key.accountId)
+        position.measured(bottom: false, anchor: messages[max(0, index - 1)].id)
+        positions[slot] = position
+        if mounted { readingPositionRestored += 1 }
     }
 
     private func observeThreadRequests() {
@@ -318,10 +380,16 @@ final class ChatChannelModel {
 
     /// F2 checking hides the view but retains its model. Resume the open
     /// conversation only after ready confirms access to this same store.
-    func setAccessConfirmed(_ confirmed: Bool) {
+    func setAccessConfirmed(_ confirmed: Bool, preservingOpening: Bool = false) {
         accessConfirmed = confirmed
         if confirmed { observeThread(); updateB1Window() }
-        else { cancelThreadRead(); b1?.hide() }
+        else {
+            cancelThreadRead()
+            // Checking suspends a first visit; its initialized position is
+            // still timeline bootstrap until the unread anchor is resolved.
+            if !preservingOpening { popupOpeningThreads.removeAll() }
+            b1?.hide()
+        }
     }
 
     private struct ThreadSnapshot: Equatable {
@@ -363,11 +431,15 @@ final class ChatChannelModel {
             guard let self, self.threadRoot == root else { return }
             self.thread = value.messages
             self.threadUnreadID = value.unreadID
+            self.threadLoaded = value.hasCursor
             self.threadHasEarlier = value.hasEarlier
+            if value.accessible { self.preparePopupOpeningPosition() }
             self.completeShown(value.messages)
             self.updateB1Window()
             if !value.accessible { self.cancelThreadRead() }
-            else if !value.hasCursor { self.loadThread(root, epoch: value.epoch) }
+            else if !value.hasCursor || (value.hasEarlier && self.popupOpeningThreads.contains(root)) {
+                self.loadThread(root, epoch: value.epoch, more: value.hasCursor)
+            }
             if value.boundaryDismissed {
                 Task { @MainActor [weak self] in
                     guard self?.readBoundaries[root] == boundary else { return }
@@ -384,7 +456,7 @@ final class ChatChannelModel {
         threadReadEpoch = nil
     }
 
-    private func loadThread(_ root: String, epoch: Int) {
+    private func loadThread(_ root: String, epoch: Int, more: Bool = false) {
         guard accessConfirmed, let sync = service.orgSessions[key]?.sync, !sync.needsSnapshot else { return }
         guard threadRead == nil || threadReadEpoch != epoch else { return }
         cancelThreadRead()
@@ -394,24 +466,28 @@ final class ChatChannelModel {
         threadRead = Task { [weak self] in
             guard let self, self.threadReadID == id, self.threadRoot == root,
                   self.accessConfirmed, !Task.isCancelled else { return }
-            await sync.readChannel(channel, .thread(root: root, more: false))
+            let outcome = await sync.readChannel(channel, .thread(root: root, more: more))
             guard self.threadReadID == id else { return }
             self.threadRead = nil
             self.threadReadID = nil
             self.threadReadEpoch = nil
+            // GRDB may deliver the page before this request releases its slot.
+            // Re-read the cursor after success so a pending opening can continue.
+            if outcome == .applied { self.observeThread() }
         }
     }
 
     func earlierReplies() {
-        guard let root = threadRoot, let sync = service.orgSessions[key]?.sync else { return }
-        let channel = channel
-        Task { await sync.readChannel(channel, .thread(root: root, more: true)) }
+        guard let root = threadRoot, let store,
+              let epoch = try? store.queue.read({ try ChatMessages.epoch($0, channel) }) else { return }
+        loadThread(root, epoch: epoch, more: threadLoaded)
     }
 
     // MARK: Local search and navigation (no new server API)
 
     func navigate(to link: ChatMessageLink) {
         guard link.matches(key: key, channel: channel), let store else { return }
+        if isPopup { do { try flushConversationDrafts() } catch { return } }
         linkObservation = nil
         if let cached = message(link.message), cached.hasFixed { navigate(to: cached); return }
         let id = link.message, channel = channel
@@ -441,6 +517,7 @@ final class ChatChannelModel {
 
     func navigate(to target: ChatMessage) {
         guard let current = message(target.messageId), current.channelId == channel else { return }
+        if isPopup { do { try flushConversationDrafts() } catch { return } }
         if navigationReturnRoot == nil {
             navigationReturnRoot = .some(threadRoot)
             navigationReturnPositions = positions
@@ -608,8 +685,9 @@ final class ChatChannelModel {
         let removedCache = !FileManager.default.fileExists(atPath: store.url.path)
         guard let drafts = (try? store.queue.read { try ChatEditDrafts.read($0, channel: channel) }) ?? (removedCache ? observed : nil) else { return }
         let ids = Set(drafts.map(\.messageId))
-        for id in editOrder where !ids.contains(id) { finishEditing(id, removeStored: false) }
+        for id in editOrder where !ids.contains(id) && !pendingEditDrafts.contains(id) { finishEditing(id, removeStored: false) }
         for var draft in drafts {
+            guard !pendingEditDrafts.contains(draft.messageId) else { continue }
             if let local = editDrafts[draft.messageId] {
                 draft.root = local.root; draft.message = local.message
                 draft.problem = local.version == draft.version ? local.problem : nil
@@ -667,6 +745,7 @@ final class ChatChannelModel {
             self.editing = nil
         }
         editDrafts[id] = nil
+        pendingEditDrafts.remove(id)
         editOrder.removeAll { $0 == id }
         editingObservations[id] = nil
     }
@@ -695,6 +774,9 @@ final class ChatChannelModel {
 
     @discardableResult
     func dismissTransient() -> Bool {
+        // The popup coordinator owns Escape; a popup never consumes it as an
+        // implicit mark-all-read or as a second thread-close action.
+        guard !isPopup else { return false }
         if editing != nil { cancelEditing() }
         else if searching { returnFromNavigation(); setSearching(false) }
         else if let root = threadRoot { markThreadRead(root); openThread(nil) }
@@ -843,6 +925,9 @@ final class ChatChannelModel {
     }
 
     func readIfLooking(root: String?, appActive: Bool, shown: Bool, atBottom: Bool) {
+        // Geometry may still describe the root-only viewport while the shared
+        // timeline applies the newly resolved unread position.
+        if isPopup, popupOpeningThreads.contains(root ?? "") || positions[root ?? ""]?.atBottom == false { return }
         guard accessConfirmed, canAutomaticallyRead(),
               ChatScrollPosition.canMarkRead(appActive: appActive, shown: shown, atBottom: atBottom,
                                              searching: searching || hasNavigationReturn) else { return }
@@ -901,7 +986,8 @@ final class ChatChannelModel {
     }
 
     func composerDraft(root: String?) -> Draft {
-        (try? store?.queue.read { db -> Draft in
+        if let pending = pendingDrafts[root ?? ""] { return pending }
+        return (try? store?.queue.read { db -> Draft in
             guard let row = try Row.fetchOne(db, sql: "SELECT * FROM drafts WHERE channel_id = ? AND thread_root_id = ?",
                                              arguments: [channel, root ?? ""]) else { return Draft() }
             return Self.readDraft(row)
@@ -920,26 +1006,83 @@ final class ChatChannelModel {
     }
 
     func draftVersion(root: String?) -> String? {
-        try? store?.queue.read { try String.fetchOne($0, sql: "SELECT version FROM drafts WHERE channel_id = ? AND thread_root_id = ?", arguments: [channel, root ?? ""]) }
+        guard pendingDrafts[root ?? ""] == nil else { return nil }
+        return try? store?.queue.read { try String.fetchOne($0, sql: "SELECT version FROM drafts WHERE channel_id = ? AND thread_root_id = ?", arguments: [channel, root ?? ""]) }
     }
 
     /// Kept only while the channel's card is and the rights are not in doubt:
     /// a save made late — after the user left the team — writes nothing
     /// (review F3-p1-3).
     func saveDraft(_ text: String, root: String?, mentionOnly: Bool? = nil, contextIds: Set<String>? = nil, attachmentSelection: [ChatAttachmentManifest]? = nil) {
+        let previous = composerDraft(root: root)
+        let draft = Draft(text: text, mentionOnly: mentionOnly ?? previous.mentionOnly,
+                          contextIds: contextIds ?? previous.contextIds,
+                          attachmentSelection: attachmentSelection ?? previous.attachmentSelection)
+        pendingDrafts[root ?? ""] = draft
+        do {
+            try persistDraft(draft, root: root)
+            pendingDrafts[root ?? ""] = nil
+            if pendingDrafts.isEmpty && pendingEditDrafts.isEmpty { draftSaveProblem = nil }
+        } catch {
+            draftSaveProblem = "The draft could not be saved on this Mac. Retry before closing."
+        }
+    }
+
+    /// Closing, replacing or promoting a conversation is conditional on this
+    /// flush. Failed text stays in this model even if its composer remounts.
+    func flushConversationDrafts() throws {
+        do {
+            for slot in pendingDrafts.keys.sorted() {
+                guard let draft = pendingDrafts[slot] else { continue }
+                try persistDraft(draft, root: slot.isEmpty ? nil : slot)
+                pendingDrafts[slot] = nil
+            }
+            if !pendingEditDrafts.isEmpty {
+                guard let store else { throw ChatError.storage("The conversation is unavailable on this Mac.") }
+                for id in pendingEditDrafts.sorted() {
+                    guard let draft = editDrafts[id] else { pendingEditDrafts.remove(id); continue }
+                    guard var saved = try store.queue.write({ try ChatEditDrafts.save($0, draft: draft, channel: channel) }) else {
+                        throw ChatError.storage("The edit could not be saved on this Mac.")
+                    }
+                    saved.root = draft.root; saved.message = draft.message
+                    editDrafts[id] = saved
+                    if activeEditing?.messageId == id { activeEditing = saved }
+                    pendingEditDrafts.remove(id)
+                }
+            }
+            draftSaveProblem = nil
+        } catch {
+            draftSaveProblem = "The draft could not be saved on this Mac. Retry before closing."
+            throw error
+        }
+    }
+
+    func retryDraftSave() { try? flushConversationDrafts() }
+
+    var hasConversationDraft: Bool {
+        if pendingDrafts.values.contains(where: { !$0.text.isEmpty || !$0.attachmentSelection.isEmpty }) || !editDrafts.isEmpty { return true }
+        if service.attachments(key)?.drafts.contains(where: { $0.owner == .channel(channel) }) == true { return true }
+        return (try? store?.queue.read { db in
+            try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM drafts WHERE channel_id = ? AND (text != '' OR attachment_selection != '[]'))", arguments: [channel])
+        }) == true
+    }
+
+    private func persistDraft(_ draft: Draft, root: String?) throws {
+        guard let store else { throw ChatError.storage("The conversation is unavailable on this Mac.") }
         let channel = channel
-        try? store?.queue.write { db in
+        let text = draft.text
+        try store.queue.write { db in
             guard try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM channels WHERE channel_id = ?)", arguments: [channel]) == true,
-                  try Bool.fetchOne(db, sql: "SELECT rights_in_doubt FROM meta WHERE id = 1") != true else { return }
+                  try Bool.fetchOne(db, sql: "SELECT rights_in_doubt FROM meta WHERE id = 1") != true else { throw ChatError.notConnected }
             if try text.isEmpty && ChatAttachments.drafts(db, channel: channel, root: root).isEmpty {
                 try db.execute(sql: "DELETE FROM drafts WHERE channel_id = ? AND thread_root_id = ?", arguments: [channel, root ?? ""])
             } else {
                 let row = try Row.fetchOne(db, sql: "SELECT * FROM drafts WHERE channel_id = ? AND thread_root_id = ?",
                                            arguments: [channel, root ?? ""])
                 let previous = row.map(Self.readDraft) ?? Draft()
-                let mentionOnly = mentionOnly ?? previous.mentionOnly
-                let contextIds = contextIds ?? previous.contextIds
-                let attachmentSelection = attachmentSelection ?? previous.attachmentSelection
+                let mentionOnly = draft.mentionOnly
+                let contextIds = draft.contextIds
+                let attachmentSelection = draft.attachmentSelection
                 let unchanged = previous.attachmentSelection == attachmentSelection && previous.text == text && previous.mentionOnly == mentionOnly && previous.contextIds == contextIds
                 let version = unchanged ? previous.version ?? UUID().uuidString.lowercased() : UUID().uuidString.lowercased()
                 let context = String(decoding: try JSONEncoder().encode(contextIds.sorted()), as: UTF8.self)

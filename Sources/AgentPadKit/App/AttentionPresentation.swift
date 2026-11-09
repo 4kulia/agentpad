@@ -17,22 +17,29 @@ final class NotificationNavigation {
     var shouldWait: (AttentionEvent) -> Bool = { _ in false }
     var validate: (AttentionEvent) -> Bool = { _ in false }
     var open: (AttentionEvent) -> Bool = { _ in false }
+    var openAsTab: ((AttentionEvent) -> Bool)?
     var unavailable: () -> Void = {}
     var telegramActivate: (String) -> Bool = { TelegramNotifications.shared.activate($0) }
+    var telegramActivateAsTab: (String) -> Bool = { TelegramNotifications.shared.activate($0, asTab: true) }
     var telegramReady: () -> Bool = { TelegramNotifications.shared.initialized }
-    private var pending: [String] = []
+    private var pending: [(id: String, asTab: Bool)] = []
     init(ledger: AttentionLedger) { self.ledger = ledger }
-    func activate(_ id: String) {
-        guard ready else { if !pending.contains(id) { pending.append(id) }; return }
+    func activate(_ id: String, asTab: Bool = false) {
+        let asTab = asTab || ConversationOpenIntent.commandClick
+        func enqueue() {
+            if let index = pending.firstIndex(where: { $0.id == id }) { pending[index].asTab = asTab }
+            else { pending.append((id, asTab)) }
+        }
+        guard ready else { enqueue(); return }
         if id.hasPrefix("telegram:") {
-            guard telegramReady() else { if !pending.contains(id), pending.count < 250 { pending.append(id) }; return }
-            if !telegramActivate(id) { unavailable() }
+            guard telegramReady() else { if pending.count < 250 { enqueue() }; return }
+            if !(asTab ? telegramActivateAsTab : telegramActivate)(id) { unavailable() }
             return
         }
         if let event = ledger.event(id), shouldWait(event) {
-            if !pending.contains(id) { pending.append(id) }; return
+            enqueue(); return
         }
-        guard let event = ledger.event(id), validate(event), open(event) else {
+        guard let event = ledger.event(id), validate(event), (asTab ? openAsTab ?? open : open)(event) else {
             ledger.resolve(id); unavailable(); return
         }
         ledger.markRead(id)
@@ -45,7 +52,13 @@ final class NotificationNavigation {
     func retryPending() {
         guard ready else { return }
         let ids = pending; pending = []
-        for id in ids { activate(id) }
+        for request in ids { activate(request.id, asTab: request.asTab) }
+    }
+}
+
+extension AttentionDestination {
+    var isConversation: Bool {
+        switch self { case .message, .directMessage, .telegram: true; default: false }
     }
 }
 

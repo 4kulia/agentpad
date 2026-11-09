@@ -123,6 +123,9 @@ final class ChatActivitySnapshotTests: XCTestCase {
         XCTAssertEqual(projection.projectionBuildCount, builds)
         let initiator = makeTestStore()
         defer { initiator.terminate() }
+        let initiatingAgent = try XCTUnwrap(initiator.active?.activeSession)
+        let remoteSelections = [a.active?.activeSession?.id, b.active?.activeSession?.id]
+        let existingTabs = [a.allSessions.map(\.id), b.allSessions.map(\.id), initiator.allSessions.map(\.id)]
         let router = TabRouter()
         router.stores = { [a, b, initiator] }
         router.ensureHost = { initiator }
@@ -135,9 +138,21 @@ final class ChatActivitySnapshotTests: XCTestCase {
         let mention = AttentionItem(id: "mention", tier: 3, time: .now, title: "#Private channel", subtitle: "Mentioned you",
             action: .mention(ChatAttention.scope(key, service), channel: "c", message: "root", sequence: 1))
         projection.activate(mention, from: initiator, router: router)
-        XCTAssertEqual(raised, b.windowID)
-        XCTAssertNil(initiator.channelTab(ref), "Needs attention must reuse the open destination in another window")
-        XCTAssertEqual(ChatMessageNavigation.take(key: key, channel: "c", from: two.engine.view)?.message, "root")
+        let popup = try XCTUnwrap(initiator.popups.visibleConversation)
+        XCTAssertEqual(popup.channel, ref)
+        XCTAssertFalse(popup === one || popup === two, "Attention opens in the initiating window despite matching remote tabs")
+        XCTAssertNil(raised, "A conversation entry cannot raise another window or Space")
+        XCTAssertTrue(initiator.active?.activeSession === initiatingAgent)
+        XCTAssertEqual([a.active?.activeSession?.id, b.active?.activeSession?.id], remoteSelections)
+        XCTAssertEqual([a.allSessions.map(\.id), b.allSessions.map(\.id), initiator.allSessions.map(\.id)], existingTabs)
+        XCTAssertNil(initiator.channelTab(ref), "Ordinary attention activation creates a popup, without a content tab")
+        XCTAssertNil(ChatMessageNavigation.take(key: key, channel: "c", from: one.engine.view))
+        XCTAssertNil(ChatMessageNavigation.take(key: key, channel: "c", from: two.engine.view))
+        let target = try XCTUnwrap(ChatMessageNavigation.take(key: key, channel: "c", from: popup.engine.view))
+        XCTAssertEqual(target.message, "root")
+        XCTAssertEqual(target.sequence, 1)
+        XCTAssertEqual(try read(db) { try Int.fetchOne($0, sql: "SELECT last_read_seq FROM read_marks WHERE channel_id = 'c'") }, 0,
+                       "Opening an unmounted popup cannot acknowledge unseen messages")
         try write(db) { _ = try ChatUnread.markRead($0, channel: "c", upTo: 1) }
         try await wait { projection.tabIndicators.isEmpty }
         XCTAssertEqual(try read(db) { try ChatUnread.unreadRepliesByChannel($0)["c"] }, 1,

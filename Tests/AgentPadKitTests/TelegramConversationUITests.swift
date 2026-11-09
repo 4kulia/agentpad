@@ -8,14 +8,19 @@ import XCTest
 actor ConversationUIFake: TelegramConversationProvider {
     var sent: [TelegramDraft] = []
     var writes: [TelegramDraft] = []
+    var draftWritesSucceed = true
+    func setDraftWritesSucceed(_ value: Bool) { draftWritesSucceed = value }
+    var requestedMessages: [Int64] = []
+    var historyRequests: [Bool] = []
     var observations: [TelegramPresentationObservation] = []
     var sponsoredActions: [TelegramSponsoredAction] = []
     var sponsoredResult: TelegramSponsoredActionResult = .none
     func setSponsoredResult(_ result: TelegramSponsoredActionResult) { sponsoredResult = result }
     func conversation(_ id: TelegramChatID, pane: UUID) -> AsyncStream<TelegramConversationSnapshot> { AsyncStream { $0.finish() } }
     func releaseConversation(_ id: TelegramChatID, pane: UUID, epoch: UUID) {}
-    func loadHistory(_ id: TelegramChatID, epoch: UUID, latest: Bool) {}
-    func updateDraft(_ id: TelegramChatID, epoch: UUID, draft: TelegramDraft) -> Bool { writes.append(draft); return true }
+    func loadHistory(_ id: TelegramChatID, epoch: UUID, latest: Bool) { historyRequests.append(latest) }
+    func updateDraft(_ id: TelegramChatID, epoch: UUID, draft: TelegramDraft) -> Bool { writes.append(draft); return draftWritesSucceed }
+    func loadMessage(_ id: TelegramChatID, epoch: UUID, message: Int64) { requestedMessages.append(message) }
     func sendDraft(_ id: TelegramChatID, epoch: UUID, draft: TelegramDraft) { sent.append(draft) }
     func retryMessage(_ id: TelegramChatID, epoch: UUID, message: Int64) {}
     func recoverMessage(_ id: TelegramChatID, epoch: UUID, operation: UUID) {}
@@ -216,7 +221,7 @@ actor ConversationUIFake: TelegramConversationProvider {
     private func forceKeyboard(_ message: Int64, personal: Bool = true) -> TelegramBotKeyboard {
         TelegramBotDecoder.keyboard(TDLibMessage("replyMarkupForceReply", ["is_personal": .bool(personal), "input_field_placeholder": .string("Reply here")]), message: message)!
     }
-    func testTopicTabsReuseExactRouteAcrossWindowsAndPreserveIndependentDrafts() throws {
+    func testTopicPopupsReuseExactRouteAndPreserveIndependentDrafts() throws {
         let store = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: { XCTFail("No terminal for Telegram"); return TestEngine() })
         defer { store.terminate() }
         let router = TabRouter(); router.stores = { [store] }

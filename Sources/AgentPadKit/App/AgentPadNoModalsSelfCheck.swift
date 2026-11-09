@@ -1215,7 +1215,7 @@ private extension NoModalsUIProbe {
             case .tool(let session): measured = session.tabState?.popupContentHeight
             case .native(let native): measured = native.contentHeight
             case .confirmation: measured = coordinator.confirmationContentHeight
-            case .account, .none: measured = nil
+            case .account, .conversation, .none: measured = nil
             }
             guard let measured else { return false }
             let expectedHeight = min(measured + 63 + (coordinator.showsDraftNotice ? 30 : 0), content.bounds.height - 48)

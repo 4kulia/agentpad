@@ -38,6 +38,9 @@ struct ChatDMSidebarSection: View {
                                 .background(store.active?.activeSession?.toolRoute == row.route(key) ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 6))
                                 .contentShape(Rectangle())
                         }.buttonStyle(.plain).chatFocusRing().accessibilityLabel(row.peer.name)
+                            .contextMenu {
+                                Button("Open as tab") { ChatDMTabs.open(key, peer: row.id, from: store, service: service, asTab: true) }
+                            }
                             .help("Unread roots: \(row.roots.count)\(row.roots.more ? "+" : ""). Unread replies: \(row.replies). Counts include loaded history only.")
                     }
                     if expanded && visible.count < entries.count {

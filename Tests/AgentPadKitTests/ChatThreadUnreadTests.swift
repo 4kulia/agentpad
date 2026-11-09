@@ -1,7 +1,7 @@
 import AppKit
+import AgentPadQuietTestSupport
 import GRDB
 import SwiftUI
-import Vision
 import XCTest
 @testable import AgentPadKit
 
@@ -9,9 +9,15 @@ import XCTest
 final class ChatThreadUnreadTests: XCTestCase {
     private var directory: URL!
     private var scope: TeamServiceTestScope!
+    private var oldAccessibility: Any?
+    private let accessibility = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
     private let key = ChatOrgKey(server: try! ChatServerAddress(parsing: "https://chat.example.com"), accountId: "me", orgId: "org")
 
     override func setUp() async throws {
+        XCTAssertTrue(APQuietIsEnabled())
+        _ = NSApplication.shared
+        oldAccessibility = NSApp.accessibilityAttributeValue(accessibility)
+        NSApp.accessibilitySetValue(true, forAttribute: accessibility)
         scope = TeamServiceTestScope()
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("thread-unread-\(UUID())")
     }
@@ -19,6 +25,7 @@ final class ChatThreadUnreadTests: XCTestCase {
     override func tearDown() async throws {
         scope.close()
         try? FileManager.default.removeItem(at: directory)
+        NSApp.accessibilitySetValue(oldAccessibility, forAttribute: accessibility)
     }
 
     @discardableResult
@@ -182,10 +189,10 @@ final class ChatThreadUnreadTests: XCTestCase {
         try post(store, "reply-2", seq: 4, root: "root")
         let model = model(store)
         let message = try XCTUnwrap(model.message("root"))
-        let host = NSHostingView(rootView: AnyView(ChatMessageRow(model: model, message: message, members: [], mentionable: [],
-            me: "me", archived: false, replies: 2).frame(width: 700, height: 180).background(ChatAppearance.surface)))
-        let window = makeWindow(host, size: NSSize(width: 700, height: 180))
-        defer { window.contentView = nil; window.close() }
+        let host = ChatQuietHost(content: AnyView(ChatNativeRowFixture(model: model, message: message, members: [], mentionable: [],
+            me: "me", archived: false, replies: 2).frame(width: 700, height: 180).background(ChatAppearance.surface)),
+            dark: false, width: 700, height: 180)
+        defer { host.close() }
         for serverCount: Int? in [nil, 10, 0] {
             if let serverCount {
                 model.service.serverCapabilities[key.server] = ["chat.thread_summary"]
@@ -197,17 +204,24 @@ final class ChatThreadUnreadTests: XCTestCase {
                 }
                 try await wait { model.b1?.state.metadata["root"]?.threadSummary?.replyCount == serverCount }
             }
-            let words = try await renderedText(host, name: "root-\(serverCount.map(String.init) ?? "local")").map(\.text).joined(separator: " ")
-            XCTAssertTrue(words.contains("2 new"), words)
-            XCTAssertTrue(words.contains(serverCount == 10 ? "10 replies" : "2 replies"), words)
+            let summary = try await nativeReplySummary(host, name: "root-\(serverCount.map(String.init) ?? "local")")
+            let drawn = summary.parityTexts
+            let expected = serverCount == 10 ? "10 replies" : "2 replies"
+            XCTAssertEqual(drawn.first { $0.id == "w06/replies/label" }?.text.string, expected)
+            XCTAssertEqual(drawn.first { $0.id == "w06/replies/unread-text" }?.text.string, "2 new")
+            let label = summary.parityButton.accessibilityLabel() ?? ""
+            XCTAssertTrue(label.hasPrefix(expected + ", 2 new"), label)
         }
         model.openThread("root")
         model.readIfLooking(root: "root", appActive: true, shown: true, atBottom: true)
         try await wait { model.feed.unreadReplyCounts.isEmpty }
         model.service.serverCapabilities[key.server] = []
-        let words = try await renderedText(host, name: "root-read").map(\.text).joined(separator: " ")
-        XCTAssertTrue(words.contains("2 replies"), words)
-        XCTAssertFalse(words.contains("new"), words)
+        let summary = try await nativeReplySummary(host, name: "root-read")
+        XCTAssertEqual(summary.parityTexts.first { $0.id == "w06/replies/label" }?.text.string, "2 replies")
+        XCTAssertNil(summary.parityTexts.first { $0.id == "w06/replies/unread-text" })
+        let label = summary.parityButton.accessibilityLabel() ?? ""
+        XCTAssertTrue(label.hasPrefix("2 replies"), label)
+        XCTAssertFalse(label.contains("new"), label)
     }
 
     func testNativeChannelHintOpensMissingRootAndReadingRemovesCount() async throws {
@@ -219,56 +233,46 @@ final class ChatThreadUnreadTests: XCTestCase {
         let conversation = ChatChannelSession()
         conversation.update(.ready(card, team: "Team", offline: true), key: key, store: store, service: service())
         let model = try XCTUnwrap(conversation.model)
+        // This cache-only fixture has no signed-in notification scope. Keep
+        // native visibility/bottom/read gates active without that separate fence.
+        XCTAssertFalse(model.canAutomaticallyRead())
+        model.canAutomaticallyRead = { true }
         let active = ChatNotifications.appActive
         ChatNotifications.appActive = { true }
         defer { ChatNotifications.appActive = active }
-        let host = NSHostingView(rootView: AnyView(ChatChannelView(card: card, team: "Team", offline: true, key: key, conversation: conversation)
-            .frame(width: 700, height: 500)))
-        let window = makeWindow(host, size: NSSize(width: 700, height: 500))
-        defer { window.contentView = nil; window.close() }
-        let text = try await renderedText(host, name: "channel-hint")
-        let hint = try XCTUnwrap(text.first { $0.text.contains("Unread thread replies: 2") }, text.map(\.text).joined(separator: " "))
-        try await wait { host.layoutSubtreeIfNeeded(); return org.unread("c")?.count == 0 && model.feed.unloadedUnreadReplyCount == 2 }
-        let point = NSPoint(x: hint.box.midX * host.bounds.width,
-                           y: (host.isFlipped ? 1 - hint.box.midY : hint.box.midY) * host.bounds.height)
-        try click(window, at: host.convert(point, to: nil))
-        try await wait { host.layoutSubtreeIfNeeded(); return model.threadRoot == "missing" && model.feed.unreadReplyCounts.isEmpty && org.unread("c")?.count == 0 }
+        let host = ChatQuietHost(content: AnyView(ChatChannelView(card: card, team: "Team", offline: true, key: key, conversation: conversation)
+            .frame(width: 700, height: 500)), dark: false, width: 700, height: 500)
+        defer { host.close() }
+        try await host.settle()
+        let timeline = try XCTUnwrap(ChatTimelineReferenceCapture.descendants(host.view, NativeChatTimelineContainer.self).first)
+        XCTAssertTrue(NavigationPresentationGate.allowsAcknowledgement(timeline, appActive: true))
+        try capture(host.view, name: "channel-hint")
+        let hint = try XCTUnwrap(host.strings.first { $0.contains("Unread thread replies: 2") }, host.strings.joined(separator: " "))
+        try await wait { host.view.layoutSubtreeIfNeeded(); return org.unread("c")?.count == 0 && model.feed.unloadedUnreadReplyCount == 2 }
+        try host.press(hint)
+        try await wait { host.view.layoutSubtreeIfNeeded(); return model.threadRoot == "missing" && model.feed.unreadReplyCounts.isEmpty && org.unread("c")?.count == 0 }
         XCTAssertNil(model.feed.firstUnloadedUnreadThread)
         model.openThread(nil)
-        let read = try await renderedText(host, name: "channel-read").map(\.text).joined(separator: " ")
-        XCTAssertFalse(read.contains("Unread thread replies"), read)
+        try await host.settle()
+        try capture(host.view, name: "channel-read")
+        XCTAssertFalse(host.strings.contains { $0.contains("Unread thread replies") }, host.strings.joined(separator: " "))
     }
 
-    private func makeWindow(_ host: NSView, size: NSSize) -> NSWindow {
-        final class Window: NSWindow { override var isKeyWindow: Bool { true } }
-        let window = Window(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false; window.contentView = host; window.orderFront(nil)
-        return window
+    /// Read the operands used by the actual native drawing path and its live
+    /// accessible control. OCR is not part of the product's unread behavior.
+    private func nativeReplySummary(_ host: ChatQuietHost, name: String) async throws -> ChatNativeReplySummaryView {
+        try await host.settle()
+        try capture(host.view, name: name)
+        let cell = try XCTUnwrap(ChatTimelineReferenceCapture.descendants(host.view, ChatNativeShellCell.self).first)
+        XCTAssertFalse(cell.replySummary.parityButton.isHidden)
+        XCTAssertNil(APQuietFailure())
+        return cell.replySummary
     }
 
-    /// Assert the actual SwiftUI text, including both production reply-button paths.
-    private func renderedText(_ host: NSView, name: String) async throws -> [(text: String, box: CGRect)] {
-        host.layoutSubtreeIfNeeded()
-        try await Task.sleep(for: .milliseconds(150))
-        host.layoutSubtreeIfNeeded()
-        let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
-        host.cacheDisplay(in: host.bounds, to: bitmap)
-        if let output = ProcessInfo.processInfo.environment["AGENTPAD_THREAD_UNREAD_CAPTURE"] {
-            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: URL(fileURLWithPath: output).appendingPathComponent("\(name).png"))
-        }
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate; request.recognitionLanguages = ["en-US"]; request.usesLanguageCorrection = false
-        try VNImageRequestHandler(cgImage: XCTUnwrap(bitmap.cgImage)).perform([request])
-        return (request.results ?? []).compactMap { result in result.topCandidates(1).first.map { ($0.string, result.boundingBox) } }
-    }
-
-    private func click(_ window: NSWindow, at point: NSPoint) throws {
-        func event(_ type: NSEvent.EventType) throws -> NSEvent {
-            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
-                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
-        }
-        NSApp.postEvent(try event(.leftMouseUp), atStart: true)
-        window.sendEvent(try event(.leftMouseDown))
-        if let up = NSApp.nextEvent(matching: .leftMouseUp, until: .distantPast, inMode: .default, dequeue: true) { window.sendEvent(up) }
+    private func capture(_ host: NSView, name: String) throws {
+        guard let output = ProcessInfo.processInfo.environment["AGENTPAD_THREAD_UNREAD_CAPTURE"] else { return }
+        let bitmap = try ChatTimelineCaptureColor.bitmap(host)
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(
+            to: URL(fileURLWithPath: output).appendingPathComponent("\(name).png"))
     }
 }

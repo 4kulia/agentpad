@@ -214,6 +214,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         SupportTabs.shared.install()
         TabRouter.shared.ensureHost = { [weak self] in self?.ensureWorkspaceHost()?.store }
         SupportTabs.shared.activateNotice = { [weak self] event in self?.activateFromInbox(event) }
+        SupportTabs.shared.activateNoticeAsTab = { [weak self] event in self?.activateFromInbox(event, asTab: true) }
         _ = AttentionSidebarModel.shared
         restoreWindows()
         SupportTabs.shared.navigation.finishStartup()
@@ -259,6 +260,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             return !event.kind.needsDecision || AttentionLedger.shared.events.contains { $0.id == event.id }
         }
         notificationNavigation.open = { [weak self] in self?.openAttention($0) ?? false }
+        notificationNavigation.openAsTab = { [weak self] in self?.openAttention($0, asTab: true) ?? false }
         notificationNavigation.unavailable = {
             SupportTabs.shared.noticeUnavailable()
         }
@@ -637,7 +639,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     private func handleDeepLink(_ link: AgentPadDeepLink) {
-        NSApp.activate(ignoringOtherApps: true)
         switch link {
         case .chatMessage(let target):
             guard let key = ChatService.shared.connection?.orgKey, target.matches(key: key, channel: target.channel),
@@ -645,13 +646,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 presentDeepLinkFailure("Connect to the message's organization and confirm channel access first.")
                 return
             }
-            guard let controller = deepLinkController()?.controller,
+            guard let controller = activeController ?? deepLinkController()?.controller,
                   let session = controller.store.showChannel(ChannelRef(key, channel: target.channel)) else { return }
-            if let window = controller.window { front(window) }
             ChatMessageNavigation.request(target, key: key, destination: session.engine.view)
         case .resumeSession(let agentId, let conversationId, let cwd):
+            NSApp.activate(ignoringOtherApps: true)
             resumeSessionFromDeepLink(agentId: agentId, conversationId: conversationId, cwd: cwd)
         case .invalid(let reason):
+            NSApp.activate(ignoringOtherApps: true)
             presentDeepLinkFailure(reason)
         }
     }
@@ -1064,18 +1066,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     /// Inbox row click → mark that event read, bring AgentPad forward, jump to the
     /// tab. The jump no-ops if the session has since closed (event outlives it).
-    private func activateFromInbox(_ event: NotificationInbox.Event) {
-        notificationNavigation.activate(event.id)
+    private func activateFromInbox(_ event: NotificationInbox.Event, asTab: Bool = false) {
+        notificationNavigation.activate(event.id, asTab: asTab)
     }
 
-    private func openAttention(_ event: AttentionEvent) -> Bool {
-        guard SupportTabs.shared.navigation.admit({ [weak self] in _ = self?.openAttention(event) }) else { return false }
-        NSApp.activate(ignoringOtherApps: true)
+    private func openAttention(_ event: AttentionEvent, asTab: Bool = false) -> Bool {
+        guard SupportTabs.shared.navigation.admit({ [weak self] in _ = self?.openAttention(event, asTab: asTab) }) else { return false }
+        if !event.destination.isConversation { NSApp.activate(ignoringOtherApps: true) }
         func channel(_ id: String) -> Session? {
             guard let scope = event.scope, let key = ChatAttention.key(scope),
                   ChatNotifications.allowed(.shared, key, channel: id) else { return nil }
             let ref = ChannelRef(key, channel: id)
-            return TabRouter.shared.openChannel(ref, scope: scope, from: activeStore)
+            return TabRouter.shared.openChannel(ref, scope: scope, from: activeStore, asTab: asTab)
         }
         switch event.destination {
         case .terminal(let id):
@@ -1108,11 +1110,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         case .update: SupportTabs.shared.settings(.updates); return true
         case .sheet: return false
         case .tabAction(_, let id): return PendingConfirmations.shared.open(id)
-        case .directMessage(let dm, _, let thread, _):
+        case .directMessage(let dm, let message, let thread, _):
             guard let scope = event.scope, ChatAttention.sameScope(scope, .shared), let key = ChatAttention.key(scope),
-                  let tab = ChatDMTabs.open(ChatDMRef(key, dm: dm), from: activeStore) else { return false }
+                  let tab = ChatDMTabs.open(ChatDMRef(key, dm: dm), from: activeStore, asTab: asTab) else { return false }
             tab.tabState?.dmPendingThread = thread
             tab.tabState?.dmModel?.openThread(thread)
+            if !message.isEmpty {
+                tab.tabState?.dmSearchTarget = message
+                tab.tabState?.dmModel?.navigateToSearchMessage(message)
+            }
             return true
         case .invitation, .publicationProposal: return false
         case .telegram: return false // TDLib locators use the bounded local adapter.
@@ -1710,13 +1716,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let snapshot = PaletteIndex.snapshot(controllers: windowControllers, model: .shared,
             recentFolders: RecentFolders.shared.paths.map { URL(fileURLWithPath: $0, isDirectory: true) })
         store.search.quickItems = { PaletteIndex.build(snapshot) }
-        store.search.quickAllowedIDs = { items in
+        store.search.quickAllowedIDs = { [weak store] items in
             _ = AgentMonitor.shared.windowGeneration
             let model = ChatOrgCurrent.shared.model, scope = model?.key.map(OrgKey.init)
             let agents = Set(ChatSidebarSnapshot(model: model, active: nil).agents.map(\.id))
             let tabs = AttentionSidebarModel.shared.projection.tabs
             return Set(items.filter { item in
                 switch item.kind {
+                case .closeTab:
+                    return store?.active?.canCloseActiveTab == true
                 case .channel(let ref):
                     guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key) else { return false }
                     return model?.visibleChannel(ref.channel) != nil
@@ -1730,14 +1738,25 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             }.map(\.id))
         }
         store.search.quickReadouts = { PaletteIndex.readouts($0) }
-        store.search.activateQuick = { [weak self] item in self?.activate(item) }
+        store.search.isConversationQuick = { item in
+            switch item.kind {
+            case .channel: return true
+            case .tab(let id, _, _):
+                guard let session = TabRouter.shared.owner(of: id)?.session else { return false }
+                if session.channel != nil { return true }
+                switch session.toolRoute { case .directMessage, .directMessageDraft, .telegram: return true; default: return false }
+            default: return false
+            }
+        }
+        store.search.activateQuick = { [weak self, weak store] item in self?.activate(item, from: store) }
+        store.search.activateQuickAsTab = { [weak self, weak store] item in self?.activate(item, from: store, asTab: true) }
     }
 
     /// Routes a palette pick to the owning window + workspace. Workspace
     /// and tab picks raise their owning window first so a cross-window
     /// jump lands in front. Agent / preset picks spawn in the *currently*
     /// active workspace (matches the muscle memory of ⌘T).
-    private func activate(_ item: PaletteItem) {
+    private func activate(_ item: PaletteItem, from origin: WorkspaceStore? = nil, asTab: Bool = false) {
         switch item.kind {
         case .workspace(let wsId, let winId):
             guard let target = windowControllers.first(where: { $0.windowId == winId }),
@@ -1754,9 +1773,25 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                   let session = pane.tabs.first(where: { $0.id == sId }) else { return }
             if let ref = session.channel {
                 guard TabRouter.shared.channelScope(ref) != nil else { return }
+                _ = TabRouter.shared.openChannel(ref, from: origin ?? activeStore, asTab: asTab)
+                return
             }
-            if case .directMessage(let ref) = session.toolRoute,
-               ref.key.map({ ChatService.shared.dmAllowed($0, ref.dm) }) != true { return }
+            switch session.toolRoute {
+            case .directMessage(let ref):
+                guard ref.key.map({ ChatService.shared.dmAllowed($0, ref.dm) }) == true else { return }
+                _ = ChatDMTabs.open(ref, from: origin ?? activeStore, asTab: asTab)
+                return
+            case .directMessageDraft(let key, let peer):
+                _ = TabRouter.shared.open(.directMessageDraft(key, peer: peer), from: origin ?? activeStore, asTab: asTab)
+                return
+            case .telegram(let id):
+                if let opened = TabRouter.shared.open(.telegram(id), from: origin ?? activeStore, asTab: asTab) {
+                    opened.tabState?.telegramRow = session.tabState?.telegramRow
+                    opened.tabState?.telegramTopicTitle = session.tabState?.telegramTopicTitle
+                }
+                return
+            default: break
+            }
             revealTab(session, in: ws, controller: target)
         case .createWorktree(let wsId, let winId):
             guard let target = windowControllers.first(where: { $0.windowId == winId }),
@@ -1771,7 +1806,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             store.addTab(in: ws, template: template)
         case .channel(let ref):
             guard let key = ChatService.shared.connection?.orgKey, ref.belongs(to: key), ChatNotifications.allowed(.shared, key, channel: ref.channel) else { return }
-            _ = TabRouter.shared.openChannel(ref, from: activeStore)
+            _ = TabRouter.shared.openChannel(ref, from: origin ?? activeStore, asTab: asTab)
         case .teamAgent(let scope, let id):
             guard let model = ChatOrgCurrent.shared.model, model.key.map(OrgKey.init) == scope,
                   ChatSidebarSnapshot(model: model, active: nil).agents.contains(where: { $0.id == id }) else { return }
@@ -1787,6 +1822,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             store.search.begin()
         case .navigation(let command):
             activeStore?.performNavigationCommand(command)
+        case .closeTab:
+            handleCloseTab()
         }
     }
 
@@ -1839,8 +1876,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             return
         }
         guard let store = activeStore, let workspace = store.active,
-              let session = workspace.activeSession else { return }
-        ConfirmCloseTab.request(session, in: workspace, store: store)
+              let pane = workspace.activePane else { return }
+        if let session = pane.activeTab {
+            ConfirmCloseTab.request(session, in: workspace, store: store)
+        } else if pane.tabs.isEmpty, workspace.root.hasMultiplePanes,
+                  activeController?.paneHost.hasKeyboardFocus == true {
+            store.closePane(pane, in: workspace)
+        }
     }
 
     @objc private func handleReopenClosedTab() {
@@ -1980,7 +2022,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                     || auxiliary.sheetParent != nil
                     || auxiliary.styleMask.contains(.closable)
             }
-            return activeStore?.active?.activeSession != nil
+            guard let workspace = activeStore?.active, workspace.canCloseActiveTab else { return false }
+            return workspace.activeSession != nil || activeController?.paneHost.hasKeyboardFocus == true
         }
 
         let terminalWindowIsKey = keyAuxiliaryWindow == nil

@@ -50,7 +50,7 @@ final class TelegramSearchModel {
         value = .init(query: value.query, notice: chats.connected ? nil : "Connect Telegram…")
         changed()
     }
-    func open(_ hit: TelegramSearchHit, from store: WorkspaceStore, beside: Bool, addToFolder: Bool, router: TabRouter = .shared) async -> Bool {
+    func open(_ hit: TelegramSearchHit, from store: WorkspaceStore, beside: Bool, addToFolder: Bool, router: TabRouter = .shared, asTab: Bool = false) async -> Bool {
         guard !opening, let provider = chats.provider else { return false }
         let operation = UUID(); openingGeneration = operation; opening = true
         defer { if openingGeneration == operation { opening = false; openingGeneration = nil } }
@@ -61,7 +61,7 @@ final class TelegramSearchModel {
             value.notice = "This Telegram chat could not be opened. Try again when connected."; return false
         }
         let opened = store.popups.performSearchAction {
-            guard TelegramTabs.open(row, from: store, beside: beside, router: router) != nil else { return false }
+            guard TelegramTabs.open(row, from: store, beside: beside, router: router, asTab: asTab) != nil else { return false }
             if addToFolder { SidebarFolderActions.shared.present(.telegram(row.id.chat), binding: binding, windowID: store.windowID) }
             return true
         }

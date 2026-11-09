@@ -593,9 +593,13 @@ final class ChatUX1Tests: XCTestCase {
         try f.write("INSERT OR REPLACE INTO agents_catalog (agent_id, owner_account_id, name, description, access, enabled, available) VALUES (?, ?, 'billing', '', 'read', 1, 1)", [CallJSON.agent, f.key.accountId])
         ChatOrgCurrent.shared.refresh(f.service)
         defer { ChatOrgCurrent.shared.refresh() }
-        let org = try XCTUnwrap(ChatOrgCurrent.shared.model)
+        let org = try XCTUnwrap(ChatOrgModel.current(f.service))
+        defer { org.stop() }
         let settings = AgentPadSettingsModel.shared
         let previous = (settings.appearanceMode, settings.lightTerminalThemeSelection, settings.darkTerminalThemeSelection)
+        let previousPairedSchema = settings.pairedThemeSchemaEnabled
+        settings.prepareFirstLaunchAppearance()
+        defer { if !previousPairedSchema { settings.load() } }
         defer { settings.appearanceMode = previous.0; settings.lightTerminalThemeSelection = previous.1; settings.darkTerminalThemeSelection = previous.2 }
         settings.lightTerminalThemeSelection = AgentPadSettingsModel.defaultLightThemeSelection
         settings.darkTerminalThemeSelection = AgentPadSettingsModel.defaultDarkThemeSelection
@@ -610,11 +614,12 @@ final class ChatUX1Tests: XCTestCase {
             model.saveDraft(text, root: nil)
             try await wait { sending ? model.feed.messages.isEmpty : model.feed.messages.first?.text == text }
             settings.appearanceMode = dark ? .dark : .light
+            XCTAssertEqual(Theme.resolved.isLight, !dark)
             func content() -> some View { VStack(alignment: .leading, spacing: 0) {
                 Text("# billing").font(Theme.display(18, weight: .semibold)).padding(24)
                 Divider()
                 ForEach(model.feed.messages) { shown in
-                    ChatMessageRow(model: model, message: shown, members: org.view.members, mentionable: [], me: f.key.accountId,
+                    ChatNativeRowFixture(model: model, message: shown, members: org.view.members, mentionable: [], me: f.key.accountId,
                                    archived: false, replies: 0)
                 }
                 Spacer()
@@ -639,7 +644,10 @@ final class ChatUX1Tests: XCTestCase {
                 try await wait { model.feed.messages.count == 1 && editors(host).first?.string == "" }
                 host.rootView = content()
             }
-            try await Task.sleep(for: .milliseconds(300)); host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(300))
+            try ChatTimelineReferenceCapture.prepareOrganization(f.service)
+            host.rootView = content()
+            host.layoutSubtreeIfNeeded()
             let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
             host.cacheDisplay(in: host.bounds, to: bitmap)
             try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to:

@@ -934,11 +934,15 @@ extension ChatInboxTests {
         let workspace = WorkspaceStore(persistence: InMemoryPersistence(), engineFactory: { TestEngine() })
         let otherTab = try XCTUnwrap(workspace.showChannel(ChannelRef(key, channel: "alpha"), newTab: true))
         let selected = try XCTUnwrap(workspace.showChannel(ChannelRef(key, channel: "alpha"), newTab: true))
-        // showChannel reuses the first matching tab, so assert the actual returned destination.
+        let agent = workspace.addTab(in: try XCTUnwrap(workspace.active), template: .terminal)
+        // The clicked inbox entry borrows a local conversation without selecting its tab.
         for id in ["reply", "root"] {
             let message = try XCTUnwrap(rows.first { $0.id == id }?.message)
             let tab = try XCTUnwrap(ChatInboxNavigation.open(message, ref: ChatInboxRef(key, kind: .unread), org: org, workspace: workspace))
-            XCTAssertTrue(workspace.active?.activeSession === tab)
+            XCTAssertTrue(workspace.active?.activeSession === agent)
+            XCTAssertTrue(workspace.popups.visibleConversation === tab)
+            XCTAssertEqual(tab.conversationPopupSource?.returnTitle, "Back to Unread")
+            XCTAssertTrue(tab.conversationPopupSource?.label.hasPrefix("Mention in #") == true)
             let wrong = tab === otherTab ? selected : otherTab
             XCTAssertNil(ChatMessageNavigation.take(key: key, channel: "alpha", from: wrong.engine.view))
             let link = try XCTUnwrap(ChatMessageNavigation.take(key: key, channel: "alpha", from: tab.engine.view))
@@ -1057,7 +1061,9 @@ extension ChatInboxTests {
             }
             if name == "list" {
                 try press("chat-inbox-message-reply")
-                XCTAssertEqual(workspace.active?.activeSession?.channel, ChannelRef(key, channel: "alpha"))
+                XCTAssertEqual(workspace.popups.visibleConversation?.channel, ChannelRef(key, channel: "alpha"))
+                XCTAssertEqual(workspace.active?.activeSession?.inbox?.kind, kind)
+                workspace.popups.dismiss(reason: .dismiss)
             }
         }
     }

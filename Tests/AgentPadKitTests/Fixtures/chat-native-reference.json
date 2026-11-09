@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "referenceRootEnvironment": "AGENTPAD_CHAT_NATIVE_REFERENCE_ROOT",
+  "expectedCoverage": "chat-native-reference-expected.json",
+  "sourceManifest": "source-manifest.json",
+  "fixtureManifest": "fixture-manifest.json",
+  "environmentManifest": "environment-manifest.json",
+  "archiveManifest": "archived-evidence.json",
+  "testCatalog": "test-catalog.json",
+  "captureIndex": "captures/captures.json",
+  "scrollEvidence": "scroll",
+  "renderer": "swiftui-reference",
+  "themes": ["light", "dark"],
+  "viewportWidths": [760, 420],
+  "viewportHeight": 600,
+  "primaryMovingEvents": {
+    "channel": 480,
+    "fixture-root": 480,
+    "media-channel": 200,
+    "media-fixture-root": 200
+  },
+  "jumpTolerancePoints": 0.75,
+  "selection": "per-message",
+  "hardwareVoiceOver": "required-before-release"
+}

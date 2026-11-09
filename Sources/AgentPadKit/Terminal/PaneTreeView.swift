@@ -57,6 +57,9 @@ private struct PaneView: View {
     private func focusThisPane() {
         guard let active = pane.activeTab else {
             store.focusPane(pane, in: workspace)
+            // A click on an already-selected empty pane must also reclaim
+            // the keyboard from sidebar/search editors; its model ID did not change.
+            (store.navigationWindow?.windowController as? AgentPadWindowController)?.paneHost.restoreFocus()
             return
         }
         let view = active.engine.view
@@ -85,7 +88,7 @@ private struct PaneView: View {
                     TerminalConfirmation(session: active)
                 }
                 TerminalTabHost(
-                    tabs: pane.tabs,
+                    tabs: pane.tabs.filter { !$0.isConversationPopup },
                     activeTabId: pane.activeTabId,
                     // The workspace-visibility condition is load-bearing in C2:
                     // every workspace's tree is mounted (hidden containers), so

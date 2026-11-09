@@ -44,6 +44,7 @@ struct TelegramConversationView: View {
         chats.snapshot.account?.account == id.account && chats.snapshot.account?.environment == id.environment
     }
     private var presentation: ConversationSnapshot { model.presentation }
+    private var ownerWindowID: UUID? { TabRouter.shared.owner(of: state)?.store.windowID }
     private var canAddToFolder: Bool { state.telegramRow?.kind.eligible == true && (id.topic == nil || id.topic?.forumID != nil) }
     private var botDialog: TelegramBotDialog? {
         model.botDialog.flatMap { $0.pane == nil || $0.pane == pane ? $0 : nil }
@@ -57,9 +58,10 @@ struct TelegramConversationView: View {
     }
     var body: some View {
         VStack(spacing: 0) {
-            header.addToFolderAnchor(.telegram(id.chat),
-                windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID,
-                enabled: !model.snapshot.capabilities.canSend && allowsKeyboardAction)
+            if !state.isPopup {
+                header.addToFolderAnchor(.telegram(id.chat), windowID: ownerWindowID,
+                    enabled: !model.snapshot.capabilities.canSend && allowsKeyboardAction)
+            }
             if !connectedAccount {
                 unavailable("Connect this Telegram account to open this conversation.")
                 Button("Telegram settings") { SupportTabs.shared.settings(.telegram) }.padding()
@@ -77,7 +79,11 @@ struct TelegramConversationView: View {
                     timeline
                 }
                 if let problem = model.problem ?? model.snapshot.error {
-                    HStack { Text(problem); Spacer(); Button(model.snapshot.isTopicList ? "Reload topics" : "Retry history") { model.load(latest: true) } }
+                    HStack {
+                        Text(problem); Spacer()
+                        if model.draftSaveFailed { Button("Retry") { Task { try? await model.flushDraft() } } }
+                        else { Button(model.snapshot.isTopicList ? "Reload topics" : "Retry history") { model.load(latest: true) } }
+                    }
                         .font(Theme.display(11)).foregroundStyle(ChatAppearance.failure).padding(10)
                 }
                 if let notice = model.notice { Text(notice).font(Theme.display(11)).foregroundStyle(.secondary).padding(8) }
@@ -86,7 +92,7 @@ struct TelegramConversationView: View {
                 if model.snapshot.capabilities.canSend {
                     botControls
                     composer.addToFolderAnchor(.telegram(id.chat),
-                        windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID,
+                        windowID: ownerWindowID,
                         enabled: allowsKeyboardAction)
                 }
                 else {
@@ -147,7 +153,7 @@ struct TelegramConversationView: View {
             guard press.modifiers == [.command, .shift], allowsKeyboardAction,
                   editor.view?.hasMarkedText() != true, NSApp.currentEvent.map({ $0.type == .keyDown && $0.isARepeat }) != true,
                   canAddToFolder else { return .ignored }
-            model.addToFolder(chats: chats, windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID); return .handled
+            model.addToFolder(chats: chats, windowID: ownerWindowID); return .handled
         }
     }
     private var header: some View {
@@ -159,22 +165,9 @@ struct TelegramConversationView: View {
                     .font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
             }
             Spacer()
-            if connectedAccount, let row = state.telegramRow, canAddToFolder {
+            if connectedAccount, state.telegramRow != nil, canAddToFolder {
                 Menu {
-                    TelegramChatActions(row: row, model: chats, windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID)
-                    if row.attention != nil {
-                        Button("Hide until next message") { Task { await chats.provider?.snoozeAttention(row.id, undo: false) } }
-                    }
-                    if row.snoozed {
-                        Button("Undo hide until next message") { Task { await chats.provider?.snoozeAttention(row.id, undo: true) } }
-                    }
-                    Button(row.hidden ? "Restore" : "Don’t show") { Task { await chats.mode(row, row.hidden ? .auto : .hidden) } }
-                    if let url = telegramURL { Link("Open in Telegram", destination: url) }
-                    Menu("Download cache · \(model.snapshot.cacheLimitMiB) MiB") {
-                        ForEach([128, 256, 512, 1024], id: \.self) { limit in Button("\(limit) MiB") { model.cacheLimit(limit) } }
-                        Divider()
-                        Button("Clear downloaded photos and documents") { model.clearCache() }
-                    }
+                    TelegramConversationActions(state: state, model: model, chats: chats)
                 } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 24)
             }
         }.padding(16).overlay(alignment: .bottom) { Divider() }
@@ -187,13 +180,7 @@ struct TelegramConversationView: View {
         }.padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)
     }
     private var telegramURL: URL? {
-        let name = model.snapshot.username.isEmpty ? state.telegramRow?.username ?? "" : model.snapshot.username
-        if !name.isEmpty, name.count <= 32, name.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") }) {
-            return URL(string: "https://t.me/" + name)
-        }
-        // No fabricated chat/message link for private destinations. The app
-        // fallback is explicit; message links use TDLib's checked resolver.
-        return URL(string: "tg://")
+        model.chatURL(row: state.telegramRow)
     }
     private var timeline: some View {
         GeometryReader { geometry in
@@ -223,7 +210,11 @@ struct TelegramConversationView: View {
                 }
                 .onAppear {
                     feedViewport = CGRect(origin: .zero, size: geometry.size)
-                    if let saved = model.scrollAnchor { viewport.stopFollowing(); proxy.scrollTo(saved, anchor: .top) }
+                    if let requested = model.requestedMessage, let row = model.snapshot.messages.first(where: { $0.messageID == requested }) {
+                        viewport.stopFollowing(); proxy.scrollTo(row.id, anchor: .center); model.requestedMessage = nil
+                    } else if model.requestedMessage == nil, let saved = model.scrollAnchor {
+                        viewport.stopFollowing(); proxy.scrollTo(saved, anchor: .top)
+                    }
                     observe()
                 }
                 .onPreferenceChange(ConversationFrames.self) { values in
@@ -362,8 +353,19 @@ struct TelegramConversationView: View {
     private var composer: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let reply = model.draft.replyTo {
+                let message = model.snapshot.messages.first { $0.messageID == reply }
                 HStack {
-                    Text("Reply: " + (model.snapshot.messages.first { $0.messageID == reply }.map { String($0.text.prefix(100)) } ?? "Message \(reply)" )).lineLimit(1)
+                    if state.isPopup {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(message.map { "Replying to \($0.author)" } ?? "Replying to message")
+                                .foregroundStyle(ChatAppearance.accent)
+                            Text(message.map { String($0.text.prefix(100)) } ?? "Message \(reply)")
+                                .foregroundStyle(ChatAppearance.secondary).lineLimit(1)
+                        }.padding(.leading, 10)
+                            .overlay(alignment: .leading) { Rectangle().fill(ChatAppearance.accent).frame(width: 2) }
+                    } else {
+                        Text("Reply: " + (message.map { String($0.text.prefix(100)) } ?? "Message \(reply)" )).lineLimit(1)
+                    }
                     Spacer(); Button("Cancel reply") { model.cancelReply() }
                 }.font(Theme.display(11))
             }
@@ -398,14 +400,24 @@ struct TelegramConversationView: View {
                         guard let view = editor.view, view.window?.firstResponder === view, allowsKeyboardAction else { return false }
                         switch TelegramComposerKey.action(code: code, modifiers: modifiers, markedText: editor.view?.hasMarkedText() == true, repeatKey: NSApp.currentEvent.map({ $0.type == .keyDown && $0.isARepeat }) == true) {
                         case .send: model.send(); return true
-                        case .addToFolder: model.addToFolder(chats: chats, windowID: TabRouter.shared.stores().first { $0.allSessions.contains { $0.tabState === state } }?.windowID); return true
+                        case .addToFolder: model.addToFolder(chats: chats, windowID: ownerWindowID); return true
                         case .native: return false
                         }
                     }).frame(height: max(52, min(160, editorHeight)))
             }
-            Text("⌘Return to send · Return for a new line").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+            HStack {
+                Text("⌘Return to send · Return for a new line")
+                Spacer()
+                if state.isPopup { Text("Esc to close") }
+            }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
         }.padding(14)
-            .onChange(of: state.primaryInputFocusRequest) { _, _ in editor.focus() }
+            .onAppear { if state.isPopup { focusComposer() } }
+            .onChange(of: model.snapshot.connected) { _, connected in if connected, state.isPopup { focusComposer() } }
+            .onChange(of: state.primaryInputFocusRequest) { _, _ in focusComposer() }
+    }
+    private func focusComposer() {
+        guard model.snapshot.connected, model.snapshot.capabilities.canSend, allowsKeyboardAction else { return }
+        editor.focus()
     }
     private func observe() {
         // Revoke queued views immediately; geometry evaluation can wait for
@@ -414,9 +426,7 @@ struct TelegramConversationView: View {
         visibilityUpdates.schedule(evaluateVisibility)
     }
     private func synchronizePopups() {
-        guard let owner = TabRouter.shared.stores().first(where: {
-            $0.allSessions.contains { $0.tabState === state }
-        })?.popups else { return }
+        guard let owner = TabRouter.shared.owner(of: state)?.store.popups else { return }
         if popupOwner !== owner { dismissNativePopups(); popupOwner = owner }
         if let page = botPopup, botPopupID != botDialog?.id {
             owner.dismiss(page, reason: .applied); botPopup = nil; botPopupID = nil
@@ -446,7 +456,8 @@ struct TelegramConversationView: View {
     }
     private func evaluateVisibility() {
         let shown = box.view.map { view in
-            view.window?.isVisible == true && view.window?.isMiniaturized != true && !view.isHiddenOrHasHiddenAncestor && !view.visibleRect.isEmpty && view.window.map { !NavigationPresentationGate.obscures($0) } == true
+            view.window?.isVisible == true && view.window?.isMiniaturized != true && !view.isHiddenOrHasHiddenAncestor && !view.visibleRect.isEmpty
+                && NavigationPresentationGate.allowsAcknowledgement(view, appActive: true)
         } ?? false
         let active = TelegramService.isInteractive && !menuTracking && model.sponsoredDialog == nil && model.botDialog == nil
             && (!jumpToLatestVisible || !overlayFrames.isEmpty)
@@ -470,6 +481,46 @@ struct TelegramConversationView: View {
     }
     private func delivery(_ state: TelegramMessage.Delivery) -> String {
         switch state { case .received: ""; case .submitting: "Submitting…"; case .pending: "Sending…"; case .sent: "Sent"; case .read: "Read"; case .failed(let error): error; case .unknown: "Delivery unknown · Check Telegram" }
+    }
+}
+
+/// The same actions remain available from the tab header and popup header.
+struct TelegramConversationActions: View {
+    @Bindable var state: TabState
+    @Bindable var model: TelegramConversationModel
+    var chats: TelegramChatsModel = TelegramService.chats
+    var body: some View {
+        if chats.snapshot.account?.account == model.id.account,
+           chats.snapshot.account?.environment == model.id.environment,
+           let row = state.telegramRow, row.kind.eligible,
+           model.id.topic == nil || model.id.topic?.forumID != nil {
+            TelegramChatActions(row: row, model: chats, windowID: TabRouter.shared.owner(of: state)?.store.windowID)
+            if row.attention != nil {
+                Button("Hide until next message") { Task { await chats.provider?.snoozeAttention(row.id, undo: false) } }
+            }
+            if row.snoozed {
+                Button("Undo hide until next message") { Task { await chats.provider?.snoozeAttention(row.id, undo: true) } }
+            }
+            Button(row.hidden ? "Restore" : "Don’t show") { Task { await chats.mode(row, row.hidden ? .auto : .hidden) } }
+            if let url = model.chatURL(row: row) { Link("Open in Telegram", destination: url) }
+            Menu("Download cache · \(model.snapshot.cacheLimitMiB) MiB") {
+                ForEach([128, 256, 512, 1024], id: \.self) { limit in Button("\(limit) MiB") { model.cacheLimit(limit) } }
+                Divider()
+                Button("Clear downloaded photos and documents") { model.clearCache() }
+            }
+        }
+    }
+}
+
+extension TelegramConversationModel {
+    func chatURL(row: TelegramChatRow?) -> URL? {
+        let name = snapshot.username.isEmpty ? row?.username ?? "" : snapshot.username
+        if !name.isEmpty, name.count <= 32, name.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") }) {
+            return URL(string: "https://t.me/" + name)
+        }
+        // Private chats use only the explicit app fallback; exact message links
+        // continue to use TDLib's checked resolver.
+        return URL(string: "tg://")
     }
 }
 

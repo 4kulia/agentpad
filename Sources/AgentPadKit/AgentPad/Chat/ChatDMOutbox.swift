@@ -186,17 +186,21 @@ struct ChatDisconnectedRow: View {
 enum ChatConversationTabs {
     static func close(_ key: ChatOrgKey?, stores: [WorkspaceStore] = TabRouter.shared.stores()) {
         for store in stores {
+            for session in store.popups.sessions where matches(session, key: key) {
+                store.popups.forgetConversation(session)
+            }
             for workspace in store.workspaces {
-                let tabs = workspace.root.allPanes.flatMap(\.tabs).filter { tab in
-                    if let channel = tab.channel { return key.map { channel.belongs(to: $0) } ?? true }
-                    switch tab.toolRoute {
-                    case .directMessage(let ref): return key.map { ref.belongs(to: $0) } ?? true
-                    case .directMessageDraft(let scope, _), .newDM(let scope): return key.map { scope == OrgKey($0) } ?? true
-                    default: return false
-                    }
-                }
+                let tabs = workspace.root.allPanes.flatMap(\.tabs).filter { matches($0, key: key) }
                 for tab in tabs { store.closeTab(tab, in: workspace) }
             }
+        }
+    }
+    private static func matches(_ tab: Session, key: ChatOrgKey?) -> Bool {
+        if let channel = tab.channel { return key.map { channel.belongs(to: $0) } ?? true }
+        switch tab.toolRoute {
+        case .directMessage(let ref): return key.map { ref.belongs(to: $0) } ?? true
+        case .directMessageDraft(let scope, _), .newDM(let scope): return key.map { scope == OrgKey($0) } ?? true
+        default: return false
         }
     }
 }

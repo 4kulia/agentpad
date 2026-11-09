@@ -20,6 +20,7 @@ struct ChatDMTab: View {
                 if available, let key = ref.key, state.dmModel == nil {
                     let model = ChatDMModel(key: key, dm: ref.dm, state: state, service: service)
                     model.tabID = SupportTabs.shared.owner(state)?.session.id
+                    model.isPopup = state.isPopup
                     state.dmModel = model
                     if let target = state.dmSearchTarget { model.navigateToSearchMessage(target); state.dmSearchTarget = nil }
                     if let root = state.dmPendingThread { model.openThread(root); state.dmPendingThread = nil }
@@ -28,7 +29,10 @@ struct ChatDMTab: View {
                 } else if !available { state.dmModel?.stop(); state.dmModel = nil; state.confirmation.invalidate() }
             }
             .onChange(of: state.primaryInputFocusRequest) { _, _ in
-                state.dmModel?.focusRequest = ChatFocusRequest(area: .composer)
+                if state.dmModel?.writable == true { state.dmModel?.focusRequest = ChatFocusRequest(area: .composer) }
+            }
+            .onChange(of: state.isPopup, initial: true) { _, isPopup in
+                state.dmModel?.isPopup = isPopup
             }
             .environment(\.openURL, OpenURLAction { ChatMarkdownText.open($0) })
     }
@@ -50,21 +54,30 @@ struct ChatDMView: View {
     private var mentionable: [(account: String, handle: String)] { members.filter { !$0.handle.isEmpty }.map { ($0.accountId, $0.handle) } }
     var body: some View {
         GeometryReader { geometry in
-            let narrow = geometry.size.width < 784
+            let narrow = model.isPopup || geometry.size.width < 784
             HSplitView {
                 if !narrow || model.threadRoot == nil {
                     VStack(spacing: 0) {
-                        header
+                        if !model.isPopup { header }
                         if card.writable, model.service.socket?.state != .connected {
                             Text("Offline — messages will be sent when the connection returns.")
                                 .font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary).padding(10)
+                                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                .chatReviewParity("caller/dm/offline", text: "Offline — messages will be sent when the connection returns.", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(11))
+                                #endif
                         }
                         if model.feed.messages.isEmpty {
                             VStack(spacing: 8) {
                                 ContactAvatar(stableID: card.peer.accountId, name: card.peer.name, kind: .person, size: 48, remote: .account(card.peer.accountId, model.key))
                                 Text(card.peer.name).font(Theme.display(19, weight: .semibold))
+                                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                    .chatReviewParity("caller/dm/introduction/name", text: card.peer.name, colors: ["foreground": Theme.chromeForeground], font: Theme.display(19, weight: .semibold))
+                                    #endif
                                 Text("Only the two of you can read this conversation. Organization admins and owners can't.")
                                     .font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary).multilineTextAlignment(.center)
+                                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                    .chatReviewParity("caller/dm/introduction/privacy", text: "Only the two of you can read this conversation. Organization admins and owners can't.", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(12))
+                                    #endif
                             }.padding(24)
                         }
                         ChatTimelineView(model: model, root: nil, members: members, mentionable: mentionable,
@@ -74,17 +87,25 @@ struct ChatDMView: View {
                 }
                 if let root = model.threadRoot {
                     VStack(spacing: 0) {
-                        HStack {
-                            if narrow { ChatIconButton(title: "Back to conversation", symbol: "chevron.left") { model.openThread(nil) } }
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("Thread").font(Theme.display(13, weight: .semibold))
-                                Label("\(card.peer.name) and you", systemImage: "lock").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
-                            }
-                            Spacer()
-                            ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markConversationRead(root: root) }
-                            ChatIconButton(title: "Close thread", symbol: "xmark") { model.openThread(nil) }
-                        }.padding(16)
-                        Divider()
+                        if !model.isPopup {
+                            HStack {
+                                if narrow { ChatIconButton(title: "Back to conversation", symbol: "chevron.left") { model.openThread(nil) } }
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Thread").font(Theme.display(13, weight: .semibold))
+                                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                        .chatReviewParity("caller/dm/thread/title", text: "Thread", colors: ["foreground": Theme.chromeForeground], font: Theme.display(13, weight: .semibold))
+                                        #endif
+                                    Label("\(card.peer.name) and you", systemImage: "lock").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                        .chatReviewParity("caller/dm/thread/privacy", text: "\(card.peer.name) and you", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                                        #endif
+                                }
+                                Spacer()
+                                ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markConversationRead(root: root) }
+                                ChatIconButton(title: "Close thread", symbol: "xmark") { model.openThread(nil) }
+                            }.padding(16)
+                            Divider()
+                        }
                         ChatTimelineView(model: model, root: root, members: members, mentionable: mentionable,
                             me: model.key.accountId, archived: !card.writable, ownerModel: nil)
                         composer(root: root)
@@ -100,7 +121,13 @@ struct ChatDMView: View {
                 ContactAvatar(stableID: card.peer.accountId, name: card.peer.name, kind: .person, size: 34, remote: .account(card.peer.accountId, model.key))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(card.peer.name).font(Theme.display(15, weight: .semibold))
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/dm/header/name", text: card.peer.name, colors: ["foreground": Theme.chromeForeground], font: Theme.display(15, weight: .semibold))
+                        #endif
                     Label("Only the two of you", systemImage: "lock").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/dm/header/privacy", text: "Only the two of you", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(11))
+                        #endif
                 }
                 Spacer()
                 ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markConversationRead(root: nil) }
@@ -114,9 +141,19 @@ struct ChatDMView: View {
             ForEach(model.orphanedFileDraftRoots, id: \.self) { savedRoot in
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Saved reply draft — its thread is not loaded").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
-                    if let draft = model.draft(root: savedRoot), !draft.text.isEmpty { Text(draft.text).font(Theme.display(12)).textSelection(.enabled) }
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/dm/orphan/" + savedRoot + "/title", text: "Saved reply draft — its thread is not loaded", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                        #endif
+                    if let draft = model.draft(root: savedRoot), !draft.text.isEmpty { Text(draft.text).font(Theme.display(12)).textSelection(.enabled)
+                            #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                            .chatReviewParity("caller/dm/orphan/" + savedRoot + "/text", text: draft.text, colors: ["foreground": Theme.chromeForeground], font: Theme.display(12))
+                            #endif
+                            }
                     ChatAttachmentDraftStrip(manager: manager, owner: .dm(model.ref.dm), root: savedRoot, allowsRetry: false)
                     Button("Delete draft") { model.deleteDraft(root: savedRoot) }.buttonStyle(.link)
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/dm/orphan/" + savedRoot + "/delete", text: "Delete draft")
+                        #endif
                 }.padding(12)
             }
         }
@@ -124,11 +161,24 @@ struct ChatDMView: View {
         else {
             VStack(alignment: .leading, spacing: 8) {
                 Label(root == nil ? "\(card.peer.name) was removed from the organization" : "Read-only", systemImage: "lock").font(Theme.display(12, weight: .semibold))
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/dm/" + (root ?? "feed") + "/read-only", text: root == nil ? "\(card.peer.name) was removed from the organization" : "Read-only", colors: ["foreground": Theme.chromeForeground], font: Theme.display(12, weight: .semibold))
+                    #endif
                 Text("The history remains available. New messages, edits and deletions are turned off.").font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/dm/" + (root ?? "feed") + "/history", text: "The history remains available. New messages, edits and deletions are turned off.", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(11))
+                    #endif
                 let savedFiles = model.attachmentManager?.files(owner: .dm(model.ref.dm), root: root) ?? []
                 if model.draft(root: root)?.text.isEmpty == false || !savedFiles.isEmpty {
                     Text("Your unsent draft — kept on this Mac only").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
-                    if let draft = model.draft(root: root), !draft.text.isEmpty { Text(draft.text).font(Theme.display(12)).textSelection(.enabled) }
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/dm/" + (root ?? "feed") + "/saved/title", text: "Your unsent draft — kept on this Mac only", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                        #endif
+                    if let draft = model.draft(root: root), !draft.text.isEmpty { Text(draft.text).font(Theme.display(12)).textSelection(.enabled)
+                            #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                            .chatReviewParity("caller/dm/" + (root ?? "feed") + "/saved/text", text: draft.text, colors: ["foreground": Theme.chromeForeground], font: Theme.display(12))
+                            #endif
+                            }
                     if let manager = model.attachmentManager { ChatAttachmentDraftStrip(manager: manager, owner: .dm(model.ref.dm), root: root) }
                     HStack {
                         if model.draft(root: root)?.text.isEmpty == false {
@@ -136,8 +186,14 @@ struct ChatDMView: View {
                                 guard let current = model.draft(root: root), !current.text.isEmpty else { return }
                                 NSPasteboard.general.clearContents(); NSPasteboard.general.setString(current.text, forType: .string)
                             }
+                            #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                            .chatReviewParity("caller/dm/" + (root ?? "feed") + "/saved/copy", text: "Copy")
+                            #endif
                         }
                         Button("Delete draft") { model.deleteDraft(root: root) }
+                            #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                            .chatReviewParity("caller/dm/" + (root ?? "feed") + "/saved/delete", text: "Delete draft")
+                            #endif
                     }
                 }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
@@ -152,13 +208,17 @@ protocol ChatDMComposing: AnyObject {
     var focusRequest: ChatFocusRequest? { get }
     var threadRoot: String? { get }
     var writable: Bool { get }
+    var isPopup: Bool { get }
     var problem: String? { get }
+    var draftSaveProblem: String? { get }
     var attachmentManager: ChatAttachmentManager? { get }
     var attachmentOwner: ChatAttachmentOwner? { get }
     func attachmentProblem(_ error: Error)
     func prepareAttachments() async throws -> ChatAttachmentOwner
     func draft(root: String?) -> ChatDMContent.Draft?
     @discardableResult func saveDraft(_ text: String, root: String?) -> String?
+    func flushConversationDrafts() throws
+    func retryDraftSave()
     func send(_ text: String, root: String?, members: [(account: String, handle: String)], version: String?) -> Bool
     func openThread(_ id: String?)
     func conversationMessages(root: String?) -> [ChatMessage]
@@ -198,7 +258,7 @@ struct ChatDMComposer: View {
     private var matches: [ChatMentionCandidate] { dismissed ? [] : token.map { ChatMentionCandidate.filtered(candidates, query: $0.query) } ?? [] }
     private var mentionable: [(account: String, handle: String)] { members.map { ($0.accountId, $0.handle) } }
     private var canSend: Bool {
-        isActive() && model.writable && version != nil && !choosingFiles
+        isActive() && model.writable && model.draftSaveProblem == nil && version != nil && !choosingFiles
             && (owner.map { attachments?.isImporting(owner: $0, root: root) } ?? false) != true
             && (ChatChannelModel.textProblem(text) == nil || text.isEmpty && !uploads.isEmpty)
             && (uploads.isEmpty || fileUI) && uploads.allSatisfy { $0.state == .ready }
@@ -206,14 +266,29 @@ struct ChatDMComposer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             if let problem = model.problem { Text(problem).font(Theme.display(11)).foregroundStyle(ChatAppearance.failure) }
+            if let problem = model.draftSaveProblem {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(problem)
+                    Button("Retry") { model.retryDraftSave() }.buttonStyle(.link)
+                }.font(Theme.display(11)).foregroundStyle(ChatAppearance.failure)
+            }
             HStack {
                 Text(dropping ? "Attach to: \(peer)" : (root == nil ? "Message to \(peer)" : "Reply to \(peer)"))
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/dm/composer/" + (root ?? "feed") + "/recipient", text: dropping ? "Attach to: \(peer)" : (root == nil ? "Message to \(peer)" : "Reply to \(peer)"), colors: ["foreground": ChatAppearance.secondary])
+                    #endif
                 Spacer()
-                if !text.isEmpty || !uploads.isEmpty { Label("Draft", systemImage: "pencil") }
+                if !text.isEmpty || !uploads.isEmpty {
+                    Label(model.isPopup && model.draftSaveProblem == nil ? "Draft kept" : "Draft", systemImage: model.isPopup ? "checkmark" : "pencil")
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/dm/composer/" + (root ?? "feed") + "/draft", text: model.isPopup && model.draftSaveProblem == nil ? "Draft kept" : "Draft", colors: ["foreground": ChatAppearance.secondary])
+                        #endif
+                }
             }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
             ChatComposerBox(control: control, attachments: attachments, owner: owner, root: root, fileUI: fileUI,
                             mentionTitle: "Mention a person", canSend: canSend, chooseFiles: chooseFiles, send: send) {
-                ChatMentionEditor(text: $text, selection: $selection, candidates: candidates, autofocus: root != nil, control: control,
+                ChatMentionEditor(text: Binding(get: { text }, set: changed), selection: $selection, candidates: candidates,
+                    autofocus: model.writable && (root != nil || model.isPopup), control: control,
                     heightChanged: { height = $0 }, placeholder: root == nil ? "Message \(peer)" : "Reply…", accessibilityName: root == nil ? "Direct message" : "Reply",
                     suggestions: .init(sections: ChatMentionSection.grouped(matches), selected: min(candidateIndex, max(0, matches.count - 1)), title: "Mention a person", choose: choose, key: model.key),
                     attachments: { attach($0) }, dropAttachments: { attach($0, fromDrop: true) }, dropTarget: { dropping = $0 }, key: key)
@@ -222,6 +297,9 @@ struct ChatDMComposer: View {
             if fileUI, let limits = attachments?.limits {
                 Text("Up to \(limits.messageFiles) files · \(ByteCountFormatter.string(fromByteCount: Int64(limits.fileBytes), countStyle: .file)) each · \(ByteCountFormatter.string(fromByteCount: Int64(limits.messageBytes), countStyle: .file)) total")
                     .font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/dm/composer/" + (root ?? "feed") + "/limits", text: "Up to \(limits.messageFiles) files · \(ByteCountFormatter.string(fromByteCount: Int64(limits.fileBytes), countStyle: .file)) each · \(ByteCountFormatter.string(fromByteCount: Int64(limits.messageBytes), countStyle: .file)) total", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(9))
+                    #endif
             }
             if fileHint {
                 HStack {
@@ -229,11 +307,23 @@ struct ChatDMComposer: View {
                     Button("Dismiss") { fileHint = false }.buttonStyle(.link)
                 }.font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
             }
-            if root == nil {
+            if model.isPopup {
+                HStack {
+                    Text("⌘↩ Send · Return for a new line")
+                    Spacer()
+                    Text("Esc to close")
+                }.font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
+            } else if root == nil {
                 HStack {
                     Label("Only you and \(peer)", systemImage: "lock")
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/dm/composer/" + (root ?? "feed") + "/privacy", text: "Only you and \(peer)", colors: ["foreground": ChatAppearance.secondary])
+                        #endif
                     Spacer()
                     Text(attachments?.limits(for: .dm("")) == nil ? "Enter — send · ⇧Enter — new line" : "⌘↩ Send · Return for a new line")
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/dm/composer/" + (root ?? "feed") + "/keys", text: attachments?.limits(for: .dm("")) == nil ? "Enter — send · ⇧Enter — new line" : "⌘↩ Send · Return for a new line", colors: ["foreground": ChatAppearance.secondary])
+                        #endif
                 }.font(Theme.display(9)).foregroundStyle(ChatAppearance.secondary)
             }
         }.padding(root == nil ? 20 : 14)
@@ -245,11 +335,14 @@ struct ChatDMComposer: View {
             .onChange(of: model.draft(root: root)) { _, draft in
                 if draft?.version != version { text = draft?.text ?? ""; version = draft?.version }
             }
-            .onChange(of: text) { _, value in
-                guard isActive() else { return }
-                dismissed = false; candidateIndex = 0
-                if model.draft(root: root)?.text != value { version = model.saveDraft(value, root: root) }
+            .onChange(of: model.draftSaveProblem) { _, problem in
+                if problem == nil { version = model.draft(root: root)?.version }
             }
+    }
+    private func changed(_ value: String) {
+        guard isActive() else { return }
+        text = value; dismissed = false; candidateIndex = 0
+        version = model.saveDraft(value, root: root)
     }
     private func loadDraft() {
         guard isActive() else { return }
@@ -298,7 +391,8 @@ struct ChatDMComposer: View {
         control.clearAfterSend(); text = ""; version = model.saveDraft("", root: root)
     }
     private func key(_ code: UInt16, _ modifiers: NSEvent.ModifierFlags) -> Bool {
-        if attachments?.limits(for: .dm("")) == nil, (code == 36 || code == 76),
+        if model.isPopup, code == 53, modifiers.intersection([.command, .control, .option, .shift]).isEmpty, matches.isEmpty { return false }
+        if !model.isPopup, attachments?.limits(for: .dm("")) == nil, (code == 36 || code == 76),
            modifiers.intersection([.shift, .option, .control]).isEmpty, matches.isEmpty { send(); return true }
         switch ChatComposerKey.action(code: code, modifiers: modifiers, hasCandidates: !matches.isEmpty, text: text, inThread: root != nil) {
         case .send: send(); return true
@@ -306,7 +400,7 @@ struct ChatDMComposer: View {
         case .nextCandidate: candidateIndex = min(matches.count - 1, candidateIndex + 1); return true
         case .chooseCandidate: if !matches.isEmpty { choose(matches[min(candidateIndex, matches.count - 1)]) }; return true
         case .dismissCandidates: dismissed = true; return true
-        case .closeThread: model.openThread(nil); return true
+        case .closeThread: if model.isPopup { return false }; model.openThread(nil); return true
         case .editLast:
             guard let message = model.conversationMessages(root: root).last(where: model.canEdit) else { return false }
             return model.beginEditing(message, root: root, recovering: false)

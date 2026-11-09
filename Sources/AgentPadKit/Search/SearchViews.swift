@@ -137,9 +137,10 @@ struct SearchSuggestionsView: View {
             }
             Divider()
             HStack {
-                Button { model.showResults() } label: { HStack { Text("View all results"); Text("⌘↵").foregroundStyle(ChatAppearance.secondary) }.padding(12) }
+                Button { model.showResults() } label: { Text("View all results").padding(12) }
                     .buttonStyle(.plain)
                 Spacer()
+                if model.isConversationChoice(model.selected) { Text("⌘↵ Open as tab").font(.caption).foregroundStyle(ChatAppearance.secondary) }
                 Button("All") { model.source = .all; model.update() }
                 Button("Telegram") { model.source = .telegram; model.update() }
             }.buttonStyle(.borderless).padding(.trailing, 12)
@@ -152,6 +153,9 @@ struct SearchSuggestionsView: View {
         Button { model.activate(id) } label: { content().frame(maxWidth: .infinity, alignment: .leading).padding(9).contentShape(Rectangle()) }
             .buttonStyle(.plain).background(model.selected == id ? ChatAppearance.accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
             .accessibilityAddTraits(model.selected == id ? [.isSelected] : [])
+            .contextMenu {
+                if model.isConversationChoice(id) { Button("Open as tab") { model.activate(id, asTab: true) } }
+            }
             .id(id)
     }
     private func heading(_ text: String) -> some View { Text(text).font(Theme.display(10, weight: .semibold)).foregroundStyle(ChatAppearance.secondary).padding(.horizontal, 9).padding(.top, 9) }

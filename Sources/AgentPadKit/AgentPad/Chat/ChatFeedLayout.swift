@@ -36,9 +36,10 @@ enum ChatFeedLayout {
     }
 
     static func date(_ iso: String) -> Date? {
-        let parser = ISO8601DateFormatter()
-        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return parser.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+        // Format styles reuse Foundation's parser. Allocating two formatters
+        // per row made a viewport update re-create hundreds of ICU parsers.
+        (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(iso))
+            ?? (try? Date.ISO8601FormatStyle().parse(iso))
     }
 
     static func rows(_ messages: [ChatMessage], unreadID: String? = nil, calendar: Calendar = .current) -> [Row] {

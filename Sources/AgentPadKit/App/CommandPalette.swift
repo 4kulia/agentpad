@@ -64,6 +64,7 @@ enum PaletteItemKind: Hashable, Sendable {
     case openRecentFolder(path: String)
     case navigation(LeftNavigationCommand)
     case attention
+    case closeTab
 }
 
 struct PaletteItem: Identifiable, Hashable, Sendable {
@@ -102,6 +103,9 @@ enum PaletteIndex {
         }
         items.append(PaletteItem(id: "needs-attention", title: "Needs attention", subtitle: "Find tabs and workspaces needing attention",
                                  kind: .attention, symbol: "exclamationmark.circle", iconAsset: nil))
+        items.append(PaletteItem(id: "close-tab", title: String(localized: "Close Tab", bundle: bundle),
+                                 subtitle: "Close the active tab or empty split pane", kind: .closeTab,
+                                 symbol: "xmark", iconAsset: nil))
         var worktrees: [UUID: URL] = [:]
         let multiWindow = controllers.count > 1
         for (idx, controller) in controllers.enumerated() {

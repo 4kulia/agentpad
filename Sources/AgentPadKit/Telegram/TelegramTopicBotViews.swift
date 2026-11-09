@@ -37,6 +37,11 @@ extension TelegramConversationView {
                                 if topic.mentionCount > 0 { Text("@ \(topic.mentionCount)").font(Theme.display(11)).foregroundStyle(ChatAppearance.accent).help("Unread mentions and replies in this topic") }
                             }.padding(14).contentShape(Rectangle())
                         }.buttonStyle(.plain)
+                        .contextMenu {
+                            Button("Open as tab") {
+                                TelegramTabs.openTopic(id.root.withTopic(.forum(topic.id)), title: topic.name, state: state, asTab: true)
+                            }
+                        }
                         .accessibilityLabel("\(topic.name), \(topic.unreadCount) unread messages, \(topic.mentionCount) mentions and replies, \(topicStatus(topic))")
                         Divider().padding(.leading, 56)
                     }
@@ -51,7 +56,9 @@ extension TelegramConversationView {
     }
     var topicBar: some View {
         HStack {
-            Button { TelegramTabs.openTopic(id.root, title: nil, state: state) } label: { Label("Back to topics", systemImage: "chevron.left") }
+            if !state.isPopup {
+                Button { TelegramTabs.openTopic(id.root, title: nil, state: state) } label: { Label("Back to topics", systemImage: "chevron.left") }
+            }
             if let topic = model.snapshot.topicInfo {
                 Text(topicStatus(topic)).foregroundStyle(.secondary)
                 Spacer()

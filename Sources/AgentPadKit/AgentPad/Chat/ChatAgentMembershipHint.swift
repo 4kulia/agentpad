@@ -47,11 +47,17 @@ struct ChatAgentMembershipHint: View {
         ForEach(mentions) { mention in
             VStack(alignment: .leading, spacing: 4) {
                 Label("@\(mention.address) isn't in this channel.", systemImage: "person.crop.circle.badge.exclamationmark")
+                    .chatMetadataParity("membership/" + mention.id + "/title", "text", text: "@\(mention.address) isn't in this channel.",
+                        colors: ["foreground": ChatAppearance.secondary], font: Theme.display(11))
                 Text(mention.guidance)
+                    .chatMetadataParity("membership/" + mention.id + "/guidance", "text", text: mention.guidance,
+                        colors: ["foreground": ChatAppearance.secondary], font: Theme.display(11))
                 if mention.canAdd {
                     Button("Add to channel") { Self.add(mention.id, model: model) }
                         .buttonStyle(.link).foregroundStyle(ChatAppearance.accent)
                         .accessibilityLabel("Add @\(mention.address) to channel")
+                        .chatMetadataParity("membership/" + mention.id + "/add", "text", text: "Add to channel",
+                            colors: ["foreground": ChatAppearance.accent], font: Theme.display(11))
                 }
             }
             .font(Theme.display(11)).foregroundStyle(ChatAppearance.secondary)

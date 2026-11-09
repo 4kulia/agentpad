@@ -56,10 +56,10 @@ struct ChatChannelView: View {
     private var panels: some View {
         GeometryReader { geometry in
             if let model {
-                let narrow = geometry.size.width < 784
+                let narrow = conversation.isPopup || geometry.size.width < 784
                 let pinsAvailable = model.b1?.supports("chat.pins") == true
                 let pinsShown = conversation.pinsShown
-                let coversConversation = pinsShown && model.pins.coversConversation(width: geometry.size.width)
+                let coversConversation = pinsShown && (conversation.isPopup || model.pins.coversConversation(width: geometry.size.width))
                 HSplitView {
                     if !coversConversation {
                         conversationPanes(model, narrow: narrow, pinsShown: pinsShown, width: geometry.size.width)
@@ -87,7 +87,8 @@ struct ChatChannelView: View {
     @ViewBuilder private func conversationPanes(_ model: ChatChannelModel, narrow: Bool, pinsShown: Bool, width: Double) -> some View {
         if !narrow || model.threadRoot == nil || pinsShown || conversation.showingAgents {
             VStack(spacing: 0) {
-                header(model)
+                if !conversation.isPopup { header(model) }
+                else { popupStatus(model) }
                 if conversation.showingAgents {
                     ScrollView { ChatChannelTrustView(key: key, channel: card.channelId, agents: agents, conversation: conversation) }
                 } else {
@@ -106,31 +107,42 @@ struct ChatChannelView: View {
         }
         if let root = model.threadRoot, !pinsShown, !conversation.showingAgents {
             VStack(spacing: 0) {
-                HStack(spacing: 8) {
-                    if narrow {
-                        ChatIconButton(title: "Back to #\(card.name)", symbol: "chevron.left") { model.openThread(nil) }
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Thread").font(Theme.display(14, weight: .semibold))
-                        if let b1 = model.b1, b1.supports("chat.thread_summary"), let summary = b1.state.metadata[root]?.threadSummary {
-                            Text(summary.label).font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                if !conversation.isPopup {
+                    HStack(spacing: 8) {
+                        if narrow {
+                            ChatIconButton(title: "Back to #\(card.name)", symbol: "chevron.left") { model.openThread(nil) }
                         }
-                    }
-                    Text("· #\(card.name)").font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
-                    if narrow { connectionStatus }
-                    Spacer(minLength: 0)
-                    if narrow && model.hasNavigationReturn {
-                        ChatIconButton(title: "Back to reading", symbol: "arrow.uturn.backward") { model.returnFromNavigation() }
-                    }
-                    if narrow {
-                        ChatIconButton(title: "Search in this channel (⌘F)", symbol: "magnifyingglass") { NSApp.sendAction(#selector(AppDelegate.handleFind), to: nil, from: nil) }
-                            .keyboardShortcut("f", modifiers: .command)
-                    }
-                    ChatIconButton(title: "Close thread", symbol: "xmark") { model.openThread(nil) }
-                    if narrow { pinsButton(model) }
-                    ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markThreadRead(root) }
-                }.padding(.horizontal, 18).frame(height: 64)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Thread").font(Theme.display(14, weight: .semibold))
+                                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                .chatReviewParity("caller/channel/thread/title", text: "Thread", colors: ["foreground": Theme.chromeForeground], font: Theme.display(14, weight: .semibold))
+                                #endif
+                            if let b1 = model.b1, b1.supports("chat.thread_summary"), let summary = b1.state.metadata[root]?.threadSummary {
+                                Text(summary.label).font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                    .chatReviewParity("caller/channel/thread/summary", text: summary.label, colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                                    #endif
+                            }
+                        }
+                        Text("· #\(card.name)").font(Theme.display(12)).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
+                            #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                            .chatReviewParity("caller/channel/thread/channel", text: "· #\(card.name)", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(12))
+                            #endif
+                        if narrow { connectionStatus }
+                        Spacer(minLength: 0)
+                        if narrow && model.hasNavigationReturn {
+                            ChatIconButton(title: "Back to reading", symbol: "arrow.uturn.backward") { model.returnFromNavigation() }
+                        }
+                        if narrow {
+                            ChatIconButton(title: "Search in this channel (⌘F)", symbol: "magnifyingglass") { NSApp.sendAction(#selector(AppDelegate.handleFind), to: nil, from: nil) }
+                                .keyboardShortcut("f", modifiers: .command)
+                        }
+                        ChatIconButton(title: "Close thread", symbol: "xmark") { model.openThread(nil) }
+                        if narrow { pinsButton(model) }
+                        ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markThreadRead(root) }
+                    }.padding(.horizontal, 18).frame(height: 64)
                     .overlay(alignment: .bottom) { Rectangle().fill(Theme.chromeHairline).frame(height: 1) }
+                }
                 if narrow && model.searching { ChatLocalSearch(model: model) }
                 ChatTimelineView(model: model, root: root, members: members, mentionable: mentionable,
                                  me: key.accountId, archived: card.archived, ownerModel: ownerModel).id(root)
@@ -150,7 +162,14 @@ struct ChatChannelView: View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("# \(card.name)").font(Theme.display(16, weight: .semibold)).lineLimit(2)
-                if let team { Text(team).font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary) }
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/channel/header/title", text: "# \(card.name)", colors: ["foreground": Theme.chromeForeground], font: Theme.display(16, weight: .semibold))
+                    #endif
+                if let team { Text(team).font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/channel/header/team", text: team, colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                        #endif
+                        }
             }
             Spacer(minLength: 0)
             if model.pins.returnsToPins {
@@ -159,7 +178,11 @@ struct ChatChannelView: View {
             if model.hasNavigationReturn {
                 ChatIconButton(title: "Back to reading", symbol: "arrow.uturn.backward") { model.returnFromNavigation() }
             }
-            if card.archived { Text("Archived · read only").font(Theme.display(10)).foregroundStyle(ChatAppearance.attention) }
+            if card.archived { Text("Archived · read only").font(Theme.display(10)).foregroundStyle(ChatAppearance.attention)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/channel/header/archive", text: "Archived · read only", colors: ["foreground": ChatAppearance.attention], font: Theme.display(10))
+                    #endif
+                    }
             connectionStatus
             pinsButton(model)
             ChatIconButton(title: "Mark as read", symbol: "checkmark") { model.markRead() }
@@ -170,10 +193,32 @@ struct ChatChannelView: View {
                     model.pins.close()
                     conversation.showingAgents.toggle()
                 }
+                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                .chatReviewParity("caller/channel/header/agents", text: conversation.showingAgents ? "Messages" : "Agents / trust", colors: ["foreground": Theme.chromeForeground])
+                #endif
             }
         }
         .padding(.horizontal, 24).frame(height: 64)
         .overlay(alignment: .bottom) { Rectangle().fill(Theme.chromeHairline).frame(height: 1) }
+    }
+
+    @ViewBuilder private func popupStatus(_ model: ChatChannelModel) -> some View {
+        if offline || card.archived || service.orgSessions[key]?.pausedChannels.contains(card.channelId) == true {
+            HStack {
+                if card.archived { Label("Archived · read only", systemImage: "lock").font(Theme.display(10)) }
+                connectionStatus
+                Spacer(minLength: 0)
+            }.foregroundStyle(ChatAppearance.secondary).padding(.horizontal, 20).padding(.vertical, 7)
+        }
+        if conversation.showingAgents || conversation.pinsShown || model.pins.returnsToPins {
+            HStack(spacing: 12) {
+                if conversation.showingAgents {
+                    Button("Back to messages") { conversation.showingAgents = false }
+                }
+                if conversation.pinsShown || model.pins.returnsToPins { pinsButton(model) }
+                Spacer(minLength: 0)
+            }.buttonStyle(.link).font(Theme.display(11)).padding(.horizontal, 20).padding(.vertical, 7)
+        }
     }
 
     @ViewBuilder private func pinsButton(_ model: ChatChannelModel) -> some View {
@@ -183,6 +228,9 @@ struct ChatChannelView: View {
             } label: {
                 Label("Pinned \(b1.state.pins?.count ?? 0)", systemImage: "pin")
                     .font(Theme.display(11, weight: .medium)).lineLimit(1)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/channel/header/pins", text: "Pinned \(b1.state.pins?.count ?? 0)", colors: ["foreground": Theme.chromeForeground], font: Theme.display(11, weight: .medium))
+                    #endif
             }.buttonStyle(.borderless).chatFocusRing().help("All pinned messages")
         }
     }
@@ -190,9 +238,15 @@ struct ChatChannelView: View {
     @ViewBuilder private var connectionStatus: some View {
         if offline {
             Label("Offline", systemImage: "network.slash").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                .chatReviewParity("caller/channel/connection", text: "Offline", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                #endif
                 .help("Offline · showing cached messages").accessibilityLabel("Offline, showing cached messages")
         } else if service.orgSessions[key]?.pausedChannels.contains(card.channelId) == true {
             Label("Updates paused", systemImage: "pause.circle").font(Theme.display(10)).foregroundStyle(ChatAppearance.attention)
+                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                .chatReviewParity("caller/channel/connection", text: "Updates paused", colors: ["foreground": ChatAppearance.attention], font: Theme.display(10))
+                #endif
                 .help("No live updates: too many open channels").accessibilityLabel("No live updates: too many open channels")
         }
     }
@@ -215,6 +269,9 @@ struct ChatChannelView: View {
                 ChatAttachmentDraftStrip(manager: manager, channel: model.channel, root: root)
             }
             Text("The channel is archived: nothing can be posted.")
+                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                .chatReviewParity("caller/channel/" + (root ?? "feed") + "/archive", text: "The channel is archived: nothing can be posted.")
+                #endif
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity)
                 .padding(10)
@@ -311,18 +368,26 @@ struct ChatRequestCardRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("\(name(card.initiatorAccountId)) asked \(card.agentName) (\(name(card.ownerAccountId))'s agent)").font(.callout)
+                .chatMetadataParity("request/" + card.id + "/title", "text", text: "\(name(card.initiatorAccountId)) asked \(card.agentName) (\(name(card.ownerAccountId))'s agent)",
+                    colors: ["foreground": Theme.chromeForeground], font: .callout)
             Text(card.stateWord).font(.caption).foregroundStyle(card.publication == "publish_failed" ? .orange : .secondary)
+                .chatMetadataParity("request/" + card.id + "/status", "text", text: card.stateWord,
+                    colors: ["foreground": card.publication == "publish_failed" ? .orange : .secondary], font: .caption)
             if let ownerModel {
                 Button("Open Request…") { RequestTabs.shared.open(card.requestId, scope: .server(OrgKey(ownerModel.key))) }.font(.caption)
+                    .chatMetadataParity("request/" + card.id + "/Open Request…", "text", text: "Open Request…", colors: ["foreground": Theme.chromeForeground], font: .system(size: 13))
             }
             if let ownerModel, ownerModel.canOpenSession(card.requestId) {
                 Button("Open Session") { problem = ownerModel.openSession(card.requestId) }.font(.caption)
-                if let problem { Text(problem).font(.caption).foregroundStyle(.red) }
+                    .chatMetadataParity("request/" + card.id + "/Open Session", "text", text: "Open Session", colors: ["foreground": Theme.chromeForeground], font: .system(size: 13))
+                if let problem { Text(problem).font(.caption).foregroundStyle(.red)
+                        .chatMetadataParity("request/" + card.id + "/problem", "text", text: problem, colors: ["foreground": .red], font: .caption) }
             }
         }
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+        .chatMetadataParity("request/" + card.id + "/card", "control", colors: ["background": Color.secondary.opacity(0.08)])
         .help(card.state.meaning ?? card.state.rawValue)
     }
 }

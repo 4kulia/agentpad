@@ -49,9 +49,12 @@ import XCTest
         let members = [ChatOrgView.Member(accountId: f.key.accountId, handle: "anna", name: "Anna", role: "owner")]
         let settings = AgentPadSettingsModel.shared
         let previous = settings.appearanceMode
-        defer { settings.appearanceMode = previous }
+        let previousPairedSchema = settings.pairedThemeSchemaEnabled
+        settings.prepareFirstLaunchAppearance()
+        defer { if !previousPairedSchema { settings.load() }; settings.appearanceMode = previous }
         for dark in [false, true] {
             settings.appearanceMode = dark ? .dark : .light
+            XCTAssertEqual(Theme.resolved.isLight, !dark)
             let view = VStack(alignment: .leading, spacing: 0) {
                 HStack {
                     Text("# billing").font(Theme.display(19, weight: .semibold))
@@ -59,7 +62,7 @@ import XCTest
                     Label("Connected", systemImage: "checkmark.circle.fill").font(Theme.display(11)).foregroundStyle(ChatAppearance.success)
                 }.padding(24)
                 Divider()
-                ChatMessageRow(model: model, message: message, members: members, mentionable: [], me: f.key.accountId, archived: false, replies: 0)
+                ChatNativeRowFixture(model: model, message: message, members: members, mentionable: [], me: f.key.accountId, archived: false, replies: 0)
                 Spacer(minLength: 20)
                 Divider()
                 ChatUX1Composer(model: model, root: nil, members: members, mentionable: [], agents: [])

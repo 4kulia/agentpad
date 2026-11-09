@@ -10,6 +10,7 @@ final class TelegramNotifications {
     var preferences: () -> AttentionPreferences = { AgentPadSettingsModel.shared.notificationPreferences }
     var isFocused: (TelegramChatID) -> Bool = { AttentionFocus.focused(.telegram($0.root, message: 0)) }
     var open: (TelegramAttentionSummary) -> Bool = { TelegramTabs.openAttention($0, from: nil) }
+    var openAsTab: (TelegramAttentionSummary) -> Bool = { TelegramTabs.openAttention($0, from: nil, asTab: true) }
     private(set) var current: [String: TelegramNotification] = [:]
     private var binding: TelegramChatID?
     private var generation = UUID()
@@ -140,14 +141,14 @@ final class TelegramNotifications {
             self.deliveryTask = nil
         }
     }
-    func activate(_ id: String) -> Bool {
+    func activate(_ id: String, asTab: Bool = false) -> Bool {
         guard let item = current[id], item.destination.root.account == binding?.account,
               item.destination.environment == binding?.environment else { return false }
         let summary = TelegramAttentionSummary(destination: item.destination, count: item.count, firstMessage: item.message,
             lastDate: item.date, kind: item.kind, identity: id)
         // Navigation does not acknowledge a Telegram read. The visible feed
         // calls viewMessages and only TDLib updates clear the source reason.
-        return open(summary)
+        return (asTab ? openAsTab : open)(summary)
     }
     func event(_ item: TelegramNotification) -> AttentionEvent {
         var event = AttentionEvent(source: "telegram", object: item.id,

@@ -185,8 +185,11 @@ struct ChatSourceProgress: View {
                 ForEach(expanded ? statuses : Array(statuses.prefix(3))) { status in card(status) }
                 if statuses.count > 3 {
                     Button(expanded ? "Show less" : "\(statuses.count - 3) more requests") { expanded.toggle() }.buttonStyle(.link)
+                        .chatMetadataParity("source/expand", "text", text: expanded ? "Show less" : "\(statuses.count - 3) more requests",
+                            colors: ["foreground": Theme.chromeForeground], font: Theme.display(10))
                 }
-                if let problem { Text(problem).foregroundStyle(ChatAppearance.failure) }
+                if let problem { Text(problem).foregroundStyle(ChatAppearance.failure)
+                        .chatMetadataParity("source/problem", "text", text: problem, colors: ["foreground": ChatAppearance.failure], font: Theme.display(10)) }
             }.font(Theme.display(10)).padding(.vertical, 6)
                 .background(WindowReader(box: window))
                 .onChange(of: statuses) { old, new in
@@ -212,37 +215,54 @@ struct ChatSourceProgress: View {
         return HStack(spacing: 10) {
             Image(systemName: presentation.answered ? "checkmark.circle" : presentation.tone == .failure ? "exclamationmark.circle" : "sparkles")
                 .font(.system(size: presentation.answered ? 14 : 22)).foregroundStyle(color).frame(width: 27)
+                .chatMetadataParity("source/" + status.id + "/icon", "control", colors: ["foreground": color])
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 7) {
                     Text(status.agent).font(Theme.display(11, weight: .medium)).lineLimit(1)
+                        .chatMetadataParity("source/" + status.id + "/agent", "text", text: status.agent,
+                            colors: ["foreground": Theme.chromeForeground], font: Theme.display(11, weight: .medium))
                     ChatBotBadge()
-                    if presentation.answered { Text("answered").foregroundStyle(color) }
+                        .chatMetadataParity("source/" + status.id + "/bot", "text", text: "BOT",
+                            colors: ["foreground": ChatAppearance.secondary, "stroke": Theme.chromeForeground.opacity(0.19)], font: Theme.mono(9))
+                    if presentation.answered { Text("answered").foregroundStyle(color)
+                            .chatMetadataParity("source/" + status.id + "/status", "text", text: "answered", colors: ["foreground": color], font: Theme.display(10)) }
                 }
                 if !presentation.answered {
                     Text(model.sourceStatusWord(status)).foregroundStyle(color).lineLimit(2)
+                        .chatMetadataParity("source/" + status.id + "/status", "text", text: model.sourceStatusWord(status),
+                            colors: ["foreground": color], font: Theme.display(10))
                     if presentation.showsActivity, let activity = model.service.activity(model.key, request: status.id) {
                         Text(activity).font(Theme.mono(9)).foregroundStyle(ChatAppearance.secondary).lineLimit(1).help(activity)
+                            .chatMetadataParity("source/" + status.id + "/activity", "text", text: activity,
+                                colors: ["foreground": ChatAppearance.secondary], font: Theme.mono(9))
                     }
                 }
-                if !connected { Text("Offline · status may have changed").foregroundStyle(ChatAppearance.secondary) }
+                if !connected { Text("Offline · status may have changed").foregroundStyle(ChatAppearance.secondary)
+                        .chatMetadataParity("source/" + status.id + "/offline", "text", text: "Offline · status may have changed",
+                            colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10)) }
             }
             Spacer(minLength: 0)
             if presentation.action == .stop {
                 ChatIconButton(title: "Stop agent", symbol: "stop.circle") {
                     problem = model.service.askToEnd(model.key, status.id, type: "request.stop", states: [.starting, .running])
                 }
+                .chatMetadataParity("source/" + status.id + "/Stop agent", "control")
             } else if presentation.action == .cancel {
                 ChatIconButton(title: "Cancel request", symbol: "xmark.circle") { problem = model.service.cancelChannelIntent(model.key, request: status.id) }
+                    .chatMetadataParity("source/" + status.id + "/Cancel request", "control")
             }
             if presentation.answered, let answer = status.answer, let message = model.message(answer) {
                 ChatIconButton(title: "Go to answer", symbol: "arrow.turn.down.right") { model.navigate(to: message) }
+                    .chatMetadataParity("source/" + status.id + "/Go to answer", "control")
             }
             ChatIconButton(title: "Request details", symbol: "ellipsis") { RequestTabs.shared.open(status.id, scope: .server(OrgKey(model.key))) }
+                .chatMetadataParity("source/" + status.id + "/Request details", "control")
         }
         .padding(.horizontal, 12).padding(.vertical, presentation.answered ? 6 : 10)
         .frame(minHeight: presentation.answered ? 32 : 64)
         .background(color.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(color.opacity(0.20)))
+        .chatMetadataParity("source/" + status.id + "/card", "control", colors: ["background": color.opacity(0.04), "border": color.opacity(0.20)])
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(status.agent), BOT, \(model.sourceStatusWord(status))\(connected ? "" : ", Offline, status may have changed")")
     }

@@ -26,6 +26,8 @@ static NSUInteger APRealFocusObservations;
 static NSUInteger APFocusBlocks;
 static atomic_ulong APSounds, APNotifications;
 static unsigned long (*APInjectedSounds)(void), (*APInjectedNotifications)(void), (*APInjectedGlobalEvents)(void);
+static void (*APInjectedCaptureAnnouncements)(bool);
+static NSArray<NSDictionary *> *(*APInjectedAnnouncements)(void);
 static BOOL APDispatching;
 static NSUInteger APInitializingWindows;
 static NSWindow *(*APRealKeyWindow)(id, SEL);
@@ -510,6 +512,8 @@ void APQuietInstall(void) {
         APInjectedSounds = dlsym(RTLD_DEFAULT, "APQuietInterposedSoundCount");
         APInjectedNotifications = dlsym(RTLD_DEFAULT, "APQuietInterposedNotificationCount");
         APInjectedGlobalEvents = dlsym(RTLD_DEFAULT, "APQuietInterposedGlobalEventCount");
+        APInjectedCaptureAnnouncements = dlsym(RTLD_DEFAULT, "APQuietInterposedCaptureAnnouncements");
+        APInjectedAnnouncements = dlsym(RTLD_DEFAULT, "APQuietInterposedAnnouncements");
         APWindows = [NSHashTable weakObjectsHashTable]; APFailures = [NSMutableArray new];
         APObservers = [NSMutableArray new]; APMonitors = [NSMutableArray new];
         APRealKeyWindow = (NSWindow *(*)(id, SEL))class_getMethodImplementation(NSApplication.class, @selector(keyWindow));
@@ -590,6 +594,8 @@ NSString *APQuietFailure(void) { APSample(); return APFailures.count ? [APFailur
 NSString *APQuietFinish(void) { APSample(); APFinished = YES; return APSummary(); }
 BOOL APQuietIsEnabled(void) { return APEnabled; }
 NSUInteger APQuietMutedSoundCount(void) { return atomic_load(&APSounds) + (APInjectedSounds ? APInjectedSounds() : 0); }
+void APQuietCaptureAnnouncements(BOOL enabled) { if (APInjectedCaptureAnnouncements) APInjectedCaptureAnnouncements(enabled); }
+NSArray<NSDictionary *> *APQuietCapturedAnnouncements(void) { return APInjectedAnnouncements ? APInjectedAnnouncements() : @[]; }
 BOOL APQuietWindowHasOSFocus(NSWindow *window) {
     if (!NSApp) return NO;
     return APRealKeyWindow && APRealMainWindow ?

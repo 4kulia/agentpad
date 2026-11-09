@@ -254,7 +254,10 @@ final class SearchTextField: NSTextField, NSTextFieldDelegate {
         handlingSuggestionClick = false
         guard let window, ownsEditor || window.firstResponder === self else { return }
         window.makeFirstResponder(nil)
-        guard let engine = store.active?.activeSession?.engine, engine.view.window === window else { return }
+        guard let engine = store.active?.activeSession?.engine, engine.view.window === window else {
+            (window.windowController as? AgentPadWindowController)?.paneHost.restoreFocus()
+            return
+        }
         if let native = engine as? NativeTabEngine { native.focus() }
         else { window.makeFirstResponder(engine.view) }
     }
@@ -276,7 +279,7 @@ final class SearchTextField: NSTextField, NSTextFieldDelegate {
             let modifiers = NSApp.currentEvent?.modifierFlags.intersection([.command, .control, .option, .shift]) ?? []
             if modifiers == [.command, .shift], model.selected?.hasPrefix("t:") == true { model.activate(addToFolder: true) }
             else if modifiers == .option { model.activate(beside: true) }
-            else if modifiers == .command { model.showResults() }
+            else if modifiers == .command { model.commandReturn() }
             else if modifiers.isEmpty { model.activate() }
         default: return false
         }
@@ -289,7 +292,8 @@ final class SearchTextField: NSTextField, NSTextFieldDelegate {
             return true
         }
         if ownsEditor, event.keyCode == 36, event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command {
-            model.showResults(); return true
+            if !event.isARepeat, (currentEditor() as? NSTextView)?.hasMarkedText() != true { model.commandReturn() }
+            return true
         }
         return super.performKeyEquivalent(with: event)
     }

@@ -46,6 +46,88 @@ final class TerminalClipboardTests: XCTestCase {
         }
     }
 
+    func testCommandCopyInLegacyMouseReportingDoesNotTypeOrInterrupt() async throws {
+        try await withTerminal { t in
+            t.feed("\u{1B}[?1003h\u{1B}[?1006h")
+            t.clipboard.setString("unchanged", forType: .string)
+            XCTAssertTrue(t.view.performKeyEquivalent(with: key(8, "c", [.command])))
+            XCTAssertEqual(t.output.take(), "")
+            XCTAssertEqual(t.clipboard.string(forType: .string), "unchanged")
+        }
+    }
+
+    func testCommandCopyInVimMouseAndModifyOtherKeysSendsNoInput() async throws {
+        try await withTerminal { t in
+            // Vim's mouse=a and modifyOtherKeys=2 in Insert mode. Mouse
+            // capture does not mean Vim understands the Super modifier.
+            t.feed("\u{1B}[?1002h\u{1B}[?1006h\u{1B}[>4;2m")
+            XCTAssertTrue(ghostty_surface_mouse_captured(t.surface))
+            t.clipboard.setString("unchanged", forType: .string)
+            for keyEquivalent in [true, false] {
+                let event = key(8, "c", [.command])
+                if keyEquivalent {
+                    XCTAssertTrue(t.view.performKeyEquivalent(with: event))
+                } else {
+                    t.view.keyDown(with: event)
+                }
+                let bytes = t.output.take()
+                print("Vim Cmd+C keyEquivalent=\(keyEquivalent): \(Array(bytes.utf8))")
+                XCTAssertEqual(bytes, "", "Vim must receive neither text nor a modified-key report")
+                XCTAssertEqual(t.clipboard.string(forType: .string), "unchanged")
+            }
+        }
+    }
+
+    func testCommandCopyWithoutKittyPreservesShellPagerAndLegacyTUIModes() async throws {
+        // Shell, less's alternate screen, and legacy TUIs such as Claude
+        // Code: focus/mouse/bracketed-paste modes do not opt into Super keys.
+        for modes in ["", "\u{1B}[?1049h", "\u{1B}[?1004h\u{1B}[?2004h\u{1B}[?1003h\u{1B}[?1006h"] {
+            try await withTerminal { t in
+                let focusReport = modes.contains("\u{1B}[?1004h")
+                    ? expectation(description: "Initial focus report") : nil
+                if let focusReport { t.output.onWrite = { _ in focusReport.fulfill() } }
+                t.feed(modes + "\u{1B}[>4;2m")
+                // The core queues this setup reply even in manual IO mode.
+                if let focusReport { await fulfillment(of: [focusReport], timeout: 2) }
+                t.output.onWrite = nil
+                XCTAssertEqual(t.output.take(), focusReport == nil ? "" : "\u{1B}[I")
+                t.clipboard.setString("unchanged", forType: .string)
+                XCTAssertTrue(t.view.performKeyEquivalent(with: key(8, "c", [.command])))
+                t.view.keyDown(with: key(8, "c", [.command]))
+                XCTAssertEqual(t.output.take(), "")
+                XCTAssertEqual(t.clipboard.string(forType: .string), "unchanged")
+                t.feed("native selection")
+                XCTAssertTrue(ghostty_surface_select_viewport_rows(t.surface, 0, 0))
+                XCTAssertTrue(t.view.performKeyEquivalent(with: key(8, "c", [.command])))
+                XCTAssertEqual(t.clipboard.string(forType: .string), "native selection")
+                XCTAssertEqual(t.output.take(), "")
+            }
+        }
+    }
+
+    func testCommandCopyTracksKittyFlagsAcrossPushPopAndAlternateScreen() async throws {
+        try await withTerminal { t in
+            // These are the per-screen pushes/pops Codex uses. No mouse
+            // reporting is needed to opt into the Kitty Super+C report.
+            let states: [(String, String)] = [
+                ("\u{1B}[>4;2m", ""),
+                ("\u{1B}[>5u", "\u{1B}[99;9u"),
+                ("\u{1B}[?1049h", ""),
+                ("\u{1B}[>5u", "\u{1B}[99;9u"),
+                ("\u{1B}[<u", ""),
+                ("\u{1B}[?1049l", "\u{1B}[99;9u"),
+                ("\u{1B}[<u", "")
+            ]
+            for (modes, expected) in states {
+                t.feed(modes)
+                XCTAssertTrue(t.view.performKeyEquivalent(with: key(8, "c", [.command])))
+                XCTAssertEqual(t.output.take(), expected, "after \(modes.debugDescription)")
+                t.view.keyDown(with: key(8, "c", [.command]))
+                XCTAssertEqual(t.output.take(), expected, "after \(modes.debugDescription)")
+            }
+        }
+    }
+
     func testEditMenuSelectorsAndValidationUseTheTerminalResponder() async throws {
         try await withTerminal { t in
             let copy = NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
@@ -356,7 +438,7 @@ final class TerminalClipboardTests: XCTestCase {
 }
 
 @MainActor
-private final class ClipboardTerminal {
+final class ClipboardTerminal {
     let session = Session(engine: TestEngine(), currentDirectory: FileManager.default.temporaryDirectory, agent: .terminal)
     let window: NSWindow
     let view: GhosttySurfaceView
@@ -398,14 +480,14 @@ private final class ClipboardTerminal {
         text.withCString { ghostty_surface_process_output(surface, $0, UInt(text.utf8.count)) }
     }
 
-    func mouse(_ type: NSEvent.EventType, column: Int, row: Int, mods: NSEvent.ModifierFlags) throws -> NSEvent {
+    func mouse(_ type: NSEvent.EventType, column: Int, row: Int, mods: NSEvent.ModifierFlags, clicks: Int = 1) throws -> NSEvent {
         var grid = ghostty_surface_grid_metrics_s()
         XCTAssertTrue(ghostty_surface_grid_metrics(surface, &grid))
         let point = NSPoint(x: grid.padding_left + (Double(column) + 0.5) * grid.cell_width,
             y: view.bounds.height - grid.padding_top - (Double(row) + 0.5) * grid.cell_height)
         return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil),
             modifierFlags: mods, timestamp: ProcessInfo.processInfo.systemUptime,
-            windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+            windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1))
     }
 
     func settleDecision() async {
@@ -427,14 +509,27 @@ private final class ClipboardTerminal {
     }
 }
 
-private final class ClipboardOutput {
+final class ClipboardOutput {
+    private let lock = NSLock()
     private var bytes = Data()
+    private var writeCallback: ((Data) -> Void)?
+    var onWrite: ((Data) -> Void)? {
+        get { lock.withLock { writeCallback } }
+        set { lock.withLock { writeCallback = newValue } }
+    }
     func append(_ pointer: UnsafePointer<CChar>, count: Int) {
-        bytes.append(UnsafeRawPointer(pointer).assumingMemoryBound(to: UInt8.self), count: count)
+        let data = Data(bytes: pointer, count: count)
+        let callback = lock.withLock {
+            bytes.append(data)
+            return writeCallback
+        }
+        callback?(data)
     }
     func take() -> String {
-        defer { bytes.removeAll(keepingCapacity: true) }
-        return String(decoding: bytes, as: UTF8.self)
+        lock.withLock {
+            defer { bytes.removeAll(keepingCapacity: true) }
+            return String(decoding: bytes, as: UTF8.self)
+        }
     }
 }
 

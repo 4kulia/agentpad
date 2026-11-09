@@ -25,14 +25,14 @@ final class NativeTabEngine: TerminalEngine {
         if let responder = host.window?.firstResponder as? NSView, responder.isDescendant(of: host) { rememberedFocus = responder }
     }
     func focus() {
-        guard let owner, owner.active?.activeSession?.id == tabID, let window = host.window,
+        guard let owner, owner.active?.activeSession?.id == tabID || owner.popups.visibleConversation?.id == tabID, let window = host.window,
               window.isKeyWindow, !host.isHiddenOrHasHiddenAncestor else { return }
         if let responder = window.firstResponder as? NSView, responder.isDescendant(of: host) { return }
         if let rememberedFocus, rememberedFocus.window === window { window.makeFirstResponder(rememberedFocus) }
         else { window.makeFirstResponder(nil); window.selectNextKeyView(host) }
     }
     func focusPrimaryInput() {
-        guard let owner, owner.active?.activeSession?.id == tabID, let window = host.window,
+        guard let owner, owner.active?.activeSession?.id == tabID || owner.popups.visibleConversation?.id == tabID, let window = host.window,
               window.isKeyWindow, !host.isHiddenOrHasHiddenAncestor else { return }
         window.makeFirstResponder(host)
         // The mounted content handles this through its own editor/focus state.

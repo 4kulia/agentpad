@@ -85,6 +85,7 @@ final class ChannelTabEngine: TerminalEngine {
     }
 
     var view: NSView { host }
+    var presentationState: ChannelTabState { .of(ref, model: service.orgCurrent.model) }
     func focusPrimaryInput() {
         guard let window = host.window, !host.isHiddenOrHasHiddenAncestor else { return }
         window.makeFirstResponder(host)

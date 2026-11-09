@@ -211,16 +211,18 @@ private actor FakeTelegramChatProvider: TelegramChatProvider {
         value.binding = .init(environment: .test,account: 42,connectionID: UUID()); model.receive(value)
         XCTAssertEqual(model.listPages.values.flatMap { $0.values }.count,0)
     }
-    func testPlaceholderUsesAccountIdentityAcrossWindowsAndBesideDoesNotDuplicate() throws {
+    func testPlaceholderUsesAccountIdentityAndExplicitBesideStaysInInitiatingWindow() throws {
         let origin = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: { XCTFail("Telegram cannot launch a terminal"); return TestEngine() })
         let detached = WorkspaceStore(persistence: InMemoryPersistence(), initiallyEmpty: true, engineFactory: { XCTFail("Telegram cannot launch a terminal"); return TestEngine() })
         defer { origin.terminate(); detached.terminate() }
         let router = TabRouter(); router.stores = { [origin, detached] }
         var raised: UUID?; router.revealWindow = { raised = $0.windowID }
         let chat = row(9007199254740991, "Large exact ID")
-        let first = try XCTUnwrap(TelegramTabs.open(chat, from: detached, router: router))
+        let first = try XCTUnwrap(TelegramTabs.open(chat, from: detached, router: router, asTab: true))
         let again = TelegramTabs.open(chat, from: origin, beside: true, router: router)
-        XCTAssertTrue(first === again); XCTAssertEqual(raised, detached.windowID)
+        XCTAssertFalse(first === again); XCTAssertNil(raised)
+        XCTAssertTrue(origin.allSessions.contains { $0 === again })
+        XCTAssertTrue(TelegramTabs.open(chat, from: origin, beside: true, router: router) === again)
         XCTAssertFalse(first.hasProcess); XCTAssertEqual(first.displayTitle, chat.title)
         XCTAssertEqual(detached.active?.root.allPanes.count, 1)
         let route = ToolRoute.telegram(chat.id)

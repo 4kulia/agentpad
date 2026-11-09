@@ -739,7 +739,7 @@ final class SearchSuggestionsFocusTests: XCTestCase {
         try await telegramFolderPopup(existingInOtherWindow: false)
     }
 
-    func testTelegramFolderPopupPreservesSearchBeforeRevealingAnotherWindow() async throws {
+    func testTelegramFolderPopupKeepsSearchAndConversationInInitiatingWindow() async throws {
         try await telegramFolderPopup(existingInOtherWindow: true)
     }
 
@@ -774,17 +774,16 @@ final class SearchSuggestionsFocusTests: XCTestCase {
             defer { other.terminate() }
             let router = TabRouter.shared, previousReveal = TabRouter.shared.revealWindow
             defer { router.revealWindow = previousReveal }
+            router.stores = { [self.store, other] }
+            let localSelection = self.store.active?.activeSession?.id
+            let localTabs = self.store.allSessions.map(\.id)
+            var remote: Session?
             if existingInOtherWindow {
-                router.stores = { [self.store, other] }
-                _ = TelegramTabs.open(row, from: other)
-                router.revealWindow = { owner in
-                    if owner === other {
-                        // Revealing an existing chat's window ends the source
-                        // field's editing before the folder chooser opens.
-                        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: self.window)
-                    }
-                }
+                remote = try XCTUnwrap(TelegramTabs.open(row, from: other, asTab: true))
             }
+            let remoteSelection = other.active?.activeSession?.id
+            var revealed: [UUID] = []
+            router.revealWindow = { revealed.append($0.windowID) }
             _ = try await self.open()
             try await self.settle { self.model.telegram.hits.count == 1 }
             let field = try XCTUnwrap(self.model.fieldFocus.field)
@@ -793,8 +792,17 @@ final class SearchSuggestionsFocusTests: XCTestCase {
             await self.fulfillment(of: [completed], timeout: 2)
             guard case .native(let page) = self.store.popups.page else { return XCTFail("Expected Add to folder popup") }
             XCTAssertEqual(page.title, "Add to folder…")
-            XCTAssertEqual((existingInOtherWindow ? other : self.store).active?.activeSession?.toolRoute, .telegram(row.id))
+            let conversation = try XCTUnwrap(self.store.popups.presentedConversations.first)
+            XCTAssertEqual(conversation.toolRoute, .telegram(row.id))
+            XCTAssertEqual(self.store.popups.presentedConversations.count, 1)
+            XCTAssertFalse(conversation === remote, "A matching remote tab cannot capture a search conversation")
+            XCTAssertEqual(self.store.active?.activeSession?.id, localSelection)
+            XCTAssertEqual(self.store.allSessions.map(\.id), localTabs)
+            XCTAssertEqual(other.active?.activeSession?.id, remoteSelection)
+            XCTAssertFalse(other.popups.isPresented)
+            XCTAssertTrue(revealed.isEmpty, "Opening the conversation and folder chooser never raises another window")
             try await self.closePopupBackToSearch(in: popupHost, field: field)
+            XCTAssertEqual(other.active?.activeSession?.id, remoteSelection)
         }
     }
 

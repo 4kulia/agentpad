@@ -268,11 +268,23 @@ final class PaneTreeHostTests: XCTestCase {
         source.layout()
         XCTAssertEqual(session.engine.view.frame, destination.bounds)
 
+        // During split collapse SwiftUI may update the departing host with
+        // its old tabs after the replacement host has already adopted them.
+        source.update(tabs: [session], activeTabId: session.id, grabsFocusOnMount: false)
+        XCTAssertTrue(session.engine.view.superview === destination)
+        XCTAssertEqual(session.engine.view.frame, destination.bounds)
+        XCTAssertTrue(session.engine.grabsFocusOnMount)
+
         source.update(tabs: [], activeTabId: nil, grabsFocusOnMount: false)
         XCTAssertTrue(
             session.engine.view.superview === destination,
             "the old pane must not detach a terminal after the new pane adopted it"
         )
+
+        // A later deliberate move back is still a fresh adoption.
+        source.update(tabs: [session], activeTabId: session.id, grabsFocusOnMount: true)
+        XCTAssertTrue(session.engine.view.superview === source)
+        XCTAssertEqual(session.engine.view.frame, source.bounds)
     }
 
 }

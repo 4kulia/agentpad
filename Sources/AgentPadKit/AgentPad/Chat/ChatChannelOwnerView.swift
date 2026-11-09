@@ -148,8 +148,13 @@ struct ChatChannelOwnerPanel: View {
                         } label: {
                             HStack {
                                 Text("\(request.agentName ?? "Agent") · \(request.state.rawValue.replacingOccurrences(of: "_", with: " "))")
+                                    .chatMetadataParity("boundary/owner/" + request.requestId + "/title", "text",
+                                        text: "\(request.agentName ?? "Agent") · \(request.state.rawValue.replacingOccurrences(of: "_", with: " "))",
+                                        colors: ["foreground": Theme.chromeForeground], font: .callout)
                                 Spacer()
                                 Text("Open Request…")
+                                    .chatMetadataParity("boundary/owner/" + request.requestId + "/open", "text", text: "Open Request…",
+                                        colors: ["foreground": Theme.chromeForeground], font: .callout)
                             }
                         }.buttonStyle(.plain).font(.callout)
                     }

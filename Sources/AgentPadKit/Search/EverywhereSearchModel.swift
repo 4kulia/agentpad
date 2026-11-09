@@ -119,10 +119,16 @@ final class EverywhereSearchModel {
     var quickReadouts: ([PaletteItem]) -> [PaletteItem] = { $0 }
     @ObservationIgnored var matchQuick: (String, [PaletteItem]) -> [PaletteItem] = { PaletteIndex.match(query: $0, in: $1, limit: 6) }
     @ObservationIgnored var activateQuick: (PaletteItem) -> Void = { _ in }
+    @ObservationIgnored var activateQuickAsTab: ((PaletteItem) -> Void)?
+    @ObservationIgnored var isConversationQuick: (PaletteItem) -> Bool = {
+        if case .channel = $0.kind { return true }; return false
+    }
     @ObservationIgnored weak var popupCoordinator: PopupCoordinator?
     @ObservationIgnored var openResults: () -> Void = {}
     @ObservationIgnored var openMessage: (ChatSearchHit) -> Void = { _ in }
+    @ObservationIgnored var openMessageAsTab: ((ChatSearchHit) -> Void)?
     @ObservationIgnored var openTelegram: (TelegramSearchHit, Bool, Bool) -> Void = { _, _, _ in }
+    @ObservationIgnored var openTelegramAsTab: ((TelegramSearchHit, Bool, Bool) -> Void)?
     @ObservationIgnored private var queryIdentity: String?
     @ObservationIgnored private var telegramSelectionLost = false
     @ObservationIgnored private var localTask: Task<Void, Never>?
@@ -262,21 +268,37 @@ final class EverywhereSearchModel {
         let position = selected.flatMap { values.firstIndex(of: $0) } ?? (delta > 0 ? -1 : values.count)
         selected = values[min(values.count - 1, max(0, position + delta))]
     }
-    func activate(_ id: String? = nil, beside: Bool = false, addToFolder: Bool = false) {
+    func isConversationChoice(_ id: String?) -> Bool {
+        guard let id else { return false }
+        if id.hasPrefix("t:") { return telegram.hits.contains { "t:" + $0.id == id } }
+        if id.hasPrefix("m:") { return messages.hits.contains { "m:" + $0.id == id } }
+        return quick.first { "q:" + $0.id == id }.map(isConversationQuick) ?? false
+    }
+    func commandReturn() {
+        if isConversationChoice(selected) { activate(asTab: true) }
+        else { showResults() }
+    }
+    func navigateMessage(_ hit: ChatSearchHit, asTab: Bool = false) {
+        if asTab || ConversationOpenIntent.commandClick { (openMessageAsTab ?? openMessage)(hit) }
+        else { openMessage(hit) }
+    }
+    func activate(_ id: String? = nil, beside: Bool = false, addToFolder: Bool = false, asTab: Bool = false) {
+        let asTab = asTab || ConversationOpenIntent.commandClick
         let id = id ?? selected
         if let hit = telegram.hits.first(where: { "t:" + $0.id == id }), source == .all || source == .telegram {
-            openTelegram(hit, beside, addToFolder); return
+            (asTab ? openTelegramAsTab ?? openTelegram : openTelegram)(hit, beside, addToFolder); return
         }
         if id?.hasPrefix("t:") == true || (source == .telegram && id == nil) { return }
         if let item = quick.first(where: { "q:" + $0.id == id }) {
             // A quick command can open any popup. Let its window retain the
             // opener before dismissal, without classifying individual routes.
-            if let popupCoordinator { popupCoordinator.performSearchAction { activateQuick(item) } }
-            else { activateQuick(item); dismiss() }
+            let action = asTab ? activateQuickAsTab ?? activateQuick : activateQuick
+            if let popupCoordinator { popupCoordinator.performSearchAction { action(item) } }
+            else { action(item); dismiss() }
             return
         }
         dismiss()
-        if let item = messages.hits.first(where: { "m:" + $0.id == id }) { openMessage(item) }
+        if let item = messages.hits.first(where: { "m:" + $0.id == id }) { navigateMessage(item, asTab: asTab) }
         else if let item = local.first(where: { "l:" + $0.id == id }) { show(item); openResults() }
         else if let item = metadata.first(where: { "d:" + $0.id == id }) { selectedHit = nil; selectedRecord = item; context = []; openResults() }
         else { showResults() }
@@ -333,10 +355,18 @@ extension WorkspaceStore {
             guard let self, let model else { return }
             Task { await SearchNavigation.open(hit, model: model, from: self) }
         }
+        model.openMessageAsTab = { [weak self, weak model] hit in
+            guard let self, let model else { return }
+            Task { await SearchNavigation.open(hit, model: model, from: self, asTab: true) }
+        }
         model.openResults = { [weak self] in guard let self else { return }; SupportTabs.shared.navigation.open(.search, from: self) }
         model.openTelegram = { [weak self, weak model] hit, beside, addToFolder in
             guard let self, let model else { return }
             Task { if await model.telegram.open(hit, from: self, beside: beside, addToFolder: addToFolder) { model.dismiss() } }
+        }
+        model.openTelegramAsTab = { [weak self, weak model] hit, beside, addToFolder in
+            guard let self, let model else { return }
+            Task { if await model.telegram.open(hit, from: self, beside: beside, addToFolder: addToFolder, asTab: true) { model.dismiss() } }
         }
         return model
     }

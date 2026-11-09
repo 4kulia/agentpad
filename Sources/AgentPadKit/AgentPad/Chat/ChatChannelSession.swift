@@ -24,6 +24,9 @@ struct ChatFocusRequest: Equatable {
 final class ChatChannelSession {
     let confirmation = ConfirmationCoordinator()
     var tabID: UUID?
+    var isPopup = false {
+        didSet { model?.isPopup = isPopup }
+    }
     var showingAgents = false
     private(set) var model: ChatChannelModel?
     private(set) var ownerModel: ChatChannelOwnerModel?
@@ -50,7 +53,7 @@ final class ChatChannelSession {
 
     func update(_ state: ChannelTabState, key: ChatOrgKey?, store: ChatStore?, service: ChatService) {
         switch state {
-        case .checking: model?.setAccessConfirmed(false)
+        case .checking: model?.setAccessConfirmed(false, preservingOpening: true)
         case .ready(let card, _, _):
             guard let key, let store else { return }
             let scope = ChatAttention.scope(key, service)
@@ -61,6 +64,7 @@ final class ChatChannelSession {
                 model?.cancelEditing(all: true)
                 let made = ChatChannelModel(key: key, channel: card.channelId)
                 made.service = service
+                made.isPopup = isPopup
                 made.follow(store)
                 model = made
                 ownerModel = ChatChannelOwnerModel(service: service, key: key, channel: card.channelId)
@@ -78,6 +82,7 @@ final class ChatChannelSession {
             model?.setAccessConfirmed(true)
             model?.confirmation = confirmation
             model?.tabID = tabID
+            model?.preparePopupOpeningPosition()
         case .notConnected, .noAccess, .noChannels:
             // Hidden until the scope is readable again. Persistent drafts are
             // removed by confirmed membership loss, never by this UI gate.

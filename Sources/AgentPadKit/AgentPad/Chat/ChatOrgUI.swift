@@ -8,7 +8,17 @@ import SwiftUI
 @MainActor
 @Observable
 final class ChatOrgCurrent {
-    static var shared: ChatOrgCurrent { ChatService.shared.orgCurrent }
+    static var shared: ChatOrgCurrent {
+        #if DEBUG
+        if let sharedForTesting { return sharedForTesting }
+        #endif
+        return ChatService.shared.orgCurrent
+    }
+    #if DEBUG
+    /// Keep fixture observations attached to their isolated service across
+    /// asynchronous UI work, without replacing the production connection.
+    static var sharedForTesting: ChatOrgCurrent?
+    #endif
     @ObservationIgnored private var org: (identity: String, model: ChatOrgModel)?
     @ObservationIgnored private var session: (identity: String, model: ChatDevicesModel)?
     /// Moves when a model is made, so views read them again.

@@ -124,6 +124,47 @@ final class ChatUnreadBoundaryTests: XCTestCase {
         XCTAssertEqual(try count(store), 0)
     }
 
+    func testChatPopupReadsItsVisibleThreadAndNeverTheCoveredChannelOrSibling() async throws {
+        let store = try store()
+        try post(store, "root", seq: 1)
+        try post(store, "visible-reply", seq: 2, root: "root")
+        try post(store, "other-root", seq: 3)
+        try post(store, "hidden-reply", seq: 4, root: "other-root")
+        let model = model(store, root: "root")
+        model.isPopup = true
+        let surface = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let covered = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let popup = NSView(frame: NSRect(x: 100, y: 50, width: 600, height: 500))
+        surface.addSubview(covered); surface.addSubview(popup)
+        let host = ChatQuietHost(view: surface, dark: true, width: 800, height: 600)
+        let behindBox = WindowBox(), popupBox = WindowBox(), overlay = UUID()
+        behindBox.view = covered; popupBox.view = popup
+        defer {
+            NavigationPresentationGate.setOverlay(overlay, window: host.window, presented: false)
+            model.endReading(root: nil); model.endReading(root: "root"); host.close()
+        }
+        try await host.settle()
+        NavigationPresentationGate.setOverlay(overlay, window: host.window, presented: true, visibleContent: popup)
+        XCTAssertEqual(try mark(store), 0, "Presentation alone never acknowledges a message")
+        model.readIfLooking(root: nil, appActive: true, shown: behindBox.shown, atBottom: true)
+        model.readIfLooking(root: "root", appActive: true, shown: popupBox.shown, atBottom: false)
+        XCTAssertEqual(try mark(store), 0)
+        XCTAssertEqual(try mark(store, root: "root"), 0, "A scrolled thread still follows the backend's bottom rule")
+        model.readIfLooking(root: "root", appActive: true, shown: popupBox.shown, atBottom: true)
+        XCTAssertEqual(try mark(store, root: "root"), 0, "A stale bottom callback cannot override the unread opening position")
+        // The timeline publishes its freshly measured position before reading.
+        var visiblePosition = try XCTUnwrap(model.positions["root"])
+        visiblePosition.measured(bottom: true, anchor: "visible-reply")
+        model.positions["root"] = visiblePosition
+        model.readIfLooking(root: "root", appActive: true, shown: popupBox.shown, atBottom: true)
+        XCTAssertEqual(try mark(store, root: "root"), 2)
+        XCTAssertEqual(try mark(store), 0)
+        XCTAssertEqual(try mark(store, root: "other-root"), 0)
+        NavigationPresentationGate.setOverlay(overlay, window: host.window, presented: false)
+        XCTAssertEqual(try mark(store), 0, "Dismissal alone does not read covered channel messages")
+        XCTAssertEqual(try mark(store, root: "other-root"), 0)
+    }
+
     func testOwnPostsFromAnotherMacAdvanceReadAndNeverCreateDivider() async throws {
         let store = try store()
         try post(store, "foreign", seq: 1)

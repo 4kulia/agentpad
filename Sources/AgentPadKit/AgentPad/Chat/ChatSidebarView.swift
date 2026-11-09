@@ -333,6 +333,7 @@ struct ChatSidebarView: View {
 
     @ViewBuilder func channelMenu(_ id: String) -> some View {
         if let model = model, let card = model.visibleChannel(id) {
+            Button("Open as tab") { open(id, asTab: true) }
             Button("Open in New Tab") { open(id, newTab: true) }
             if let unread = model.unread(id) {
                 Button(unread.muted ? "Unmute Thread Replies" : "Mute Thread Replies") { model.setMuted(id, !unread.muted) }
@@ -424,9 +425,9 @@ struct ChatSidebarView: View {
             .fixedSize(horizontal: false, vertical: true).padding(9)
     }
     func resetFilteredFocus() { navigation.selection = nil; navigation.agentID = nil; navigation.filterCollapsed = [] }
-    func open(_ id: String, newTab: Bool = false) {
+    func open(_ id: String, newTab: Bool = false, asTab: Bool = false) {
         guard let model = model, let key = model.key, model.visibleChannel(id) != nil else { return }
-        store.showChannel(ChannelRef(key, channel: id), newTab: newTab)
+        store.showChannel(ChannelRef(key, channel: id), newTab: newTab, asTab: asTab)
     }
     func openCreated() {
         guard let model = model, let key = model.key else { return }

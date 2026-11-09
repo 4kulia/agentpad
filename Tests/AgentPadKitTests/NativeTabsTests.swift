@@ -100,25 +100,46 @@ final class NativeTabsTests: XCTestCase {
         }
     }
 
-    func testCreateChannelClosesPopupAndReusesExistingChannelTab() throws {
+    func testCreateChannelReplacesFormWithLocalConversationPopupAndReusesIt() throws {
         let store = empty(); defer { store.terminate() }
         let router = TabRouter(); router.stores = { [store] }
+        var raised: [UUID] = []; router.revealWindow = { raised.append($0.windowID) }
         let route = ToolRoute.newChannel(try scope(), teamID: "team", draftID: UUID())
         let tab = try XCTUnwrap(router.open(route, from: store))
         let oldState = try XCTUnwrap(tab.tabState)
         let channel = ChannelRef(server: "https://example.com:443", account: "me", org: "org", channel: "created")
+        let raisesBeforeFirstCompletion = raised.count
         let created = try XCTUnwrap(router.rekey(tab.id, to: channel))
+        XCTAssertEqual(raised.count, raisesBeforeFirstCompletion)
         XCTAssertFalse(created === tab)
         XCTAssertEqual(created.channel, channel)
         XCTAssertTrue(oldState.isClosed)
         XCTAssertFalse(store.popups.contains(tab.id))
-        XCTAssertFalse(store.popups.isPresented)
+        XCTAssertTrue(store.popups.visibleConversation === created)
+        XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertNil(store.active?.activeSession)
         XCTAssertEqual((created.engine as? ChannelTabEngine)?.starts, 0)
         let second = try XCTUnwrap(router.open(.newChannel(try scope(), teamID: "team", draftID: UUID()), from: store))
+        let raisesBeforeSecondCompletion = raised.count
         XCTAssertTrue(router.rekey(second.id, to: channel) === created)
+        XCTAssertEqual(raised.count, raisesBeforeSecondCompletion)
         XCTAssertTrue(try XCTUnwrap(second.tabState).isClosed)
         XCTAssertFalse(store.popups.contains(second.id))
-        XCTAssertEqual(store.allSessions.count, 1)
+        XCTAssertTrue(store.popups.visibleConversation === created)
+        XCTAssertEqual(store.popups.sessions.map(\.id), [created.id])
+        XCTAssertTrue(store.allSessions.isEmpty)
+        XCTAssertTrue(store.showChannel(channel, asTab: true) === created)
+        XCTAssertTrue(store.active?.activeSession === created)
+        XCTAssertNil(store.popups.visibleConversation)
+        XCTAssertEqual(raised.count, raisesBeforeSecondCompletion)
+        let third = try XCTUnwrap(router.open(.newChannel(try scope(), teamID: "team", draftID: UUID()), from: store))
+        let raisesBeforeThirdCompletion = raised.count
+        XCTAssertTrue(router.rekey(third.id, to: channel) === created)
+        XCTAssertTrue(try XCTUnwrap(third.tabState).isClosed)
+        XCTAssertFalse(store.popups.contains(third.id))
+        XCTAssertTrue(store.popups.visibleConversation === created, "A matching local tab is hosted by the popup")
+        XCTAssertEqual(store.allSessions.map(\.id), [created.id])
+        XCTAssertEqual(raised.count, raisesBeforeThirdCompletion, "Completing a channel form cannot raise a window or switch Spaces")
     }
 
     func testRoundTripMultiWindowEmptySplitSecretsAndExplicitPopupDraftRecovery() throws {

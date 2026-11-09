@@ -13,23 +13,27 @@ BATCHES = ["main", "settings", "local", "connection", "composition", "publicatio
            "organization", "operations", "folders", "telegram", "video", "fallback", "startup"]
 
 
-def screen_unlocked() -> bool:
+def console_locked() -> bool | None:
     root = plistlib.loads(subprocess.check_output(["ioreg", "-n", "Root", "-d1", "-a"]))
-    return root.get("IOConsoleLocked") is False
+    return root.get("IOConsoleLocked")
 
 
 def run_batch(binary: Path, batch: str, shots: Path) -> dict:
     shots.mkdir(parents=True, exist_ok=True)
     log = shots / "native.log"
     started = time.monotonic()
+    locked = console_locked()
+    preflight = f"Preflight: IOConsoleLocked={json.dumps(locked)}; QUIET mode; isolated home/config/state under .build\n"
+    log.write_text(preflight)
+    print(f"Quiet matrix {batch}: IOConsoleLocked={json.dumps(locked)}", flush=True)
     libraries = [binary.parent / name for name in
                  ("libAgentPadQuietInterposer.dylib", "libAgentPadQuietTestSupport.dylib")]
     for library in libraries:
         if not library.is_file():
             raise RuntimeError(f"Quiet test library is missing: {library.name}; run swift build first")
-    if not screen_unlocked():
-        log.write_text("NOT RUN: IOConsoleLocked is not false\n")
-        return {"batch": batch, "exit": 2, "seconds": 0, "log": str(log)}
+    # None of BATCHES drives the live chat scroll/render pipeline gated by
+    # test-quiet.py. The 2026-10-23/24 locked folders run passed all 534 checks
+    # with six pixel-identical captures; retain every QUIET proof while locked.
     with tempfile.TemporaryDirectory(prefix=f"quiet-{batch}-", dir=Path.cwd() / ".build") as scratch:
         root = Path(scratch)
         (root / "tmp").mkdir()
@@ -43,8 +47,7 @@ def run_batch(binary: Path, batch: str, shots: Path) -> dict:
         if batch not in {"main", "startup"}:
             child_environment["AGENTPAD_POPUP_PHASE3_BATCH"] = batch
         arguments = [str(binary), "--self-check-first-launch", "capture"] if batch == "startup" else [str(binary), "--self-check-no-modals"]
-        with log.open("w") as output:
-            output.write("Preflight: IOConsoleLocked=false; QUIET mode; isolated home/config/state under .build\n")
+        with log.open("a") as output:
             output.flush()
             process = subprocess.Popen(arguments, env=child_environment, stdout=output, stderr=subprocess.STDOUT)
             try:
@@ -63,7 +66,7 @@ def run_batch(binary: Path, batch: str, shots: Path) -> dict:
             code = 1
             with log.open("a") as output:
                 output.write("FAIL: quietness proof failed or missing\n")
-        result = {"batch": batch, "exit": code, "seconds": round(time.monotonic() - started, 2), "log": str(log)}
+        result = {"batch": batch, "exit": code, "seconds": round(time.monotonic() - started, 2), "log": str(log), "console_locked": locked}
         print(f"Quiet matrix {batch}: {'PASS' if code == 0 else 'FAIL'} (exit {code}, {result['seconds']}s); {log}", flush=True)
         if code:
             print("\n".join(content.splitlines()[-12:]), flush=True)

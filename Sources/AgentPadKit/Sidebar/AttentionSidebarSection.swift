@@ -18,6 +18,7 @@ struct AttentionSidebarSection: View {
             expanded: $store.attentionExpanded,
             activate: { model.activate($0, from: store) }, secondary: model.secondary,
             settings: { SupportTabs.shared.navigation.open(.settings, from: store, section: .notifications) },
+            openAsTab: { model.activate($0, from: store, asTab: true) },
             itemTitle: model.title, loadMore: { await telegram.expandAttention() },
             viewportChanged: { telegram.attentionViewport($0, owner: interactionID) }, windowID: store.windowID, interactionChanged: { held in
                 interactionHeld = held
@@ -61,6 +62,7 @@ struct AttentionSectionContent: View {
     var activate: (AttentionItem) -> Void
     var secondary: (AttentionItem) -> Void
     var settings: () -> Void
+    var openAsTab: ((AttentionItem) -> Void)? = nil
     var itemTitle: (AttentionItem) -> String = { $0.title }
     var loadMore: () async -> Void = {}
     var viewportChanged: (Set<Int64>) -> Void = { _ in }
@@ -143,6 +145,7 @@ struct AttentionSectionContent: View {
                                 .background(hovered == item.id ? Theme.chromeSelection : .clear, in: RoundedRectangle(cornerRadius: 5))
                                 .onHover { hovered = $0 ? item.id : nil }
                                 .sidebarContextMenu(selected: focused == item.id) {
+                                    if let openAsTab, item.isConversation { Button("Open as tab") { openAsTab(item) } }
                                     if let action = item.secondary { Button(action.rawValue) { secondary(item) } }
                                     if case .telegram(let summary) = item.action, let row = telegram.loadedRow(summary.destination) {
                                         TelegramChatActions(row: row, model: telegram, windowID: windowID, anchor: "attention:" + item.id)

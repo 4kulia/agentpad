@@ -243,10 +243,12 @@ final class ChatChannelAgentsTests: XCTestCase {
 
             if removing { ChatSidebarActions.removeAgent(member, from: card, model, from: host) }
             else { ChatSidebarActions.addAgent(catalog, to: card, model, from: host) }
-            let session = try XCTUnwrap(host.active?.activeSession)
+            let session = try XCTUnwrap(host.popups.visibleConversation)
             let engine = try XCTUnwrap(session.engine as? ChannelTabEngine)
             let c = engine.conversation.confirmation
             XCTAssertEqual(engine.ref, ChannelRef(key, channel: "c1"))
+            XCTAssertTrue(host.allSessions.isEmpty, "Sidebar membership opens the channel popup without creating a tab")
+            XCTAssertNil(host.active?.activeSession)
             XCTAssertTrue(engine.conversation.showingAgents)
             XCTAssertEqual(c.phase, .awaiting)
             XCTAssertEqual(c.context?.tabID, session.id)
@@ -265,7 +267,8 @@ final class ChatChannelAgentsTests: XCTestCase {
             XCTAssertEqual(commands.first?.0, removing ? "agent.remove_from_channel" : "agent.add_to_channel")
             XCTAssertEqual(commands.first?.1["agent_id"], .string("a1"))
             XCTAssertEqual(commands.first?.1["channel_id"], .string("c1"))
-            XCTAssertEqual(host.allSessions.count, 1)
+            XCTAssertTrue(host.popups.visibleConversation === session, "Completing inline consent keeps its conversation open")
+            XCTAssertTrue(host.allSessions.isEmpty)
         }
     }
 
@@ -284,9 +287,11 @@ final class ChatChannelAgentsTests: XCTestCase {
                 model.enqueue = { _, _ in commands += 1; return "command" }
                 if removing { ChatSidebarActions.removeAgent(member, from: card, model, from: host) }
                 else { ChatSidebarActions.addAgent(catalog, to: card, model, from: host) }
-                let engine = try XCTUnwrap(host.active?.activeSession?.engine as? ChannelTabEngine)
+                let session = try XCTUnwrap(host.popups.visibleConversation)
+                let engine = try XCTUnwrap(session.engine as? ChannelTabEngine)
                 let c = engine.conversation.confirmation
                 XCTAssertEqual(c.phase, .awaiting)
+                XCTAssertTrue(host.allSessions.isEmpty)
                 c.canShow = { true }; c.shown(true)
                 var view = model.view
                 switch change {
@@ -303,6 +308,7 @@ final class ChatChannelAgentsTests: XCTestCase {
                 c.confirm()
                 XCTAssertEqual(c.phase, change == "cancel" ? .cancelled : .invalidated, change)
                 XCTAssertEqual(commands, 0, change)
+                XCTAssertTrue(host.popups.visibleConversation === session, "Cancelled or stale consent does not navigate away")
             }
         }
     }

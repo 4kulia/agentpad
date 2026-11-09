@@ -48,6 +48,11 @@ final class Session: Identifiable {
     var engine: any TerminalEngine
     // AgentPad: a channel tab (probe V1) — its engine is a ChannelTabEngine.
     var content: TabContent = .terminal
+    /// A conversation can borrow its one native view into the window popup.
+    /// This is presentation state, never part of restored tab persistence.
+    var isConversationPopup = false
+    /// Runtime return context for a conversation opened from an inbox entry.
+    var conversationPopupSource: (label: String, returnTitle: String)?
     var channel: ChannelRef? {
         get { if case .channel(let ref) = content { ref } else { nil } }
         set { content = newValue.map(TabContent.channel) ?? .terminal }

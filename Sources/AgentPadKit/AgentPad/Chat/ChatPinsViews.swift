@@ -21,17 +21,32 @@ struct ChatPinBanner: View {
                             HStack(spacing: 6) {
                                 Image(systemName: "pin.fill")
                                 Text("Pinned message").fontWeight(.semibold)
+                                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                    .chatReviewParity("caller/pin-banner/title", text: "Pinned message", colors: ["foreground": ChatAppearance.accent], font: Theme.display(10, weight: .semibold))
+                                    #endif
                                 Text("\((pins.firstIndex { $0.id == pin.id } ?? 0) + 1) / \(pins.count)")
+                                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                    .chatReviewParity("caller/pin-banner/count", text: "\((pins.firstIndex { $0.id == pin.id } ?? 0) + 1) / \(pins.count)", colors: ["foreground": ChatAppearance.accent])
+                                    #endif
                                 Text("· \(ChatPins.author(pin, members: members))").lineLimit(1)
+                                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                    .chatReviewParity("caller/pin-banner/author", text: "· \(ChatPins.author(pin, members: members))", colors: ["foreground": ChatAppearance.accent])
+                                    #endif
                             }.font(Theme.display(10)).foregroundStyle(ChatAppearance.accent)
                             Text(pin.excerpt.replacingOccurrences(of: "\n", with: " "))
                                 .font(Theme.display(12)).lineLimit(1).foregroundStyle(Theme.chromeForeground)
+                                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                .chatReviewParity("caller/pin-banner/excerpt", text: pin.excerpt.replacingOccurrences(of: "\n", with: " "), colors: ["foreground": Theme.chromeForeground], font: Theme.display(12))
+                                #endif
                         }
                         Spacer(minLength: 0)
                     }.contentShape(Rectangle())
                 }.buttonStyle(.plain).chatFocusRing().help("Go to this message and show the next pin")
                 Button("All \(pins.count)") { model.pins.open() }
                     .buttonStyle(.borderless).font(Theme.display(11, weight: .medium))
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/pin-banner/all", text: "All \(pins.count)", font: Theme.display(11, weight: .medium))
+                    #endif
                 ChatIconButton(title: "Hide pin banner for this channel", symbol: "xmark") { b1.setBannerHidden(true) }
             }.padding(.horizontal, 20).padding(.vertical, 10).frame(height: 64)
                 .background(ChatAppearance.accent.opacity(0.06))
@@ -60,7 +75,13 @@ struct ChatPinnedMessages: View {
             HStack(spacing: 10) {
                 Image(systemName: "pin.fill").foregroundStyle(ChatAppearance.accent)
                 Text("Pinned messages").font(Theme.display(14, weight: .semibold))
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/pins/title", text: "Pinned messages", colors: ["foreground": Theme.chromeForeground], font: Theme.display(14, weight: .semibold))
+                    #endif
                 Text("\(pins.count)").font(Theme.mono(11)).foregroundStyle(ChatAppearance.secondary)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/pins/count", text: "\(pins.count)", colors: ["foreground": ChatAppearance.secondary], font: Theme.mono(11))
+                    #endif
                 Spacer(minLength: 0)
                 ChatIconButton(title: state.bannerHidden ? "Show pin banner" : "Hide pin banner", symbol: state.bannerHidden ? "eye.slash" : "eye") {
                     b1.setBannerHidden(!state.bannerHidden)
@@ -78,9 +99,18 @@ struct ChatPinnedMessages: View {
                     .accessibilityLabel("Search pinned messages")
                 HStack {
                     Picker("Authors", selection: $presentation.filter) {
-                        ForEach(ChatPinFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                        ForEach(ChatPinFilter.allCases, id: \.self) { value in
+                            Text(value.rawValue)
+                            #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                            .chatReviewParity("caller/pins/filter/" + value.rawValue, text: value.rawValue)
+                            #endif
+                            .tag(value)
+                        }
                     }.pickerStyle(.segmented).labelsHidden()
                     Text("\(matches.count) of \(pins.count)").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary).fixedSize()
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/pins/matches", text: "\(matches.count) of \(pins.count)", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                        #endif
                 }
             }.padding(16)
             Divider()
@@ -98,8 +128,14 @@ struct ChatPinnedMessages: View {
                     if !ChatPins.missing(pins, messages: state.pinMessages).isEmpty {
                         HStack {
                             Text("Loading complete messages…").foregroundStyle(ChatAppearance.secondary)
+                                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                .chatReviewParity("caller/pins/loading", text: "Loading complete messages…", colors: ["foreground": ChatAppearance.secondary])
+                                #endif
                             Spacer()
                             Button("Retry") { b1.loadPinBodies(retry: true) }
+                                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                .chatReviewParity("caller/pins/retry-bodies", text: "Retry")
+                                #endif
                         }.font(Theme.display(11)).padding(.horizontal, 16).padding(.top, 10)
                     }
                     if matches.isEmpty {
@@ -144,10 +180,16 @@ struct ChatPinnedMessages: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         Text(ChatPins.author(pin, members: members)).font(Theme.display(12, weight: .semibold))
+                            #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                            .chatReviewParity("caller/pins/" + pin.id + "/author", text: ChatPins.author(pin, members: members), colors: ["foreground": Theme.chromeForeground], font: Theme.display(12, weight: .semibold))
+                            #endif
                         if ChatPins.isAgent(pin) { Text("BOT").font(Theme.mono(9)).foregroundStyle(ChatAppearance.secondary) }
                     }
-                    Text("Pinned by \(ChatPins.name(pin.pinnedBy, members: members)) · \(ChatMessageRow.time(pin.pinnedAt))")
+                    Text("Pinned by \(ChatPins.name(pin.pinnedBy, members: members)) · \(ChatMessageTime.formatted(pin.pinnedAt))")
                         .font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/pins/" + pin.id + "/pinner", text: "Pinned by \(ChatPins.name(pin.pinnedBy, members: members)) · \(ChatMessageTime.formatted(pin.pinnedAt))", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                        #endif
                 }
                 Spacer(minLength: 0)
             }
@@ -158,19 +200,32 @@ struct ChatPinnedMessages: View {
                     .fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Text(pin.excerpt).foregroundStyle(ChatAppearance.secondary).fixedSize(horizontal: false, vertical: true)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/pins/" + pin.id + "/excerpt", text: pin.excerpt, colors: ["foreground": ChatAppearance.secondary])
+                    #endif
                 Text("Preview · the complete message has not loaded yet").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/pins/" + pin.id + "/preview", text: "Preview · the complete message has not loaded yet", colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                    #endif
             }
             Divider()
             HStack {
                 Button {
                     model.pins.prepareJump(pin, width: width)
                     model.navigate(to: ChatMessageLink(key: model.key, channel: b1.channel, message: pin.id, sequence: pin.seq))
-                } label: { Label("In conversation", systemImage: "arrow.turn.up.left") }
+                } label: { Label("In conversation", systemImage: "arrow.turn.up.left")
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/pins/" + pin.id + "/conversation", text: "In conversation")
+                        #endif
+                        }
                 Spacer()
                 if b1.pending(pin.id, choice: "pin") {
                     ProgressView().controlSize(.mini).accessibilityLabel("Unpinning message")
                 }
                 Button("Unpin") { b1.unpin(pin.id) }
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/pins/" + pin.id + "/unpin", text: "Unpin")
+                    #endif
                     .disabled(!b1.canChange || b1.pending(pin.id, choice: "pin") || message?.hasFixed != true || message?.deleted == true)
             }.buttonStyle(.borderless).font(Theme.display(11))
             if let error = b1.problem(pin.id) ?? state.intents[pin.id]?.first(where: { $0.choice == "pin" })?.error {

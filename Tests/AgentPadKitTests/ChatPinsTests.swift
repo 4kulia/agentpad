@@ -360,11 +360,15 @@ final class ChatPinsTests: XCTestCase {
         let model = try XCTUnwrap(conversation.model)
         let settings = AgentPadSettingsModel.shared
         let prior = (settings.appearanceMode, settings.lightTerminalThemeSelection, settings.darkTerminalThemeSelection)
+        let previousPairedSchema = settings.pairedThemeSchemaEnabled
+        settings.prepareFirstLaunchAppearance()
+        defer { if !previousPairedSchema { settings.load() } }
         defer { settings.appearanceMode = prior.0; settings.lightTerminalThemeSelection = prior.1; settings.darkTerminalThemeSelection = prior.2 }
         settings.lightTerminalThemeSelection = AgentPadSettingsModel.defaultLightThemeSelection
         settings.darkTerminalThemeSelection = AgentPadSettingsModel.defaultDarkThemeSelection
         for dark in [false, true] {
             settings.appearanceMode = dark ? .dark : .light
+            XCTAssertEqual(Theme.resolved.isLight, !dark)
             model.pins.close()
             let content = ChatChannelView(card: card, team: "Product", offline: true, key: key, conversation: conversation)
             try await capture(content, output: output, name: "banner-\(dark ? "dark" : "light")", size: NSSize(width: 1040, height: 720), dark: dark)

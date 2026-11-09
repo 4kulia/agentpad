@@ -888,6 +888,138 @@ final class AttachmentTestServer: @unchecked Sendable {
         XCTAssertFalse(manager.current(capture))
     }
 
+    func testChatTimelineAttachmentReconciliationOnlyInvalidatesChangedPreviews() async throws {
+        let f = try await fixture(), manager = try manager(f), image = Self.png()
+        var file = try file(image, name: "screen.png"); file.hasPreview = true
+        let attached = try message(f, file: file)
+        let other = try message(f, file: file, id: "another-attached-message")
+        var plain = ChatTimelineW01.message("plain"); plain.channelId = channel
+        let model = ChatTimelineW01Model(directory: root, key: f.key, service: f.service)
+        model.channel = channel; model.feed.messages = [plain, attached, other]
+        let adapter = ChatTimelineAdapter()
+        func capture() -> NativeTimelineSnapshot {
+            adapter.snapshot(model: model, root: nil, members: [], mentionable: [], me: f.key.accountId,
+                archived: false, ownerModel: nil, style: ChatTimelineW01.style(), now: ChatTimelineW01.day)
+        }
+        let before = capture()
+        let revision = manager.revision
+        manager.reconcile()
+        XCTAssertGreaterThan(manager.revision, revision, "Exercise the periodic manager notification")
+        XCTAssertEqual(capture().rows, before.rows, "An unchanged reconciliation must not invalidate any row")
+        server.change { $0.downloads = image }
+        _ = try await manager.load(attached, file: file, preview: true)
+        let loaded = capture()
+        XCTAssertEqual(loaded.rows.filter { $0.messageID != attached.id }, before.rows.filter { $0.messageID != attached.id })
+        let oldRow = try XCTUnwrap(before.rows.first { $0.messageID == attached.id })
+        let newRow = try XCTUnwrap(loaded.rows.first { $0.messageID == attached.id })
+        XCTAssertGreaterThan(newRow.contentRevision, oldRow.contentRevision)
+        XCTAssertEqual(newRow.layoutRevision, oldRow.layoutRevision, "Decoded previews use the reserved geometry")
+        manager.reconcile()
+        XCTAssertEqual(capture().rows, loaded.rows)
+        manager.suspend()
+        let cleared = capture()
+        XCTAssertEqual(cleared.rows.filter { $0.messageID != attached.id }, loaded.rows.filter { $0.messageID != attached.id })
+        XCTAssertGreaterThan(try XCTUnwrap(cleared.rows.first { $0.messageID == attached.id }).contentRevision, newRow.contentRevision)
+    }
+
+    func testChatTimelineEmptyAttachmentContainerRevisionsMatchNativeGeometry() async throws {
+        let f = try await fixture()
+        var valid = limits; valid.dmSenderBytes = 20 * 1024 * 1024
+        var changed = valid; changed.fileBytes += 1
+        var invalid = valid; invalid.fileBytes = 0
+        var otherInvalid = valid; otherInvalid.messageFiles = 0
+        var noDMQuota = valid; noDMQuota.dmSenderBytes = nil
+        var zeroDMQuota = valid; zeroDMQuota.dmSenderBytes = 0
+        let capabilities: Set<String> = ["chat.dm", "chat.attachments", "chat.dm.attachments"]
+        f.service.serverCapabilities[f.key.server] = capabilities
+        f.service.serverAttachmentLimits[f.key.server] = valid
+        let transport = FakeSocketTransport()
+        let socket = ChatSocket(server: f.key.server, token: "test-only", makeTransport: { transport })
+        let sync = ChatSync(key: f.key, store: f.store,
+            api: ChatAPI(server: f.key.server, protocolClasses: [ChatStubProtocol.self]), socket: socket, outbox: nil, token: "test-only")
+        f.service.orgSessions[f.key]?.sync = sync
+        defer { sync.stop(); socket.stop(); f.service.orgSessions[f.key]?.sync = nil }
+        sync.dm.sessionId = "s-anna"; sync.dm.configure(true)
+        let card = ChatDMCard(dmId: ChatTimelineW01Model.dm,
+            peer: .init(accountId: CallJSON.boris, name: "Boris", handle: "boris", active: true),
+            state: "active", version: 1, createdAt: "2026-10-06T12:00:00Z", head: 0, messages: [])
+        let catalog = try JSONEncoder().encode(ChatDMPage(dms: [card], next: nil))
+        ChatStubProtocol.reset { _, _ in .success(.init(status: 200, body: catalog)) }
+        try await sync.dm.reloadCatalog(valid: { true })
+
+        let states: [(String, Set<String>, ChatAttachmentLimits?, Bool, Bool, Bool)] = [
+            // Label, capabilities, limits, pending access, channel container, DM container.
+            ("enabled", capabilities, valid, false, true, true),
+            ("different valid limits", capabilities, changed, false, true, true),
+            ("DM capability absent", capabilities.subtracting(["chat.dm.attachments"]), valid, false, true, false),
+            ("DM capability restored", capabilities, valid, false, true, true),
+            ("DM quota absent", capabilities, noDMQuota, false, true, false),
+            ("DM quota zero", capabilities, zeroDMQuota, false, true, false),
+            ("DM quota restored", capabilities, valid, false, true, true),
+            ("attachment capability absent", ["chat.dm", "chat.dm.attachments"], valid, false, false, false),
+            ("limits change while disabled", ["chat.dm", "chat.dm.attachments"], changed, false, false, false),
+            ("attachment capability restored", capabilities, valid, false, true, true),
+            ("limits absent", capabilities, nil, false, false, false),
+            ("invalid limits", capabilities, invalid, false, false, false),
+            ("different invalid limits", capabilities, otherInvalid, false, false, false),
+            ("valid limits restored", capabilities, valid, false, true, true),
+            ("unrelated capability", capabilities.union(["chat.attachments_context"]), valid, false, true, true),
+            ("access pending", capabilities, valid, true, false, false),
+            ("limits change while access pending", capabilities, changed, true, false, false),
+            ("limits absent while access pending", capabilities, nil, true, false, false),
+            ("access restored without limits", capabilities, nil, false, false, false),
+            ("access and limits restored", capabilities, valid, false, true, true),
+        ]
+        for dm in [false, true] {
+            for thread in [false, true] {
+                let root: String? = thread ? "root" : nil
+                var plain = ChatTimelineW01.message("plain", root: root, dm: dm); plain.channelId = dm ? "" : channel
+                var deleted = ChatTimelineW01.message("deleted", seq: 2, root: root, dm: dm); deleted.channelId = plain.channelId
+                deleted.deletedAt = "2026-10-06T12:01:00Z"
+                let model = ChatTimelineW01Model(directory: self.root, key: f.key, service: f.service)
+                model.isDM = dm; model.channel = channel; model.threadRoot = root; model.feed.messages = [plain, deleted]
+                let adapter = ChatTimelineAdapter()
+                func nativeHeight(_ message: ChatMessage) -> CGFloat {
+                    NSHostingView(rootView: ChatNativeRowFixture(model: model, message: message, members: [], mentionable: [],
+                        me: f.key.accountId, archived: false, replies: 0, inThread: thread).frame(width: 560)).fittingSize.height
+                }
+                var previous: NativeTimelineSnapshot?
+                var previousHeight: CGFloat?
+                var shownHeight: CGFloat?
+                var deletedHeight: CGFloat?
+                for (label, support, limits, pendingAccess, channelVisible, dmVisible) in states {
+                    f.service.serverCapabilities[f.key.server] = support
+                    f.service.serverAttachmentLimits[f.key.server] = limits
+                    f.service.orgSessions[f.key]?.snapshotOwed = pendingAccess
+                    let visible = dm ? dmVisible : channelVisible
+                    let context = "\(dm ? "DM" : "channel") \(thread ? "thread" : "feed"): \(label)"
+                    let height = nativeHeight(plain)
+                    if shownHeight == nil { shownHeight = height }
+                    XCTAssertEqual(height == shownHeight, visible, context)
+                    if !visible { XCTAssertLessThan(height, try XCTUnwrap(shownHeight), context) }
+                    let currentDeletedHeight = nativeHeight(deleted)
+                    if deletedHeight == nil { deletedHeight = currentDeletedHeight }
+                    XCTAssertEqual(currentDeletedHeight, deletedHeight, context)
+                    let snapshot = adapter.snapshot(model: model, root: root, members: [], mentionable: [], me: f.key.accountId,
+                        archived: false, ownerModel: nil, style: ChatTimelineW01.style(), now: ChatTimelineW01.day)
+                    let row = try XCTUnwrap(snapshot.rows.first { $0.messageID == plain.id })
+                    guard case .message(let message) = row.payload else { return XCTFail("Missing message payload") }
+                    XCTAssertEqual(message.content.attachments,
+                        .init(limits: nil, available: visible, availableFileIDs: [], pauseReason: nil), context)
+                    if let previous, let previousHeight {
+                        let old = try XCTUnwrap(previous.rows.first { $0.messageID == plain.id })
+                        XCTAssertEqual(row.layoutRevision != old.layoutRevision, height != previousHeight, context)
+                        XCTAssertEqual(row.contentRevision != old.contentRevision, height != previousHeight, context)
+                        if height == previousHeight { XCTAssertEqual(row, old, context) }
+                        XCTAssertEqual(snapshot.rows.filter { $0.messageID != plain.id },
+                            previous.rows.filter { $0.messageID != plain.id }, context)
+                    }
+                    previous = snapshot; previousHeight = height
+                }
+            }
+        }
+    }
+
     func testViewerTabsHaveIndependentBytesAndRejectLateDownloadsAfterRevisionOrRevocation() async throws {
         let f = try await fixture(), manager = try manager(f)
         let firstBytes = Self.png(), secondBytes = try metadataImage("public.jpeg")

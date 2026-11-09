@@ -24,7 +24,11 @@ struct ChatComposerBox<Editor: View>: View {
                 if fileUI { ChatIconButton(title: "Attach files", symbol: "paperclip", action: chooseFiles) }
                 ChatIconButton(title: "Insert emoji", symbol: "face.smiling", action: control.emoji)
                 ChatIconButton(title: mentionTitle, symbol: "at") { control.insert("@") }
-                if formattingEnabled { Button("Aa") { formatting.toggle() }.buttonStyle(.plain).frame(width: 28, height: 28)
+                if formattingEnabled { Button("Aa") { formatting.toggle() }.buttonStyle(.plain)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    .chatReviewParity("caller/composer/" + (root ?? "feed") + "/formatting", text: "Aa", colors: ["foreground": Theme.chromeForeground])
+                    #endif
+                    .frame(width: 28, height: 28)
                     .help("Show formatting").accessibilityLabel("Show formatting").accessibilityValue(formatting ? "Shown" : "Hidden").chatFocusRing()
                 }
                 Spacer()

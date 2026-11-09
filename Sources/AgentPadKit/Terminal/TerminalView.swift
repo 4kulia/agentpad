@@ -73,6 +73,10 @@ final class TerminalTabHostView: NSView {
         focusedTabID = activeTabId
         for session in tabs where session.id == activeTabId || session.spawnsInBackground {
             let view = session.engine.view
+            // Split collapse can update the departing host after its
+            // replacement adopted this view. A known view with a new owner
+            // has moved away; only a fresh mount may adopt it back.
+            if mountedViews[session.id] != nil, let owner = view.superview, owner !== self { continue }
             let isActive = session.id == activeTabId
             // Set mount-time gates before addSubview triggers
             // viewDidMoveToWindow on an already-windowed host.

@@ -82,7 +82,7 @@ final class SearchReviewChatTests: XCTestCase {
         XCTAssertFalse(model.hits.contains { $0.messageID == "two" }, "A newer cached revision must hide the obsolete snippet")
     }
 
-    func testMessageResultsReuseLocalAndDetachedTabsAndRevealRootsAndReplies() async throws {
+    func testMessageResultsOpenLocalPopupWithoutFocusingTabsAndRevealRootsAndReplies() async throws {
         let isolation = TeamServiceTestScope()
         defer { isolation.close() }
         let cache = try await connect()
@@ -119,12 +119,13 @@ final class SearchReviewChatTests: XCTestCase {
         let count = stores.flatMap(\.allSessions).count
         for owner in stores {
             if owner === detached {
+                origin.popups.dismiss(reason: .dismiss)
                 // The same live-session transfer used when detaching a tab.
                 let workspace = try XCTUnwrap(detached.active), pane = try XCTUnwrap(workspace.activePane)
                 XCTAssertTrue(detached.handleTabDrop(droppedId: tab.id, to: pane, at: 0, in: workspace))
                 XCTAssertNil(origin.channelTab(ChannelRef(key, channel: "channel")))
             }
-            _ = owner.addEmptyWorkspace() // The resolver must also select the hidden workspace.
+            _ = owner.addEmptyWorkspace()
             for id in ["one", "two"] {
                 var result = hit(id)
                 result.threadRootID = id == "two" ? "one" : nil
@@ -135,18 +136,22 @@ final class SearchReviewChatTests: XCTestCase {
                 ]))
                 let page = try JSONEncoder().encode(ChatMessagesPage(messages: [wire], next: nil, head: 100))
                 ChatStubProtocol.reset { _, _ in .success(.init(status: 200, body: page)) }
+                let activeWorkspace = origin.active?.id
                 await SearchNavigation.open(result, model: model, from: origin, service: service, router: router)
                 XCTAssertNil(model.navigationError)
                 XCTAssertTrue(model.returnAvailable)
-                XCTAssertEqual(revealedWindow, owner.windowID)
-                XCTAssertTrue(owner.active?.activeSession === tab)
-                XCTAssertEqual(stores.flatMap(\.allSessions).count, count, "Message results must not duplicate a channel tab")
+                XCTAssertNil(revealedWindow, "A conversation result does not jump windows or Spaces")
+                XCTAssertEqual(origin.active?.id, activeWorkspace, "The agent workspace stays selected behind the popup")
+                XCTAssertEqual(stores.flatMap(\.allSessions).count, count, "Ordinary message results create no tabs")
+                let popup = try XCTUnwrap(origin.popups.visibleConversation)
+                XCTAssertTrue(popup.isConversationPopup)
+                XCTAssertEqual(popup.channel, tab.channel)
                 let wrongHost = try XCTUnwrap(origin.allSessions.first { $0 !== tab }?.engine.view)
                 XCTAssertNil(ChatMessageNavigation.take(key: key, channel: "channel", from: wrongHost))
-                let link = try XCTUnwrap(ChatMessageNavigation.take(key: key, channel: "channel", from: tab.engine.view))
+                let link = try XCTUnwrap(ChatMessageNavigation.take(key: key, channel: "channel", from: popup.engine.view))
                 XCTAssertEqual(link.message, id); XCTAssertEqual(link.sequence, result.messageSeq)
                 channel.navigate(to: link)
-                XCTAssertEqual(channel.revealMessageID, id, "The reused tab receives the scroll and highlight target")
+                XCTAssertEqual(channel.revealMessageID, id, "The popup receives the scroll and highlight target")
                 XCTAssertEqual(channel.threadRoot, result.threadRootID)
                 let messages = id == "one" ? channel.feed.messages : channel.thread
                 XCTAssertEqual(messages.first { $0.id == id }?.text, "Current server message")

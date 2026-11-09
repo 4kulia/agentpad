@@ -30,11 +30,13 @@ final class PopupCoordinator {
     }
     @MainActor enum Page {
         case tool(Session)
+        case conversation(Session)
         case account(ClaudeAccountForm)
         case confirmation(ConfirmationCoordinator)
         case native(NativePage)
         var id: ObjectIdentifier {
             switch self {
+            case .conversation(let session): ObjectIdentifier(session)
             case .tool(let session): ObjectIdentifier(session)
             case .account(let form): ObjectIdentifier(form)
             case .confirmation(let confirmation): ObjectIdentifier(confirmation)
@@ -43,6 +45,7 @@ final class PopupCoordinator {
         }
         var title: String {
             switch self {
+            case .conversation(let session): session.conversationTitle
             case .tool(let session):
                 if case .ask = session.toolRoute { session.tabState?.askForm?.receiptTitle ?? "Ask agent" }
                 else { session.toolRoute?.title ?? "" }
@@ -53,6 +56,7 @@ final class PopupCoordinator {
         }
         var presentationTitle: String {
             switch self {
+            case .conversation(let session): return session.conversationTitle
             case .tool(let session):
                 if let state = session.tabState, state.presentsPopupDecision {
                     if case .fileOperations = state.route { return "Replace file" }
@@ -88,6 +92,7 @@ final class PopupCoordinator {
         }
         var keepsDraft: Bool {
             switch self {
+            case .conversation(let session): session.hasConversationDraft
             case .tool(let session):
                 switch session.toolRoute {
                 case .settings, .linkFailure, .fileOperations, .importSession, .closeWorkspaces: false
@@ -103,6 +108,13 @@ final class PopupCoordinator {
     private(set) var backStack: [Page] = []
     private(set) var sessions: [Session] = []
     private(set) var draftKept = false
+    var showConversationPicker = false { didSet { syncGate() } }
+    private(set) var conversationSaving = false
+    private(set) var conversationSaveError: String?
+    private(set) var conversationDraftReceipt: String?
+    @ObservationIgnored private weak var receiptConversation: Session?
+    @ObservationIgnored private var pendingConversationTransition: (() -> Void)?
+    @ObservationIgnored private var conversationSaveTask: Task<Void, Never>?
     var confirmationContentHeight: CGFloat?
     @ObservationIgnored private weak var store: WorkspaceStore?
     @ObservationIgnored weak var window: NSWindow?
@@ -118,8 +130,18 @@ final class PopupCoordinator {
     init(store: WorkspaceStore? = nil) { self.store = store }
     var ownerStore: WorkspaceStore? { store }
     var isPresented: Bool { page != nil }
+    var visibleConversation: Session? {
+        guard case .conversation(let session) = page else { return nil }
+        return session
+    }
+    var presentedConversations: [Session] {
+        (backStack + (page.map { [$0] } ?? [])).compactMap {
+            if case .conversation(let session) = $0 { return session }; return nil
+        }
+    }
     var showsDraftNotice: Bool {
         guard draftKept else { return false }
+        if case .conversation(let session) = page { return session.hasConversationDraft }
         if case .native(let page) = page { return page.keepsDraft() }
         guard case .tool(let session) = page else { return true }
         if session.tabState?.presentsPopupDecision == true { return false }
@@ -158,6 +180,7 @@ final class PopupCoordinator {
     func discardRuntimeDraft(_ draft: Page) throws {
         guard retainedRuntimeDrafts.contains(where: { $0.id == draft.id }) else { return }
         switch draft {
+        case .conversation: break // Chat drafts keep their backend's own discard actions.
         case .tool(let session):
             guard session.tabState?.connectionForm?.busy != true else { return }
             try session.tabState?.askForm?.discard()
@@ -172,8 +195,12 @@ final class PopupCoordinator {
     }
     var canGoBack: Bool { !backStack.isEmpty && !locksDismissal }
     var locksDismissal: Bool {
+        if conversationSaving { return true }
         switch page {
         case .confirmation: return true
+        case .conversation(let session):
+            let confirmation = session.channelConversation?.confirmation ?? session.tabState?.confirmation
+            return confirmation?.destructive == true && confirmation?.showsBlock == true
         case .native(let native): return native.locksDismissal()
         case .tool(let session):
             if let state = session.tabState, state.isCloseWorkspacesReview { return state.closeWorkspaces?.completed != true }
@@ -181,16 +208,126 @@ final class PopupCoordinator {
         default: return false
         }
     }
-    func contains(_ id: UUID) -> Bool { sessions.contains { $0.id == id } }
+    func contains(_ id: UUID) -> Bool {
+        sessions.contains { $0.id == id && (!$0.content.isConversation || $0.isConversationPopup || store?.allSessions.contains(where: { $0.id == id }) != true) }
+    }
     func find(_ route: ToolRoute) -> TabRouter.Location? {
         guard let session = sessions.first(where: { $0.toolRoute == route }) else { return nil }
         return location(of: session.id)
     }
     func location(of id: UUID) -> TabRouter.Location? {
-        guard let store, let session = sessions.first(where: { $0.id == id }),
+        guard let store, contains(id), let session = sessions.first(where: { $0.id == id }),
               let workspace = store.active ?? store.workspaces.first,
               let pane = workspace.activePane ?? workspace.root.firstPane else { return nil }
         return .init(store: store, workspace: workspace, pane: pane, session: session)
+    }
+
+    private func conversation(_ content: TabContent) -> Session? {
+        guard content.isConversation, let store else { return nil }
+        if let current = visibleConversation, current.content == content { return current }
+        let local = store.allSessions.sorted {
+            if $0.lastActivated != $1.lastActivated { return $0.lastActivated > $1.lastActivated }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        if let existing = (local + sessions).first(where: { $0.content == content && $0.tabState?.isClosed != true }) {
+            return existing
+        }
+        let workspace = store.active ?? store.addEmptyWorkspace()
+        switch content {
+        case .channel(let ref): return store.makeChannelSession(ref, cwd: workspace.workingDirectory)
+        case .tool(let route): return store.makeToolSession(route, cwd: workspace.workingDirectory)
+        default: return nil
+        }
+    }
+    @discardableResult func presentConversation(_ content: TabContent) -> Session? {
+        guard !locksDismissal, let session = conversation(content), presentConversation(session) else { return nil }
+        return session
+    }
+    @discardableResult func presentConversation(_ session: Session) -> Bool {
+        guard session.content.isConversation, !locksDismissal else { return false }
+        session.conversationPopupSource = nil
+        if !sessions.contains(where: { $0 === session }) { sessions.append(session) }
+        if let native = session.engine as? NativeTabEngine { native.owner = store }
+        if page?.id == ObjectIdentifier(session) { showConversationPicker = false; return true }
+        show(.conversation(session))
+        return true
+    }
+    @discardableResult func openConversationAsTab(_ content: TabContent) -> Session? {
+        guard !locksDismissal, let session = conversation(content), let store else { return nil }
+        afterSavingConversations { [weak self, weak store] in
+            guard let self, let store else { return }
+            self.dismissSaved(reason: .dismiss)
+            guard !self.isPresented else { return }
+            session.setConversationPopup(false)
+            self.sessions.removeAll { $0 === session }
+            self.kept.remove(ObjectIdentifier(session))
+            self.conversationDraftReceipt = nil; self.receiptConversation = nil
+            store.adoptConversationTab(session)
+        }
+        return session
+    }
+    func promoteConversation() {
+        guard let session = visibleConversation else { return }
+        _ = openConversationAsTab(session.content)
+    }
+    func reopenConversationDraft() {
+        guard let session = receiptConversation else { return }
+        _ = presentConversation(session.content)
+    }
+    /// The backend's existing logout/revocation path also owns retained popup
+    /// sessions. It must not leave an old account's view or observer alive.
+    func forgetConversation(_ session: Session) {
+        guard session.content.isConversation, sessions.contains(where: { $0 === session }) else { return }
+        if presentedConversations.contains(where: { $0 === session }) {
+            conversationSaveTask?.cancel(); conversationSaveTask = nil
+            conversationSaving = false; pendingConversationTransition = nil; conversationSaveError = nil
+        }
+        if visibleConversation === session { dismissSaved(reason: .applied) }
+        backStack.removeAll { $0.id == ObjectIdentifier(session) }
+        session.setConversationPopup(false)
+        sessions.removeAll { $0 === session }; kept.remove(ObjectIdentifier(session))
+        if store?.allSessions.contains(where: { $0 === session }) != true { session.engine.terminate() }
+        syncGate()
+    }
+    /// Explicit content commands can be asynchronous only while a Telegram
+    /// draft is being flushed. Do not select a covered tab on a failed save.
+    func leaveForContent(_ action: @escaping () -> Void) {
+        guard !locksDismissal else { return }
+        afterSavingConversations { [weak self] in
+            guard let self else { return }
+            self.dismissSaved(reason: .dismiss)
+            guard !self.isPresented else { return }
+            action()
+        }
+    }
+    func retryConversationSave() {
+        guard let pendingConversationTransition, !conversationSaving else { return }
+        afterSavingConversations(pendingConversationTransition)
+    }
+    private func afterSavingConversations(_ action: @escaping () -> Void) {
+        guard !conversationSaving else { return }
+        let conversations = presentedConversations
+        pendingConversationTransition = action
+        do { for session in conversations { try session.flushConversationDrafts() } }
+        catch { conversationSaveError = error.localizedDescription; return }
+        let telegram = conversations.compactMap { $0.tabState?.telegramModel }.filter(\.hasUnsavedDraft)
+        guard !telegram.isEmpty else {
+            conversationSaveError = nil; pendingConversationTransition = nil; action(); return
+        }
+        conversationSaving = true
+        conversationSaveTask = Task { [weak self] in
+            do {
+                for model in telegram { try await model.flushDraft() }
+                guard let self, !Task.isCancelled else { return }
+                self.conversationSaving = false; self.conversationSaveError = nil
+                self.pendingConversationTransition = nil; self.conversationSaveTask = nil
+                action()
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                self.conversationSaving = false; self.conversationSaveTask = nil
+                self.conversationSaveError = error.localizedDescription
+            }
+        }
     }
     @discardableResult
     func present(_ route: ToolRoute, navigation: TabNavigation = TabNavigation()) -> Session {
@@ -293,6 +430,12 @@ final class PopupCoordinator {
         store?.searchModel?.dismiss()
     }
     private func show(_ next: Page) {
+        guard page?.id != next.id, !locksDismissal else { return }
+        if !presentedConversations.isEmpty {
+            afterSavingConversations { [weak self] in self?.showSaved(next) }
+        } else { showSaved(next) }
+    }
+    private func showSaved(_ next: Page) {
         if page?.id == next.id { return }
         if let current = page {
             guard !locksDismissal else { return }
@@ -303,29 +446,43 @@ final class PopupCoordinator {
                 let discarded = Array(backStack.dropFirst(index + 1)) + [current]
                 for old in discarded {
                     if case .native(let native) = old { finishNative(native, reason: .dismiss) }
+                    if case .conversation(let session) = old { session.setConversationPopup(false) }
                 }
                 backStack.removeSubrange(index...)
             }
-            else { backStack.append(current) }
+            else if case .conversation(let previous) = current, case .conversation = next {
+                previous.setConversationPopup(false)
+            } else { backStack.append(current) }
         } else {
             captureOpenerAndDismissSearch()
         }
         store?.invalidateTabConfirmations()
         draftKept = kept.contains(next.id)
         page = next
+        showConversationPicker = false
+        conversationDraftReceipt = nil
+        if case .conversation(let session) = next { session.setConversationPopup(true) }
         if case .native(let native) = next { native.active = true }
         syncGate()
     }
     func back() {
+        guard !presentedConversations.isEmpty else { backSaved(); return }
+        afterSavingConversations { [weak self] in self?.backSaved() }
+    }
+    private func backSaved() {
         guard canGoBack, let previous = backStack.popLast() else { return }
         if let page { suspend(page) }
         if let page, page.keepsDraft { kept.insert(page.id) }
         if case .native(let native) = page { finishNative(native, reason: .dismiss) }
+        if case .conversation(let session) = page { session.setConversationPopup(false) }
         page = previous; draftKept = kept.contains(previous.id)
+        if case .conversation(let session) = previous { session.setConversationPopup(true) }
         if case .native(let native) = previous { native.active = true }
+        syncGate()
     }
     func dismiss(_ session: Session, reason: DismissReason) {
         guard contains(session.id) else { return }
+        if visibleConversation === session { dismiss(reason: reason); return }
         guard case .tool(let visible) = page, visible === session else {
             // Completion may arrive after the popup was dismissed or replaced.
             // Consume that completed form without navigating the current page.
@@ -338,6 +495,12 @@ final class PopupCoordinator {
         dismiss(reason: reason)
     }
     func dismiss(reason: DismissReason) {
+        if reason == .dismiss, !presentedConversations.isEmpty {
+            guard !locksDismissal else { return }
+            afterSavingConversations { [weak self] in self?.dismissSaved(reason: reason) }
+        } else { dismissSaved(reason: reason) }
+    }
+    private func dismissSaved(reason: DismissReason) {
         guard let current = page, reason != .dismiss || !locksDismissal else { return }
         if reason == .dismiss {
             do { try saveDrafts() }
@@ -350,11 +513,20 @@ final class PopupCoordinator {
             backStack.filter(\.keepsDraft).forEach { kept.insert($0.id) }
             for old in backStack + [current] {
                 if case .native(let native) = old { finishNative(native, reason: .dismiss) }
+                if case .conversation(let session) = old {
+                    if session.hasConversationDraft {
+                        conversationDraftReceipt = "Draft kept · \(session.conversationTitle)"
+                        receiptConversation = session
+                    }
+                    session.setConversationPopup(false)
+                }
             }
             backStack.removeAll()
             page = nil
         } else {
-            if case .tool(let session) = current {
+            if case .conversation(let session) = current {
+                session.setConversationPopup(false)
+            } else if case .tool(let session) = current {
                 guard finish(session, reason: reason) else { return }
             } else if case .account(let form) = current {
                 form.cancel()
@@ -396,7 +568,10 @@ final class PopupCoordinator {
     }
     func invalidateConfirmations() { sessions.forEach { $0.tabState?.confirmation.invalidate() } }
     func attach(to window: NSWindow?) { self.window = window; syncGate() }
-    private func syncGate() { NavigationPresentationGate.setOverlay(overlayID, window: window, presented: isPresented) }
+    private func syncGate() {
+        NavigationPresentationGate.setOverlay(overlayID, window: window, presented: isPresented,
+            visibleContent: showConversationPicker ? nil : visibleConversation?.engine.view)
+    }
     private func restoreFocus() {
         guard let window else { return }
         defer { opener = nil }
@@ -418,8 +593,14 @@ final class PopupCoordinator {
         session.focusPrimaryInput()
     }
     func terminate() {
+        conversationSaveTask?.cancel(); conversationSaveTask = nil; pendingConversationTransition = nil
+        conversationSaving = false
         page = nil; backStack.removeAll(); syncGate()
-        sessions.forEach { $0.engine.terminate() }; sessions.removeAll()
+        for session in sessions {
+            session.setConversationPopup(false)
+            if store?.allSessions.contains(where: { $0 === session }) != true { session.engine.terminate() }
+        }
+        sessions.removeAll()
         accountForms.values.forEach { $0.cancel() }; accountForms.removeAll(); added.removeAll()
         for native in nativePages { finishNative(native, reason: .cancel) }
         nativePages.removeAll()
@@ -452,13 +633,28 @@ private struct PopupHost: View {
                         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.chromeHairline))
                         .shadow(color: .black.opacity(0.35), radius: 32, y: 18)
                 }.frame(width: geometry.size.width, height: geometry.size.height)
+            } else if let receipt = coordinator.conversationDraftReceipt {
+                HStack(spacing: 14) {
+                    Image(systemName: "checkmark").foregroundStyle(.green)
+                    Text(receipt)
+                    Button("Reopen") { coordinator.reopenConversationDraft() }
+                        .buttonStyle(.plain).foregroundStyle(ChatAppearance.accent)
+                        .accessibilityIdentifier("popup-draft-reopen")
+                }
+                    .font(Theme.display(11)).padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(Theme.chromeBackground, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.chromeHairline))
+                    .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+                    .accessibilityIdentifier("popup-draft-receipt")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom).padding(42)
             }
         }
         .background(PopupWindowProbe(coordinator: coordinator).allowsHitTesting(false))
-        .allowsHitTesting(coordinator.isPresented)
+        .allowsHitTesting(coordinator.isPresented || coordinator.conversationDraftReceipt != nil)
         .preferredColorScheme(Theme.chromeColorScheme)
     }
     private func width(_ page: PopupCoordinator.Page) -> CGFloat {
+        if case .conversation = page { return 720 }
         if case .native(let native) = page { return native.width }
         if case .tool(let session) = page {
             if session.tabState?.presentsPopupDecision == true { return 580 }
@@ -475,6 +671,12 @@ private struct PopupHost: View {
     }
     private func height(_ page: PopupCoordinator.Page) -> CGFloat {
         switch page {
+        case .conversation(let session):
+            if coordinator.showConversationPicker { return 390 }
+            if case .telegram = session.toolRoute { return 700 }
+            if session.conversationHasBack { return 600 }
+            if session.channel != nil { return 620 }
+            return 500
         case .tool(let session):
             if session.toolRoute?.fitsPopupContent == true, let height = session.tabState?.popupContentHeight {
                 return height + 63 + (coordinator.showsDraftNotice ? 30 : 0)
@@ -655,6 +857,9 @@ private struct PopupDialog: NSViewRepresentable {
                 if self.window?.firstResponder === self || !self.containsFocus() {
                     self.focusInside()
                 }
+                if let session = self.coordinator?.visibleConversation, self.coordinator?.showConversationPicker != true {
+                    session.focusPrimaryInput()
+                }
             }
             monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] event in
                 guard let self, self.coordinator?.isPresented == true,
@@ -668,7 +873,18 @@ private struct PopupDialog: NSViewRepresentable {
                     }
                     return event
                 }
-                if event.keyCode == 53 { self.coordinator?.dismiss(reason: .dismiss); return nil }
+                if event.keyCode == 53 {
+                    if let editor = window.firstResponder as? NSTextView, editor.hasMarkedText() { return event }
+                    if let editor = window.firstResponder as? ChatMentionEditor.Editor,
+                       editor.consume?(event.keyCode, event.modifierFlags) == true { return nil }
+                    if self.coordinator?.showConversationPicker == true { self.coordinator?.showConversationPicker = false }
+                    else { self.coordinator?.dismiss(reason: .dismiss) }
+                    return nil
+                }
+                if event.keyCode == 35, event.modifierFlags.contains(.command), self.coordinator?.visibleConversation != nil {
+                    self.coordinator?.showConversationPicker = true
+                    return nil
+                }
                 // A delayed terminal mount must not receive the next key if
                 // it reclaimed focus after the popup was presented.
                 if !self.containsFocus() { self.focusInside() }
@@ -726,6 +942,9 @@ private struct PopupDialog: NSViewRepresentable {
                 view.layoutSubtreeIfNeeded()
                 view.window?.recalculateKeyViewLoop()
                 if view.window?.firstResponder === view || !view.containsFocus() { view.focusInside() }
+                if let session = view.coordinator?.visibleConversation, view.coordinator?.showConversationPicker != true {
+                    session.focusPrimaryInput()
+                }
             }
         }
     }
@@ -736,6 +955,9 @@ private struct PopupPanel: View {
     let page: PopupCoordinator.Page
     var body: some View {
         VStack(spacing: 0) {
+            if case .conversation(let session) = page {
+                ChatPopupHeader(coordinator: coordinator, session: session)
+            } else {
             HStack(spacing: 12) {
                 if coordinator.canGoBack {
                     Button { coordinator.back() } label: { Image(systemName: "arrow.left") }
@@ -754,15 +976,52 @@ private struct PopupPanel: View {
                     .buttonStyle(.plain).disabled(coordinator.locksDismissal)
                     .accessibilityLabel("Close popup").accessibilityIdentifier("popup-close")
             }.padding(.horizontal, 20).frame(height: 62)
+            }
             Divider()
-            if coordinator.showsDraftNotice {
+            if case .conversation(let session) = page, !coordinator.showConversationPicker,
+               let source = session.conversationPopupSource {
+                HStack {
+                    Label(source.label, systemImage: "bell").lineLimit(1)
+                    Spacer()
+                    Button(source.returnTitle) { coordinator.dismiss(reason: .dismiss) }.buttonStyle(.plain)
+                        .accessibilityIdentifier("popup-back-to-source")
+                }.font(Theme.display(11)).foregroundStyle(ChatAppearance.accent)
+                    .padding(.horizontal, 20).frame(height: 34)
+                    .background(ChatAppearance.accent.opacity(0.12)).accessibilityIdentifier("popup-source-context")
+            }
+            if coordinator.showsDraftNotice && coordinator.visibleConversation == nil {
                 Text("Draft kept · nothing sent or applied by closing.")
                     .font(Theme.display(11)).foregroundStyle(.orange)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20)
                     .frame(height: 30).background(.orange.opacity(0.10))
                     .accessibilityIdentifier("popup-draft-kept")
             }
+            if let error = coordinator.conversationSaveError {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Draft could not be saved").font(Theme.display(12, weight: .semibold))
+                        Text(error).font(Theme.display(11)).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Button("Retry") { coordinator.retryConversationSave() }.accessibilityIdentifier("popup-save-retry")
+                }.padding(12).foregroundStyle(ChatAppearance.failure)
+                    .background(ChatAppearance.failure.opacity(0.08)).accessibilityIdentifier("popup-save-error")
+            }
+            ZStack {
+                ForEach(coordinator.presentedConversations) { session in
+                    ChatPopupMount(session: session, visible: coordinator.visibleConversation === session && !coordinator.showConversationPicker)
+                        .accessibilityHidden(coordinator.visibleConversation !== session || coordinator.showConversationPicker)
+                }
+                if coordinator.showConversationPicker, coordinator.visibleConversation != nil {
+                    ChatPopupPicker(coordinator: coordinator)
+                }
+                nonConversationContent
+            }
+        }.foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground)
+    }
+    @ViewBuilder private var nonConversationContent: some View {
             switch page {
+            case .conversation: EmptyView()
             case .tool(let session): PopupToolContent(session: session).id(session.id)
             case .account(let form):
                 ClaudeAccountFormView(form: form, onCancel: { coordinator.dismiss(reason: .cancel) },
@@ -808,7 +1067,6 @@ private struct PopupPanel: View {
                     .onPreferenceChange(PopupFormHeightKey.self) { if $0 > 0 { coordinator.confirmationContentHeight = $0 } }
                     .onAppear { confirmation.shown(true) }
             }
-        }.foregroundStyle(Theme.chromeForeground).background(Theme.chromeBackground)
     }
 }
 

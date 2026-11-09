@@ -117,8 +117,11 @@ final class ChatDMAttentionSource: AttentionDMSource {
     }
     func stop() { epoch = UUID(); observation?.cancel(); observation = nil; rows = []; conversations = []; changed?([]); changed = nil; scope = nil }
     func open(_ conversation: String, scope: AttentionScope, from store: WorkspaceStore? = nil) {
+        open(conversation, scope: scope, from: store, asTab: false)
+    }
+    func open(_ conversation: String, scope: AttentionScope, from store: WorkspaceStore?, asTab: Bool) {
         guard let service, ChatAttention.sameScope(scope, service), let key = ChatAttention.key(scope) else { return }
-        ChatDMTabs.open(ChatDMRef(key, dm: conversation), from: store, service: service)
+        ChatDMTabs.open(ChatDMRef(key, dm: conversation), from: store, service: service, asTab: asTab)
     }
     func markRead(_ conversation: String, scope: AttentionScope) {
         guard let service, ChatAttention.sameScope(scope, service), let key = ChatAttention.key(scope), service.dmAllowed(key, conversation) else { return }

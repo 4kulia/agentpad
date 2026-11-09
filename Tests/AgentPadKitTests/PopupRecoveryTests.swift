@@ -4,8 +4,8 @@ import XCTest
 @MainActor
 final class PopupRecoveryTests: XCTestCase {
     private func operation(mode: FileOperations.PasteMode = .copy) -> (ToolRoute, FileTransferSnapshot) {
-        let source = URL(fileURLWithPath: "/Users/kulia/agentpad-attn")
-        let destination = URL(fileURLWithPath: "/Users/kulia/agentpad-docs")
+        let source = URL(fileURLWithPath: "/fictional/popup-recovery/source")
+        let destination = URL(fileURLWithPath: "/fictional/popup-recovery/destination")
         let readme = source.appendingPathComponent("README.md")
         let config = source.appendingPathComponent("config.json")
         let notes = source.appendingPathComponent("notes.md")

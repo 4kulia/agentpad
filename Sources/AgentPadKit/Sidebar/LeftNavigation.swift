@@ -248,17 +248,20 @@ enum NavigationPresentationGate {
     static let didChange = Notification.Name("AgentPadNavigationPresentationDidChange")
     private final class WindowReference {
         weak var window: NSWindow?
-        init(_ window: NSWindow) { self.window = window }
+        weak var visibleContent: NSView?
+        init(_ window: NSWindow, visibleContent: NSView?) {
+            self.window = window; self.visibleContent = visibleContent
+        }
     }
     private static var overlays: [UUID: WindowReference] = [:]
-    static func setOverlay(_ id: UUID, window: NSWindow?, presented: Bool) {
+    static func setOverlay(_ id: UUID, window: NSWindow?, presented: Bool, visibleContent: NSView? = nil) {
         let previous = overlays[id]?.window
         let next = presented ? window : nil
-        guard previous !== next else {
+        guard previous !== next || overlays[id]?.visibleContent !== visibleContent else {
             if next == nil { overlays[id] = nil }
             return
         }
-        overlays[id] = next.map(WindowReference.init)
+        overlays[id] = next.map { WindowReference($0, visibleContent: visibleContent) }
         if let previous { recheck(previous) }
         if let next { recheck(next) }
     }
@@ -279,7 +282,17 @@ enum NavigationPresentationGate {
 
     static func allowsAcknowledgement(_ view: NSView, appActive: Bool) -> Bool {
         guard appActive, let window = view.window, window.isKeyWindow, window.isVisible, !window.isMiniaturized,
-              !obscures(window), !view.isHiddenOrHasHiddenAncestor, !view.frame.isEmpty, !view.visibleRect.isEmpty else { return false }
+              window.attachedSheet == nil, !view.isHiddenOrHasHiddenAncestor,
+              !view.frame.isEmpty, !view.visibleRect.isEmpty else { return false }
+        let presented = overlays.values.filter { $0.window === window }
+        if !presented.isEmpty {
+            // Only the current conversation's actual subtree can acknowledge.
+            // A form, picker or decision above it grants no reading ownership.
+            return presented.allSatisfy { overlay in
+                overlay.visibleContent.map { view === $0 || view.isDescendant(of: $0) } == true
+            }
+        }
+        guard !obscures(window) else { return false }
         return true
     }
 }

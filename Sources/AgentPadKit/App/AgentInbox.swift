@@ -121,6 +121,7 @@ struct InboxView: View {
     var inbox = NotificationInbox.shared
     let onActivate: (NotificationInbox.Event) -> Void
     let onClear: () -> Void
+    var onOpenAsTab: ((NotificationInbox.Event) -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -186,6 +187,11 @@ struct InboxView: View {
                 ForEach(inbox.events) { event in
                     Button { onActivate(event) } label: { InboxRow(event: event) }
                         .buttonStyle(.plain).accessibilityIdentifier("notification-" + event.id)
+                        .contextMenu {
+                            if event.notice.destination.isConversation, let onOpenAsTab {
+                                Button("Open as tab") { onOpenAsTab(event) }
+                            }
+                        }
                 }
             }
             .padding(.vertical, 4)

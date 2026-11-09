@@ -55,6 +55,7 @@ final class TabRouter {
         let key = route.key(windowID: windowID)
         var matches: [Location] = []
         for store in stores() where !store.isTerminated {
+            if route.isConversation && store.windowID != windowID { continue }
             for workspace in store.workspaces {
                 for pane in workspace.root.allPanes {
                     for session in pane.tabs where session.toolRoute?.key(windowID: store.windowID) == key {
@@ -79,34 +80,27 @@ final class TabRouter {
     }
 
     @discardableResult
-    func openChannel(_ ref: ChannelRef, scope: AttentionScope? = nil, from initiator: WorkspaceStore? = nil) -> Session? {
-        if let admit, !admit({ [weak self, weak initiator] in self?.openChannel(ref, scope: scope, from: initiator) }) { return nil }
+    func openChannel(_ ref: ChannelRef, scope: AttentionScope? = nil, from initiator: WorkspaceStore? = nil, asTab: Bool = false) -> Session? {
+        let asTab = asTab || ConversationOpenIntent.commandClick
+        if let admit, !admit({ [weak self, weak initiator] in self?.openChannel(ref, scope: scope, from: initiator, asTab: asTab) }) { return nil }
         guard let store = initiator ?? ensureHost(), !store.isTerminated,
               let currentScope = channelScope(ref), scope == nil || scope == currentScope else { return nil }
-        prepareDestinations()
-        let target = AttentionTabDestination.channel(currentScope, ref.channel)
-        // A just-opened gate may still be loading display metadata. The prepared
-        // route identity remains usable after the live authorization above.
-        let matches = destinations().values.filter { $0.channel == ref || $0.destinations.contains(target) }.compactMap { tab -> Location? in
-            guard let location = owner(of: tab.id), location.session.channel == ref else { return nil }
-            return location
-        }
-        if let existing = preferred(matches, windowID: store.windowID) {
-            guard channelScope(ref) == currentScope else { return nil }
-            reveal(existing); return existing.session
-        }
         guard channelScope(ref) == currentScope else { return nil }
-        let session = store.showChannel(ref)
-        revealWindow(store)
-        return session
+        return store.showChannel(ref, asTab: asTab)
     }
     @discardableResult
     func open(_ route: ToolRoute, from initiator: WorkspaceStore? = nil, section: SettingsTabSection? = nil,
-              load: ((TabState) async -> Void)? = nil) -> Session? {
+              load: ((TabState) async -> Void)? = nil, asTab: Bool = false) -> Session? {
+        let asTab = asTab || ConversationOpenIntent.commandClick
         if let admit, !admit({ [weak self, weak initiator] in
-            self?.open(route, from: initiator, section: section, load: load)
+            self?.open(route, from: initiator, section: section, load: load, asTab: asTab)
         }) { return nil }
         guard let store = initiator ?? ensureHost(), !store.isTerminated else { return nil }
+        if route.isConversation {
+            let session = asTab ? store.popups.openConversationAsTab(.tool(route)) : store.popups.presentConversation(.tool(route))
+            if let state = session?.tabState, let load { Task { await load(state) } }
+            return session
+        }
         if route.presentation == .popup {
             let existing = store.popups.find(route)
             let session = store.popups.present(route)
@@ -115,7 +109,6 @@ final class TabRouter {
             if existing == nil, let load, let state = session.tabState { Task { await load(state) } }
             return session
         }
-        store.popups.dismiss(reason: .dismiss)
         if let existing = find(route, windowID: store.windowID) {
             if let section { existing.session.tabState?.select(section) }
             reveal(existing); return existing.session
@@ -128,19 +121,29 @@ final class TabRouter {
         return session
     }
     func reveal(_ location: Location) {
+        if location.session.isConversationPopup {
+            location.store.popups.presentConversation(location.session)
+            return
+        }
         if location.store.popups.contains(location.session.id), let route = location.session.toolRoute {
             location.store.popups.present(route)
             revealWindow(location.store)
             return
         }
-        location.workspace.zoomedPaneId = nil
-        location.store.activateWorkspace(location.workspace)
-        location.store.activateTab(location.session, in: location.workspace)
-        revealWindow(location.store)
+        location.store.popups.leaveForContent { [weak self] in
+            location.workspace.zoomedPaneId = nil
+            location.store.activateWorkspace(location.workspace)
+            location.store.activateTab(location.session, in: location.workspace)
+            self?.revealWindow(location.store)
+        }
     }
     @discardableResult
     func rekey(_ id: TabID, to route: ToolRoute) -> Session? {
         guard let current = owner(of: id), let state = current.session.tabState else { return nil }
+        if current.session.isConversationPopup, route.isConversation {
+            state.leave(); state.route = route; current.session.content = .tool(route)
+            return current.session
+        }
         if current.store.popups.contains(id) {
             if route.presentation == .popup {
                 state.route = route; current.session.content = .tool(route)
@@ -168,9 +171,7 @@ final class TabRouter {
     func rekey(_ id: TabID, to channel: ChannelRef) -> Session? {
         if let current = owner(of: id), current.store.popups.contains(id) {
             current.store.popups.dismiss(current.session, reason: .applied)
-            let session = current.store.showChannel(channel)
-            revealWindow(current.store)
-            return session
+            return current.store.showChannel(channel)
         }
         guard let current = owner(of: id), current.session.toolRoute != nil,
               current.store.tabCloseCoordinator.prepare([current.session]) else { return nil }

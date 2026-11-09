@@ -78,12 +78,21 @@ struct ChatMentionEditor: NSViewRepresentable {
         var suppressCommandReturnRepeat = false
         var focusOnAttach = false
         var placeholder = "" { didSet { needsDisplay = true } }
+        // These are the operands consumed by the existing placeholder draw.
+        var placeholderDrawingOrigin: NSPoint { NSPoint(x: textContainerInset.width + 5, y: textContainerInset.height) }
+        var placeholderDrawingAttributes: [NSAttributedString.Key: Any] {
+            [.font: font ?? NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor]
+        }
         private var didAutofocus = false
         override func draw(_ dirtyRect: NSRect) {
             super.draw(dirtyRect)
             if string.isEmpty && !hasMarkedText() {
+                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                (placeholder as NSString).draw(at: placeholderDrawingOrigin, withAttributes: placeholderDrawingAttributes)
+                #else
                 (placeholder as NSString).draw(at: NSPoint(x: textContainerInset.width + 5, y: textContainerInset.height),
                     withAttributes: [.font: font ?? NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor])
+                #endif
             }
         }
         override func viewDidMoveToWindow() {

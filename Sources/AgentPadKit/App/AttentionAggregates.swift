@@ -410,21 +410,21 @@ final class AttentionSidebarModel {
         updateProjection()
     }
 
-    func activate(_ item: AttentionItem, from store: WorkspaceStore, router: TabRouter = .shared) {
+    func activate(_ item: AttentionItem, from store: WorkspaceStore, router: TabRouter = .shared, asTab: Bool = false) {
         guard !item.inFlight else { return }
         switch item.action {
-        case .event(let id): AttentionCoordinator.shared.navigation?.activate(id)
+        case .event(let id): AttentionCoordinator.shared.navigation?.activate(id, asTab: asTab)
         case .mention(let scope, let channel, let message, let sequence):
             guard let key = ChatAttention.key(scope), ChatAttention.sameScope(scope, service),
                   ChatNotifications.allowed(service, key, channel: channel),
-                  let tab = router.openChannel(ChannelRef(key, channel: channel), scope: scope, from: store) else { return }
+                  let tab = router.openChannel(ChannelRef(key, channel: channel), scope: scope, from: store, asTab: asTab) else { return }
             ChatMessageNavigation.request(ChatMessageLink(key: key, channel: channel, message: message, sequence: sequence),
                                           key: key, destination: tab.engine.view)
         case .dm(let scope, let conversation):
             guard ChatAttention.sameScope(scope, service) else { return }
-            aggregates.dmSource?.open(conversation, scope: scope, from: store)
+            aggregates.dmSource?.open(conversation, scope: scope, from: store, asTab: asTab)
         case .telegram(let summary):
-            TelegramTabs.openAttention(summary, from: store, router: router)
+            TelegramTabs.openAttention(summary, from: store, router: router, asTab: asTab)
         }
     }
 

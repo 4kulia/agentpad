@@ -529,6 +529,9 @@ private enum PartBRows {
         let chats = TelegramChatsModel(), provider = PartBProvider(PartBRows.snapshot()), store = makeTestStore()
         defer { SidebarFolderActions.shared.request = nil; store.terminate() }
         let router = TabRouter(); router.stores = { [store] }
+        let selectedAgent = try XCTUnwrap(store.active?.activeSession)
+        let originalTabs = store.allSessions.map(\.id)
+        var raised: [UUID] = []; router.revealWindow = { raised.append($0.windowID) }
         chats.attach(provider)
         for _ in 0..<50 where !chats.connected { await Task.yield() }
         var snapshot = PartBRows.snapshot()
@@ -539,7 +542,12 @@ private enum PartBRows {
         XCTAssertEqual(search.hits.map(\.row.id.chat),[2,99])
         search.search("Chat"); XCTAssertEqual(search.hits.map(\.row.id.chat),[99,2])
         let opened = await search.open(.init(row: exact), from: store, beside: false, addToFolder: true, router: router)
-        XCTAssertTrue(opened); XCTAssertEqual(store.active?.activeSession?.toolRoute, .telegram(exact.id))
+        XCTAssertTrue(opened)
+        XCTAssertEqual(store.popups.presentedConversations.count, 1)
+        XCTAssertEqual(store.popups.presentedConversations.first?.toolRoute, .telegram(exact.id))
+        XCTAssertTrue(store.active?.activeSession === selectedAgent)
+        XCTAssertEqual(store.allSessions.map(\.id), originalTabs)
+        XCTAssertTrue(raised.isEmpty)
         XCTAssertEqual(SidebarFolderActions.shared.request?.item, .telegram(99)); XCTAssertEqual(SidebarFolderActions.shared.request?.binding, snapshot.binding)
         let conversation = TelegramConversationModel(id: exact.id); conversation.addToFolder(chats: chats, windowID: store.windowID)
         XCTAssertEqual(SidebarFolderActions.shared.request?.windowID,store.windowID)

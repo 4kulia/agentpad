@@ -9,9 +9,13 @@ final class ChatInboxTabEngine: TerminalEngine {
     var onClose: () -> Void = {}
     var openMessage: (ChatMessage) -> Void = { _ in }
     var openChannel: (String) -> Void = { _ in }
+    var openMessageAsTab: (ChatMessage) -> Void = { _ in }
+    var openChannelAsTab: (String) -> Void = { _ in }
     private lazy var host: NSView = NSHostingView(rootView: ChatInboxTabView(ref: ref,
         openMessage: { [weak self] in self?.openMessage($0) }, openChannel: { [weak self] in self?.openChannel($0) },
-        close: { [weak self] in self?.onClose() }))
+        close: { [weak self] in self?.onClose() },
+        openMessageAsTab: { [weak self] in self?.openMessageAsTab($0) },
+        openChannelAsTab: { [weak self] in self?.openChannelAsTab($0) }))
 
     init(ref: ChatInboxRef) { self.ref = ref }
     var view: NSView { host }
@@ -52,9 +56,17 @@ final class ChatInboxTabEngine: TerminalEngine {
 @MainActor
 enum ChatInboxNavigation {
     @discardableResult
-    static func open(_ message: ChatMessage, ref: ChatInboxRef, org: ChatOrgModel?, workspace: WorkspaceStore) -> Session? {
+    static func open(_ message: ChatMessage, ref: ChatInboxRef, org: ChatOrgModel?, workspace: WorkspaceStore, asTab: Bool = false) -> Session? {
+        let asTab = asTab || ConversationOpenIntent.commandClick
         guard case .ready = ref.state(org), let key = org?.key, org?.visibleChannel(message.channelId) != nil,
-              let tab = workspace.showChannel(ChannelRef(key, channel: message.channelId)) else { return nil }
+              let tab = workspace.showChannel(ChannelRef(key, channel: message.channelId), asTab: asTab) else { return nil }
+        if !asTab {
+            let mention = message.mentions.contains(key.accountId)
+            let name = org?.visibleChannel(message.channelId)?.name ?? message.channelId
+            let time = ISO8601DateFormatter().date(from: message.createdAt)?.formatted(date: .omitted, time: .shortened)
+            tab.conversationPopupSource = ((mention ? "Mention" : "Message") + " in #\(name)" + (time.map { " · \($0)" } ?? ""),
+                                          "Back to \(ref.kind.title)")
+        }
         ChatMessageNavigation.request(ChatMessageLink(key: key, message: message), key: key, destination: tab.engine.view)
         return tab
     }
@@ -65,15 +77,18 @@ struct ChatInboxTabView: View {
     var openMessage: (ChatMessage) -> Void
     var openChannel: (String) -> Void
     var close: () -> Void
+    var openMessageAsTab: ((ChatMessage) -> Void)?
+    var openChannelAsTab: ((String) -> Void)?
     @State private var model: ChatInboxModel
     private let current: ChatOrgCurrent
     private let service: ChatService
 
     init(ref: ChatInboxRef, openMessage: @escaping (ChatMessage) -> Void, openChannel: @escaping (String) -> Void,
          close: @escaping () -> Void, model: ChatInboxModel? = nil, current: ChatOrgCurrent = .shared,
-         service: ChatService = .shared) {
+         service: ChatService = .shared, openMessageAsTab: ((ChatMessage) -> Void)? = nil, openChannelAsTab: ((String) -> Void)? = nil) {
         self.ref = ref; self.openMessage = openMessage; self.openChannel = openChannel; self.close = close
         self.current = current; self.service = service
+        self.openMessageAsTab = openMessageAsTab; self.openChannelAsTab = openChannelAsTab
         _model = State(initialValue: model ?? ChatInboxModel(ref: ref))
     }
 
@@ -107,7 +122,8 @@ struct ChatInboxTabView: View {
                     ChatInboxView(kind: ref.kind, entries: model.entries(org), sidebar: ChatSidebarSnapshot(model: org, active: nil),
                                   members: org.members, problem: model.problem,
                                   loading: model.loading, limited: model.limited, retry: { model.retry() },
-                                  markAllRead: { model.markAllRead(org, service: service) }, openMessage: openMessage, openChannel: openChannel)
+                                  markAllRead: { model.markAllRead(org, service: service) }, openMessage: openMessage, openChannel: openChannel,
+                                  openMessageAsTab: openMessageAsTab, openChannelAsTab: openChannelAsTab)
                 }
             case .checking:
                 unavailable("Checking access…", detail: "Your messages will appear when access is confirmed.")
@@ -183,6 +199,8 @@ struct ChatInboxView: View {
     var markAllRead: () -> Void
     var openMessage: (ChatMessage) -> Void
     var openChannel: (String) -> Void
+    var openMessageAsTab: ((ChatMessage) -> Void)? = nil
+    var openChannelAsTab: ((String) -> Void)? = nil
 
     private var channels: [ChatSidebarSnapshot.Channel] { sidebar.teams.flatMap(\.channels) }
     private var presentation: ChatInboxPresentation { ChatInboxPresentation(kind: kind, entries: entries, sidebar: sidebar) }
@@ -262,6 +280,7 @@ struct ChatInboxView: View {
         Button(missing.title) { openChannel(missing.id) }
             .buttonStyle(.borderless).padding(.horizontal, 24).padding(.vertical, 12).chatFocusRing()
             .accessibilityIdentifier("chat-inbox-remainder-\(missing.id)")
+            .contextMenu { if let openChannelAsTab { Button("Open as tab") { openChannelAsTab(missing.id) } } }
     }
 
     private func row(_ entry: ChatInbox.Entry) -> some View {
@@ -299,6 +318,7 @@ struct ChatInboxView: View {
                 .contentShape(Rectangle())
         }.buttonStyle(.plain).chatFocusRing().accessibilityHint("Open message" + (message.threadRootId == nil ? " in channel" : " in thread"))
             .accessibilityIdentifier("chat-inbox-message-\(entry.id)")
+            .contextMenu { if let openMessageAsTab { Button("Open as tab") { openMessageAsTab(message) } } }
     }
 
     private func timestamp(_ value: String) -> String {

@@ -149,6 +149,11 @@ final class Workspace: Identifiable {
 
     var activeSession: Session? { activePane?.activeTab }
 
+    /// Close Tab also removes an empty split, but keeps a lone empty pane.
+    var canCloseActiveTab: Bool {
+        activeSession != nil || (activePane?.tabs.isEmpty == true && root.hasMultiplePanes)
+    }
+
     /// Distinct non-terminal agents and aggregated activity, computed in a
     /// single tree walk. Sidebar reads all three per render. The walk runs
     /// to completion (no short-circuit) so each field reflects the whole

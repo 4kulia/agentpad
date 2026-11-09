@@ -6,6 +6,7 @@ import Foundation
 protocol ChatConversationPresentation: AnyObject {
     var key: ChatOrgKey { get }
     var service: ChatService { get }
+    var tabID: UUID? { get }
     var isDM: Bool { get }
     var feed: ChatChannelModel.Feed { get }
     var b1: ChatB1Channel? { get }
@@ -18,6 +19,7 @@ protocol ChatConversationPresentation: AnyObject {
     var positions: [String: ChatScrollPosition] { get set }
     var focusedMessageID: String? { get }
     var revealMessageID: String? { get }
+    var revealRequest: UInt64 { get }
     var focusRequest: ChatFocusRequest? { get }
     var readingPositionRestored: Int { get }
     var searching: Bool { get }
@@ -50,6 +52,16 @@ protocol ChatConversationPresentation: AnyObject {
 }
 
 extension ChatConversationPresentation {
+    var tabID: UUID? { nil }
+    /// Message controls keep the current engine, drafts and reading positions
+    /// when promoting a thread. The owning window supplies the tab destination.
+    func openThreadFromMessage(_ root: String, asTab: Bool = ConversationOpenIntent.commandClick,
+                               router: TabRouter = .shared) {
+        openThread(root)
+        guard asTab, threadRoot == root, let tabID, let owner = router.owner(of: tabID) else { return }
+        _ = owner.store.popups.openConversationAsTab(owner.session.content)
+    }
+    var revealRequest: UInt64 { 0 }
     func cancelEditing() { cancelEditing(messageID: nil, all: false) }
     @discardableResult func beginEditing(_ message: ChatMessage, root: String?) -> Bool { beginEditing(message, root: root, recovering: false) }
     func markConversationRead(root: String?) { markConversationRead(root: root, clearingBoundary: true) }

@@ -42,6 +42,26 @@ final class PaneTreeHostView: FlippedLayoutView {
     private var workspaceViews: [UUID: WorkspaceRootView] = [:]
     private var renderScheduled = false
 
+    // An empty pane has no terminal/editor to own the keyboard. Keep focus
+    // on the pane area rather than the window, so menu actions can tell it
+    // apart from the sidebar and global search.
+    override var acceptsFirstResponder: Bool { true }
+
+    var hasKeyboardFocus: Bool {
+        guard let window, NSApp.keyWindow === window,
+              let responder = window.firstResponder as? NSView else { return false }
+        let focusedView: NSView
+        if let editor = responder as? NSTextView, editor.isFieldEditor {
+            // AppKit's shared field editor is not necessarily a child of
+            // its text field; the field owns the focus context.
+            guard let field = editor.delegate as? NSView else { return false }
+            focusedView = field
+        } else {
+            focusedView = responder
+        }
+        return focusedView.isDescendant(of: self) && !focusedView.isHiddenOrHasHiddenAncestor
+    }
+
     /// What terminal focus should track: the active tab of the active pane of
     /// the active workspace. Focus is only re-asserted when this key changes —
     /// an unrelated reconcile must never steal the caret from a composer /
@@ -178,9 +198,10 @@ final class PaneTreeHostView: FlippedLayoutView {
         guard let session = pane?.activeTab else {
             // Empty splits are focusable too: never keep typing into the
             // previously selected terminal while an empty pane is active.
-            if let responder = window.firstResponder as? NSView,
-               workspaceViews.values.contains(where: { responder.isDescendant(of: $0) }) {
-                window.makeFirstResponder(nil)
+            let responder = window.firstResponder
+            if force || responder === window || responder == nil
+                || (responder as? NSView)?.isDescendant(of: self) == true {
+                window.makeFirstResponder(self)
             }
             return
         }

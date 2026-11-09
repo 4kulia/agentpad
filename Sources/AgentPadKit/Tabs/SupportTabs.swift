@@ -25,8 +25,8 @@ final class SupportTabNavigation {
         return true
     }
     @discardableResult
-    func open(_ route: ToolRoute, from store: WorkspaceStore? = nil, section: SettingsTabSection? = nil) -> Session? {
-        return router.open(route, from: store, section: section)
+    func open(_ route: ToolRoute, from store: WorkspaceStore? = nil, section: SettingsTabSection? = nil, asTab: Bool = false) -> Session? {
+        return router.open(route, from: store, section: section, asTab: asTab)
     }
     func finishStartup() {
         ready = true
@@ -54,6 +54,7 @@ final class SupportTabs {
     var ledger: AttentionLedger
     var updates = UpdatesTabModel()
     var activateNotice: (NotificationInbox.Event) -> Void = { _ in }
+    var activateNoticeAsTab: ((NotificationInbox.Event) -> Void)?
     init(router: TabRouter = .shared, ledger: AttentionLedger = .shared) {
         navigation = SupportTabNavigation(router: router); self.ledger = ledger
     }
@@ -290,7 +291,8 @@ struct NotificationTabView: View {
                         }
                     }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
                 }
-            } else { InboxView(inbox: NotificationInbox(ledger: support.ledger), onActivate: support.activateNotice, onClear: {}) }
+            } else { InboxView(inbox: NotificationInbox(ledger: support.ledger), onActivate: support.activateNotice, onClear: {},
+                               onOpenAsTab: support.activateNoticeAsTab) }
         }
     }
     private func runtimeBusy(_ page: PopupCoordinator.Page) -> Bool {

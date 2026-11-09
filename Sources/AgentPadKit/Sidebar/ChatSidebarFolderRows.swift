@@ -9,6 +9,7 @@ extension ChatSidebarView {
             .id(id).overlay(focusBorder(id))
             .sidebarContextMenu(selected: focus == .folders && navigation.selection == id) {
                 Button("Open") { ChatDMTabs.open(key, peer: person.id, from: store) }
+                Button("Open as tab") { ChatDMTabs.open(key, peer: person.id, from: store, asTab: true) }
                 folderItemActions(item, entry: entry, folder: folder)
             }
             .addToFolderAnchor(item, windowID: store.windowID, anchor: entry)

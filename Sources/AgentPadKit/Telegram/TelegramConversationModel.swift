@@ -33,11 +33,13 @@ final class TelegramConversationModel: ConversationActions {
     @ObservationIgnored private var dirtyDraft = false
     @ObservationIgnored private var persistedRevision: UUID?
     @ObservationIgnored private var submitted: UUID?
+    private(set) var draftSaveFailed = false
     @ObservationIgnored var panes = Set<UUID>()
     @ObservationIgnored private let observations = TelegramPresentationObservations()
     init(id: TelegramChatID) { self.id = id; snapshot = .init(destination: id) }
     deinit { observations.invalidateAll(); saveTask?.cancel(); inlineTask?.cancel() }
     var canSend: Bool { snapshot.capabilities.canSend && snapshot.connected && !draft.isEmpty && !importing && submitted != draft.revision && !blocksInlineSend }
+    var hasUnsavedDraft: Bool { dirtyDraft && persistedRevision != draft.revision }
     var presentation: ConversationSnapshot {
         .init(destination: .telegram(id), epoch: snapshot.epoch, revision: snapshot.revision,
               rows: TelegramSponsoredLayout.rows(snapshot), hasOlder: snapshot.hasOlder, draftRevision: draft.revision, presence: snapshot.presence, canSend: canSend)
@@ -67,7 +69,7 @@ final class TelegramConversationModel: ConversationActions {
         if snapshot.epoch != value.epoch {
             observations.invalidateAll()
             saveTask?.cancel(); saveTask = nil; dirtyDraft = false; submitted = nil; draft = value.draft; persistedRevision = value.draft.revision
-            importDirectory = nil
+            importDirectory = nil; draftSaveFailed = false
             botDialog = nil; appliedForceReply = nil; forcedReplyMessage = nil; checkedInlineName = nil
             sponsoredOperation = UUID(); sponsoredBusy = false
             inlineTask?.cancel(); inlineTask = nil; checkingInline = false
@@ -90,7 +92,7 @@ final class TelegramConversationModel: ConversationActions {
     }
     func change(_ mutate: (inout TelegramDraft) -> Void) {
         draft.sendAsText = nil
-        mutate(&draft); draft.revision = UUID(); dirtyDraft = true; problem = nil
+        mutate(&draft); draft.revision = UUID(); dirtyDraft = true; problem = nil; draftSaveFailed = false
         inspectInlineDraft()
         guard saveTask == nil else { return }
         saveTask = Task { [weak self] in
@@ -102,12 +104,35 @@ final class TelegramConversationModel: ConversationActions {
                 guard !Task.isCancelled else { break }
                 if saved { self.persistedRevision = value.revision }
                 else {
-                    if self.submitted != value.revision && self.draft.revision == value.revision { self.problem = "Draft not saved. Keep this tab open and try again." }
+                    if self.submitted != value.revision && self.draft.revision == value.revision {
+                        self.draftSaveFailed = true
+                        self.problem = "Draft not saved. Keep this conversation open and retry."
+                    }
                     break
                 }
             }
             self.saveTask = nil
         }
+    }
+    /// Dismissal, switching and promotion use the same connector draft path as
+    /// typing. A failed write keeps the current panel and its attachments alive.
+    func flushDraft() async throws {
+        let saving = saveTask
+        saving?.cancel()
+        await saving?.value
+        saveTask = nil
+        while dirtyDraft && persistedRevision != draft.revision {
+            let value = draft, epoch = snapshot.epoch
+            guard let provider, await provider.updateDraft(id, epoch: epoch, draft: value), snapshot.epoch == epoch else {
+                draftSaveFailed = true
+                problem = "Draft not saved. Keep this conversation open and retry."
+                throw TelegramDraftSaveError()
+            }
+            persistedRevision = value.revision
+            if draft.revision == value.revision { dirtyDraft = false }
+        }
+        draftSaveFailed = false
+        if problem == "Draft not saved. Keep this conversation open and retry." { problem = nil }
     }
     func send() {
         guard canSend, let provider else { return }
@@ -183,6 +208,10 @@ final class TelegramConversationModel: ConversationActions {
             }
         }
     }
+}
+
+private struct TelegramDraftSaveError: LocalizedError {
+    var errorDescription: String? { "Draft not saved. Keep this conversation open and retry." }
 }
 
 @MainActor final class TelegramConversations {

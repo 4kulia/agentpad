@@ -48,6 +48,9 @@ struct AttentionItem: Identifiable, Equatable, Sendable {
     var telegramChat: Int64?
     enum TelegramPlaceholder: Sendable { case loading, inactive }
     var telegramPlaceholder: TelegramPlaceholder?
+    var isConversation: Bool {
+        switch action { case .mention, .dm, .telegram: true; case .event: false }
+    }
 }
 
 /// No message bodies. The future DM client supplies these through the same gate.
@@ -95,12 +98,16 @@ protocol AttentionDMSource: AnyObject {
     func stop()
     func refresh()
     func open(_ conversation: String, scope: AttentionScope, from store: WorkspaceStore?)
+    func open(_ conversation: String, scope: AttentionScope, from store: WorkspaceStore?, asTab: Bool)
     func markRead(_ conversation: String, scope: AttentionScope)
 }
 
 extension AttentionDMSource {
     var conversations: [AttentionConversation] { [] }
     func refresh() {}
+    func open(_ conversation: String, scope: AttentionScope, from store: WorkspaceStore?, asTab: Bool) {
+        open(conversation, scope: scope, from: store)
+    }
 }
 
 struct AttentionCurrent: Equatable, Sendable {

@@ -135,6 +135,7 @@ struct SearchResultsTab: View {
                             Button { model.activate("t:" + hit.id) } label: {
                                 Label(hit.row.title + " · " + hit.row.displayKind, systemImage: hit.row.symbol)
                             }.buttonStyle(.plain)
+                                .contextMenu { Button("Open as tab") { model.activate("t:" + hit.id, asTab: true) } }
                         }
                         if model.telegram.value.searching { Text("Searching Telegram…").font(.caption) }
                         if let notice = model.telegram.value.notice { Text(notice).font(.caption) }
@@ -160,7 +161,7 @@ struct SearchResultsTab: View {
         }
         if model.messages.loading { ProgressView().controlSize(.small) }
         ForEach(model.messages.hits) { hit in
-            Button { model.openMessage(hit) } label: {
+            Button { model.navigateMessage(hit) } label: {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Label(messagePlace(hit), systemImage: hit.kind == .dm ? "person.2" : "number").font(.caption.weight(.medium))
@@ -171,6 +172,7 @@ struct SearchResultsTab: View {
                     SearchSnippetText(text: hit.snippet, query: model.query)
                 }.resultCard()
             }.buttonStyle(.plain).id("m:" + hit.id)
+                .contextMenu { Button("Open as tab") { model.navigateMessage(hit, asTab: true) } }
         }
         if model.messages.next != nil { Button("Load more messages") { model.messages.search(model.serverRequest, more: true, debounce: false) }.disabled(model.messages.loading) }
         if model.messages.availability() == .ready, !model.messages.loading, model.messages.error == nil, model.messages.hits.isEmpty, (try? SearchQuery(model.query)) != nil {

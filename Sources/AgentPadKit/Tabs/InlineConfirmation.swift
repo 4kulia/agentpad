@@ -149,11 +149,15 @@ struct InlineConfirmation<Details: View>: View {
     private var inlineContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(coordinator.title).font(.headline)
+                .chatParity("w05/confirmation/title", "text", text: coordinator.title, colors: ["foreground": Theme.chromeForeground], font: .headline)
             Text(coordinator.consequences).fixedSize(horizontal: false, vertical: true)
+                .chatParity("w05/confirmation/consequences", "text", text: coordinator.consequences, colors: ["foreground": Theme.chromeForeground])
             details
             if case .failed(let error) = coordinator.phase {
                 Text(error).foregroundStyle(.red).accessibilityIdentifier("inline-confirmation-error")
+                    .chatParity("w05/confirmation/error", "text", text: error, colors: ["foreground": .red])
                 Button("Keep editing") { coordinator.cancel() }.focused($cancelFocused)
+                    .chatParity("w05/confirmation/cancel", "text", text: "Keep editing", colors: ["foreground": Theme.chromeForeground])
             } else {
                 ViewThatFits(in: .horizontal) {
                     HStack { buttons }
@@ -164,6 +168,7 @@ struct InlineConfirmation<Details: View>: View {
         .padding(16).frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.chromeBackground, in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.chromeSeparator))
+        .chatParity("w05/confirmation", "control", colors: ["background": Theme.chromeBackground, "border": Theme.chromeSeparator])
     }
     private var popupContent: some View {
         VStack(spacing: 0) {
@@ -204,9 +209,11 @@ struct InlineConfirmation<Details: View>: View {
     @ViewBuilder private var buttons: some View {
         Button(coordinator.cancelTitle) { coordinator.cancel() }.focused($cancelFocused)
             .disabled(coordinator.isExecuting).accessibilityIdentifier("inline-confirmation-cancel")
+            .chatParity("w05/confirmation/cancel", "text", text: coordinator.cancelTitle, colors: ["foreground": Theme.chromeForeground.opacity(coordinator.isExecuting ? 0.25 : 1)])
         Button(coordinator.verb, role: coordinator.destructive ? .destructive : nil) { coordinator.confirm() }
             .disabled(coordinator.isExecuting).accessibilityIdentifier("inline-confirmation-accept")
-        if coordinator.isExecuting { ProgressView().controlSize(.small) }
+            .chatParity("w05/confirmation/accept", "text", text: coordinator.verb, colors: ["foreground": Theme.chromeForeground.opacity(coordinator.isExecuting ? 0.25 : 1)])
+        if coordinator.isExecuting { ProgressView().controlSize(.small).chatParity("w05/confirmation/spinner", "control") }
     }
 }
 

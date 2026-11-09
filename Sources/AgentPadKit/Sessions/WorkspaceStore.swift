@@ -649,23 +649,26 @@ final class WorkspaceStore {
     @discardableResult
     func openToolTab(_ route: ToolRoute, navigation: TabNavigation = TabNavigation()) -> Session {
         if route.presentation == .popup { return popups.present(route, navigation: navigation) }
-        popups.dismiss(reason: .dismiss)
         // Reopen/duplicate enter here without the router. Connection still
         // has one login flow across every window, including hidden windows.
         let owners = route == .connection ? [self] + peerStores().filter { $0 !== self } : [self]
         for owner in owners where !owner.isTerminated {
             if let existing = owner.allSessions.first(where: { $0.toolRoute?.key(windowID: owner.windowID) == route.key(windowID: windowID) }),
                let location = owner.location(ofSessionId: existing.id) {
-                location.workspace.zoomedPaneId = nil
-                owner.activateWorkspace(location.workspace); owner.activateTab(existing, in: location.workspace)
-                if owner !== self { TabRouter.shared.revealWindow(owner) }
+                popups.leaveForContent {
+                    location.workspace.zoomedPaneId = nil
+                    owner.activateWorkspace(location.workspace); owner.activateTab(existing, in: location.workspace)
+                    if owner !== self { TabRouter.shared.revealWindow(owner) }
+                }
                 return existing
             }
         }
         let workspace = active ?? addEmptyWorkspace()
         let pane = workspace.activePane ?? workspace.root.firstPane!
         let session = makeToolSession(route, navigation: navigation, cwd: workspace.workingDirectory)
-        attachSession(session, to: pane, at: pane.tabs.count, in: workspace)
+        popups.leaveForContent { [weak self] in
+            self?.attachSession(session, to: pane, at: pane.tabs.count, in: workspace)
+        }
         return session
     }
 
@@ -1514,6 +1517,9 @@ final class WorkspaceStore {
     /// this serves both `closeTab` (which terminates first) and a tab move
     /// (which re-homes the live session elsewhere).
     private func detachSession(_ session: Session, from pane: Pane, at idx: Int, in workspace: Workspace, keepingEmptyPane: Bool = false) {
+        // A popup may have borrowed this tab earlier. Its source window must
+        // relinquish that reference before the tab is closed or re-homed.
+        popups.forgetConversation(session)
         session.terminalConfirmation.invalidate()
         session.tabState?.leave(moving: true)
         (session.engine as? ChannelTabEngine)?.conversation.confirmation.invalidate()
@@ -2654,7 +2660,7 @@ final class WorkspaceStore {
     }
 
     // AgentPad: channel tabs (probe V1).
-    private func makeChannelSession(_ ref: ChannelRef, id: UUID = UUID(), cwd: URL) -> Session {
+    func makeChannelSession(_ ref: ChannelRef, id: UUID = UUID(), cwd: URL) -> Session {
         let session = Session(id: id, engine: ChannelTabEngine(ref: ref), currentDirectory: cwd, agent: .terminal)
         session.channel = ref
         holdChannelClose(session)
@@ -2668,12 +2674,20 @@ final class WorkspaceStore {
             engine.owner = self
             engine.state.confirmation.canShow = { [weak engine] in
                 guard let engine, let owner = engine.owner else { return false }
-                return owner.isOnScreen && owner.active?.activeSession?.id == engine.tabID && engine.view.window?.isKeyWindow == true
+                let popupVisible = owner.popups.visibleConversation?.id == engine.tabID && !owner.popups.showConversationPicker
+                guard !owner.popups.isPresented || popupVisible else { return false }
+                return owner.isOnScreen && (owner.active?.activeSession?.id == engine.tabID || popupVisible)
+                    && engine.view.window?.isKeyWindow == true && !engine.view.isHiddenOrHasHiddenAncestor
             }
             engine.state.confirmation.restoreFocus = { [weak engine] in engine?.focus() }
             engine.state.changed = { [weak engine] in engine?.owner?.scheduleSave() }
             engine.state.confirmation.reveal = { [weak engine] in
-                guard let engine, let owner = engine.owner,
+                guard let engine, let owner = engine.owner else { return false }
+                if let session = owner.popups.sessions.first(where: { $0.id == engine.tabID }),
+                   owner.popups.contains(session.id), session.content.isConversation {
+                    return owner.popups.presentConversation(session)
+                }
+                guard
                       let location = owner.location(ofSessionId: engine.tabID),
                       let session = location.pane.tabs.first(where: { $0.id == engine.tabID }) else { return false }
                 location.workspace.zoomedPaneId = nil
@@ -2683,8 +2697,9 @@ final class WorkspaceStore {
             }
         }
         let close: () -> Void = { [weak self, weak session] in
-            guard let self, let session,
-                  let workspace = self.workspaces.first(where: { ws in ws.root.allPanes.contains { $0.tabs.contains { $0 === session } } })
+            guard let self, let session else { return }
+            if session.isConversationPopup { self.popups.dismiss(reason: .dismiss); return }
+            guard let workspace = self.workspaces.first(where: { ws in ws.root.allPanes.contains { $0.tabs.contains { $0 === session } } })
             else { return }
             self.closeTab(session, in: workspace)
         }
@@ -2692,7 +2707,11 @@ final class WorkspaceStore {
             engine.conversation.tabID = session.id
             engine.onClose = close
             engine.conversation.confirmation.canShow = { [weak self, weak session, weak engine] in
-                guard let self, let session, let engine, self.isOnScreen,
+                guard let self, let session, let engine, self.isOnScreen else { return false }
+                if self.popups.visibleConversation === session {
+                    return !self.popups.showConversationPicker && self.popups.window?.isKeyWindow == true
+                }
+                guard !self.popups.isPresented,
                       let workspace = self.active,
                       let pane = workspace.root.allPanes.first(where: { $0.activeTab === session }),
                       workspace.zoomedPaneId == nil || workspace.zoomedPaneId == pane.id,
@@ -2706,7 +2725,9 @@ final class WorkspaceStore {
                 engine.conversation.model?.focusRequest = ChatFocusRequest(area: .feed)
             }
             engine.conversation.confirmation.reveal = { [weak self, weak session] in
-                guard let self, let session, let location = self.location(ofSessionId: session.id) else { return false }
+                guard let self, let session else { return false }
+                if self.popups.contains(session.id) { return self.popups.presentConversation(session) }
+                guard let location = self.location(ofSessionId: session.id) else { return false }
                 location.workspace.zoomedPaneId = nil
                 self.activateWorkspace(location.workspace); self.activateTab(session, in: location.workspace)
                 TabRouter.shared.revealWindow(self)
@@ -2720,10 +2741,19 @@ final class WorkspaceStore {
                 guard let self else { return }
                 ChatInboxNavigation.open(message, ref: ref, org: ChatOrgCurrent.shared.model, workspace: self)
             }
+            engine.openMessageAsTab = { [weak self] message in
+                guard let self else { return }
+                ChatInboxNavigation.open(message, ref: ref, org: ChatOrgCurrent.shared.model, workspace: self, asTab: true)
+            }
             engine.openChannel = { [weak self] channel in
                 let org = ChatOrgCurrent.shared.model
                 guard case .ready = ref.state(org), let key = org?.key, org?.visibleChannel(channel) != nil else { return }
                 self?.showChannel(ChannelRef(key, channel: channel))
+            }
+            engine.openChannelAsTab = { [weak self] channel in
+                let org = ChatOrgCurrent.shared.model
+                guard case .ready = ref.state(org), let key = org?.key, org?.visibleChannel(channel) != nil else { return }
+                self?.showChannel(ChannelRef(key, channel: channel), asTab: true)
             }
         }
     }
@@ -2769,16 +2799,31 @@ final class WorkspaceStore {
         return nil
     }
 
-    /// Brings `ref`'s tab forward, or opens one in the active workspace.
+    /// Conversation activation is a window popup. Deliberate tab commands keep
+    /// their local workspace semantics and reuse the retained conversation.
     @discardableResult
-    func showChannel(_ ref: ChannelRef, newTab: Bool = false) -> Session? {
-        if !newTab, let (session, workspace) = channelTab(ref) {
-            activateWorkspace(workspace)
-            activateTab(session, in: workspace)
-            return session
+    func showChannel(_ ref: ChannelRef, newTab: Bool = false, asTab: Bool = false) -> Session? {
+        if !newTab {
+            if asTab || ConversationOpenIntent.commandClick { return popups.openConversationAsTab(.channel(ref)) }
+            return popups.presentConversation(.channel(ref))
         }
         guard let workspace = active ?? workspaces.first else { return nil }
         return openChannelTab(ref, in: workspace)
+    }
+
+    /// Promotion moves the same view/model into this window's pane. It never
+    /// consults another window and never reconstructs an editor or timeline.
+    func adoptConversationTab(_ session: Session) {
+        if let location = location(ofSessionId: session.id) {
+            location.workspace.zoomedPaneId = nil
+            activateWorkspace(location.workspace); activateTab(session, in: location.workspace)
+        } else {
+            let workspace = active ?? addEmptyWorkspace()
+            let pane = workspace.activePane ?? workspace.root.firstPane!
+            holdChannelClose(session)
+            attachSession(session, to: pane, at: pane.tabs.count, in: workspace)
+        }
+        scheduleSave()
     }
 
     @discardableResult
@@ -2788,13 +2833,16 @@ final class WorkspaceStore {
             preconditionFailure("workspace has no panes")
         }
         let session = makeChannelSession(ref, cwd: workspace.workingDirectory)
-        configureSession(session, in: workspace, codexRolloutId: nil)
-        target.tabs.append(session)
-        target.activeTabId = session.id
-        if workspace.activePaneId != target.id { workspace.activePaneId = target.id }
-        AgentAnswerSource.scheduleRefresh(session)
-        session.lastActivated = Date()
-        scheduleSave()
+        popups.leaveForContent { [weak self] in
+            guard let self else { return }
+            self.configureSession(session, in: workspace, codexRolloutId: nil)
+            target.tabs.append(session)
+            target.activeTabId = session.id
+            if workspace.activePaneId != target.id { workspace.activePaneId = target.id }
+            AgentAnswerSource.scheduleRefresh(session)
+            session.lastActivated = Date()
+            self.scheduleSave()
+        }
         return session
     }
 

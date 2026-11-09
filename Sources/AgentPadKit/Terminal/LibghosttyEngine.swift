@@ -1436,13 +1436,28 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         guard window?.firstResponder === self, !isHiddenOrHasHiddenAncestor,
               surface != nil, let action = Self.clipboardAction(for: event)
         else { return false }
-        performClipboardAction(action)
+        performClipboardAction(action, event: event)
         return true
     }
 
-    private func performClipboardAction(_ action: ClipboardAction) {
+    private func performClipboardAction(_ action: ClipboardAction, event: NSEvent) {
         switch action {
-        case .copy: copy(self)
+        case .copy:
+            if let surface, !ghostty_surface_has_selection(surface) {
+                // Gate reports on the core's current Kitty keyboard flags:
+                // a textless Super+C encodes only in Kitty mode. Legacy mode
+                // returns before modifyOtherKeys, which Vim can misinterpret.
+                // The core reads the active screen's flags for each key, so
+                // pushes/pops and alternate-screen switches need no host cache.
+                // Codex 0.163.0 pushes flags 5 on Ghostty (CSI > 5 u).
+                // Use the recognized Command-layout C: the unmodified layout
+                // can be Cyrillic, which the TUI's copy binding does not match.
+                var key = Self.makeKeyEvent(for: event)
+                key.unshifted_codepoint = UnicodeScalar("c").value
+                _ = Self.send(key, text: nil, to: surface)
+            } else {
+                copy(self)
+            }
         case .paste: paste(self)
         }
     }
@@ -1458,7 +1473,7 @@ final class GhosttySurfaceView: NSView, NSMenuItemValidation {
         let cmdOnly = cmd && mods.intersection([.shift, .control, .option]).isEmpty
 
         if let action = Self.clipboardAction(for: event) {
-            performClipboardAction(action)
+            performClipboardAction(action, event: event)
             return
         }
 

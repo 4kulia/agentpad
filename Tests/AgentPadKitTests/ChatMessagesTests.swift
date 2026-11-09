@@ -2190,9 +2190,11 @@ extension ChatMessagesTests {
         XCTAssertTrue(panel.canChange, "a regular member can react to another member's message")
 
         let shown = try XCTUnwrap(model.message("m")), reply = try XCTUnwrap(row(store, "reply"))
+        model.openThread("m")
+        try await waitUntil { model.conversationMessages(root: "m").contains { $0.id == "reply" } }
         let host = NSHostingView(rootView: AnyView(VStack {
-            ChatMessageRow(model: model, message: shown, members: [], mentionable: [], me: me, archived: false, replies: 1, selected: true)
-            ChatMessageRow(model: model, message: reply, members: [], mentionable: [], me: me, archived: false, replies: 0, inThread: true)
+            ChatNativeRowFixture(model: model, message: shown, members: [], mentionable: [], me: me, archived: false, replies: 1, selected: true)
+            ChatNativeRowFixture(model: model, message: reply, members: [], mentionable: [], me: me, archived: false, replies: 0, inThread: true)
         }.frame(width: 400, height: 260)))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 260), styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

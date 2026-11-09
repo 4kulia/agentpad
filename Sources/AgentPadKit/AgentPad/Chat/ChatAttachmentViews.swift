@@ -91,6 +91,9 @@ import UniformTypeIdentifiers
 }
 
 struct ChatAttachmentDraftStrip: View {
+    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+    @Environment(\.chatParityEnabled) private var reviewProbeEnabled
+    #endif
     let manager: ChatAttachmentManager
     let owner: ChatAttachmentOwner
     let root: String?
@@ -102,7 +105,14 @@ struct ChatAttachmentDraftStrip: View {
     var body: some View {
         VStack(spacing: 6) {
             if manager.isImporting(owner: owner, root: root) {
-                HStack { ProgressView().controlSize(.small); Text("Preparing files…").font(Theme.display(11)); Spacer() }.padding(7)
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Preparing files…").font(Theme.display(11))
+                        #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                        .chatReviewParity("caller/draft/importing/" + owner.id + "/" + (root ?? "feed"), text: "Preparing files…", font: Theme.display(11))
+                        #endif
+                    Spacer()
+                }.padding(7)
             }
             ForEach(manager.files(owner: owner, root: root)) { draft in
                 HStack(spacing: 9) {
@@ -111,18 +121,58 @@ struct ChatAttachmentDraftStrip: View {
                     } else { Image(systemName: "doc").font(.system(size: 22)).frame(width: 42, height: 38).foregroundStyle(ChatAppearance.secondary) }
                     VStack(alignment: .leading, spacing: 3) {
                         Text(draft.file.name).font(Theme.display(11, weight: .medium)).lineLimit(1)
+                            #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                            .chatReviewParity("caller/draft/" + draft.id + "/name", text: draft.file.name, colors: ["foreground": Theme.chromeForeground], font: Theme.display(11, weight: .medium))
+                            #endif
                         HStack(spacing: 5) {
                             Text(draft.file.sizeText)
+                                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                .chatReviewParity("caller/draft/" + draft.id + "/size", text: draft.file.sizeText, colors: ["foreground": draft.state == .failed ? ChatAppearance.failure : ChatAppearance.secondary])
+                                #endif
                             Text("·")
+                                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                .chatReviewParity("caller/draft/" + draft.id + "/separator", text: "·", colors: ["foreground": draft.state == .failed ? ChatAppearance.failure : ChatAppearance.secondary])
+                                #endif
                             Text(status(draft))
-                            if allowsRetry && manager.canRetry(draft) { Button("Retry") { manager.retry(draft) }.buttonStyle(.link) }
+                                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                .chatReviewParity("caller/draft/" + draft.id + "/status", text: status(draft), colors: ["foreground": draft.state == .failed ? ChatAppearance.failure : ChatAppearance.secondary])
+                                #endif
+                            if allowsRetry && manager.canRetry(draft) {
+                                Button("Retry") { manager.retry(draft) }.buttonStyle(.link)
+                                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                    .chatReviewParity("caller/draft/" + draft.id + "/retry", text: "Retry")
+                                    #endif
+                            }
                         }.font(Theme.display(10)).foregroundStyle(draft.state == .failed ? ChatAppearance.failure : ChatAppearance.secondary)
                         if draft.state == .uploading { ProgressView(value: draft.progress).progressViewStyle(.linear).frame(maxWidth: 230) }
-                        if let problem = draft.problem { Text(problem).font(Theme.display(10)).foregroundStyle(ChatAppearance.failure) }
+                        if let problem = draft.problem { Text(problem).font(Theme.display(10)).foregroundStyle(ChatAppearance.failure)
+                                #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                                .chatReviewParity("caller/draft/" + draft.id + "/problem", text: problem, colors: ["foreground": ChatAppearance.failure], font: Theme.display(10))
+                                #endif
+                                }
                     }
                     Spacer(minLength: 4)
+                    #if DEBUG && AGENTPAD_CHAT_NATIVE_W09_CAPTURE
+                    if reviewProbeEnabled {
+                        // The semantic name hides the drawn title from AX.
+                        // Observe the original styled Button without that name
+                        // only in capture builds. A same-host neutrality test
+                        // verifies pixels, geometry and both real actions; the
+                        // original branch certifies the production semantic name.
+                        Button("Delete") { manager.remove(draft) }
+                            .buttonStyle(.link)
+                            .help("Delete saved attachment").chatFocusRing()
+                            .chatReviewParity("caller/draft/" + draft.id + "/delete", text: "Delete")
+                    } else {
+                        Button("Delete") { manager.remove(draft) }
+                            .buttonStyle(.link)
+                            .help("Delete saved attachment").accessibilityLabel("Delete \(draft.file.name)").chatFocusRing()
+                    }
+                    #else
                     Button("Delete") { manager.remove(draft) }
-                        .buttonStyle(.link).help("Delete saved attachment").accessibilityLabel("Delete \(draft.file.name)").chatFocusRing()
+                        .buttonStyle(.link)
+                        .help("Delete saved attachment").accessibilityLabel("Delete \(draft.file.name)").chatFocusRing()
+                    #endif
                 }.padding(7).background(Theme.chromeHover, in: RoundedRectangle(cornerRadius: 6))
                     .accessibilityElement(children: .contain).accessibilityLabel("\(draft.file.mime), \(draft.file.name), \(draft.file.sizeText), \(status(draft))")
             }
@@ -174,6 +224,17 @@ struct ChatAttachmentCard: View {
     @State private var problem: String?
     @State private var busy = false
     @State private var retry = 0
+    private var mediaParityID: String {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["AGENTPAD_CHAT_NATIVE_W06_CAPTURE"] == "1"
+            ? "w06/attachment/" + file.id : ""
+        #else
+        ""
+        #endif
+    }
+    private func mediaParityID(_ part: String) -> String {
+        mediaParityID.isEmpty ? "" : mediaParityID + "/" + part
+    }
     private struct PreviewTask: Hashable {
         var stamp: ChatAttachmentManager.Stamp?
         var retry: Int
@@ -184,6 +245,8 @@ struct ChatAttachmentCard: View {
         return max(44, min(height, width * CGFloat(h) / CGFloat(w)))
     }
     var body: some View {
+        let stamp = manager.stamp(owner: message.attachmentOwner, message: message, file: file)
+        let available = stamp != nil
         VStack(alignment: .leading, spacing: 4) {
             if file.isImage {
                 Button {
@@ -191,44 +254,65 @@ struct ChatAttachmentCard: View {
                 } label: {
                     Group {
                         if let image = manager.image(message, file: file) { Image(decorative: image, scale: 1).resizable().scaledToFit() }
-                        else if problem != nil { Image(systemName: "photo.badge.exclamationmark").foregroundStyle(ChatAppearance.secondary) }
-                        else { ProgressView().controlSize(.small) }
+                        else if problem != nil { Image(systemName: "photo.badge.exclamationmark").foregroundStyle(ChatAppearance.secondary)
+                            .chatParity(mediaParityID("failure-icon"), "control", colors: ["foreground": ChatAppearance.secondary]) }
+                        else { ProgressView().controlSize(.small).chatParity(mediaParityID("spinner"), "control") }
                     }.frame(maxWidth: width).frame(height: imageHeight)
                         .background(Theme.chromeHover, in: RoundedRectangle(cornerRadius: 7))
                         .contentShape(Rectangle())
                 }.buttonStyle(.plain).disabled(!available || busy).help("Open image").chatFocusRing()
+                    .chatParity(mediaParityID("image"), "control", colors: ["background": Theme.chromeHover])
                 Text(file.name).font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary).lineLimit(1)
+                    .chatParity(mediaParityID("name"), "text", text: file.name,
+                        colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
             } else {
                 HStack(spacing: 10) {
                     Image(systemName: "doc.text").font(.system(size: 23)).foregroundStyle(ChatAppearance.accent)
+                        .chatParity(mediaParityID("document"), "control", colors: ["foreground": ChatAppearance.accent])
                     VStack(alignment: .leading, spacing: 3) {
                         Text(file.name).font(Theme.display(12, weight: .medium)).lineLimit(1)
+                            .chatParity(mediaParityID("name"), "text", text: file.name,
+                                colors: ["foreground": Theme.chromeForeground], font: Theme.display(12, weight: .medium))
                         Text("\(file.mime) · \(file.sizeText)").font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
+                            .chatParity(mediaParityID("detail"), "text", text: "\(file.mime) · \(file.sizeText)",
+                                colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
                     }
                     Spacer(minLength: 4)
-                    if busy { ProgressView().controlSize(.mini) }
+                    if busy { ProgressView().controlSize(.mini).chatParity(mediaParityID("spinner"), "control") }
                     else { Button { save() } label: { Image(systemName: "arrow.down.to.line").frame(width: 28, height: 28) }
-                        .buttonStyle(.plain).help("Save…").accessibilityLabel("Save \(file.name)").chatFocusRing().disabled(!available) }
+                        .buttonStyle(.plain).help("Save…").accessibilityLabel("Save \(file.name)").chatFocusRing().disabled(!available)
+                        .chatParity(mediaParityID("save"), "control") }
                 }.padding(10).frame(maxWidth: width).background(Theme.chromeHover, in: RoundedRectangle(cornerRadius: 7))
+                    .chatParity(mediaParityID("background"), "control", colors: ["background": Theme.chromeHover])
             }
             if let problem {
-                HStack { Text(problem); if available { Button("Retry") { self.problem = nil; if file.isImage { retry += 1 } else { save() } }.buttonStyle(.link) } }
+                HStack {
+                    Text(problem).chatParity(mediaParityID("problem"), "text", text: problem,
+                        colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                    if available {
+                        Button("Retry") { self.problem = nil; if file.isImage { retry += 1 } else { save() } }.buttonStyle(.link)
+                            .chatParity(mediaParityID("retry"), "text", text: "Retry",
+                                colors: ["foreground": ChatAppearance.secondary], font: Theme.display(10))
+                    }
+                }
                     .font(Theme.display(10)).foregroundStyle(ChatAppearance.secondary)
             }
         }
+        .chatParity(mediaParityID, "control")
         .background(ChatSidebarWindowReader(reference: host))
         .accessibilityElement(children: .contain).accessibilityLabel("\(file.mime), \(file.name), \(file.sizeText)")
-        .task(id: PreviewTask(stamp: manager.stamp(owner: message.attachmentOwner, message: message, file: file), retry: retry)) {
-            guard file.isImage, file.hasPreview, available, manager.image(message, file: file) == nil else { return }
+        .task(id: PreviewTask(stamp: stamp, retry: retry)) {
+            guard file.isImage, file.hasPreview, self.available, manager.image(message, file: file) == nil else { return }
             problem = nil
             do { _ = try await manager.load(message, file: file, preview: true) }
-            catch { if !Task.isCancelled { problem = available ? "Preview failed to load." : "File unavailable." } }
+            catch { if !Task.isCancelled { problem = self.available ? "Preview failed to load." : "File unavailable." } }
         }
 
     }
     private func save() {
         guard let window = host.window, let anchor = host.view,
-              let session = TabRouter.shared.stores().flatMap(\.allSessions).first(where: { anchor.isDescendant(of: $0.engine.view) }),
+              let session = TabRouter.shared.stores().flatMap({ $0.allSessions + $0.popups.sessions })
+                .first(where: { anchor.isDescendant(of: $0.engine.view) }),
               let owner = TabRouter.shared.owner(of: session.id) else { return }
         busy = true; problem = nil
         Task {

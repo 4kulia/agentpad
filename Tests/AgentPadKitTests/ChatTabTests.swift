@@ -75,17 +75,45 @@ final class ChatTabTests: XCTestCase {
         XCTAssertNil(back.explicitName)
     }
 
-    /// The open tab of a channel is found by the whole ref (review F2b-3).
-    func testShowChannelFindsTheTabByTheWholeRef() throws {
+    /// Ordinary activation keeps the agent selected; whole-reference identity
+    /// and deliberate new-tab commands retain their existing guarantees.
+    func testShowChannelUsesWholeRefForPopupAndExplicitTabOpening() throws {
         let a = store(InMemoryPersistence())
+        defer { a.terminate() }
         let ws = a.workspaces[0]
+        let agent = try XCTUnwrap(ws.activeSession)
         let opened = try XCTUnwrap(a.showChannel(ref))
-        XCTAssertTrue(a.showChannel(ref) === opened, "brought forward, not opened again")
+        XCTAssertTrue(a.popups.visibleConversation === opened)
+        XCTAssertTrue(a.showChannel(ref) === opened, "The same popup conversation is retained")
+        XCTAssertTrue(ws.activeSession === agent)
+        XCTAssertNil(a.channelTab(ref), "An ordinary click creates no tab")
         var otherAccount = ref
         otherAccount.account = "a2"
-        XCTAssertFalse(a.showChannel(otherAccount) === opened)
+        let other = try XCTUnwrap(a.showChannel(otherAccount))
+        XCTAssertFalse(other === opened)
+        XCTAssertEqual(other.channel, otherAccount)
+        XCTAssertTrue(ws.activeSession === agent)
+        XCTAssertTrue(ws.root.allPanes.flatMap(\.tabs).filter { $0.channel != nil }.isEmpty)
+        XCTAssertTrue(a.showChannel(ref, asTab: true) === opened)
+        XCTAssertTrue(ws.activeSession === opened); XCTAssertNil(a.popups.visibleConversation)
+        XCTAssertTrue(a.showChannel(otherAccount, asTab: true) === other)
         XCTAssertFalse(a.showChannel(ref, newTab: true) === opened)
         XCTAssertEqual(ws.root.allPanes.flatMap(\.tabs).filter { $0.channel != nil }.count, 3)
+    }
+
+    func testPlainClickOnAnExistingChannelTabShowsPopupWithoutSelectingIt() throws {
+        let a = store(InMemoryPersistence())
+        defer { a.terminate() }
+        let workspace = a.workspaces[0]
+        let channel = a.openChannelTab(ref, in: workspace)
+        let agent = a.addTab(in: workspace)
+        XCTAssertTrue(a.showChannel(ref) === channel)
+        XCTAssertTrue(a.popups.visibleConversation === channel)
+        XCTAssertTrue(workspace.activeSession === agent)
+        XCTAssertEqual(workspace.root.allPanes.flatMap(\.tabs).filter { $0.channel == ref }.map(\.id), [channel.id])
+        XCTAssertTrue(a.showChannel(ref, asTab: true) === channel)
+        XCTAssertTrue(workspace.activeSession === channel)
+        XCTAssertNil(a.popups.visibleConversation)
     }
 
     func testDuplicateMoveAndClose() throws {

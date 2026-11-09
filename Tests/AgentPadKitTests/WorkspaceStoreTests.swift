@@ -4,9 +4,11 @@ import XCTest
 
 @MainActor
 final class WorkspaceStoreTests: XCTestCase {
-    private let projectA = URL(fileURLWithPath: "/tmp/projectA")
-    private let projectB = URL(fileURLWithPath: "/tmp/projectB")
-    private let projectC = URL(fileURLWithPath: "/tmp/projectC")
+    // XCTest constructs fixtures before setUp creates these directories. Keep
+    // their URL identity independent of which earlier test created the path.
+    private let projectA = URL(fileURLWithPath: "/tmp/projectA", isDirectory: true)
+    private let projectB = URL(fileURLWithPath: "/tmp/projectB", isDirectory: true)
+    private let projectC = URL(fileURLWithPath: "/tmp/projectC", isDirectory: true)
     private var startupAdmission: ((@escaping () -> Void) -> Bool)?
 
     override func setUp() async throws {

@@ -81,6 +81,7 @@ struct TelegramFolderRow: View {
     }
     @ViewBuilder var menu: some View {
         Button("Open") { TelegramTabs.open(row, from: store) }
+        Button("Open as tab") { TelegramTabs.open(row, from: store, asTab: true) }
         Button("Open in New Tab") { TelegramTabs.open(row, from: store, newTab: true) }
         TelegramChatActions(row: row, model: model, windowID: store.windowID, anchor: entryID)
         if let folder { Button("Remove from \"\(folder.name)\"") { folders.remove(.telegram(row.id.chat), from: folder.id) } }

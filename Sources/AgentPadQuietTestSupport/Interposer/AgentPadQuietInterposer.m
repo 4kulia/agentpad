@@ -7,6 +7,13 @@
 // tuples in the main executable. This library has no shipped-app dependency.
 // Quiet harnesses fail closed unless its marker is present before AppKit starts.
 static atomic_ulong sounds, notifications, globalEvents;
+static NSMutableArray<NSDictionary *> *announcements;
+void APQuietInterposedCaptureAnnouncements(bool enabled) {
+    @synchronized(NSApplication.class) { announcements = enabled ? [NSMutableArray new] : nil; }
+}
+NSArray<NSDictionary *> *APQuietInterposedAnnouncements(void) {
+    @synchronized(NSApplication.class) { return announcements.copy ?: @[]; }
+}
 bool APQuietInterposerLoaded(void) { return true; }
 unsigned long APQuietInterposedSoundCount(void) { return atomic_load(&sounds); }
 unsigned long APQuietInterposedNotificationCount(void) { return atomic_load(&notifications); }
@@ -24,7 +31,10 @@ static SInt32 quietAlert(CFTimeInterval timeout, CFOptionFlags flags, CFURLRef i
     notifications++; if (response) *response = kCFUserNotificationCancelResponse; return 0;
 }
 static void quietAccessibility(id element, NSAccessibilityNotificationName notification, NSDictionary *userInfo) {
-    if ([notification isEqualToString:NSAccessibilityAnnouncementRequestedNotification]) { sounds++; return; }
+    if ([notification isEqualToString:NSAccessibilityAnnouncementRequestedNotification]) {
+        @synchronized(NSApplication.class) { [announcements addObject:userInfo.copy ?: @{}]; }
+        sounds++; return;
+    }
     // dyld leaves calls from the replacing image bound to the system function.
     NSAccessibilityPostNotificationWithUserInfo(element, notification, userInfo);
 }

@@ -481,6 +481,18 @@ final class ChatAttachmentManager {
         lru.removeAll { $0 == capture }; lru.append(capture)
         return image
     }
+    /// Immutable render input for this message only. Reading it observes cache
+    /// notifications but neither starts work nor changes the preview LRU.
+    func cachedPreviews(_ message: ChatMessage) -> [String: Data] {
+        _ = revision
+        var result: [String: Data] = [:]
+        for file in message.attachments {
+            if let capture = stamp(owner: message.attachmentOwner, message: message, file: file), decodedPreviews[capture] != nil {
+                result[file.id] = previews[capture]
+            }
+        }
+        return result
+    }
     func load(_ message: ChatMessage, file: ChatAttachment, preview: Bool) async throws -> Data {
         guard let capture = stamp(owner: message.attachmentOwner, message: message, file: file), let limits else { throw ChatAttachmentError.unavailable }
         if preview, let cached = previews[capture] { return cached }

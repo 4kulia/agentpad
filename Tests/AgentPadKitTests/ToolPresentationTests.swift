@@ -218,13 +218,17 @@ final class ToolPresentationTests: XCTestCase {
         XCTAssertTrue(video.contains(".popupHost("))
         let nativeExceptions: [(String, String)] = [
             ("App/CommandPalette.swift", "NSPanel"), ("App/AttentionOverlay.swift", ".popover("),
-            ("AgentPad/Chat/ChatMentionPopup.swift", "NSPanel"), ("AgentPad/Chat/ChatMessageRow.swift", ".attentionPopover("),
+            ("AgentPad/Chat/ChatMentionPopup.swift", "NSPanel"), ("AgentPad/Chat/ChatNativeRowActions.swift", "ChatNativeAttentionPopover"),
             ("Sidebar/WorkspaceRailView.swift", "attentionPopover"), ("Terminal/CodexUsagePill.swift", "attentionPopover"),
             ("Tabs/SupportTabs.swift", "NSOpenPanel"), ("AgentPad/QuickLookPanel.swift", "QLPreviewPanel"),
             ("Telegram/TelegramSponsoredVideoWindow.swift", "NSWindow(contentRect:"),
             ("App/NotificationManager.swift", "requestAuthorization"), ("App/AppDelegate.swift", "func addWindow(")
         ]
         for (path, marker) in nativeExceptions { XCTAssertTrue(try source(path).contains(marker), "Named native exception changed: \(path)") }
+        let nativeChatPopup = try source("AgentPad/Chat/ChatNativeRowActions.swift")
+        XCTAssertTrue(nativeChatPopup.contains("NavigationPresentationGate.setOverlay(id, window: window, presented: true)"))
+        XCTAssertTrue(nativeChatPopup.contains("func popoverDidClose("))
+        XCTAssertTrue(nativeChatPopup.contains("NavigationPresentationGate.setOverlay(id, window: ownerWindow, presented: false)"))
         XCTAssertTrue(try source("AgentPad/Updater.swift").contains("Sparkle"))
     }
 

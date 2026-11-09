@@ -49,6 +49,15 @@ struct ContactAvatar: View {
     @State private var visibilityID = UUID()
     @State private var displayed: (Content, NSImage)?
     private var placeholder: AvatarPlaceholder { .init(stableID: stableID, name: name, kind: kind) }
+    private var mediaParityID: String {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["AGENTPAD_CHAT_NATIVE_W06_CAPTURE"] == "1"
+            || ProcessInfo.processInfo.environment["AGENTPAD_CHAT_NATIVE_W07_CAPTURE"] == "1" && size == 21
+            ? "w06/avatar/\(stableID)/\(name)/\(Int(size))" : ""
+        #else
+        ""
+        #endif
+    }
 
     var body: some View {
         let rgb = placeholder.color(isLight: Theme.resolved.isLight)
@@ -76,6 +85,10 @@ struct ContactAvatar: View {
                     }
             }
         }.frame(width: size, height: size)
+            .chatParity(mediaParityID, "avatar", text: picture == nil ? placeholder.letter : nil,
+                colors: picture == nil ? ["foreground": .white] : [:],
+                srgbTokens: picture == nil ? ["fill": rgb] : [:],
+                font: Theme.display(size * 0.46, weight: .semibold))
             .clipShape(RoundedRectangle(cornerRadius: placeholder.cornerRadius(size: size)))
             .accessibilityHidden(true)
             .task(id: Load(content: content, generation: generation)) {

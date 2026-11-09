@@ -57,9 +57,9 @@ import XCTest
         let root = TelegramChatID(environment: .test, account: 42, chat: 1)
         let first = root.withTopic(.forum(1)), second = root.withTopic(.forum(2))
         let router = TabRouter(); router.stores = { [store] }
-        let topicTab = try XCTUnwrap(router.open(.telegram(first), from: store))
-        let otherTopic = try XCTUnwrap(router.open(.telegram(second), from: store))
-        let forumTab = try XCTUnwrap(router.open(.telegram(root), from: store))
+        let topicTab = try XCTUnwrap(router.open(.telegram(first), from: store, asTab: true))
+        let otherTopic = try XCTUnwrap(router.open(.telegram(second), from: store, asTab: true))
+        let forumTab = try XCTUnwrap(router.open(.telegram(root), from: store, asTab: true))
         let summary = TelegramAttentionSummary(destination: first, count: 3, firstMessage: 100, lastDate: 1000, kind: .mention, identity: "forum:1:1")
         var snapshot = TelegramChatSnapshot(); snapshot.account = root.root; snapshot.state = .complete
         snapshot.binding = .init(environment: .test,account: 42,connectionID: UUID())
@@ -99,7 +99,7 @@ import XCTest
         let model = AttentionSidebarModel(ledger: AttentionLedger(), telegram: chats, storesProvider: { [store] })
         XCTAssertTrue(model.workspaceIndicators.isEmpty); XCTAssertTrue(model.items.isEmpty)
         let router = TabRouter(); router.stores = { [store] }
-        let tab = try XCTUnwrap(router.open(.telegram(id), from: store)); model.updateProjection()
+        let tab = try XCTUnwrap(router.open(.telegram(id), from: store, asTab: true)); model.updateProjection()
         XCTAssertEqual(model.tabIndicators[tab.id]?.kind, .unread)
         XCTAssertEqual(model.projection.telegram.attention.totalCount, 0)
         XCTAssertTrue(model.items.isEmpty)
