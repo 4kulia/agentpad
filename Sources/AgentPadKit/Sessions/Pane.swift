@@ -9,6 +9,10 @@ final class Pane: Identifiable {
     let id: UUID
     var tabs: [Session]
     var activeTabId: UUID?
+    /// Bumped by every selection (`WorkspaceStore.activateTab`), the same tab
+    /// included, so the tab strip brings the selected tab back into view after
+    /// a manual scroll. Pane focus (`focusPaneTab`) does not bump it.
+    var revealSerial = 0
 
     init(id: UUID = UUID(), tabs: [Session] = [], activeTabId: UUID? = nil) {
         self.id = id

@@ -1908,7 +1908,21 @@ final class WorkspaceStore {
         activateTab(pane.tabs[pane.tabs.cyclicIndex(from: currentIdx, step: direction)], in: workspace)
     }
 
+    /// Select a tab: the user or a navigation picked it (tab click, sidebar,
+    /// popup, ⌘-number, open). Its tab strip scrolls it into view, even when it
+    /// was already selected.
     func activateTab(_ session: Session, in workspace: Workspace) {
+        activateTab(session, in: workspace, reveal: true)
+    }
+
+    /// Focus a pane's tab without selecting it anew (a click in the terminal,
+    /// its right-click menu, terminal focus): a manually scrolled tab strip
+    /// stays where the user left it.
+    func focusPaneTab(_ session: Session, in workspace: Workspace) {
+        activateTab(session, in: workspace, reveal: false)
+    }
+
+    private func activateTab(_ session: Session, in workspace: Workspace, reveal: Bool) {
         // Switching to a tab counts as reading any notification that pointed at
         // it — clears the inbox entry + the bell dot without an explicit click.
         NotificationInbox.shared.markRead(forSession: session.id)
@@ -1920,6 +1934,7 @@ final class WorkspaceStore {
         // flag is lifelong; PaneView's active-tab exclusion is the one
         // consumer gate, so the structure closes the race with no timing.
         guard let pane = pane(containing: session, in: workspace) else { return }
+        if reveal { pane.revealSerial &+= 1 }
         AgentAnswerSource.scheduleRefresh(session)
         session.lastActivated = Date()
         var changed = false
@@ -3204,7 +3219,7 @@ final class WorkspaceStore {
         engine.onOpenFile = { [weak self, weak session, weak workspace] reference in
             guard let self, let session, let workspace else { return }
             self.activateWorkspace(workspace)
-            self.activateTab(session, in: workspace)
+            self.focusPaneTab(session, in: workspace)
             var isDirectory: ObjCBool = false
             if FileManager.default.fileExists(atPath: reference.url.path, isDirectory: &isDirectory),
                isDirectory.boolValue {
@@ -3331,7 +3346,7 @@ final class WorkspaceStore {
         }
         engine.onFocus = { [weak self, weak session, weak workspace] in
             guard let self, let session, let workspace else { return }
-            self.activateTab(session, in: workspace)
+            self.focusPaneTab(session, in: workspace)
         }
         engine.onCommandFinished = { [weak self, weak session] exit, duration in
             guard let self, !self.isTerminated, let session,

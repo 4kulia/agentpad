@@ -16,15 +16,26 @@ struct TabBarItem: View {
     var onLastAnswer: (Bool) -> Void = { _ in }
 
     var attention = AttentionSidebarModel.shared
+    /// Width the tab strip assigned (TabStripLayout); nil keeps the natural width.
+    var width: CGFloat? = nil
+    /// Narrower than its natural width: compact paddings; an inactive tab's
+    /// close button overlays the title end on hover instead of taking space.
+    var compressed = false
     private var indicator: AttentionIndicator? { attention.tabIndicators[tab.id] }
     private var title: String { attention.tabTitle(tab) }
 
     @State private var isHovered = false
     @State private var isContextMenuOpen = false
 
+    private var gap: CGFloat { compressed ? TabStripMetrics.compactGap : TabStripMetrics.gap }
+    private var overlaysClose: Bool { compressed && !isActive && !tab.nameEdit.isEditing }
+
     var body: some View {
-        HStack(spacing: 7) {
-            HStack(spacing: 7) {
+        #if DEBUG
+        let _ = TabStripRenderCount.rows += 1
+        #endif
+        HStack(spacing: gap) {
+            HStack(spacing: gap) {
                 AttentionIndicatorView(indicator: indicator)
                 // AgentPad: saved chat lists have their own navigation symbols.
                 AgentIconView(asset: tab.hasProcess ? tab.displayAgent.iconAsset : nil,
@@ -37,6 +48,8 @@ struct TabBarItem: View {
                     Text(title)
                     .font(Theme.display(12, weight: isActive ? .medium : .regular))
                     .lineLimit(1)
+                    .frame(maxWidth: width == nil ? nil : .infinity, alignment: .leading)
+                    .mask { titleMask }
                 }
             }
             .overlay { if !tab.nameEdit.isEditing { TabDragSource(session: tab, store: store, onActivate: onActivate) } }
@@ -46,19 +59,31 @@ struct TabBarItem: View {
                                     help: AgentAnswerSource.problem(tab)?.rawValue ?? "Forward last agent answer…") { onLastAnswer(false) }
                     .disabled(!CompositionTabs.available(tab))
             }
-            HoverableIconButton(
-                systemName: "xmark",
-                fontSize: 9,
-                size: 16,
-                help: "Close tab",
-                action: onClose
-            )
-            .opacity(isHovered || isActive ? 1 : 0)
-            .allowsHitTesting(isHovered || isActive)
+            if !overlaysClose {
+                closeButton
+                    .opacity(isHovered || isActive ? 1 : 0)
+                    .allowsHitTesting(isHovered || isActive)
+            }
         }
         .foregroundStyle(isActive ? Theme.chromeForeground : Theme.chromeForeground.opacity(0.62))
-        .padding(.horizontal, 11)
+        .padding(.horizontal, compressed ? TabStripMetrics.compactPadding : TabStripMetrics.padding)
         .padding(.vertical, 8)
+        .frame(width: width, alignment: .leading)
+        .overlay(alignment: .trailing) {
+            // A compressed inactive tab has no room for its close button: it
+            // appears over the title end on hover (mockup f2 c, f5).
+            if overlaysClose {
+                closeButton
+                    .background {
+                        // Mockup: surface mixed with 7 % foreground.
+                        RoundedRectangle(cornerRadius: 4, style: .continuous).fill(Color(nsColor: Theme.terminalSurface))
+                            .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous).fill(Theme.chromeForeground.opacity(0.09)))
+                    }
+                    .padding(.trailing, 6)
+                    .opacity(isHovered ? 1 : 0)
+                    .allowsHitTesting(isHovered)
+            }
+        }
         .background(rowBackground)
         .clipShape(RoundedRectangle(cornerRadius: Theme.chromeSelectionCornerRadius, style: .continuous))
         .contentShape(Rectangle())
@@ -96,6 +121,30 @@ struct TabBarItem: View {
                     if tab.hasProcess { tab.nameEdit.begin(tab.explicitName ?? tab.title) }
                 },
                 onSplit: onSplit, onMoveToNewWindow: onMoveToNewWindow, onLastAnswer: onLastAnswer)
+        }
+    }
+
+    private var closeButton: some View {
+        HoverableIconButton(
+            systemName: "xmark",
+            fontSize: 9,
+            size: 16,
+            help: "Close tab",
+            action: onClose
+        )
+    }
+
+    /// Fades the title end under the overlaid close button (100 % − 20 pt →
+    /// 100 % − 4 pt), only while that button shows.
+    @ViewBuilder private var titleMask: some View {
+        if overlaysClose && isHovered {
+            HStack(spacing: 0) {
+                Rectangle()
+                LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing).frame(width: 16)
+                Color.clear.frame(width: 4)
+            }
+        } else {
+            Rectangle()
         }
     }
 

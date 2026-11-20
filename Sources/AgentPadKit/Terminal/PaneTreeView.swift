@@ -63,7 +63,7 @@ private struct PaneView: View {
             return
         }
         let view = active.engine.view
-        store.activateTab(active, in: workspace)
+        store.focusPaneTab(active, in: workspace)
         guard active.hasProcess, let window = view.window else { return }
         // TabBarItem activates the selected tab in its own tap handler. The
         // pane-wide simultaneous gesture also receives that click; if the
@@ -115,7 +115,7 @@ private struct PaneView: View {
                             // Only a process surface needs this interceptor.
                             // Native editors keep their own contextual actions.
                             RightClickCatcher { unit in
-                                store.activateTab(active, in: workspace)
+                                store.focusPaneTab(active, in: workspace)
                                 contextMenuAnchor = unit
                                 contextMenuOpen = true
                             }
@@ -1133,7 +1133,7 @@ private struct GitDiffStatusSegment: View {
                     // whose repo-wide diff the popover just displayed — the
                     // root travels inside the numstat snapshot, never from
                     // the pill's possibly-stale `gitStatus`.
-                    store.activateTab(session, in: workspace)
+                    store.focusPaneTab(session, in: workspace)
                     store.revealFileTree(
                         root: (loaded.diff?.repoRoot).map { URL(fileURLWithPath: $0, isDirectory: true) }
                     )
