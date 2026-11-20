@@ -455,6 +455,14 @@ struct ChatAttachmentStorage: Sendable {
             }
         }
     }
+    /// Whether `path` is `folder` or inside it on disk, resolved as grants are:
+    /// links followed even where their target is missing, `..` taken from a
+    /// link's target, the volume's case rules. nil when either path cannot be
+    /// resolved (a link loop, a file on the way, an unreadable folder).
+    static func isFolder(_ path: String, within folder: String) -> Bool? {
+        guard let path = try? resolvedFolder(path), let folder = try? resolvedFolder(folder) else { return nil }
+        return path.relative(to: folder) != nil
+    }
     private struct Folder {
         struct Identity: Equatable {
             let device: dev_t

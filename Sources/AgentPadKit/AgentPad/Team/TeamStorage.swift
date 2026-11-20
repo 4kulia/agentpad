@@ -19,15 +19,16 @@ struct TeamStorage: Sendable {
     static var isTestProcess: Bool { NSClassFromString("XCTestCase") != nil }
 
     static func testDirectoryIsSafe(_ directory: URL) -> Bool {
-        let path = directory.standardizedFileURL.resolvingSymlinksInPath().path
         // Include the account's actual home even when the test process uses
         // CFFIXED_USER_HOME to isolate other application support files.
         let homes = [FileManager.default.homeDirectoryForCurrentUser,
                      URL(fileURLWithPath: String(cString: getpwuid(getuid())!.pointee.pw_dir))]
         return homes.allSatisfy { home in
             let profile = home.appendingPathComponent("Library/Application Support/agentpad")
-                .standardizedFileURL.resolvingSymlinksInPath().path
-            return path != profile && !path.hasPrefix(profile + "/")
+            // Not resolvingSymlinksInPath(): it leaves the whole path unresolved
+            // when any part is missing, so a link into a profile whose folder
+            // does not exist yet passed. Unresolvable counts as unsafe.
+            return ChatAttachmentStorage.isFolder(directory.path, within: profile.path) == false
         }
     }
 
